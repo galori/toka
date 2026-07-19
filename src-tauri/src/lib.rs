@@ -1,9 +1,10 @@
+#[cfg(any(not(feature = "e2e"), test))]
 mod providers;
 mod search;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(not(feature = "e2e"), target_os = "macos"))]
 use providers::MdfindSearchProvider;
-#[cfg(target_os = "linux")]
+#[cfg(all(not(feature = "e2e"), target_os = "linux"))]
 use providers::RecollSearchProvider;
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
@@ -68,15 +69,31 @@ fn prepare_video(
 }
 
 fn platform_provider() -> Arc<dyn SearchProvider> {
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "e2e")]
+    {
+        struct FixtureSearchProvider;
+        impl SearchProvider for FixtureSearchProvider {
+            fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
+                let path = std::env::var_os("TOKA_E2E_VIDEO").ok_or_else(|| {
+                    SearchError::Provider("The integration-test video was not configured.".into())
+                })?;
+                Ok(vec![path.into()])
+            }
+        }
+        Arc::new(FixtureSearchProvider)
+    }
+    #[cfg(all(not(feature = "e2e"), target_os = "macos"))]
     {
         Arc::new(MdfindSearchProvider::system())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
     {
         Arc::new(RecollSearchProvider::system())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        not(feature = "e2e"),
+        not(any(target_os = "macos", target_os = "linux"))
+    ))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
@@ -92,7 +109,13 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .manage(Arc::new(SearchEngine::new(platform_provider())))
         .invoke_handler(tauri::generate_handler![search_videos, prepare_video])
         .run(tauri::generate_context!())

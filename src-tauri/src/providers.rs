@@ -1,5 +1,8 @@
 use crate::search::{SearchError, SearchProvider};
-use std::{path::PathBuf, process::Command, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
+
+#[cfg(not(feature = "e2e"))]
+use std::process::Command;
 
 #[derive(Debug)]
 struct ProcessOutput {
@@ -12,8 +15,10 @@ trait ProcessRunner: Send + Sync {
     fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error>;
 }
 
+#[cfg(not(feature = "e2e"))]
 struct SystemProcessRunner;
 
+#[cfg(not(feature = "e2e"))]
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
         let output = Command::new(program).args(args).output()?;
@@ -32,7 +37,7 @@ pub struct MdfindSearchProvider {
 
 #[cfg(any(target_os = "macos", test))]
 impl MdfindSearchProvider {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(feature = "e2e")))]
     pub fn system() -> Self {
         Self {
             runner: Arc::new(SystemProcessRunner),
@@ -65,7 +70,7 @@ pub struct RecollSearchProvider {
 
 #[cfg(any(target_os = "linux", test))]
 impl RecollSearchProvider {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
     pub fn system() -> Self {
         Self {
             runner: Arc::new(SystemProcessRunner),

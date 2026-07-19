@@ -9,12 +9,17 @@ edition = "2021"
 name = "toka_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+e2e = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-wdio = "1"
+tauri-plugin-wdio-webdriver = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 

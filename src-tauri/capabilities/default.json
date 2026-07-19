@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Capabilities for the Toka main window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "wdio:default", "wdio-webdriver:default"]
 }
