@@ -1,0 +1,22 @@
+[package]
+name = "toka"
+version = "0.1.0"
+description = "Toka media player and organizer"
+authors = ["Toka contributors"]
+edition = "2021"
+
+[lib]
+name = "toka_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["protocol-asset"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
