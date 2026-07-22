@@ -31,6 +31,12 @@ function VideoIcon() {
   );
 }
 
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
+  const wholeSeconds = Math.floor(seconds);
+  return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
+}
+
 function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const nativeSurface = useRef<HTMLDivElement>(null);
@@ -39,6 +45,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
+  const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
   const video = videos[index];
 
   useEffect(() => {
@@ -118,6 +125,15 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     });
   };
 
+  const pause = () => {
+    if (native) void setNativePaused(true).catch((reason: unknown) => setError(errorMessage(reason)));
+    else element.current?.pause();
+  };
+
+  const selectVideo = (nextIndex: number) => {
+    if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
+  };
+
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
@@ -125,6 +141,16 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           ← Back
         </button>
         <h1 title={video.fileName}>{video.fileName}</h1>
+        {videos.length > 1 ? (
+          <button
+            type="button"
+            className="playlist-toggle"
+            aria-expanded={playlistOpen}
+            onClick={() => setPlaylistOpen((open) => !open)}
+          >
+            Playlist <span>{videos.length}</span>
+          </button>
+        ) : null}
       </div>
 
       {error ? <p role="alert" className="message error">{error}</p> : null}
@@ -150,11 +176,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             />
           )}
           <div className="player-controls" aria-label="Video controls">
-            <button type="button" onClick={play}>Play</button>
-            <button type="button" onClick={() => {
-              if (native) void setNativePaused(true).catch((reason: unknown) => setError(errorMessage(reason)));
-              else element.current?.pause();
-            }}>Pause</button>
+            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video">◀◀</button>
+            <button type="button" className="play-button" onClick={play}>Play</button>
+            <button type="button" className="transport-button" onClick={pause}>Pause</button>
+            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">▶▶</button>
             <input
               aria-label="Video timeline"
               type="range"
@@ -169,7 +194,29 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 setCurrentTime(nextTime);
               }}
             />
+            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
           </div>
+          {videos.length > 1 && playlistOpen ? (
+            <aside className="playlist-drawer" aria-label="Playlist">
+              <h2>Up next</h2>
+              <ol>
+                {videos.map((item, itemIndex) => (
+                  <li key={item.id}>
+                    <button
+                      type="button"
+                      className={itemIndex === index ? "active" : undefined}
+                      aria-current={itemIndex === index ? "true" : undefined}
+                      onClick={() => selectVideo(itemIndex)}
+                      title={item.fileName}
+                    >
+                      <span className="playlist-marker" />
+                      <span>{item.fileName}</span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </aside>
+          ) : null}
         </div>
       ) : null}
       {videos.length > 1 ? (
@@ -220,15 +267,18 @@ export default function App() {
     <main className={hasSubmitted ? "app" : "app initial"}>
       <form role="search" onSubmit={submit} className="search-form">
         <label className="sr-only" htmlFor="video-search">Search videos</label>
-        <input
-          id="video-search"
-          type="search"
-          value={query}
-          onChange={(event) => setQuery(event.currentTarget.value)}
-          placeholder="Search videos…"
-          autoComplete="off"
-          autoFocus
-        />
+        <div className="search-field">
+          <input
+            id="video-search"
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.currentTarget.value)}
+            placeholder="Search videos…"
+            autoComplete="off"
+            autoFocus
+          />
+          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <span className="search-glyph" aria-hidden="true">⌕</span>}
+        </div>
       </form>
 
       {loading ? <p className="message" aria-live="polite">Searching…</p> : null}
