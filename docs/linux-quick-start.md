@@ -8,7 +8,7 @@ These instructions target Ubuntu and Debian. For another distribution, install t
 sudo apt update
 sudo apt install build-essential curl file libayatana-appindicator3-dev \
   libegl1-mesa-dev libepoxy-dev libglx-dev libgtk-3-dev libmpv2 librsvg2-dev \
-  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev recoll wget
+  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev plocate wget
 ```
 
 Install [Node.js 20+](https://nodejs.org/) and [Rust stable](https://rustup.rs/) if they are not already installed.
@@ -19,11 +19,13 @@ From the repository:
 
 ```sh
 npm ci
-recollindex
+sudo updatedb
 npm run tauri dev
 ```
 
-`recollindex` creates or refreshes Toka's search index. Use the Recoll desktop app to choose which folders are indexed.
+`updatedb` creates or refreshes the plocate index used by Toka. Configure indexed
+and excluded paths in `/etc/updatedb.conf`. To use Recoll instead, install it and
+launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 
 ## 3. Build an installable app
 
@@ -36,4 +38,4 @@ with `dpkg` so Toka appears in the Applications menu and can be launched from th
 
 Toka uses `libmpv2` for Linux video playback. On Tails, add it to Additional Software so it is restored when Persistent Storage is unlocked.
 
-If searches return nothing, check Recoll's indexed folders and run `recollindex` again. More troubleshooting is available in [Development](development.md).
+If searches return nothing, check `/etc/updatedb.conf` and run `sudo updatedb` again. More troubleshooting is available in [Development](development.md).

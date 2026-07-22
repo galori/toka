@@ -1,6 +1,6 @@
 # Toka
 
-Toka is a small, read-only desktop app for finding and playing videos on macOS and Linux. It searches the operating system's existing index—Spotlight on macOS or Recoll on Linux—and never moves or modifies your files.
+Toka is a small, read-only desktop app for finding and playing videos on macOS and Linux. It searches the operating system's existing index—Spotlight on macOS or plocate on Linux—and never moves or modifies your files.
 
 ## Quick start
 
@@ -22,6 +22,6 @@ from there. See the platform quick-start guide for details.
 
 - Supported search results: MP4, MOV, MKV, AVI, WebM, M4V, MPEG, MPG, and MPE.
 - Linux playback uses the embedded libmpv/FFmpeg media engine; other platforms use the system WebKit media engine. Toka does not transcode files.
-- Search results are based on the current Spotlight or Recoll index, not a live filesystem scan.
+- Search results are based on the current Spotlight or plocate index, not a live filesystem scan.
 
 See [Development](docs/development.md) for tests, project structure, troubleshooting, and implementation details. The official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) cover other Linux distributions.

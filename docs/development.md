@@ -10,7 +10,7 @@ npm run build           # type-check and build only the web frontend
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or Recoll index.
+The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.
 
 ## How it works
 
@@ -26,8 +26,9 @@ The `e2e` Cargo feature replaces the platform search provider with a fixture pro
 
 ## Linux troubleshooting
 
-- No results: open Recoll, check its indexed folders, then run `recollindex`.
-- `recollq` not found: install the `recoll` package and launch Toka from a session where the executable is available on `PATH`.
+- No results: check `/etc/updatedb.conf`, then run `sudo updatedb` to refresh plocate's index.
+- `plocate` not found: install the `plocate` package and launch Toka from a session where the executable is available on `PATH`.
+- Optional Recoll provider: install `recoll`, run `recollindex`, and launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.
 - AppImage compatibility: build on the oldest Linux base you intend to support. Newer build systems may require a newer glibc on the destination computer.

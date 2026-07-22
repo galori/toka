@@ -228,4 +228,32 @@ mod tests {
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
     }
+
+    #[test]
+    fn plocate_uses_filename_mode_without_a_shell_and_parses_paths() {
+        let runner = Arc::new(FakeRunner::new("/media/Summer Vacation.mkv\n"));
+        let provider = PlocateSearchProvider {
+            runner: runner.clone(),
+        };
+
+        let paths = provider.candidates("summer vacation").unwrap();
+
+        assert_eq!(
+            *runner.invocation.lock().unwrap(),
+            Some((
+                "plocate".into(),
+                [
+                    "--ignore-case",
+                    "--basename",
+                    "--existing",
+                    "--",
+                    "vacation"
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            ))
+        );
+        assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
+    }
 }
