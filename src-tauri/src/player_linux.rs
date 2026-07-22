@@ -1,3 +1,4 @@
+use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 use libloading::Library;
 use serde::Serialize;
@@ -327,6 +328,35 @@ thread_local! {
     static VIDEO_AREA: RefCell<Option<gtk::GLArea>> = const { RefCell::new(None) };
 }
 
+fn disconnect_incompatible_resize_handlers(webview: &gtk::Widget) {
+    // Tauri's Linux mouse and touch resize handlers assume the webview is still a
+    // direct child of Tao's GtkBox. The player wraps it in a GtkOverlay, so those
+    // handlers panic while walking the widget hierarchy. Toka uses a decorated
+    // window and does not need the borderless-window resize handlers.
+    unsafe {
+        for signal_name in [
+            b"button-press-event\0".as_slice(),
+            b"touch-event\0".as_slice(),
+        ] {
+            let signal_id = gtk::glib::gobject_ffi::g_signal_lookup(
+                signal_name.as_ptr().cast(),
+                webview.type_().into_glib(),
+            );
+            if signal_id != 0 {
+                gtk::glib::gobject_ffi::g_signal_handlers_disconnect_matched(
+                    webview.as_ptr().cast(),
+                    gtk::glib::gobject_ffi::G_SIGNAL_MATCH_ID,
+                    signal_id,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
 pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
         .get_webview_window("main")
@@ -337,6 +367,7 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
         .into_iter()
         .next()
         .ok_or("The web view was not created.")?;
+    disconnect_incompatible_resize_handlers(&webview);
     vbox.remove(&webview);
 
     let overlay = gtk::Overlay::new();
