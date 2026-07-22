@@ -7,7 +7,8 @@ These instructions target Ubuntu and Debian. For another distribution, install t
 ```sh
 sudo apt update
 sudo apt install build-essential curl file libayatana-appindicator3-dev \
-  libmpv2 librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev libxdo-dev recoll wget
+  libegl1-mesa-dev libepoxy-dev libglx-dev libgtk-3-dev libmpv2 librsvg2-dev \
+  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev recoll wget
 ```
 
 Install [Node.js 20+](https://nodejs.org/) and [Rust stable](https://rustup.rs/) if they are not already installed.
