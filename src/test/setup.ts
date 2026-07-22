@@ -1,5 +1,11 @@
 import "@testing-library/jest-dom/vitest";
 
+globalThis.ResizeObserver = class ResizeObserverMock {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+
 Object.defineProperty(HTMLMediaElement.prototype, "play", {
   configurable: true,
   value: vi.fn().mockResolvedValue(undefined),

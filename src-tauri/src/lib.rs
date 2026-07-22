@@ -3,7 +3,7 @@ mod player_linux;
 mod providers;
 mod search;
 
-#[cfg(all(not(feature = "e2e"), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{PlocateSearchProvider, RecollSearchProvider};
@@ -148,7 +148,7 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
             return Arc::new(FixtureSearchProvider);
         }
     }
-    #[cfg(all(not(feature = "e2e"), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         Arc::new(MdfindSearchProvider::system())
     }
@@ -162,10 +162,7 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
             ))),
         }
     }
-    #[cfg(all(
-        not(feature = "e2e"),
-        not(any(target_os = "macos", target_os = "linux"))
-    ))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
