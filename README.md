@@ -10,10 +10,13 @@ Toka is a small, read-only desktop app for finding and playing videos on macOS a
 ## Build
 
 ```sh
-npm run tauri build
+npm run build:linux # Linux: builds and installs the .deb
+npm run build:mac   # macOS: builds the .app and .dmg
 ```
 
-Installable bundles are written below `src-tauri/target/release/bundle/` (`.deb` and AppImage on Linux; `.app` and `.dmg` on macOS). Build Linux bundles on Linux and macOS bundles on macOS.
+Build Linux bundles on Linux and macOS bundles on macOS. The Linux command installs
+the generated `.deb` so Toka appears in the Applications menu and can be launched
+from there. See the platform quick-start guide for details.
 
 ## Notes
 

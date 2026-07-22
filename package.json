@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "build:linux": "npm run tauri build -- --bundles deb && sudo dpkg --install ./src-tauri/target/release/bundle/deb/Toka_${npm_package_version}_$(dpkg --print-architecture).deb",
+    "build:mac": "npm run tauri build -- --bundles app,dmg",
     "build": "tsc && vite build",
     "test": "vitest run",
     "test:integration": "npm run build:integration && wdio run wdio.conf.ts && npm run test:integration:real-provider",

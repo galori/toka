@@ -28,10 +28,11 @@ npm run tauri dev
 ## 3. Build an installable app
 
 ```sh
-npm run tauri build
+npm run build:linux
 ```
 
-The `.deb` and AppImage bundles are written below `src-tauri/target/release/bundle/`.
+This builds the `.deb` below `src-tauri/target/release/bundle/deb/` and installs it
+with `dpkg` so Toka appears in the Applications menu and can be launched from there.
 
 Toka uses `libmpv2` for Linux video playback. On Tails, add it to Additional Software so it is restored when Persistent Storage is unlocked.
 

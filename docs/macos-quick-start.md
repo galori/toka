@@ -24,7 +24,7 @@ Toka searches the existing Spotlight index; no separate search service is requir
 ## 3. Build an installable app
 
 ```sh
-npm run tauri build
+npm run build:mac
 ```
 
 The `.app` and `.dmg` bundles are written below `src-tauri/target/release/bundle/`.
