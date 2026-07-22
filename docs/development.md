@@ -17,7 +17,7 @@ The native integration test uses an embedded WebDriver and a generated video fix
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
 - macOS search runs `/usr/bin/mdfind`.
-- Linux search runs `recollq`; installing Recoll through the system package manager normally places it on the app's executable path.
+- Linux search uses `plocate` by default. Set `TOKA_SEARCH_PROVIDER=recoll` before launching Toka to use `recollq` instead.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
 

@@ -1,11 +1,10 @@
-#[cfg(any(not(feature = "e2e"), test))]
 mod providers;
 mod search;
 
 #[cfg(all(not(feature = "e2e"), target_os = "macos"))]
 use providers::MdfindSearchProvider;
-#[cfg(all(not(feature = "e2e"), target_os = "linux"))]
-use providers::RecollSearchProvider;
+#[cfg(target_os = "linux")]
+use providers::{PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
 use std::sync::Arc;
@@ -80,15 +79,23 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
                 Ok(std::env::split_paths(&paths).collect())
             }
         }
-        Arc::new(FixtureSearchProvider)
+        if std::env::var_os("TOKA_SEARCH_PROVIDER").is_none() {
+            return Arc::new(FixtureSearchProvider);
+        }
     }
     #[cfg(all(not(feature = "e2e"), target_os = "macos"))]
     {
         Arc::new(MdfindSearchProvider::system())
     }
-    #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
-        Arc::new(RecollSearchProvider::system())
+        match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
+            Ok("recoll") => Arc::new(RecollSearchProvider::system()),
+            Ok("plocate") | Err(_) => Arc::new(PlocateSearchProvider::system()),
+            Ok(name) => Arc::new(InvalidProvider(format!(
+                "Unknown Linux search provider: {name}"
+            ))),
+        }
     }
     #[cfg(all(
         not(feature = "e2e"),
@@ -104,6 +111,13 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
             }
         }
         Arc::new(UnsupportedProvider)
+    }
+}
+
+struct InvalidProvider(String);
+impl SearchProvider for InvalidProvider {
+    fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
+        Err(SearchError::Provider(self.0.clone()))
     }
 }
 

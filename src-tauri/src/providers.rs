@@ -1,7 +1,6 @@
 use crate::search::{SearchError, SearchProvider};
 use std::{path::PathBuf, sync::Arc};
 
-#[cfg(not(feature = "e2e"))]
 use std::process::Command;
 
 #[derive(Debug)]
@@ -15,10 +14,8 @@ trait ProcessRunner: Send + Sync {
     fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error>;
 }
 
-#[cfg(not(feature = "e2e"))]
 struct SystemProcessRunner;
 
-#[cfg(not(feature = "e2e"))]
 impl ProcessRunner for SystemProcessRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
         let output = Command::new(program).args(args).output()?;
@@ -37,7 +34,7 @@ pub struct MdfindSearchProvider {
 
 #[cfg(any(target_os = "macos", test))]
 impl MdfindSearchProvider {
-    #[cfg(all(target_os = "macos", not(feature = "e2e")))]
+    #[cfg(target_os = "macos")]
     pub fn system() -> Self {
         Self {
             runner: Arc::new(SystemProcessRunner),
@@ -70,7 +67,7 @@ pub struct RecollSearchProvider {
 
 #[cfg(any(target_os = "linux", test))]
 impl RecollSearchProvider {
-    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+    #[cfg(target_os = "linux")]
     pub fn system() -> Self {
         Self {
             runner: Arc::new(SystemProcessRunner),
@@ -97,6 +94,37 @@ impl SearchProvider for RecollSearchProvider {
         parse_output(
             output,
             "Recoll search failed. Ensure Recoll is installed and its index has been built",
+        )
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub struct PlocateSearchProvider {
+    runner: Arc<dyn ProcessRunner>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl PlocateSearchProvider {
+    #[cfg(target_os = "linux")]
+    pub fn system() -> Self {
+        Self {
+            runner: Arc::new(SystemProcessRunner),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl SearchProvider for PlocateSearchProvider {
+    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+        let term = longest_term(query)?;
+        let args = ["--ignore-case", "--basename", "--existing", "--", term]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
+        parse_output(
+            output,
+            "plocate search failed. Ensure plocate is installed and its index has been built",
         )
     }
 }
