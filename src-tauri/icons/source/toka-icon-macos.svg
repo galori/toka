@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="64" fill="#170c09"/>
+  <rect width="512" height="512" rx="114" fill="#170c09"/>
   <text x="256" y="255" fill="#f1eee7" font-family="Helvetica, Arial, sans-serif" font-size="109" font-weight="700" letter-spacing="1.6" text-anchor="middle">toka</text>
   <rect x="135" y="286" width="88" height="21" rx="10.5" fill="#f56333"/>
   <rect x="236" y="286" width="56" height="21" rx="10.5" fill="#524440"/>
