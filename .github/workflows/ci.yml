@@ -16,7 +16,7 @@ jobs:
             bundles: app,dmg
           - os: ubuntu-24.04
             rust-target: x86_64-unknown-linux-gnu
-            bundles: appimage,deb
+            bundles: deb
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
