@@ -2,7 +2,14 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   prepareVideo,
+  loadNativeVideo,
+  nativePlaybackState,
   searchVideos,
+  seekNativeVideo,
+  setNativePaused,
+  setNativeVideoBounds,
+  stopNativeVideo,
+  type PreparedVideo,
   type SearchPage,
   type VideoResult,
 } from "./api";
@@ -26,26 +33,75 @@ function VideoIcon() {
 
 function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
-  const [source, setSource] = useState<string>();
+  const nativeSurface = useRef<HTMLDivElement>(null);
+  const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
     let active = true;
+    let nativeActive = false;
     prepareVideo(video.id)
-      .then(({ filePath }) => {
-        if (active) setSource(convertFileSrc(filePath));
+      .then((result) => {
+        if (!active) return;
+        setPrepared(result);
+        if (result.playbackBackend === "native") {
+          nativeActive = true;
+          return loadNativeVideo(result.filePath);
+        }
       })
       .catch((reason: unknown) => {
         if (active) setError(errorMessage(reason));
       });
     return () => {
       active = false;
+      if (nativeActive) {
+        void Promise.resolve(setNativeVideoBounds({ x: 0, y: 0, width: 1, height: 1, visible: false })).catch(() => {});
+        void Promise.resolve(stopNativeVideo()).catch(() => {});
+      }
     };
   }, [video.id]);
 
+  const native = prepared?.playbackBackend === "native";
+
+  useEffect(() => {
+    if (!native || !nativeSurface.current) return;
+    const surface = nativeSurface.current;
+    const updateBounds = () => {
+      const bounds = surface.getBoundingClientRect();
+      void setNativeVideoBounds({
+        x: Math.round(bounds.x),
+        y: Math.round(bounds.y),
+        width: Math.round(bounds.width),
+        height: Math.round(bounds.height),
+        visible: bounds.width > 0 && bounds.height > 0,
+      }).catch((reason: unknown) => setError(errorMessage(reason)));
+    };
+    updateBounds();
+    const observer = new ResizeObserver(updateBounds);
+    observer.observe(surface);
+    window.addEventListener("resize", updateBounds);
+    const poll = window.setInterval(() => {
+      void nativePlaybackState()
+        .then((state) => {
+          setDuration(state.duration);
+          setCurrentTime(state.currentTime);
+        })
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+    }, 250);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateBounds);
+      window.clearInterval(poll);
+    };
+  }, [native]);
+
   const play = () => {
+    if (native) {
+      void setNativePaused(false).catch((reason: unknown) => setError(errorMessage(reason)));
+      return;
+    }
     element.current?.play().catch(() => {
       setError("This video could not be played by the system media engine.");
     });
@@ -61,23 +117,30 @@ function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
       </div>
 
       {error ? <p role="alert" className="message error">{error}</p> : null}
-      {!source && !error ? <p className="message">Preparing video…</p> : null}
-      {source ? (
+      {!prepared && !error ? <p className="message">Preparing video…</p> : null}
+      {prepared ? (
         <div className="player-shell">
-          <video
-            ref={element}
-            src={source}
-            aria-label={`Playing ${video.fileName}`}
-            onLoadedMetadata={(event) => {
-              setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
-              play();
-            }}
-            onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-            onError={() => setError("This video format or codec is not supported on this computer.")}
-          />
+          {native ? (
+            <div ref={nativeSurface} className="native-video" aria-label={`Playing ${video.fileName}`} />
+          ) : (
+            <video
+              ref={element}
+              src={convertFileSrc(prepared.filePath)}
+              aria-label={`Playing ${video.fileName}`}
+              onLoadedMetadata={(event) => {
+                setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
+                play();
+              }}
+              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+              onError={() => setError("This video format or codec is not supported on this computer.")}
+            />
+          )}
           <div className="player-controls" aria-label="Video controls">
             <button type="button" onClick={play}>Play</button>
-            <button type="button" onClick={() => element.current?.pause()}>Pause</button>
+            <button type="button" onClick={() => {
+              if (native) void setNativePaused(true).catch((reason: unknown) => setError(errorMessage(reason)));
+              else element.current?.pause();
+            }}>Pause</button>
             <input
               aria-label="Video timeline"
               type="range"
@@ -87,7 +150,8 @@ function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
               value={Math.min(currentTime, duration || 0)}
               onChange={(event) => {
                 const nextTime = Number(event.currentTarget.value);
-                if (element.current) element.current.currentTime = nextTime;
+                if (native) void seekNativeVideo(nextTime).catch((reason: unknown) => setError(errorMessage(reason)));
+                else if (element.current) element.current.currentTime = nextTime;
                 setCurrentTime(nextTime);
               }}
             />

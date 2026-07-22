@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+mod player_linux;
 #[cfg(any(not(feature = "e2e"), test))]
 mod providers;
 mod search;
@@ -15,6 +17,7 @@ use tauri::{Manager, State};
 #[serde(rename_all = "camelCase")]
 struct PreparedVideo {
     file_path: String,
+    playback_backend: &'static str,
 }
 
 #[derive(Serialize)]
@@ -65,7 +68,69 @@ fn prepare_video(
         .map_err(|_| CommandError::from(SearchError::VideoUnavailable))?;
     Ok(PreparedVideo {
         file_path: path.to_string_lossy().into_owned(),
+        playback_backend: if cfg!(target_os = "linux") {
+            "native"
+        } else {
+            "web"
+        },
     })
+}
+
+#[cfg(target_os = "linux")]
+fn playback_error(message: String) -> CommandError {
+    CommandError {
+        kind: "Playback",
+        message,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn load_native_video(
+    file_path: String,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::load(player.inner(), &file_path).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_native_paused(
+    paused: bool,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::set_paused(player.inner(), paused).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn seek_native_video(
+    seconds: f64,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::seek(player.inner(), seconds).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn native_playback_state(
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<player_linux::PlaybackState, CommandError> {
+    player_linux::state(player.inner()).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn stop_native_video(
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::stop(player.inner()).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: bool) {
+    player_linux::set_bounds(x, y, width, height, visible);
 }
 
 fn platform_provider() -> Arc<dyn SearchProvider> {
@@ -110,14 +175,34 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
-    #[cfg(feature = "e2e")]
+    #[cfg(feature = "webdriver")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
 
+    let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider())));
+    #[cfg(target_os = "linux")]
+    let builder = {
+        let player = player_linux::NativePlayer::new();
+        let setup_player = player.clone();
+        builder
+            .manage(player)
+            .setup(move |app| player_linux::install(app, setup_player.clone()))
+            .invoke_handler(tauri::generate_handler![
+                search_videos,
+                prepare_video,
+                load_native_video,
+                set_native_paused,
+                seek_native_video,
+                native_playback_state,
+                stop_native_video,
+                set_native_video_bounds
+            ])
+    };
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video]);
+
     builder
-        .manage(Arc::new(SearchEngine::new(platform_provider())))
-        .invoke_handler(tauri::generate_handler![search_videos, prepare_video])
         .run(tauri::generate_context!())
         .expect("error while running Toka");
 }

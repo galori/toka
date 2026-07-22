@@ -82,10 +82,9 @@ impl RecollSearchProvider {
 impl SearchProvider for RecollSearchProvider {
     fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
-        // Leading wildcard also prevents a query beginning with `-` from being
-        // interpreted as another command-line option.
-        let filename_query = format!("*{term}*");
-        let args = ["-f", "-b", "--paths-only", "-C", "-n", "0", &filename_query]
+        let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
+        let filename_query = format!("filename:\"*{escaped}*\"");
+        let args = ["-b", "--paths-only", "-C", "-n", "0", &filename_query]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
@@ -180,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn recoll_uses_filename_mode_without_a_shell_and_parses_paths() {
+    fn recoll_uses_filename_query_without_a_shell_and_parses_paths() {
         let runner = Arc::new(FakeRunner::new("/media/Summer Vacation.mkv\n"));
         let provider = RecollSearchProvider {
             runner: runner.clone(),
@@ -192,10 +191,17 @@ mod tests {
             *runner.invocation.lock().unwrap(),
             Some((
                 "recollq".into(),
-                vec!["-f", "-b", "--paths-only", "-C", "-n", "0", "*vacation*"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
+                vec![
+                    "-b",
+                    "--paths-only",
+                    "-C",
+                    "-n",
+                    "0",
+                    "filename:\"*vacation*\"",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
             ))
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);

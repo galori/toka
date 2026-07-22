@@ -6,9 +6,13 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:install": "npm run tauri build && sudo dpkg --install ./src-tauri/target/release/bundle/deb/Toka_${npm_package_version}_$(dpkg --print-architecture).deb",
     "test": "vitest run",
+    "test:all": "./scripts/test-all.sh",
     "test:integration": "npm run build:integration && wdio run wdio.conf.ts",
+    "test:integration:live": "npm run build:integration:live && wdio run wdio.live.conf.ts",
     "build:integration": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
+    "build:integration:live": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features webdriver --config src-tauri/tauri.e2e.conf.json",
     "test:watch": "vitest",
     "tauri": "tauri"
   },

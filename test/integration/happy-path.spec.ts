@@ -9,7 +9,7 @@ describe("Toka happy path", () => {
     await result.waitForDisplayed();
     await result.click();
 
-    const player = await $('video[aria-label="Playing toka-e2e-happy-path.mp4"]');
+    const player = await $('[aria-label="Playing toka-e2e-happy-path.mp4"]');
     await player.waitForDisplayed();
     await $("button=Pause").click();
     await $("button=Play").click();
