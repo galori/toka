@@ -109,6 +109,8 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 
 .player-shell video { display: block; width: 100%; max-height: calc(100vh - 230px); background: #000; }
 
+.native-video { width: 100%; height: calc(100vh - 300px); min-height: 240px; background: #000; }
+
 .player-controls { gap: 10px; padding: 14px; background: #141820; }
 
 .player-controls input[type="range"] { flex: 1; accent-color: #69a8ff; }

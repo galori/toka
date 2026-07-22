@@ -30,6 +30,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "shortDescription": "Search and play videos indexed by your operating system"
+    "shortDescription": "Search and play videos indexed by your operating system",
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libepoxy0", "libegl1", "libglx0", "libmpv2"]
+      }
+    }
   }
 }

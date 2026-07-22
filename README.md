@@ -18,7 +18,7 @@ Installable bundles are written below `src-tauri/target/release/bundle/` (`.deb`
 ## Notes
 
 - Supported search results: MP4, MOV, MKV, AVI, WebM, M4V, MPEG, MPG, and MPE.
-- Playback depends on the codecs supported by the computer's WebKit media engine. Toka does not transcode files.
+- Linux playback uses the embedded libmpv/FFmpeg media engine; other platforms use the system WebKit media engine. Toka does not transcode files.
 - Search results are based on the current Spotlight or Recoll index, not a live filesystem scan.
 
 See [Development](docs/development.md) for tests, project structure, troubleshooting, and implementation details. The official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) cover other Linux distributions.

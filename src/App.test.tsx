@@ -16,6 +16,10 @@ beforeEach(() => {
   convertFileSrcMock.mockClear();
 });
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 test("starts with a focused search field and displays submitted results", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "summer vacation",
@@ -138,4 +142,45 @@ test("playlist mode advances through every search result", async () => {
 
   expect(screen.getByLabelText("Playing playlist-3.mp4")).toBeVisible();
   expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-3" });
+});
+
+test("native playlist advances when libmpv reports end of file", async () => {
+  vi.stubGlobal("ResizeObserver", class {
+    observe() {}
+    disconnect() {}
+  });
+  const results = [1, 2].map((number) => ({
+    id: `native-${number}`,
+    fileName: `native-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 1, currentTime: 1, paused: true, ended: true });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+
+  expect(await screen.findByLabelText("Playing native-1.mp4")).toBeVisible();
+  expect(await screen.findByLabelText("Playing native-2.mp4", {}, { timeout: 1_000 })).toBeVisible();
+  expect(screen.getByText("Playlist video 2 of 2")).toBeVisible();
 });
