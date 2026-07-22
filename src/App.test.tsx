@@ -16,10 +16,6 @@ beforeEach(() => {
   convertFileSrcMock.mockClear();
 });
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
-
 test("starts with a focused search field and displays submitted results", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "summer vacation",
@@ -145,10 +141,6 @@ test("playlist mode advances through every search result", async () => {
 });
 
 test("native playlist advances when libmpv reports end of file", async () => {
-  vi.stubGlobal("ResizeObserver", class {
-    observe() {}
-    disconnect() {}
-  });
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,
     fileName: `native-${number}.mp4`,
