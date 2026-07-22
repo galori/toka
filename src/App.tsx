@@ -24,15 +24,21 @@ function VideoIcon() {
   );
 }
 
-function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
+function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
+  const [index, setIndex] = useState(0);
   const [source, setSource] = useState<string>();
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
+  const video = videos[index];
 
   useEffect(() => {
     let active = true;
+    setSource(undefined);
+    setDuration(0);
+    setCurrentTime(0);
+    setError(undefined);
     prepareVideo(video.id)
       .then(({ filePath }) => {
         if (active) setSource(convertFileSrc(filePath));
@@ -73,6 +79,9 @@ function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
               play();
             }}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            onEnded={() => {
+              if (index < videos.length - 1) setIndex((current) => current + 1);
+            }}
             onError={() => setError("This video format or codec is not supported on this computer.")}
           />
           <div className="player-controls" aria-label="Video controls">
@@ -94,6 +103,11 @@ function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
           </div>
         </div>
       ) : null}
+      {videos.length > 1 ? (
+        <p className="playlist-status" aria-live="polite">
+          Playlist video {index + 1} of {videos.length}
+        </p>
+      ) : null}
     </section>
   );
 }
@@ -101,7 +115,7 @@ function Player({ video, onBack }: { video: VideoResult; onBack: () => void }) {
 export default function App() {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState<SearchPage>();
-  const [selected, setSelected] = useState<VideoResult>();
+  const [playing, setPlaying] = useState<VideoResult[]>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const requestNumber = useRef(0);
@@ -112,7 +126,7 @@ export default function App() {
     const currentRequest = ++requestNumber.current;
     setLoading(true);
     setError(undefined);
-    setSelected(undefined);
+    setPlaying(undefined);
     try {
       const response = await searchVideos(trimmed, requestedPage);
       if (currentRequest === requestNumber.current) setPage(response);
@@ -131,7 +145,7 @@ export default function App() {
     void runSearch(query, 1);
   };
 
-  const hasSubmitted = loading || Boolean(page) || Boolean(error) || Boolean(selected);
+  const hasSubmitted = loading || Boolean(page) || Boolean(error) || Boolean(playing);
 
   return (
     <main className={hasSubmitted ? "app" : "app initial"}>
@@ -150,12 +164,17 @@ export default function App() {
 
       {loading ? <p className="message" aria-live="polite">Searching…</p> : null}
       {error ? <p role="alert" className="message error">{error}</p> : null}
-      {selected && page ? <Player video={selected} onBack={() => setSelected(undefined)} /> : null}
+      {playing && page ? <Player videos={playing} onBack={() => setPlaying(undefined)} /> : null}
 
-      {!loading && !selected && page ? (
+      {!loading && !playing && page ? (
         <section className="results">
           <div className="results-summary">
             <p>{page.totalResults} {page.totalResults === 1 ? "video" : "videos"}</p>
+            {page.results.length > 1 ? (
+              <button type="button" className="playlist-button" onClick={() => setPlaying(page.results)}>
+                Play all
+              </button>
+            ) : null}
             {page.totalPages > 0 ? <p>Page {page.page} of {page.totalPages}</p> : null}
           </div>
           {page.results.length ? (
@@ -167,7 +186,7 @@ export default function App() {
                     className="video-tile"
                     aria-label={`Play ${video.fileName}`}
                     title={video.fileName}
-                    onClick={() => setSelected(video)}
+                    onClick={() => setPlaying([video])}
                   >
                     <span className="video-art"><VideoIcon /></span>
                     <span className="video-name">{video.fileName}</span>

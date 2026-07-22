@@ -87,13 +87,15 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 
 .pagination { justify-content: center; gap: 18px; }
 
-.pagination button, .back-button, .player-controls button {
+.pagination button, .back-button, .player-controls button, .playlist-button {
   border: 1px solid #3a4556;
   border-radius: 10px;
   background: #1a202a;
   color: inherit;
   padding: 9px 15px;
 }
+
+.playlist-status { margin: 12px 0 0; text-align: center; color: #aeb8c8; }
 
 .message { text-align: center; color: #aeb8c8; }
 

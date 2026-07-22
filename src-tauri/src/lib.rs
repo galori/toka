@@ -74,10 +74,10 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
         struct FixtureSearchProvider;
         impl SearchProvider for FixtureSearchProvider {
             fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
-                let path = std::env::var_os("TOKA_E2E_VIDEO").ok_or_else(|| {
-                    SearchError::Provider("The integration-test video was not configured.".into())
+                let paths = std::env::var_os("TOKA_E2E_VIDEOS").ok_or_else(|| {
+                    SearchError::Provider("The integration-test videos were not configured.".into())
                 })?;
-                Ok(vec![path.into()])
+                Ok(std::env::split_paths(&paths).collect())
             }
         }
         Arc::new(FixtureSearchProvider)

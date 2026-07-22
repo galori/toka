@@ -101,3 +101,41 @@ test("paginates and reports provider failures", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("Recoll search could not start.");
   await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("broken"));
 });
+
+test("playlist mode advances through every search result", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-3.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+
+  const first = await screen.findByLabelText("Playing playlist-1.mp4");
+  expect(screen.getByText("Playlist video 1 of 3")).toBeVisible();
+  fireEvent.ended(first);
+  const second = await screen.findByLabelText("Playing playlist-2.mp4");
+  expect(screen.getByText("Playlist video 2 of 3")).toBeVisible();
+  fireEvent.ended(second);
+  const third = await screen.findByLabelText("Playing playlist-3.mp4");
+  expect(screen.getByText("Playlist video 3 of 3")).toBeVisible();
+  fireEvent.ended(third);
+
+  expect(screen.getByLabelText("Playing playlist-3.mp4")).toBeVisible();
+  expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-3" });
+});
