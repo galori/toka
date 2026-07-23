@@ -127,6 +127,16 @@ test("rotates web playback clockwise and counter-clockwise", async () => {
   expect(video).toHaveStyle({ transform: "rotate(0deg)" });
 });
 
+test("changes playback speed for web video", async () => {
+  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup(); render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  expect(video).toHaveProperty("playbackRate", 1.5);
+});
+
 test("sends the selected rotation to native playback", async () => {
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {

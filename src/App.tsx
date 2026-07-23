@@ -8,6 +8,7 @@ import {
   searchVideos,
   seekNativeVideo,
   setNativePaused,
+  setNativeSpeed,
   setNativeVideoRotation,
   setNativeVideoBounds,
   stopNativeVideo,
@@ -50,6 +51,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [loop, setLoop] = useState(false);
+  const [speed, setSpeed] = useState(1);
   const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
@@ -63,6 +65,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
+    setSpeed(1);
     setPlayingBack(false);
     setRotation(0);
     setNativeBaseRotation(0);
@@ -265,6 +268,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               style={{ transform: `rotate(${rotation}deg)` }}
               onLoadedMetadata={(event) => {
                 setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
+                event.currentTarget.playbackRate = speed;
                 play();
               }}
               onPlay={() => setPlayingBack(true)}
@@ -286,6 +290,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
             <button type="button" className="play-button" onClick={play} aria-keyshortcuts="Space">Play</button>
             <button type="button" className="transport-button" onClick={pause} aria-keyshortcuts="Space">Pause</button>
+            <select
+              aria-label="Playback speed"
+              value={speed}
+              onChange={(event) => {
+                const next = Number(event.currentTarget.value);
+                setSpeed(next);
+                if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
+                else if (element.current) element.current.playbackRate = next;
+              }}
+            >
+              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
+            </select>
             <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
             <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">▶▶</button>
             <button

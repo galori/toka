@@ -46,6 +46,7 @@ export function loadNativeVideo(filePath: string): Promise<void> {
 export function setNativePaused(paused: boolean): Promise<void> {
   return invoke("set_native_paused", { paused });
 }
+export function setNativeSpeed(speed: number): Promise<void> { return invoke("set_native_speed", { speed }); }
 
 export function nativeVideoRotation(): Promise<number> {
   return invoke("native_video_rotation");
