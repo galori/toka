@@ -175,6 +175,11 @@ input[type="search"]:focus {
 }
 .search-glyph { color: oklch(0.68 0.19 38); pointer-events: none; }
 .clear-search:hover { color: oklch(0.95 0.01 90); }
+.clear-search:focus-visible,
+button:focus-visible {
+  outline: 2px solid oklch(0.68 0.19 38);
+  outline-offset: 2px;
+}
 
 .results-summary {
   min-height: 42px;
@@ -190,7 +195,27 @@ input[type="search"]:focus {
   padding: 10px 24px;
   font-weight: 700;
 }
+.playlist-button,
+.pagination button,
+.back-button,
+.player-controls button,
+.playlist-toggle,
+.playlist-drawer button {
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+}
 .playlist-button:hover { background: oklch(0.73 0.19 38); }
+
+.pagination button:not(:disabled):hover,
+.back-button:hover,
+.player-controls .transport-button:not(:disabled):hover,
+.playlist-toggle:hover {
+  border-color: oklch(0.68 0.19 38);
+  background: oklch(0.28 0.02 40);
+}
+
+.player-controls .play-button:hover {
+  background: oklch(0.73 0.19 38);
+}
 
 .video-grid {
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
@@ -234,6 +259,8 @@ input[type="search"]:focus {
   border-radius: 12px;
   background: #000;
 }
+.player-shell:fullscreen { display: flex; flex-direction: column; justify-content: center; border: 0; border-radius: 0; }
+.player-shell:fullscreen video, .player-shell:fullscreen .native-video { max-height: calc(100vh - 58px); height: auto; }
 .player-controls {
   gap: 12px;
   padding: 14px 18px;
@@ -297,6 +324,10 @@ input[type="search"]:focus {
   background: oklch(0.22 0.02 40);
   color: oklch(0.95 0.01 90);
   font-weight: 600;
+}
+.playlist-drawer button:hover {
+  background: oklch(0.22 0.02 40);
+  color: oklch(0.95 0.01 90);
 }
 .playlist-drawer button > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .playlist-marker { flex: 0 0 13px; height: 13px; border-radius: 2px; background: oklch(0.4 0.02 40); }

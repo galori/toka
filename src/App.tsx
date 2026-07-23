@@ -39,12 +39,15 @@ function formatTime(seconds: number): string {
 
 function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
+  const playerShell = useRef<HTMLDivElement>(null);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const [index, setIndex] = useState(0);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
+  const [fullscreen, setFullscreen] = useState(false);
+  const [loop, setLoop] = useState(false);
   const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
   const video = videos[index];
 
@@ -102,9 +105,16 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         .then((state) => {
           setDuration(state.duration);
           setCurrentTime(state.currentTime);
-          if (state.ended && !advancing && index < videos.length - 1) {
+          if (!state.ended) advancing = false;
+          if (state.ended && !advancing) {
             advancing = true;
-            setIndex((current) => current + 1);
+            if (index < videos.length - 1) setIndex((current) => current + 1);
+            else if (loop && videos.length > 1) setIndex(0);
+            else if (loop) {
+              void seekNativeVideo(0)
+                .then(() => setNativePaused(false))
+                .catch((reason: unknown) => setError(errorMessage(reason)));
+            }
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
@@ -114,7 +124,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [index, native, videos.length]);
+  }, [index, loop, native, videos.length]);
 
   const play = () => {
     if (native) {
@@ -133,6 +143,26 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
 
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
+  };
+
+  useEffect(() => {
+    const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerShell.current);
+    document.addEventListener("fullscreenchange", updateFullscreen);
+    return () => document.removeEventListener("fullscreenchange", updateFullscreen);
+  }, []);
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) {
+      const exiting = document.exitFullscreen?.();
+      if (exiting) void exiting.catch((reason: unknown) => setError(errorMessage(reason)));
+      return;
+    }
+    const shell = playerShell.current;
+    if (!shell?.requestFullscreen) {
+      setError("Fullscreen mode is not supported by this system.");
+      return;
+    }
+    void shell.requestFullscreen().catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
   return (
@@ -157,7 +187,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       {error ? <p role="alert" className="message error">{error}</p> : null}
       {!prepared && !error ? <p className="message">Preparing video…</p> : null}
       {prepared ? (
-        <div className="player-shell">
+        <div ref={playerShell} className="player-shell">
           {native ? (
             <div ref={nativeSurface} className="native-video" aria-label={`Playing ${video.fileName}`} />
           ) : (
@@ -172,6 +202,11 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
               onEnded={() => {
                 if (index < videos.length - 1) setIndex((current) => current + 1);
+                else if (loop && videos.length > 1) setIndex(0);
+                else if (loop && element.current) {
+                  element.current.currentTime = 0;
+                  play();
+                }
               }}
               onError={() => setError("This video format or codec is not supported on this computer.")}
             />
@@ -181,6 +216,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             <button type="button" className="play-button" onClick={play}>Play</button>
             <button type="button" className="transport-button" onClick={pause}>Pause</button>
             <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">▶▶</button>
+            <button
+              type="button"
+              className="transport-button"
+              onClick={() => setLoop((enabled) => !enabled)}
+              aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
+              aria-pressed={loop}
+            >
+              {loop ? "Looping" : "Loop"}
+            </button>
+            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            </button>
             <input
               aria-label="Video timeline"
               type="range"
