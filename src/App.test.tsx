@@ -67,6 +67,25 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("enters fullscreen mode for the player", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+
+  expect(requestFullscreen).toHaveBeenCalledOnce();
+});
+
 test("paginates and reports provider failures", async () => {
   invokeMock
     .mockResolvedValueOnce({

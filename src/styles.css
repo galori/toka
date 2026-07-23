@@ -234,6 +234,8 @@ input[type="search"]:focus {
   border-radius: 12px;
   background: #000;
 }
+.player-shell:fullscreen { display: flex; flex-direction: column; justify-content: center; border: 0; border-radius: 0; }
+.player-shell:fullscreen video, .player-shell:fullscreen .native-video { max-height: calc(100vh - 58px); height: auto; }
 .player-controls {
   gap: 12px;
   padding: 14px 18px;
