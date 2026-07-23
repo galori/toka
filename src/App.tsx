@@ -316,8 +316,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
             <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
             <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
-            <button type="button" className="play-button" onClick={play} aria-keyshortcuts="Space">Play</button>
-            <button type="button" className="transport-button" onClick={pause} aria-keyshortcuts="Space">Pause</button>
+            <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">Play</button>
+            <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">Pause</button>
             <select
               aria-label="Playback speed"
               value={speed}
