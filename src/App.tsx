@@ -3,10 +3,12 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   loadNativeVideo,
   nativePlaybackState,
+  nativeVideoRotation,
   prepareVideo,
   searchVideos,
   seekNativeVideo,
   setNativePaused,
+  setNativeVideoRotation,
   setNativeVideoBounds,
   stopNativeVideo,
   type PreparedVideo,
@@ -57,6 +59,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [loop, setLoop] = useState(false);
+  const [rotation, setRotation] = useState(0);
+  const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
   const video = videos[index];
 
@@ -67,12 +71,16 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
+    setRotation(0);
+    setNativeBaseRotation(0);
     prepareVideo(video.id)
       .then(async (result) => {
         if (!active) return;
         if (result.playbackBackend === "native") {
           nativeActive = true;
           await loadNativeVideo(result.filePath);
+          const baseRotation = await nativeVideoRotation();
+          if (active) setNativeBaseRotation(baseRotation);
           await setNativePaused(false);
         }
         if (active) setPrepared(result);
@@ -150,6 +158,17 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     else element.current?.pause();
   };
 
+  const rotate = (amount: number) => {
+    setRotation((current) => {
+      const next = (current + amount + 360) % 360;
+      if (native) {
+        const degrees = (nativeBaseRotation + next) % 360;
+        void setNativeVideoRotation(degrees).catch((reason: unknown) => setError(errorMessage(reason)));
+      }
+      return next;
+    });
+  };
+
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
   };
@@ -219,6 +238,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               ref={element}
               src={convertFileSrc(prepared.filePath)}
               aria-label={`Playing ${video.fileName}`}
+              style={{ transform: `rotate(${rotation}deg)` }}
               onLoadedMetadata={(event) => {
                 setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
                 play();
@@ -253,8 +273,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             />
             <div className="player-transport">
               <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><span aria-hidden="true">⏮</span></button>
+              <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left"><span aria-hidden="true">↶</span></button>
               <button type="button" className="play-button" onClick={play} aria-label="Play"><span className="play-glyph" aria-hidden="true" /><span className="sr-only">Play</span></button>
               <button type="button" className="transport-button" onClick={pause} aria-label="Pause"><span aria-hidden="true">⏸</span><span className="sr-only">Pause</span></button>
+              <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right"><span aria-hidden="true">↷</span></button>
               <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><span aria-hidden="true">⏭</span></button>
               <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
               <span className="player-utilities">

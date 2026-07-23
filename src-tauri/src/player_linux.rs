@@ -10,6 +10,7 @@ use std::{
 use tauri::{App, Manager};
 
 const MPV_FORMAT_FLAG: c_int = 3;
+const MPV_FORMAT_INT64: c_int = 4;
 const MPV_FORMAT_DOUBLE: c_int = 5;
 const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
 const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
@@ -183,6 +184,19 @@ impl Mpv {
         })
     }
 
+    fn set_i64(&mut self, name: &str, value: i64) -> Result<(), String> {
+        let name = CString::new(name).unwrap();
+        let mut value = value;
+        self.check(unsafe {
+            (self.api.set_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_INT64,
+                (&mut value as *mut i64).cast(),
+            )
+        })
+    }
+
     fn get_double(&self, name: &str) -> Option<f64> {
         let name = CString::new(name).ok()?;
         let mut value: f64 = 0.0;
@@ -209,6 +223,20 @@ impl Mpv {
             )
         };
         (code >= 0).then_some(value != 0)
+    }
+
+    fn get_i64(&self, name: &str) -> Option<i64> {
+        let name = CString::new(name).ok()?;
+        let mut value: i64 = 0;
+        let code = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_INT64,
+                (&mut value as *mut i64).cast(),
+            )
+        };
+        (code >= 0).then_some(value)
     }
 
     fn initialize_renderer(&mut self) -> Result<(), String> {
@@ -519,7 +547,20 @@ pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
 }
 
 pub fn set_paused(player: &NativePlayer, paused: bool) -> Result<(), String> {
-    player.with_mpv(|mpv| mpv.set_flag("pause", paused))
+  player.with_mpv(|mpv| mpv.set_flag("pause", paused))
+}
+
+pub fn rotation(player: &NativePlayer) -> Result<i32, String> {
+    player.with_mpv(|mpv| {
+        Ok(mpv
+            .get_i64("video-rotate")
+            .unwrap_or(0)
+            .rem_euclid(360) as i32)
+    })
+}
+
+pub fn set_rotation(player: &NativePlayer, degrees: i32) -> Result<(), String> {
+    player.with_mpv(|mpv| mpv.set_i64("video-rotate", i64::from(degrees.rem_euclid(360))))
 }
 
 pub fn seek(player: &NativePlayer, seconds: f64) -> Result<(), String> {
