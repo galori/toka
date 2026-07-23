@@ -1,5 +1,6 @@
 async function playerDiagnostics(fileName: string) {
   return browser.execute((expectedFileName) => {
+    const windowWithMediaError = window as Window & { tokaMediaError?: Record<string, unknown> };
     const video = document.querySelector<HTMLVideoElement>(`video[aria-label="Playing ${expectedFileName}"]`);
     const player = document.querySelector(".player-view");
     const alert = document.querySelector('[role="alert"]');
@@ -7,6 +8,7 @@ async function playerDiagnostics(fileName: string) {
     const bounds = video?.getBoundingClientRect();
     return {
       expectedFileName,
+      capturedMediaError: windowWithMediaError.tokaMediaError,
       playerText: player?.textContent?.trim(),
       playerHtml: player?.outerHTML,
       alert: alert?.textContent?.trim(),
@@ -33,6 +35,21 @@ describe("Toka playlist", () => {
     await browser.execute(() => document.querySelector("form")?.requestSubmit());
 
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
+    await browser.execute(() => {
+      const windowWithMediaError = window as Window & { tokaMediaError?: Record<string, unknown> };
+      windowWithMediaError.tokaMediaError = undefined;
+      document.addEventListener("error", (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLMediaElement)) return;
+        windowWithMediaError.tokaMediaError = {
+          currentSrc: target.currentSrc,
+          errorCode: target.error?.code,
+          errorMessage: target.error?.message,
+          networkState: target.networkState,
+          readyState: target.readyState,
+        };
+      }, true);
+    });
     await $("button=Play all").click();
 
     for (let number = 1; number <= 5; number += 1) {
