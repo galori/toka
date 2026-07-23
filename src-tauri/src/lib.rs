@@ -103,6 +103,11 @@ fn set_native_paused(
 ) -> Result<(), CommandError> {
     player_linux::set_paused(player.inner(), paused).map_err(playback_error)
 }
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_native_speed(speed: f64, player: State<'_, Arc<player_linux::NativePlayer>>) -> Result<(), CommandError> {
+    player_linux::set_speed(player.inner(), speed).map_err(playback_error)
+}
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
@@ -224,6 +229,7 @@ pub fn run() {
                 prepare_video,
                 load_native_video,
                 set_native_paused,
+                set_native_speed,
                 native_video_rotation,
                 set_native_video_rotation,
                 seek_native_video,

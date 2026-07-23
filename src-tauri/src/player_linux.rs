@@ -196,6 +196,10 @@ impl Mpv {
             )
         })
     }
+    fn set_double(&mut self, name: &str, value: f64) -> Result<(), String> {
+        let name = CString::new(name).unwrap(); let mut value = value;
+        self.check(unsafe { (self.api.set_property)(self.handle, name.as_ptr(), MPV_FORMAT_DOUBLE, (&mut value as *mut f64).cast()) })
+    }
 
     fn get_double(&self, name: &str) -> Option<f64> {
         let name = CString::new(name).ok()?;
@@ -548,6 +552,10 @@ pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
 
 pub fn set_paused(player: &NativePlayer, paused: bool) -> Result<(), String> {
   player.with_mpv(|mpv| mpv.set_flag("pause", paused))
+}
+pub fn set_speed(player: &NativePlayer, speed: f64) -> Result<(), String> {
+    if !speed.is_finite() || !(0.5..=2.0).contains(&speed) { return Err("Playback speed must be between 0.5× and 2×.".into()); }
+    player.with_mpv(|mpv| mpv.set_double("speed", speed))
 }
 
 pub fn rotation(player: &NativePlayer) -> Result<i32, String> {

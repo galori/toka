@@ -164,6 +164,24 @@ test("rotates web playback clockwise and counter-clockwise", async () => {
   expect(video).toHaveStyle({ transform: "rotate(0deg)" });
 });
 
+test("changes playback speed for web video", async () => {
+  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup(); render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  expect(video).toHaveProperty("playbackRate", 1.5);
+});
+
+test("skips web playback by ten seconds", async () => {
+  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup(); render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}"); await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4"); Object.defineProperty(video, "duration", { configurable: true, value: 120 }); Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  fireEvent.timeUpdate(video); await user.click(screen.getByRole("button", { name: "Skip forward 10 seconds" })); expect((video as HTMLVideoElement).currentTime).toBe(30);
+});
+
 test("sends the selected rotation to native playback", async () => {
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
@@ -189,6 +207,39 @@ test("sends the selected rotation to native playback", async () => {
   await user.click(await screen.findByRole("button", { name: "Rotate left" }));
 
   expect(invokeMock).toHaveBeenCalledWith("set_native_video_rotation", { degrees: 270 });
+});
+
+test("keyboard shortcuts control player actions without hijacking search input", async () => {
+  const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `clip-${number}.mp4`, extension: "mp4" }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip-2.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip-1.mp4" });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const user = userEvent.setup();
+  render(<App />);
+
+  const search = screen.getByRole("searchbox");
+  await user.type(search, "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const video = await screen.findByLabelText("Playing clip-1.mp4");
+
+  fireEvent.keyDown(window, { key: "]" });
+  expect(video).toHaveStyle({ transform: "rotate(90deg)" });
+  fireEvent.keyDown(window, { key: "ArrowRight", shiftKey: true });
+  expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
+  fireEvent.keyDown(window, { key: "ArrowLeft", shiftKey: true });
+  expect(await screen.findByLabelText("Playing clip-1.mp4")).toBeVisible();
+  fireEvent.keyDown(window, { key: "l" });
+  expect(screen.getByRole("button", { name: "Loop playlist" })).toHaveAttribute("aria-pressed", "true");
+  fireEvent.keyDown(window, { key: "f" });
+  expect(requestFullscreen).toHaveBeenCalledOnce();
+
+  search.focus();
+  fireEvent.keyDown(search, { key: "]" });
+  expect(screen.getByLabelText("Playing clip-1.mp4")).toHaveStyle({ transform: "rotate(0deg)" });
 });
 
 test("loops a playlist back to its first video", async () => {
