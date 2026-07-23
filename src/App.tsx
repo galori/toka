@@ -174,6 +174,13 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     });
   };
 
+  const skip = (amount: number) => {
+    const next = Math.max(0, Math.min(duration || Number.POSITIVE_INFINITY, currentTime + amount));
+    if (native) void seekNativeVideo(next).catch((reason: unknown) => setError(errorMessage(reason)));
+    else if (element.current) element.current.currentTime = next;
+    setCurrentTime(next);
+  };
+
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
   };
@@ -216,6 +223,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         run(() => rotate(-90));
       } else if (event.key === "]") {
         run(() => rotate(90));
+      } else if (event.key === ",") {
+        run(() => skip(-10));
+      } else if (event.key === ".") {
+        run(() => skip(10));
       } else if (event.shiftKey && event.key === "ArrowLeft" && index > 0) {
         run(() => selectVideo(index - 1));
       } else if (event.shiftKey && event.key === "ArrowRight" && index < videos.length - 1) {
@@ -232,7 +243,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [fullscreen, index, native, nativeBaseRotation, onBack, playingBack, videos.length]);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, videos.length]);
 
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
@@ -288,6 +299,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           <div className="player-controls" aria-label="Video controls">
             <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
             <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
+            <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
             <button type="button" className="play-button" onClick={play} aria-keyshortcuts="Space">Play</button>
             <button type="button" className="transport-button" onClick={pause} aria-keyshortcuts="Space">Pause</button>
             <select
@@ -303,6 +315,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
             </select>
             <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
+            <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
             <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">▶▶</button>
             <button
               type="button"

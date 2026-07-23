@@ -137,6 +137,14 @@ test("changes playback speed for web video", async () => {
   expect(video).toHaveProperty("playbackRate", 1.5);
 });
 
+test("skips web playback by ten seconds", async () => {
+  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup(); render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}"); await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4"); Object.defineProperty(video, "duration", { configurable: true, value: 120 }); Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  fireEvent.timeUpdate(video); await user.click(screen.getByRole("button", { name: "Skip forward 10 seconds" })); expect((video as HTMLVideoElement).currentTime).toBe(30);
+});
+
 test("sends the selected rotation to native playback", async () => {
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
