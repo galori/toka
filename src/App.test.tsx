@@ -173,6 +173,9 @@ test("native playlist advances when libmpv reports end of file", async () => {
   await user.click(await screen.findByRole("button", { name: "Play all" }));
 
   expect(await screen.findByLabelText("Playing native-1.mp4")).toBeVisible();
+  await waitFor(() => {
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", { paused: false });
+  });
   expect(await screen.findByLabelText("Playing native-2.mp4", {}, { timeout: 1_000 })).toBeVisible();
   expect(screen.getByText("Playlist video 2 of 2")).toBeVisible();
 });

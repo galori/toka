@@ -67,7 +67,10 @@ fn prepare_video(
         .map_err(|_| CommandError::from(SearchError::VideoUnavailable))?;
     Ok(PreparedVideo {
         file_path: path.to_string_lossy().into_owned(),
-        playback_backend: if cfg!(all(target_os = "linux", not(feature = "e2e"))) {
+        playback_backend: if cfg!(all(
+            target_os = "linux",
+            any(not(feature = "e2e"), feature = "native-e2e")
+        )) {
             "native"
         } else {
             "web"
