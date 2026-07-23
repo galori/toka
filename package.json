@@ -9,9 +9,11 @@
     "build:mac": "npm run tauri build -- --bundles app,dmg",
     "build": "tsc && vite build",
     "test": "vitest run",
-    "test:integration": "npm run build:integration && wdio run wdio.conf.ts && npm run test:integration:real-provider",
+    "test:integration": "npm run build:integration && wdio run wdio.conf.ts && npm run test:integration:real-provider && npm run test:integration:native",
     "test:integration:real-provider": "if [ \"$(uname -s)\" = Linux ]; then wdio run wdio.plocate.conf.ts; fi",
+    "test:integration:native": "if [ \"$(uname -s)\" = Linux ]; then npm run build:integration:native && wdio run wdio.native.conf.ts; fi",
     "build:integration": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
+    "build:integration:native": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features native-e2e --config src-tauri/tauri.e2e.conf.json",
     "plocate:configure": "sudoedit /usr/local/sbin/update-plocate-media && printf '\\nTo rebuild the plocate index now, run: sudo systemctl start plocate-updatedb.service\\n'",
     "test:watch": "vitest",
     "tauri": "tauri"

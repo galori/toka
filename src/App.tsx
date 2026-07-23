@@ -61,6 +61,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         if (result.playbackBackend === "native") {
           nativeActive = true;
           await loadNativeVideo(result.filePath);
+          await setNativePaused(false);
         }
         if (active) setPrepared(result);
       })
