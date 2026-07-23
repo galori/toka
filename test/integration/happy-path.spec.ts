@@ -1,6 +1,9 @@
 async function playerDiagnostics(fileName: string) {
   return browser.execute((expectedFileName) => {
-    const windowWithMediaError = window as Window & { tokaMediaError?: Record<string, unknown> };
+    const windowWithMediaError = window as Window & {
+      tokaMediaError?: Record<string, unknown>;
+      tokaAssetResponse?: Record<string, unknown>;
+    };
     const video = document.querySelector<HTMLVideoElement>(`video[aria-label="Playing ${expectedFileName}"]`);
     const player = document.querySelector(".player-view");
     const alert = document.querySelector('[role="alert"]');
@@ -8,6 +11,7 @@ async function playerDiagnostics(fileName: string) {
     const bounds = video?.getBoundingClientRect();
     return {
       expectedFileName,
+      assetResponse: windowWithMediaError.tokaAssetResponse,
       capturedMediaError: windowWithMediaError.tokaMediaError,
       playerText: player?.textContent?.trim(),
       playerHtml: player?.outerHTML,
@@ -36,8 +40,12 @@ describe("Toka playlist", () => {
 
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
     await browser.execute(() => {
-      const windowWithMediaError = window as Window & { tokaMediaError?: Record<string, unknown> };
+      const windowWithMediaError = window as Window & {
+        tokaMediaError?: Record<string, unknown>;
+        tokaAssetResponse?: Record<string, unknown>;
+      };
       windowWithMediaError.tokaMediaError = undefined;
+      windowWithMediaError.tokaAssetResponse = undefined;
       document.addEventListener("error", (event) => {
         const target = event.target;
         if (!(target instanceof HTMLMediaElement)) return;
@@ -48,6 +56,19 @@ describe("Toka playlist", () => {
           networkState: target.networkState,
           readyState: target.readyState,
         };
+        void fetch(target.currentSrc)
+          .then((response) => {
+            windowWithMediaError.tokaAssetResponse = {
+              contentLength: response.headers.get("content-length"),
+              contentType: response.headers.get("content-type"),
+              ok: response.ok,
+              status: response.status,
+              supportsRanges: response.headers.get("accept-ranges"),
+            };
+          })
+          .catch((reason: unknown) => {
+            windowWithMediaError.tokaAssetResponse = { fetchError: String(reason) };
+          });
       }, true);
     });
     await $("button=Play all").click();
