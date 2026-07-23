@@ -13,4 +13,4 @@
 * [x] Add guidance in AGENTS.md to guide that we should do TDD development whenever possible (and do that now too)
 * [x] Add a "full screen" button
 * [x] Add a "loop video" / "loop playlist" button
-* [ ] Add hover states for the buttons
+* [x] Add hover states for the buttons
