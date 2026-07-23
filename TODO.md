@@ -9,3 +9,8 @@
 * [x] Launch error: see .scratch/launch-error.txt
 * [x] Apply new design: see /home/gall/workspace/toka/design/*
 * [x] Add guidance in AGENTS.md to check the TODO.md file after every task is complete to see if there are any new tasks. If there are then spawn a subagent to do each task (just so that the subagent starts with a relatively empty context). If there are multiple tasks and if it seems like the tasks could be performed in parallel then spawn the sub agents in parallel. But if unsure then do it sequentially. (The default should be sequential but assess each set of tasks to determine)
+* [x] Review the designs in the designs/ folder and do a visual design review, to ensure that the app matches the design. I already saw a couple of problems: the text inside the search field ("Search videos") isn't visually centered, the magnifying glass is too small. The text on the button (like Play, Pause) arent' vertically centered
+* [x] Add guidance in AGENTS.md to guide that we should do TDD development whenever possible (and do that now too)
+* [x] Add a "full screen" button
+* [x] Add a "loop video" / "loop playlist" button
+* [x] Add hover states for the buttons
