@@ -40,6 +40,18 @@ function formatTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
+export function playbackSource(filePath: string): string {
+  // WebKitGTK does not load media from Tauri's custom asset protocol. The E2E
+  // build uses controlled local fixtures, so a file URL exercises the browser
+  // fallback without changing production's scoped asset-protocol behavior.
+  if (import.meta.env.VITE_E2E === "1") {
+    const url = new URL("file://");
+    url.pathname = filePath;
+    return url.href;
+  }
+  return convertFileSrc(filePath);
+}
+
 function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
@@ -290,7 +302,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           ) : (
             <video
               ref={element}
-              src={convertFileSrc(prepared.filePath)}
+              src={playbackSource(prepared.filePath)}
               aria-label={`Playing ${video.fileName}`}
               style={{ transform: `rotate(${rotation}deg)` }}
               onLoadedMetadata={(event) => {

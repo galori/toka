@@ -47,7 +47,10 @@ jobs:
       - name: Integration tests
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            gst-inspect-1.0 qtdemux h264parse avdec_h264 avdec_aac
+            for element in qtdemux h264parse avdec_h264 avdec_aac; do
+              gst-inspect-1.0 --exists "$element"
+              echo "GStreamer element available: $element"
+            done
             LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
               xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24 +extension GLX +render -noreset" \
               npm run test:integration

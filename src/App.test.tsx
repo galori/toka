@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import App from "./App";
+import App, { playbackSource } from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -14,6 +14,17 @@ const convertFileSrcMock = vi.mocked(convertFileSrc);
 beforeEach(() => {
   invokeMock.mockReset();
   convertFileSrcMock.mockClear();
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+test("uses an encoded file URL for the web playback fallback in E2E builds", () => {
+  vi.stubEnv("VITE_E2E", "1");
+
+  expect(playbackSource("/Videos/clip #1.mp4")).toBe("file:///Videos/clip%20%231.mp4");
+  expect(convertFileSrcMock).not.toHaveBeenCalled();
 });
 
 test("starts with a focused search field and displays submitted results", async () => {
