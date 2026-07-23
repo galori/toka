@@ -1,3 +1,30 @@
+async function playerDiagnostics(fileName: string) {
+  return browser.execute((expectedFileName) => {
+    const video = document.querySelector<HTMLVideoElement>(`video[aria-label="Playing ${expectedFileName}"]`);
+    const player = document.querySelector(".player-view");
+    const alert = document.querySelector('[role="alert"]');
+    const style = video ? getComputedStyle(video) : undefined;
+    const bounds = video?.getBoundingClientRect();
+    return {
+      expectedFileName,
+      playerText: player?.textContent?.trim(),
+      playerHtml: player?.outerHTML,
+      alert: alert?.textContent?.trim(),
+      video: video && {
+        currentSrc: video.currentSrc,
+        readyState: video.readyState,
+        error: video.error?.message,
+        paused: video.paused,
+        display: style?.display,
+        visibility: style?.visibility,
+        opacity: style?.opacity,
+        width: bounds?.width,
+        height: bounds?.height,
+      },
+    };
+  }, fileName);
+}
+
 describe("Toka playlist", () => {
   it("searches for matching videos and plays every result in order", async () => {
     const search = await $("#video-search");
@@ -11,7 +38,11 @@ describe("Toka playlist", () => {
     for (let number = 1; number <= 5; number += 1) {
       const fileName = "sample" + number + ".mp4";
       const player = await $(`video[aria-label="Playing ${fileName}"]`);
-      await player.waitForDisplayed();
+      try {
+        await player.waitForDisplayed();
+      } catch (error) {
+        throw new Error(`${String(error)}\nPlayer diagnostics: ${JSON.stringify(await playerDiagnostics(fileName), null, 2)}`);
+      }
       await expect($(".playlist-status")).toHaveText("Playlist video " + number + " of 5");
       if (number < 5) {
         await browser.execute(() => {
