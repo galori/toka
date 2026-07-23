@@ -40,7 +40,9 @@ jobs:
       - name: Integration tests
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
-            xvfb-run --auto-servernum npm run test:integration
+            LIBGL_ALWAYS_SOFTWARE=1 MESA_LOADER_DRIVER_OVERRIDE=llvmpipe \
+              xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24 +extension GLX +render -noreset" \
+              npm run test:integration
           else
             npm run test:integration
           fi
