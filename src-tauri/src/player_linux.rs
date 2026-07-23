@@ -17,13 +17,9 @@ const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 #[cfg(feature = "native-e2e")]
-const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
-#[cfg(feature = "native-e2e")]
-const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
-#[cfg(feature = "native-e2e")]
-const GL_RGB: u32 = 0x1907;
-#[cfg(feature = "native-e2e")]
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
+#[cfg(feature = "native-e2e")]
+const GL_RGBA: u32 = 0x1908;
 
 type MpvHandle = c_void;
 type MpvRenderContext = c_void;
@@ -31,8 +27,6 @@ type GlGetIntegerv = unsafe extern "C" fn(u32, *mut c_int);
 #[cfg(feature = "native-e2e")]
 type GlReadPixels =
     unsafe extern "C" fn(c_int, c_int, c_int, c_int, u32, u32, *mut c_void);
-#[cfg(feature = "native-e2e")]
-type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
 
 #[repr(C)]
 struct MpvRenderParam {
@@ -278,21 +272,20 @@ impl Mpv {
         })?;
         #[cfg(feature = "native-e2e")]
         unsafe {
-            let mut color = [0_u8; 3];
-            let mut read_framebuffer = 0;
-            (EPOXY_GL_GET_INTEGERV)(GL_READ_FRAMEBUFFER_BINDING, &mut read_framebuffer);
-            (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, framebuffer as u32);
+            // GL's default pack alignment is four bytes. Reading RGB into a
+            // three-byte buffer overflows it, and rebinding the draw FBO can
+            // sample a different buffer from GTK's active read framebuffer.
+            let mut color = [0_u8; 4];
             (EPOXY_GL_READ_PIXELS)(
                 width / 2,
                 height / 2,
                 1,
                 1,
-                GL_RGB,
+                GL_RGBA,
                 GL_UNSIGNED_BYTE,
                 color.as_mut_ptr().cast(),
             );
-            (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, read_framebuffer as u32);
-            self.last_frame_color = Some(color);
+            self.last_frame_color = Some(rgb_from_rgba(color));
         }
         Ok(())
     }
@@ -319,9 +312,6 @@ extern "C" {
     #[cfg(feature = "native-e2e")]
     #[link_name = "epoxy_glReadPixels"]
     static EPOXY_GL_READ_PIXELS: GlReadPixels;
-    #[cfg(feature = "native-e2e")]
-    #[link_name = "epoxy_glBindFramebuffer"]
-    static EPOXY_GL_BIND_FRAMEBUFFER: GlBindFramebuffer;
 }
 
 #[link(name = "EGL")]
@@ -554,4 +544,19 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
 
 pub fn stop(player: &NativePlayer) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.command(&["stop"]))
+}
+
+#[cfg(any(feature = "native-e2e", test))]
+fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
+    [color[0], color[1], color[2]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rgb_from_rgba;
+
+    #[test]
+    fn extracts_rgb_from_an_aligned_rgba_pixel() {
+        assert_eq!(rgb_from_rgba([12, 34, 56, 255]), [12, 34, 56]);
+    }
 }
