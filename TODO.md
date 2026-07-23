@@ -16,7 +16,7 @@
 * [x] Add hover states for the buttons
 * [ ] 
 * [x] Add the playlist componet as seen here file:///home/gall/workspace/toka/design/Toka%20Style%20Guide.dc.html and $design-compare it and then fix any discrepancies
-* [ ] Add a "rotate" feature (left & right rotate arrows?)
+* [x] Add a "rotate" feature (left & right rotate arrows?)
 * [ ] Add keyboard controls for every action (rotate, skip to next video, skip to previous video, add guidance in AGENTS.md that every feature we add should have a keyboard shortcut associated with it. 
 * [ ] add a speed control that can speed up and slow down playback
 * [ ] add skip forward / skip backwards actions that jump a set amount (10s? 30s ? whatever you recommend, lets try something and I'll see how it feels)

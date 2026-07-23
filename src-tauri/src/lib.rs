@@ -106,6 +106,23 @@ fn set_native_paused(
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
+fn native_video_rotation(
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<i32, CommandError> {
+    player_linux::rotation(player.inner()).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_native_video_rotation(
+    degrees: i32,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::set_rotation(player.inner(), degrees).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
 fn seek_native_video(
     seconds: f64,
     player: State<'_, Arc<player_linux::NativePlayer>>,
@@ -207,6 +224,8 @@ pub fn run() {
                 prepare_video,
                 load_native_video,
                 set_native_paused,
+                native_video_rotation,
+                set_native_video_rotation,
                 seek_native_video,
                 native_playback_state,
                 stop_native_video,

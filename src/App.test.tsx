@@ -106,6 +106,54 @@ test("loops a single video when loop video is enabled", async () => {
   expect(play).toHaveBeenCalled();
 });
 
+test("rotates web playback clockwise and counter-clockwise", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+
+  await user.click(screen.getByRole("button", { name: "Rotate right" }));
+  expect(video).toHaveStyle({ transform: "rotate(90deg)" });
+
+  await user.click(screen.getByRole("button", { name: "Rotate left" }));
+  expect(video).toHaveStyle({ transform: "rotate(0deg)" });
+});
+
+test("sends the selected rotation to native playback", async () => {
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "native-1", fileName: "native.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({ filePath: "/Videos/native.mp4", playbackBackend: "native" });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play native.mp4" }));
+  await user.click(await screen.findByRole("button", { name: "Rotate left" }));
+
+  expect(invokeMock).toHaveBeenCalledWith("set_native_video_rotation", { degrees: 270 });
+});
+
 test("loops a playlist back to its first video", async () => {
   const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `playlist-${number}.mp4`, extension: "mp4" }));
   invokeMock

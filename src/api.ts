@@ -47,6 +47,14 @@ export function setNativePaused(paused: boolean): Promise<void> {
   return invoke("set_native_paused", { paused });
 }
 
+export function nativeVideoRotation(): Promise<number> {
+  return invoke("native_video_rotation");
+}
+
+export function setNativeVideoRotation(degrees: number): Promise<void> {
+  return invoke("set_native_video_rotation", { degrees });
+}
+
 export function seekNativeVideo(seconds: number): Promise<void> {
   return invoke("seek_native_video", { seconds });
 }
