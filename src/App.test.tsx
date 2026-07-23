@@ -22,9 +22,18 @@ afterEach(() => {
 
 test("uses an encoded file URL for the web playback fallback in E2E builds", () => {
   vi.stubEnv("VITE_E2E", "1");
+  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
 
   expect(playbackSource("/Videos/clip #1.mp4")).toBe("file:///Videos/clip%20%231.mp4");
   expect(convertFileSrcMock).not.toHaveBeenCalled();
+});
+
+test("retains the asset protocol for E2E builds on platforms that support it", () => {
+  vi.stubEnv("VITE_E2E", "1");
+  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+
+  expect(playbackSource("/Videos/clip.mp4")).toBe("asset:///Videos/clip.mp4");
+  expect(convertFileSrcMock).toHaveBeenCalledWith("/Videos/clip.mp4");
 });
 
 test("starts with a focused search field and displays submitted results", async () => {
