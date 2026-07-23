@@ -197,6 +197,43 @@ test("playlist mode advances through every search result", async () => {
   expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-3" });
 });
 
+test("opens the playlist drawer and plays a selected playlist item", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-3.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+
+  const toggle = screen.getByRole("button", { name: "Playlist 3" });
+  expect(toggle).toHaveAttribute("aria-expanded", "true");
+  expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "playlist-1.mp4" })).toHaveAttribute("aria-current", "true");
+
+  await user.click(toggle);
+  expect(screen.queryByRole("complementary", { name: "Playlist" })).not.toBeInTheDocument();
+  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: "playlist-3.mp4" }));
+
+  expect(await screen.findByLabelText("Playing playlist-3.mp4")).toBeVisible();
+  expect(screen.getByRole("button", { name: "playlist-3.mp4" })).toHaveAttribute("aria-current", "true");
+});
+
 test("native playlist advances when libmpv reports end of file", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,

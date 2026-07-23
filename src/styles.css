@@ -291,12 +291,12 @@ button:focus-visible {
   position: absolute;
   top: 0;
   right: 0;
-  bottom: 58px;
-  width: min(280px, 45%);
+  bottom: 0;
+  width: 280px;
   overflow: auto;
   border-left: 1px solid oklch(0.28 0.02 40);
   padding: 18px;
-  background: oklch(0.15 0.015 40 / 0.98);
+  background: oklch(0.15 0.015 40);
 }
 .playlist-drawer h2 {
   margin: 0 0 12px;
@@ -315,7 +315,7 @@ button:focus-visible {
   overflow: hidden;
   border: 0;
   border-radius: 8px;
-  padding: 10px;
+  padding: 9px 10px;
   background: transparent;
   color: oklch(0.65 0.02 60);
   text-align: left;
