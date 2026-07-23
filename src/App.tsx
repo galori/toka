@@ -41,13 +41,12 @@ function formatTime(seconds: number): string {
 }
 
 export function playbackSource(filePath: string): string {
-  // Linux WebKitGTK does not load media from Tauri's custom asset protocol.
-  // The E2E build uses controlled local fixtures, so a file URL exercises its
-  // browser fallback without changing production or macOS behavior.
+  // Linux WebKitGTK does not load media from Tauri's custom asset protocol or
+  // file URLs in WebDriver. The E2E fixture server provides an HTTP media URL
+  // without changing production or macOS behavior.
   if (import.meta.env.VITE_E2E === "1" && navigator.userAgent.includes("Linux")) {
-    const url = new URL("file://");
-    url.pathname = filePath;
-    return url.href;
+    const fileName = filePath.split(/[\\/]/).at(-1) ?? "";
+    return `http://127.0.0.1:1421/${encodeURIComponent(fileName)}`;
   }
   return convertFileSrc(filePath);
 }

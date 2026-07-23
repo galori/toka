@@ -20,11 +20,11 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-test("uses an encoded file URL for the web playback fallback in E2E builds", () => {
+test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
   vi.stubEnv("VITE_E2E", "1");
   vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
 
-  expect(playbackSource("/Videos/clip #1.mp4")).toBe("file:///Videos/clip%20%231.mp4");
+  expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:1421/clip%20%231.mp4");
   expect(convertFileSrcMock).not.toHaveBeenCalled();
 });
 
