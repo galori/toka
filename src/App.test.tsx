@@ -67,6 +67,43 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("uses the overlay player controls from the design", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  const controls = await screen.findByLabelText("Video controls");
+  expect(controls).toHaveClass("player-controls");
+  expect(screen.getByLabelText("Video timeline")).toHaveClass("player-timeline");
+  expect(screen.getByRole("button", { name: "Play" })).toHaveClass("play-button");
+  expect(screen.getByRole("button", { name: "Pause" })).toHaveTextContent("Pause");
+});
+
+test("presents a dedicated unsupported-format state", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockRejectedValueOnce(new Error("This video format or codec is not supported on this computer."));
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  expect(await screen.findByRole("heading", { name: "This video format isn't supported on your computer" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Back to results" })).toBeVisible();
+});
+
 test("enters fullscreen mode for the player", async () => {
   invokeMock
     .mockResolvedValueOnce({

@@ -31,6 +31,15 @@ function VideoIcon() {
   );
 }
 
+function SearchIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="search-glyph" aria-hidden="true">
+      <circle cx="10.75" cy="10.75" r="6.25" />
+      <path d="m16 16 4 4" />
+    </svg>
+  );
+}
+
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const wholeSeconds = Math.floor(seconds);
@@ -165,6 +174,22 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     void shell.requestFullscreen().catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
+  if (error) {
+    const unsupported = error.includes("format") || error.includes("codec");
+    return (
+      <section className="player-error-state" aria-label={`Unable to play ${video.fileName}`}>
+        <div className="unsupported-icon" aria-hidden="true"><span /></div>
+        <h1>{unsupported ? "This video format isn't supported on your computer" : "This video could not be played"}</h1>
+        <p>{video.fileName}</p>
+        <p role="alert" className="sr-only">{error}</p>
+        <div className="error-actions">
+          <button type="button" className="back-button" onClick={onBack} aria-label="Back to results">← Back to results</button>
+          {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}>Skip to next</button> : null}
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
@@ -184,7 +209,6 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         ) : null}
       </div>
 
-      {error ? <p role="alert" className="message error">{error}</p> : null}
       {!prepared && !error ? <p className="message">Preparing video…</p> : null}
       {prepared ? (
         <div ref={playerShell} className="player-shell">
@@ -212,23 +236,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             />
           )}
           <div className="player-controls" aria-label="Video controls">
-            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video">◀◀</button>
-            <button type="button" className="play-button" onClick={play}>Play</button>
-            <button type="button" className="transport-button" onClick={pause}>Pause</button>
-            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">▶▶</button>
-            <button
-              type="button"
-              className="transport-button"
-              onClick={() => setLoop((enabled) => !enabled)}
-              aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
-              aria-pressed={loop}
-            >
-              {loop ? "Looping" : "Loop"}
-            </button>
-            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            </button>
             <input
+              className="player-timeline"
               aria-label="Video timeline"
               type="range"
               min="0"
@@ -242,7 +251,17 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 setCurrentTime(nextTime);
               }}
             />
-            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+            <div className="player-transport">
+              <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><span aria-hidden="true">⏮</span></button>
+              <button type="button" className="play-button" onClick={play} aria-label="Play"><span className="play-glyph" aria-hidden="true" /><span className="sr-only">Play</span></button>
+              <button type="button" className="transport-button" onClick={pause} aria-label="Pause"><span aria-hidden="true">⏸</span><span className="sr-only">Pause</span></button>
+              <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><span aria-hidden="true">⏭</span></button>
+              <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+              <span className="player-utilities">
+                <button type="button" className="transport-button" onClick={() => setLoop((enabled) => !enabled)} aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"} aria-pressed={loop}><span aria-hidden="true">↻</span></button>
+                <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}><span aria-hidden="true">⛶</span></button>
+              </span>
+            </div>
           </div>
           {videos.length > 1 && playlistOpen ? (
             <aside className="playlist-drawer" aria-label="Playlist">
@@ -325,7 +344,7 @@ export default function App() {
             autoComplete="off"
             autoFocus
           />
-          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <span className="search-glyph" aria-hidden="true">⌕</span>}
+          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <SearchIcon />}
         </div>
       </form>
 
