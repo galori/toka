@@ -67,6 +67,63 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("enters fullscreen mode for the player", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+
+  expect(requestFullscreen).toHaveBeenCalledOnce();
+});
+
+test("loops a single video when loop video is enabled", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  await user.click(screen.getByRole("button", { name: "Loop video" }));
+  expect(screen.getByRole("button", { name: "Loop video" })).toHaveAttribute("aria-pressed", "true");
+  fireEvent.ended(video);
+  expect(play).toHaveBeenCalled();
+});
+
+test("loops a playlist back to its first video", async () => {
+  const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `playlist-${number}.mp4`, extension: "mp4" }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await user.click(await screen.findByRole("button", { name: "Loop playlist" }));
+  fireEvent.ended(await screen.findByLabelText("Playing playlist-1.mp4"));
+  fireEvent.ended(await screen.findByLabelText("Playing playlist-2.mp4"));
+  expect(await screen.findByLabelText("Playing playlist-1.mp4")).toBeVisible();
+});
+
 test("paginates and reports provider failures", async () => {
   invokeMock
     .mockResolvedValueOnce({
