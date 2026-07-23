@@ -17,9 +17,9 @@
 * [ ] 
 * [x] Add the playlist componet as seen here file:///home/gall/workspace/toka/design/Toka%20Style%20Guide.dc.html and $design-compare it and then fix any discrepancies
 * [x] Add a "rotate" feature (left & right rotate arrows?)
-* [ ] Add keyboard controls for every action (rotate, skip to next video, skip to previous video, add guidance in AGENTS.md that every feature we add should have a keyboard shortcut associated with it. 
-* [ ] add a speed control that can speed up and slow down playback
-* [ ] add skip forward / skip backwards actions that jump a set amount (10s? 30s ? whatever you recommend, lets try something and I'll see how it feels)
+* [x] Add keyboard controls for every action (rotate, skip to next video, skip to previous video, add guidance in AGENTS.md that every feature we add should have a keyboard shortcut associated with it. 
+* [x] add a speed control that can speed up and slow down playback
+* [x] add skip forward / skip backwards actions that jump a set amount (10s? 30s ? whatever you recommend, lets try something and I'll see how it feels)
 * [ ] Add subtitle display if there is a subtitle file in the same folder or embedded in the video. Add subtitle on/off actions and buttons and keyboard keys
 * [ ] I'm not seeing any of the play/pause/scrub controls anymore even though they were previously. See the video controls in the designs (see file:///home/gall/workspace/toka/design/Toka%20Style%20Guide.dc.html) and then do $design-compare and apply and fix any discrepancies.  Also add an integration test for each of the buttons, I would want tests to fail if the controls are missing.
 * [ ] I'd like to add thumbnail display, but before implementing recommend an approach. Intuitively it seems to me that we should just display the thumbnails from the file system (so from GNOME / Nautilus). Is that a reasonable thing to do ?  The problem is that I've had experience previously with other players and search apps that display GNOME / Nautilus thumbnails and they don't trigger thumbnail generation...the only way to get those thumbnails to generate is to visit the same folder directly with the Files app - and then display them. And there wasn't a straightforward way to generate thumbnails for an entire folder tree. So in many other cases apps instead generated their own thumbnails. I'd like you to recommend an approach here before implementing.

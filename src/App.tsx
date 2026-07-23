@@ -8,6 +8,7 @@ import {
   searchVideos,
   seekNativeVideo,
   setNativePaused,
+  setNativeSpeed,
   setNativeVideoRotation,
   setNativeVideoBounds,
   stopNativeVideo,
@@ -50,6 +51,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [loop, setLoop] = useState(false);
+  const [speed, setSpeed] = useState(1);
+  const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
@@ -62,6 +65,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
+    setSpeed(1);
+    setPlayingBack(false);
     setRotation(0);
     setNativeBaseRotation(0);
     prepareVideo(video.id)
@@ -73,6 +78,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           const baseRotation = await nativeVideoRotation();
           if (active) setNativeBaseRotation(baseRotation);
           await setNativePaused(false);
+          if (active) setPlayingBack(true);
         }
         if (active) setPrepared(result);
       })
@@ -136,17 +142,25 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
 
   const play = () => {
     if (native) {
-      void setNativePaused(false).catch((reason: unknown) => setError(errorMessage(reason)));
+      void setNativePaused(false)
+        .then(() => setPlayingBack(true))
+        .catch((reason: unknown) => setError(errorMessage(reason)));
       return;
     }
-    element.current?.play().catch(() => {
-      setError("This video could not be played by the system media engine.");
-    });
+    void element.current?.play()
+      .then(() => setPlayingBack(true))
+      .catch(() => setError("This video could not be played by the system media engine."));
   };
 
   const pause = () => {
-    if (native) void setNativePaused(true).catch((reason: unknown) => setError(errorMessage(reason)));
-    else element.current?.pause();
+    if (native) {
+      void setNativePaused(true)
+        .then(() => setPlayingBack(false))
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+    } else {
+      element.current?.pause();
+      setPlayingBack(false);
+    }
   };
 
   const rotate = (amount: number) => {
@@ -158,6 +172,13 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       }
       return next;
     });
+  };
+
+  const skip = (amount: number) => {
+    const next = Math.max(0, Math.min(duration || Number.POSITIVE_INFINITY, currentTime + amount));
+    if (native) void seekNativeVideo(next).catch((reason: unknown) => setError(errorMessage(reason)));
+    else if (element.current) element.current.currentTime = next;
+    setCurrentTime(next);
   };
 
   const selectVideo = (nextIndex: number) => {
@@ -184,10 +205,50 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     void shell.requestFullscreen().catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey ||
+        (target instanceof Element && target.closest("input, textarea, select, button, [contenteditable], [role=textbox]"))
+      ) return;
+
+      const run = (action: () => void) => {
+        event.preventDefault();
+        action();
+      };
+      if (event.key === " " || event.key === "Spacebar") {
+        run(playingBack ? pause : play);
+      } else if (event.key === "[") {
+        run(() => rotate(-90));
+      } else if (event.key === "]") {
+        run(() => rotate(90));
+      } else if (event.key === ",") {
+        run(() => skip(-10));
+      } else if (event.key === ".") {
+        run(() => skip(10));
+      } else if (event.shiftKey && event.key === "ArrowLeft" && index > 0) {
+        run(() => selectVideo(index - 1));
+      } else if (event.shiftKey && event.key === "ArrowRight" && index < videos.length - 1) {
+        run(() => selectVideo(index + 1));
+      } else if (event.key.toLowerCase() === "l") {
+        run(() => setLoop((enabled) => !enabled));
+      } else if (event.key.toLowerCase() === "p" && videos.length > 1) {
+        run(() => setPlaylistOpen((open) => !open));
+      } else if (event.key.toLowerCase() === "f") {
+        run(toggleFullscreen);
+      } else if (event.key === "Escape") {
+        run(fullscreen ? toggleFullscreen : onBack);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, videos.length]);
+
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
-        <button type="button" className="back-button" onClick={onBack} aria-label="Back to results">
+        <button type="button" className="back-button" onClick={onBack} aria-label="Back to results" aria-keyshortcuts="Escape">
           ← Back
         </button>
         <h1 title={video.fileName}>{video.fileName}</h1>
@@ -196,6 +257,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             type="button"
             className="playlist-toggle"
             aria-expanded={playlistOpen}
+            aria-keyshortcuts="P"
             onClick={() => setPlaylistOpen((open) => !open)}
           >
             Playlist <span>{videos.length}</span>
@@ -217,8 +279,11 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               style={{ transform: `rotate(${rotation}deg)` }}
               onLoadedMetadata={(event) => {
                 setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
+                event.currentTarget.playbackRate = speed;
                 play();
               }}
+              onPlay={() => setPlayingBack(true)}
+              onPause={() => setPlayingBack(false)}
               onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
               onEnded={() => {
                 if (index < videos.length - 1) setIndex((current) => current + 1);
@@ -232,22 +297,37 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             />
           )}
           <div className="player-controls" aria-label="Video controls">
-            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video">◀◀</button>
-            <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left">↶</button>
-            <button type="button" className="play-button" onClick={play}>Play</button>
-            <button type="button" className="transport-button" onClick={pause}>Pause</button>
-            <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right">↷</button>
-            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">▶▶</button>
+            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
+            <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
+            <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
+            <button type="button" className="play-button" onClick={play} aria-keyshortcuts="Space">Play</button>
+            <button type="button" className="transport-button" onClick={pause} aria-keyshortcuts="Space">Pause</button>
+            <select
+              aria-label="Playback speed"
+              value={speed}
+              onChange={(event) => {
+                const next = Number(event.currentTarget.value);
+                setSpeed(next);
+                if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
+                else if (element.current) element.current.playbackRate = next;
+              }}
+            >
+              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
+            </select>
+            <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
+            <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
+            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">▶▶</button>
             <button
               type="button"
               className="transport-button"
               onClick={() => setLoop((enabled) => !enabled)}
               aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
               aria-pressed={loop}
+              aria-keyshortcuts="L"
             >
               {loop ? "Looping" : "Loop"}
             </button>
-            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
               {fullscreen ? "Exit fullscreen" : "Fullscreen"}
             </button>
             <input
