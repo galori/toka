@@ -20,8 +20,8 @@ describe("Toka playlist", () => {
       }
     }
 
-    await $("button=Pause").click();
-    await $("button=Play").click();
+    await $('button[aria-label="Pause"]').click();
+    await $('button[aria-label="Play"]').click();
     await $("button[aria-label=\"Back to results\"]").click();
     await expect($("button=Play all")).toBeDisplayed();
   });

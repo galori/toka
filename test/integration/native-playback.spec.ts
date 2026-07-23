@@ -31,7 +31,7 @@ describe("Toka native Linux playback", () => {
       timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
     });
 
-    await $("button=Pause").click();
-    await $("button=Play").click();
+    await $('button[aria-label="Pause"]').click();
+    await $('button[aria-label="Play"]').click();
   });
 });
