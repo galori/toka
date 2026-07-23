@@ -147,8 +147,11 @@ input[type="search"] {
   border: 1px solid oklch(0.3 0.02 40);
   border-radius: 12px;
   background: oklch(0.17 0.02 40);
-  padding: 16px 48px 16px 18px;
+  /* Keep the native search control's text line centered in the design-height field. */
+  height: 56px;
+  padding: 0 48px 0 18px;
   font-size: 17px;
+  line-height: 24px;
   box-shadow: none;
 }
 
@@ -167,7 +170,7 @@ input[type="search"]:focus {
   padding: 4px;
   background: transparent;
   color: oklch(0.6 0.02 60);
-  font-size: 21px;
+  font-size: 28px;
   line-height: 1;
 }
 .search-glyph { color: oklch(0.68 0.19 38); pointer-events: none; }
@@ -237,6 +240,13 @@ input[type="search"]:focus {
   background: oklch(0.15 0.015 40);
 }
 .player-controls button { padding: 8px 11px; }
+.player-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  line-height: 1;
+}
 .player-controls .play-button {
   border: 0;
   background: oklch(0.68 0.19 38);
