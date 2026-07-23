@@ -12,5 +12,5 @@
 * [x] Review the designs in the designs/ folder and do a visual design review, to ensure that the app matches the design. I already saw a couple of problems: the text inside the search field ("Search videos") isn't visually centered, the magnifying glass is too small. The text on the button (like Play, Pause) arent' vertically centered
 * [x] Add guidance in AGENTS.md to guide that we should do TDD development whenever possible (and do that now too)
 * [x] Add a "full screen" button
-* [ ] Add a "loop video" / "loop playlist" button
+* [x] Add a "loop video" / "loop playlist" button
 * [ ] Add hover states for the buttons
