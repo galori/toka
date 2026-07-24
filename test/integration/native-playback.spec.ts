@@ -13,10 +13,22 @@ describe("Toka native Linux playback", () => {
       renderCount?: number;
       renderSize?: [number, number];
     }>;
+    // Retries (see wdio.native.conf.ts) re-run this block in the same session,
+    // where a previous attempt left the app in the player. Return to search
+    // first so the retry starts from the same state as the first attempt.
+    await browser.execute(() => {
+      const back = document.querySelector<HTMLButtonElement>('button[aria-label="Back to results"]');
+      back?.click();
+    });
     const search = await $("#video-search");
-    await search.click();
-    await browser.keys("native blue");
-    await browser.execute(() => document.querySelector("form")?.requestSubmit());
+    await search.waitForDisplayed();
+    await browser.execute(() => {
+      const field = document.querySelector<HTMLInputElement>("#video-search");
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(field, "native blue");
+      field?.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("form")?.requestSubmit();
+    });
 
     const result = await $('button[aria-label="Play native-blue.mp4"]');
     await result.waitForDisplayed();
