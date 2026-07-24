@@ -23,6 +23,8 @@ The native integration test uses an embedded WebDriver and a generated video fix
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
 - Subtitles come from sidecar files beside the video (`talk.srt`, `talk.en.srt`) and from tracks inside it. Rust detects the sidecars and converts SRT to WebVTT for the web media engine; on Linux mpv supplies both sidecar and embedded tracks. `S` toggles them.
 
+`docs/thumbnails.md` records the decided approach for result thumbnails.
+
 The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it.
 
 ## Linux troubleshooting
