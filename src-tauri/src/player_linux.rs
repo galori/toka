@@ -37,6 +37,12 @@ type GlReadPixels =
 type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
 #[cfg(feature = "native-e2e")]
 type GlGetError = unsafe extern "C" fn() -> u32;
+#[cfg(feature = "native-e2e")]
+type GlGetString = unsafe extern "C" fn(u32) -> *const c_char;
+#[cfg(feature = "native-e2e")]
+const GL_RENDERER: u32 = 0x1F01;
+#[cfg(feature = "native-e2e")]
+const GL_VERSION: u32 = 0x1F02;
 
 #[repr(C)]
 struct MpvRenderParam {
@@ -143,6 +149,14 @@ struct Mpv {
     blue_render_count: u64,
     #[cfg(feature = "native-e2e")]
     last_gl_error: u32,
+    #[cfg(feature = "native-e2e")]
+    gl_renderer: Option<String>,
+    #[cfg(feature = "native-e2e")]
+    gl_version: Option<String>,
+    #[cfg(feature = "native-e2e")]
+    last_grid: Option<Vec<String>>,
+    #[cfg(feature = "native-e2e")]
+    last_grid_render_index: u64,
 }
 
 // libmpv serializes access to a handle. Toka additionally protects it with the mutex below.
@@ -177,14 +191,29 @@ impl Mpv {
             blue_render_count: 0,
             #[cfg(feature = "native-e2e")]
             last_gl_error: 0,
+            #[cfg(feature = "native-e2e")]
+            gl_renderer: None,
+            #[cfg(feature = "native-e2e")]
+            gl_version: None,
+            #[cfg(feature = "native-e2e")]
+            last_grid: None,
+            #[cfg(feature = "native-e2e")]
+            last_grid_render_index: 0,
         };
         player.set_option("vo", "libmpv")?;
         #[cfg(feature = "native-e2e")]
         player.set_option("hwdec", "no")?;
         #[cfg(feature = "native-e2e")]
         player.set_option("log-file", "/tmp/toka-mpv-e2e.log")?;
+        // llvmpipe silently loses mpv's multi-pass pipeline (render into
+        // intermediate FBO textures, then a final scaled pass) on some
+        // launches: the whole process then presents black with zero GL
+        // errors (#57). Dumb mode collapses rendering to one direct pass
+        // with no intermediate textures, which made the E2E readback
+        // deterministic — pure blue every frame — while still exercising
+        // real decode, upload, draw, and readback.
         #[cfg(feature = "native-e2e")]
-        player.set_option("msg-level", "all=debug")?;
+        player.set_option("gpu-dumb-mode", "yes")?;
         #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
@@ -344,6 +373,19 @@ impl Mpv {
             (self.api.render_context_create)(&mut context, self.handle, params.as_mut_ptr())
         })?;
         self.render_context = context;
+        #[cfg(feature = "native-e2e")]
+        unsafe {
+            // Identify the GL context this launch actually created, so runs
+            // that come up with a different driver or version are visible.
+            let renderer = (EPOXY_GL_GET_STRING)(GL_RENDERER);
+            if !renderer.is_null() {
+                self.gl_renderer = Some(CStr::from_ptr(renderer).to_string_lossy().into_owned());
+            }
+            let version = (EPOXY_GL_GET_STRING)(GL_VERSION);
+            if !version.is_null() {
+                self.gl_version = Some(CStr::from_ptr(version).to_string_lossy().into_owned());
+            }
+        }
         Ok(())
     }
 
@@ -413,6 +455,42 @@ impl Mpv {
                 *slot = rgb_from_rgba(color);
             }
             self.last_gl_error = (EPOXY_GL_GET_ERROR)();
+            // Periodically map the whole framebuffer coarsely so failures show
+            // where anything was drawn: 'B' blue, '.' near-black, '#' other.
+            if self.render_count % 120 == 0 && width > 0 && height > 0 {
+                const COLUMNS: c_int = 24;
+                const ROWS: c_int = 10;
+                let mut grid = Vec::with_capacity(ROWS as usize);
+                for row in 0..ROWS {
+                    let mut line = String::with_capacity(COLUMNS as usize);
+                    for column in 0..COLUMNS {
+                        let x = (2 * column + 1) * width / (2 * COLUMNS);
+                        let y = (2 * row + 1) * height / (2 * ROWS);
+                        let mut color = [0_u8; 4];
+                        (EPOXY_GL_READ_PIXELS)(
+                            x,
+                            y,
+                            1,
+                            1,
+                            GL_RGBA,
+                            GL_UNSIGNED_BYTE,
+                            color.as_mut_ptr().cast(),
+                        );
+                        let (red, green, blue) =
+                            (u16::from(color[0]), u16::from(color[1]), u16::from(color[2]));
+                        line.push(if blue > 180 && blue > red * 2 && blue > green * 2 {
+                            'B'
+                        } else if red < 8 && green < 8 && blue < 8 {
+                            '.'
+                        } else {
+                            '#'
+                        });
+                    }
+                    grid.push(line);
+                }
+                self.last_grid = Some(grid);
+                self.last_grid_render_index = self.render_count;
+            }
             (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, read_framebuffer as u32);
             let center = colors[0];
             self.last_frame_color = Some(center);
@@ -461,6 +539,9 @@ extern "C" {
     #[cfg(feature = "native-e2e")]
     #[link_name = "epoxy_glGetError"]
     static EPOXY_GL_GET_ERROR: GlGetError;
+    #[cfg(feature = "native-e2e")]
+    #[link_name = "epoxy_glGetString"]
+    static EPOXY_GL_GET_STRING: GlGetString;
 }
 
 #[link(name = "EGL")]
@@ -687,6 +768,16 @@ pub struct PlaybackState {
     blue_render_count: u64,
     #[cfg(feature = "native-e2e")]
     gl_error: u32,
+    #[cfg(feature = "native-e2e")]
+    gl_renderer: Option<String>,
+    #[cfg(feature = "native-e2e")]
+    gl_version: Option<String>,
+    #[cfg(feature = "native-e2e")]
+    grid: Option<Vec<String>>,
+    #[cfg(feature = "native-e2e")]
+    grid_render_index: u64,
+    #[cfg(feature = "native-e2e")]
+    video_rect_margins: Option<[i64; 4]>,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -813,6 +904,26 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             blue_render_count: mpv.blue_render_count,
             #[cfg(feature = "native-e2e")]
             gl_error: mpv.last_gl_error,
+            #[cfg(feature = "native-e2e")]
+            gl_renderer: mpv.gl_renderer.clone(),
+            #[cfg(feature = "native-e2e")]
+            gl_version: mpv.gl_version.clone(),
+            #[cfg(feature = "native-e2e")]
+            grid: mpv.last_grid.clone(),
+            #[cfg(feature = "native-e2e")]
+            grid_render_index: mpv.last_grid_render_index,
+            #[cfg(feature = "native-e2e")]
+            video_rect_margins: match (
+                mpv.get_i64("osd-dimensions/ml"),
+                mpv.get_i64("osd-dimensions/mr"),
+                mpv.get_i64("osd-dimensions/mt"),
+                mpv.get_i64("osd-dimensions/mb"),
+            ) {
+                (Some(left), Some(right), Some(top), Some(bottom)) => {
+                    Some([left, right, top, bottom])
+                }
+                _ => None,
+            },
         })
     })
 }
