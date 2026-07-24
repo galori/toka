@@ -1,5 +1,17 @@
 describe("Toka native Linux playback", () => {
   it("decodes and renders a blue video frame", async () => {
+    const nativeState = () => browser.execute(() => {
+      const tauri = (window as typeof window & {
+        __TAURI__: { core: { invoke: (command: string) => Promise<unknown> } };
+      }).__TAURI__;
+      return tauri.core.invoke("native_playback_state");
+    }) as Promise<{
+      currentTime: number;
+      frameColor?: [number, number, number];
+      framebuffer?: number;
+      renderCount?: number;
+      renderSize?: [number, number];
+    }>;
     const search = await $("#video-search");
     await search.click();
     await browser.keys("native blue");
@@ -17,19 +29,17 @@ describe("Toka native Linux playback", () => {
     const timeText = await time.getText();
 
     expect(timeText).not.toMatch(/^0:00 \/ /);
-    await browser.waitUntil(async () => {
-      const state = await browser.execute(() => {
-        const tauri = (window as typeof window & {
-          __TAURI__: { core: { invoke: (command: string) => Promise<unknown> } };
-        }).__TAURI__;
-        return tauri.core.invoke("native_playback_state");
-      }) as { frameColor?: [number, number, number] };
-      const [red = 0, green = 0, blue = 0] = state.frameColor ?? [];
-      return blue > 180 && blue > red * 2 && blue > green * 2;
-    }, {
-      timeout: 5_000,
-      timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
-    });
+    try {
+      await browser.waitUntil(async () => {
+        const [red = 0, green = 0, blue = 0] = (await nativeState()).frameColor ?? [];
+        return blue > 180 && blue > red * 2 && blue > green * 2;
+      }, {
+        timeout: 5_000,
+        timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
+      });
+    } catch (error) {
+      throw new Error(`${String(error)}\n[DEBUG-native-e2e] ${JSON.stringify(await nativeState())}`);
+    }
 
     await $('button[aria-label="Pause"]').click();
     await $('button[aria-label="Play"]').click();

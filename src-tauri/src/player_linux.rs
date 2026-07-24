@@ -115,6 +115,12 @@ struct Mpv {
     render_context: *mut MpvRenderContext,
     #[cfg(feature = "native-e2e")]
     last_frame_color: Option<[u8; 3]>,
+    #[cfg(feature = "native-e2e")]
+    last_render_size: Option<[c_int; 2]>,
+    #[cfg(feature = "native-e2e")]
+    last_framebuffer: Option<c_int>,
+    #[cfg(feature = "native-e2e")]
+    render_count: u64,
 }
 
 // libmpv serializes access to a handle. Toka additionally protects it with the mutex below.
@@ -133,6 +139,12 @@ impl Mpv {
             render_context: ptr::null_mut(),
             #[cfg(feature = "native-e2e")]
             last_frame_color: None,
+            #[cfg(feature = "native-e2e")]
+            last_render_size: None,
+            #[cfg(feature = "native-e2e")]
+            last_framebuffer: None,
+            #[cfg(feature = "native-e2e")]
+            render_count: 0,
         };
         player.set_option("vo", "libmpv")?;
         player.set_option("hwdec", "auto-safe")?;
@@ -278,6 +290,12 @@ impl Mpv {
         self.initialize_renderer()?;
         let mut framebuffer: c_int = 0;
         unsafe { (EPOXY_GL_GET_INTEGERV)(GL_FRAMEBUFFER_BINDING, &mut framebuffer) };
+        #[cfg(feature = "native-e2e")]
+        {
+            self.last_render_size = Some([width, height]);
+            self.last_framebuffer = Some(framebuffer);
+            self.render_count += 1;
+        }
         let mut fbo = MpvOpenGlFbo {
             fbo: framebuffer,
             width,
@@ -544,6 +562,12 @@ pub struct PlaybackState {
     ended: bool,
     #[cfg(feature = "native-e2e")]
     frame_color: Option<[u8; 3]>,
+    #[cfg(feature = "native-e2e")]
+    render_size: Option<[c_int; 2]>,
+    #[cfg(feature = "native-e2e")]
+    framebuffer: Option<c_int>,
+    #[cfg(feature = "native-e2e")]
+    render_count: u64,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -587,6 +611,12 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             ended: mpv.get_flag("eof-reached").unwrap_or(false),
             #[cfg(feature = "native-e2e")]
             frame_color: mpv.last_frame_color,
+            #[cfg(feature = "native-e2e")]
+            render_size: mpv.last_render_size,
+            #[cfg(feature = "native-e2e")]
+            framebuffer: mpv.last_framebuffer,
+            #[cfg(feature = "native-e2e")]
+            render_count: mpv.render_count,
         })
     })
 }
