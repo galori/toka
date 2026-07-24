@@ -113,15 +113,11 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 
 .player-controls { gap: 10px; padding: 14px; background: #141820; }
 
-.player-controls input[type="range"] { flex: 1; accent-color: #69a8ff; }
-
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 560px) {
   .app { width: min(100% - 24px, 1180px); padding-top: 18px; }
   .video-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-  .player-controls { flex-wrap: wrap; }
-  .player-controls input[type="range"] { flex-basis: 100%; }
 }
 
 /* Toka design system */
@@ -300,29 +296,43 @@ button:focus-visible {
 .player-transport { display: flex; align-items: center; gap: 18px; }
 .player-controls button {
   display: inline-flex;
+  flex: none;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  min-height: 24px;
+  min-width: 28px;
+  height: 28px;
   border: 0;
-  padding: 0;
+  padding: 0 4px;
   background: transparent;
   color: oklch(0.9 0.01 90);
   font-size: 16px;
+  font-weight: 700;
   line-height: 1;
+  white-space: nowrap;
 }
+.player-controls .transport-button[aria-pressed="true"] { color: oklch(0.68 0.19 38); }
 .player-controls .play-button {
-  width: 42px;
-  min-height: 42px;
+  min-width: 42px;
+  height: 42px;
   border-radius: 50%;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
-  font-weight: 700;
 }
 .play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
-.player-utilities { display: flex; gap: 12px; margin-left: auto; }
+.pause-glyph { width: 14px; height: 16px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
+.player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.player-utilities select {
+  height: 28px;
+  border: 1px solid oklch(0.4 0.02 40 / 0.7);
+  border-radius: 8px;
+  padding: 0 6px;
+  background: oklch(0.2 0.02 40 / 0.8);
+  color: oklch(0.9 0.01 90);
+  font: 700 13px inherit;
+}
 .time-display {
-  color: oklch(0.7 0.01 90);
+  margin-left: 6px;
+  color: oklch(0.75 0.01 90);
   font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
   white-space: nowrap;
 }

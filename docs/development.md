@@ -21,6 +21,7 @@ The native integration test uses an embedded WebDriver and a generated video fix
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
+- Subtitles come from sidecar files beside the video (`talk.srt`, `talk.en.srt`) and from tracks inside it. Rust detects the sidecars and converts SRT to WebVTT for the web media engine; on Linux mpv supplies both sidecar and embedded tracks. `S` toggles them.
 
 The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it.
 

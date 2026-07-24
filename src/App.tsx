@@ -1,21 +1,31 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   loadNativeVideo,
   nativePlaybackState,
+  nativeSubtitleTracks,
   nativeVideoRotation,
   prepareVideo,
   searchVideos,
   seekNativeVideo,
   setNativePaused,
   setNativeSpeed,
+  setNativeSubtitle,
   setNativeVideoRotation,
   setNativeVideoBounds,
   stopNativeVideo,
+  subtitleCues,
   type PreparedVideo,
   type SearchPage,
   type VideoResult,
 } from "./api";
+
+// A subtitle Toka can turn on, whichever backend supplies it: a sidecar file
+// detected by Rust, an mpv track, or a track the web engine found in the file.
+type SubtitleOption =
+  | { source: "sidecar"; label: string; language: string | null; track: number }
+  | { source: "native"; label: string; id: number }
+  | { source: "embedded"; label: string; textTrack: TextTrack };
 
 function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
@@ -67,6 +77,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
+  const [nativeSubtitles, setNativeSubtitles] = useState<SubtitleOption[]>([]);
+  const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
+  const [subtitleIndex, setSubtitleIndex] = useState(-1);
+  const [subtitleCueUrl, setSubtitleCueUrl] = useState<string>();
   const video = videos[index];
 
   useEffect(() => {
@@ -80,6 +94,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setPlayingBack(false);
     setRotation(0);
     setNativeBaseRotation(0);
+    setNativeSubtitles([]);
+    setEmbeddedSubtitles([]);
+    setSubtitleIndex(-1);
+    setSubtitleCueUrl(undefined);
     prepareVideo(video.id)
       .then(async (result) => {
         if (!active) return;
@@ -107,10 +125,28 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
 
   const native = prepared?.playbackBackend === "native";
 
+  const subtitles = useMemo<SubtitleOption[]>(() => {
+    if (native) return nativeSubtitles;
+    const sidecars = (prepared?.subtitles ?? [])
+      .filter((subtitle) => subtitle.webPlayable)
+      .map<SubtitleOption>((subtitle) => ({
+        source: "sidecar",
+        label: subtitle.label,
+        language: subtitle.language,
+        track: subtitle.track,
+      }));
+    return [...sidecars, ...embeddedSubtitles];
+  }, [embeddedSubtitles, native, nativeSubtitles, prepared]);
+
+  const selectedSubtitle = subtitles[subtitleIndex];
+
   useEffect(() => {
     if (!native || !nativeSurface.current) return;
     const surface = nativeSurface.current;
     let advancing = false;
+    // mpv only knows the file's subtitle tracks once it has finished loading,
+    // so the list is refreshed alongside the playback poll until it settles.
+    let knownTrackCount = -1;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
       void setNativeVideoBounds({
@@ -143,6 +179,15 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
+      void nativeSubtitleTracks()
+        .then((tracks) => {
+          if (tracks.length === knownTrackCount) return;
+          knownTrackCount = tracks.length;
+          setNativeSubtitles(
+            tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
+          );
+        })
+        .catch(() => {});
     }, 250);
     return () => {
       observer.disconnect();
@@ -196,6 +241,72 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
   };
 
+  const selectSubtitle = (nextIndex: number) => {
+    const option = subtitles[nextIndex];
+    setSubtitleIndex(option ? nextIndex : -1);
+    if (native) {
+      void setNativeSubtitle(option?.source === "native" ? option.id : null)
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+      return;
+    }
+    if (option?.source !== "sidecar") {
+      setSubtitleCueUrl(undefined);
+      return;
+    }
+    void subtitleCues(video.id, option.track)
+      .then((cues) => setSubtitleCueUrl(`data:text/vtt;charset=utf-8,${encodeURIComponent(cues)}`))
+      .catch((reason: unknown) => setError(errorMessage(reason)));
+  };
+
+  const toggleSubtitles = () => selectSubtitle(subtitleIndex >= 0 ? -1 : 0);
+
+  // The web engine surfaces tracks carried inside the file itself; they join
+  // the list beside the sidecar files Rust found.
+  useEffect(() => {
+    const media = element.current;
+    if (native || !media?.textTracks) return;
+    const sync = () => {
+      const own = media.querySelector("track")?.track;
+      const found: SubtitleOption[] = [];
+      for (let position = 0; position < media.textTracks.length; position += 1) {
+        const textTrack = media.textTracks[position];
+        if (textTrack === own || (textTrack.kind !== "subtitles" && textTrack.kind !== "captions")) continue;
+        found.push({
+          source: "embedded",
+          label: textTrack.label || textTrack.language.toUpperCase() || `Track ${position + 1}`,
+          textTrack,
+        });
+      }
+      setEmbeddedSubtitles((current) =>
+        current.length === found.length && current.every((option, at) => option.label === found[at].label)
+          ? current
+          : found,
+      );
+    };
+    sync();
+    media.textTracks.addEventListener?.("addtrack", sync);
+    media.textTracks.addEventListener?.("removetrack", sync);
+    return () => {
+      media.textTracks.removeEventListener?.("addtrack", sync);
+      media.textTracks.removeEventListener?.("removetrack", sync);
+    };
+  }, [native, prepared]);
+
+  // A text track stays invisible until its mode is "showing".
+  useEffect(() => {
+    const media = element.current;
+    if (native || !media?.textTracks) return;
+    const own = media.querySelector("track")?.track;
+    for (let position = 0; position < media.textTracks.length; position += 1) {
+      const textTrack = media.textTracks[position];
+      const showing =
+        selectedSubtitle?.source === "sidecar"
+          ? textTrack === own
+          : selectedSubtitle?.source === "embedded" && selectedSubtitle.textTrack === textTrack;
+      textTrack.mode = showing ? "showing" : "disabled";
+    }
+  }, [native, selectedSubtitle, subtitleCueUrl]);
+
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerShell.current);
     document.addEventListener("fullscreenchange", updateFullscreen);
@@ -242,6 +353,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         run(() => selectVideo(index - 1));
       } else if (event.shiftKey && event.key === "ArrowRight" && index < videos.length - 1) {
         run(() => selectVideo(index + 1));
+      } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
+        run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
         run(() => setLoop((enabled) => !enabled));
       } else if (event.key.toLowerCase() === "p" && videos.length > 1) {
@@ -254,7 +367,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, videos.length]);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, subtitleIndex, subtitles, videos.length]);
 
   if (error) {
     const unsupported = error.includes("format") || error.includes("codec");
@@ -321,42 +434,19 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 }
               }}
               onError={() => setError("This video format or codec is not supported on this computer.")}
-            />
+            >
+              {subtitleCueUrl && selectedSubtitle?.source === "sidecar" ? (
+                <track
+                  kind="subtitles"
+                  src={subtitleCueUrl}
+                  label={selectedSubtitle.label}
+                  srcLang={selectedSubtitle.language ?? undefined}
+                  default
+                />
+              ) : null}
+            </video>
           )}
           <div className="player-controls" aria-label="Video controls">
-            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
-            <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
-            <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
-            <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">Play</button>
-            <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">Pause</button>
-            <select
-              aria-label="Playback speed"
-              value={speed}
-              onChange={(event) => {
-                const next = Number(event.currentTarget.value);
-                setSpeed(next);
-                if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
-                else if (element.current) element.current.playbackRate = next;
-              }}
-            >
-              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
-            </select>
-            <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
-            <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
-            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">▶▶</button>
-            <button
-              type="button"
-              className="transport-button"
-              onClick={() => setLoop((enabled) => !enabled)}
-              aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
-              aria-pressed={loop}
-              aria-keyshortcuts="L"
-            >
-              {loop ? "Looping" : "Loop"}
-            </button>
-            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
-              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            </button>
             <input
               className="player-timeline"
               aria-label="Video timeline"
@@ -372,7 +462,73 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 setCurrentTime(nextTime);
               }}
             />
-            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+            <div className="player-transport">
+              <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">⏮</button>
+              <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
+              <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">
+                <span className="play-glyph" aria-hidden="true" />
+              </button>
+              <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">
+                <span className="pause-glyph" aria-hidden="true" />
+              </button>
+              <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
+              <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">⏭</button>
+              <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+              <div className="player-utilities">
+                <button
+                  type="button"
+                  className="transport-button"
+                  onClick={toggleSubtitles}
+                  disabled={subtitles.length === 0}
+                  aria-label="Subtitles"
+                  aria-pressed={subtitleIndex >= 0}
+                  aria-keyshortcuts="S"
+                >
+                  CC
+                </button>
+                {subtitles.length > 1 ? (
+                  <select
+                    aria-label="Subtitle track"
+                    value={subtitleIndex}
+                    onChange={(event) => selectSubtitle(Number(event.currentTarget.value))}
+                  >
+                    <option value={-1}>Off</option>
+                    {subtitles.map((option, position) => (
+                      <option key={option.label + position} value={position}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                <select
+                  aria-label="Playback speed"
+                  value={speed}
+                  onChange={(event) => {
+                    const next = Number(event.currentTarget.value);
+                    setSpeed(next);
+                    if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
+                    else if (element.current) element.current.playbackRate = next;
+                  }}
+                >
+                  {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
+                </select>
+                <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
+                <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
+                <button
+                  type="button"
+                  className="transport-button"
+                  onClick={() => setLoop((enabled) => !enabled)}
+                  aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
+                  aria-pressed={loop}
+                  aria-keyshortcuts="L"
+                >
+                  ⟳
+                </button>
+                <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
+                  {fullscreen ? "⤡" : "⛶"}
+                </button>
+              </div>
+            </div>
           </div>
           {videos.length > 1 && playlistOpen ? (
             <aside className="playlist-drawer" aria-label="Playlist">
