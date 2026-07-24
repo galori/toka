@@ -324,39 +324,6 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             />
           )}
           <div className="player-controls" aria-label="Video controls">
-            <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
-            <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
-            <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
-            <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">Play</button>
-            <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">Pause</button>
-            <select
-              aria-label="Playback speed"
-              value={speed}
-              onChange={(event) => {
-                const next = Number(event.currentTarget.value);
-                setSpeed(next);
-                if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
-                else if (element.current) element.current.playbackRate = next;
-              }}
-            >
-              {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
-            </select>
-            <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
-            <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
-            <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">▶▶</button>
-            <button
-              type="button"
-              className="transport-button"
-              onClick={() => setLoop((enabled) => !enabled)}
-              aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
-              aria-pressed={loop}
-              aria-keyshortcuts="L"
-            >
-              {loop ? "Looping" : "Loop"}
-            </button>
-            <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
-              {fullscreen ? "Exit fullscreen" : "Fullscreen"}
-            </button>
             <input
               className="player-timeline"
               aria-label="Video timeline"
@@ -372,7 +339,48 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 setCurrentTime(nextTime);
               }}
             />
-            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+            <div className="player-transport">
+              <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">⏮</button>
+              <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
+              <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">
+                <span className="play-glyph" aria-hidden="true" />
+              </button>
+              <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">
+                <span className="pause-glyph" aria-hidden="true" />
+              </button>
+              <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
+              <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">⏭</button>
+              <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+              <div className="player-utilities">
+                <select
+                  aria-label="Playback speed"
+                  value={speed}
+                  onChange={(event) => {
+                    const next = Number(event.currentTarget.value);
+                    setSpeed(next);
+                    if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
+                    else if (element.current) element.current.playbackRate = next;
+                  }}
+                >
+                  {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
+                </select>
+                <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
+                <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
+                <button
+                  type="button"
+                  className="transport-button"
+                  onClick={() => setLoop((enabled) => !enabled)}
+                  aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
+                  aria-pressed={loop}
+                  aria-keyshortcuts="L"
+                >
+                  ⟳
+                </button>
+                <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
+                  {fullscreen ? "⤡" : "⛶"}
+                </button>
+              </div>
+            </div>
           </div>
           {videos.length > 1 && playlistOpen ? (
             <aside className="playlist-drawer" aria-label="Playlist">

@@ -102,9 +102,33 @@ test("uses the overlay player controls from the design", async () => {
 
   const controls = await screen.findByLabelText("Video controls");
   expect(controls).toHaveClass("player-controls");
-  expect(screen.getByLabelText("Video timeline")).toHaveClass("player-timeline");
-  expect(screen.getByRole("button", { name: "Play" })).toHaveClass("play-button");
-  expect(screen.getByRole("button", { name: "Pause" })).toHaveTextContent("Pause");
+
+  // The design stacks a full-width scrubber above a single transport row, so the
+  // stylesheet's .player-transport and .player-utilities rules have to find the
+  // elements they lay out. Without them every control collapses to a 24px column.
+  const timeline = screen.getByLabelText("Video timeline");
+  expect(timeline).toHaveClass("player-timeline");
+  expect(timeline.parentElement).toBe(controls);
+
+  const transport = controls.querySelector(".player-transport");
+  const utilities = controls.querySelector(".player-utilities");
+  expect(transport).toBeInTheDocument();
+  expect(utilities).toBeInTheDocument();
+
+  for (const name of ["Previous video", "Skip back 10 seconds", "Play", "Pause", "Skip forward 10 seconds", "Next video"]) {
+    expect(transport).toContainElement(screen.getByRole("button", { name }));
+  }
+  expect(transport).toContainElement(screen.getByText("0:00 / 0:00"));
+
+  for (const name of ["Rotate left", "Rotate right", "Loop video", "Enter fullscreen"]) {
+    expect(utilities).toContainElement(screen.getByRole("button", { name }));
+  }
+  expect(utilities).toContainElement(screen.getByRole("combobox", { name: "Playback speed" }));
+
+  const play = screen.getByRole("button", { name: "Play" });
+  expect(play).toHaveClass("play-button");
+  expect(play.querySelector(".play-glyph")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Pause" }).querySelector(".pause-glyph")).toBeInTheDocument();
 });
 
 test("presents a dedicated unsupported-format state", async () => {
