@@ -145,8 +145,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     const surface = nativeSurface.current;
     let advancing = false;
     // mpv only knows the file's subtitle tracks once it has finished loading,
-    // so the list is refreshed alongside the playback poll until it settles.
-    let knownTrackCount = -1;
+    // so the playback poll also asks for them — until it finds some, or until
+    // the file has clearly had long enough to report that it has none.
+    let subtitleLookupsLeft = 20;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
       void setNativeVideoBounds({
@@ -179,15 +180,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
-      void nativeSubtitleTracks()
-        .then((tracks) => {
-          if (tracks.length === knownTrackCount) return;
-          knownTrackCount = tracks.length;
-          setNativeSubtitles(
-            tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
-          );
-        })
-        .catch(() => {});
+      if (subtitleLookupsLeft > 0) {
+        subtitleLookupsLeft -= 1;
+        void nativeSubtitleTracks()
+          .then((tracks) => {
+            if (tracks.length === 0) return;
+            subtitleLookupsLeft = 0;
+            setNativeSubtitles(
+              tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
+            );
+          })
+          .catch(() => {});
+      }
     }, 250);
     return () => {
       observer.disconnect();
