@@ -26,13 +26,15 @@ type Metrics = {
   insideShell: boolean;
   clipsContent: boolean;
   onTop: boolean;
+  shareOfOverlayWidth: number;
 };
 
 async function metricsFor(selector: string): Promise<Metrics | undefined> {
   return browser.execute((target) => {
     const element = document.querySelector<HTMLElement>(target);
     const shell = document.querySelector<HTMLElement>(".player-shell");
-    if (!element || !shell) return undefined;
+    const overlay = document.querySelector<HTMLElement>(".player-controls");
+    if (!element || !shell || !overlay) return undefined;
     const box = element.getBoundingClientRect();
     const shellBox = shell.getBoundingClientRect();
     const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
@@ -46,20 +48,18 @@ async function metricsFor(selector: string): Promise<Metrics | undefined> {
         box.right <= shellBox.right + 1,
       clipsContent: element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1,
       onTop: element === centre || element.contains(centre),
+      shareOfOverlayWidth: box.width / overlay.clientWidth,
     };
   }, selector);
 }
 
-async function expectUsable(selector: string) {
+async function expectLaidOut(selector: string): Promise<Metrics> {
   const control = await $(selector);
   await expect(control).toBeDisplayed();
 
   const metrics = await metricsFor(selector);
   if (!metrics) throw new Error(`No player shell or control found for ${selector}`);
-  // 24px is the design system's smallest interactive step. The remaining flags
-  // are reported together so a failure names what went wrong about the layout.
-  expect(metrics.width).toBeGreaterThanOrEqual(24);
-  expect(metrics.height).toBeGreaterThanOrEqual(24);
+  // Reported together so a failure names what went wrong about the layout.
   expect({
     laidOutInsideThePlayer: metrics.insideShell,
     clipsItsOwnContent: metrics.clipsContent,
@@ -69,6 +69,14 @@ async function expectUsable(selector: string) {
     clipsItsOwnContent: false,
     coveredByAnotherElement: false,
   });
+  return metrics;
+}
+
+// A pressable control. 24px is the design system's smallest interactive step.
+async function expectPressable(selector: string) {
+  const metrics = await expectLaidOut(selector);
+  expect(metrics.width).toBeGreaterThanOrEqual(24);
+  expect(metrics.height).toBeGreaterThanOrEqual(24);
 }
 
 describe("Toka player controls", () => {
@@ -94,23 +102,28 @@ describe("Toka player controls", () => {
   });
 
   it("shows the scrub timeline across the overlay", async () => {
-    await expectUsable('input[aria-label="Video timeline"]');
+    // The scrubber is a range input, not a button: the design draws it as a
+    // thin bar, so it is held to spanning the overlay rather than to the
+    // pressable minimum.
+    const metrics = await expectLaidOut('input[aria-label="Video timeline"]');
+    expect(metrics.shareOfOverlayWidth).toBeGreaterThan(0.9);
+    expect(metrics.height).toBeGreaterThan(0);
   });
 
   for (const label of transportControls) {
     it(`shows the ${label.toLowerCase()} control`, async () => {
-      await expectUsable(`.player-transport > button[aria-label="${label}"]`);
+      await expectPressable(`.player-transport > button[aria-label="${label}"]`);
     });
   }
 
   for (const label of utilityControls) {
     it(`shows the ${label.toLowerCase()} control`, async () => {
-      await expectUsable(`.player-utilities button[aria-label="${label}"]`);
+      await expectPressable(`.player-utilities button[aria-label="${label}"]`);
     });
   }
 
   it("shows the playback speed control", async () => {
-    await expectUsable('.player-utilities select[aria-label="Playback speed"]');
+    await expectPressable('.player-utilities select[aria-label="Playback speed"]');
   });
 
   it("shows the elapsed and total time", async () => {
