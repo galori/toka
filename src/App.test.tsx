@@ -276,6 +276,72 @@ test("selects and clears the mpv subtitle track for native playback", async () =
   await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: null }));
 });
 
+test("shows its keyboard shortcut on every control that has one", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 1,
+      results: [1, 2].map((n) => ({ id: `video-${n}`, fileName: `clip-${n}.mp4`, extension: "mp4" })),
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Video controls");
+
+  const player = screen.getByLabelText(/^Player for /);
+  const controls = [...player.querySelectorAll("[aria-keyshortcuts]")];
+  expect(controls.length).toBeGreaterThan(10);
+  for (const control of controls) {
+    // A select cannot hold a child, so its hint sits beside it.
+    const hint = control.querySelector(".key-hint") ?? control.parentElement?.querySelector(".key-hint");
+    expect(hint, `${control.getAttribute("aria-label")} has no visible shortcut`).toBeTruthy();
+  }
+
+  // The example from the issue: 'rotate right' is bound to ']' and says so.
+  const rotateRight = screen.getByRole("button", { name: "Rotate right" });
+  expect(rotateRight).toHaveAttribute("aria-keyshortcuts", "]");
+  expect(rotateRight.querySelector(".key-hint")).toHaveTextContent("]");
+
+  // Chords are shown as glyphs rather than raw DOM key names.
+  expect(
+    screen.getByRole("button", { name: "Next video" }).querySelector(".key-hint"),
+  ).toHaveTextContent("⇧→");
+  expect(
+    screen.getByRole("button", { name: "Back to results" }).querySelector(".key-hint"),
+  ).toHaveTextContent("Esc");
+});
+
+test("steps playback speed with the keyboard", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  const speed = screen.getByRole("combobox", { name: "Playback speed" });
+
+  fireEvent.keyDown(window, { key: "=" });
+  expect(speed).toHaveValue("1.25");
+  expect(video).toHaveProperty("playbackRate", 1.25);
+
+  fireEvent.keyDown(window, { key: "-" });
+  fireEvent.keyDown(window, { key: "-" });
+  expect(speed).toHaveValue("0.75");
+
+  // The ends of the range hold rather than wrapping around.
+  fireEvent.keyDown(window, { key: "-" });
+  fireEvent.keyDown(window, { key: "-" });
+  expect(speed).toHaveValue("0.5");
+});
+
 test("presents a dedicated unsupported-format state", async () => {
   invokeMock
     .mockResolvedValueOnce({
