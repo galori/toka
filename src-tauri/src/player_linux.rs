@@ -9,6 +9,8 @@ use std::{
 };
 use tauri::{App, Manager};
 
+#[cfg(feature = "native-e2e")]
+const MPV_FORMAT_STRING: c_int = 1;
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_INT64: c_int = 4;
 const MPV_FORMAT_DOUBLE: c_int = 5;
@@ -66,6 +68,8 @@ type MpvSetProperty =
 type MpvGetProperty =
     unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
 type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
+#[cfg(feature = "native-e2e")]
+type MpvFree = unsafe extern "C" fn(*mut c_void);
 type MpvRenderContextCreate =
     unsafe extern "C" fn(*mut *mut MpvRenderContext, *mut MpvHandle, *mut MpvRenderParam) -> c_int;
 type MpvRenderContextRender =
@@ -82,6 +86,8 @@ struct MpvApi {
     set_property: MpvSetProperty,
     get_property: MpvGetProperty,
     error_string: MpvErrorString,
+    #[cfg(feature = "native-e2e")]
+    free: MpvFree,
     render_context_create: MpvRenderContextCreate,
     render_context_render: MpvRenderContextRender,
     render_context_free: MpvRenderContextFree,
@@ -107,6 +113,8 @@ impl MpvApi {
             set_property: symbol!("mpv_set_property", MpvSetProperty),
             get_property: symbol!("mpv_get_property", MpvGetProperty),
             error_string: symbol!("mpv_error_string", MpvErrorString),
+            #[cfg(feature = "native-e2e")]
+            free: symbol!("mpv_free", MpvFree),
             render_context_create: symbol!("mpv_render_context_create", MpvRenderContextCreate),
             render_context_render: symbol!("mpv_render_context_render", MpvRenderContextRender),
             render_context_free: symbol!("mpv_render_context_free", MpvRenderContextFree),
@@ -155,6 +163,10 @@ impl Mpv {
         player.set_option("vo", "libmpv")?;
         #[cfg(feature = "native-e2e")]
         player.set_option("hwdec", "no")?;
+        #[cfg(feature = "native-e2e")]
+        player.set_option("log-file", "/tmp/toka-mpv-e2e.log")?;
+        #[cfg(feature = "native-e2e")]
+        player.set_option("msg-level", "all=debug")?;
         #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
@@ -248,6 +260,26 @@ impl Mpv {
             )
         };
         (code >= 0).then_some(value != 0)
+    }
+
+    #[cfg(feature = "native-e2e")]
+    fn get_string(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        let mut value: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            (self.api.get_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_STRING,
+                (&mut value as *mut *mut c_char).cast(),
+            )
+        };
+        if code < 0 || value.is_null() {
+            return None;
+        }
+        let text = unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned();
+        unsafe { (self.api.free)(value.cast()) };
+        Some(text)
     }
 
     fn get_i64(&self, name: &str) -> Option<i64> {
@@ -586,6 +618,16 @@ pub struct PlaybackState {
     framebuffer: Option<c_int>,
     #[cfg(feature = "native-e2e")]
     render_count: u64,
+    #[cfg(feature = "native-e2e")]
+    video_format: Option<String>,
+    #[cfg(feature = "native-e2e")]
+    vo_configured: Option<bool>,
+    #[cfg(feature = "native-e2e")]
+    display_size: Option<[i64; 2]>,
+    #[cfg(feature = "native-e2e")]
+    decoder_frame_drops: Option<i64>,
+    #[cfg(feature = "native-e2e")]
+    vo_frame_drops: Option<i64>,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -635,6 +677,19 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             framebuffer: mpv.last_framebuffer,
             #[cfg(feature = "native-e2e")]
             render_count: mpv.render_count,
+            #[cfg(feature = "native-e2e")]
+            video_format: mpv.get_string("video-format"),
+            #[cfg(feature = "native-e2e")]
+            vo_configured: mpv.get_flag("vo-configured"),
+            #[cfg(feature = "native-e2e")]
+            display_size: match (mpv.get_i64("dwidth"), mpv.get_i64("dheight")) {
+                (Some(width), Some(height)) => Some([width, height]),
+                _ => None,
+            },
+            #[cfg(feature = "native-e2e")]
+            decoder_frame_drops: mpv.get_i64("decoder-frame-drop-count"),
+            #[cfg(feature = "native-e2e")]
+            vo_frame_drops: mpv.get_i64("frame-drop-count"),
         })
     })
 }

@@ -57,6 +57,15 @@ jobs:
           else
             npm run test:integration
           fi
+      - name: Dump mpv E2E log on failure
+        if: failure() && runner.os == 'Linux'
+        run: |
+          if [ -f /tmp/toka-mpv-e2e.log ]; then
+            echo "=== last 400 lines of /tmp/toka-mpv-e2e.log ==="
+            tail -400 /tmp/toka-mpv-e2e.log
+          else
+            echo "No mpv E2E log was written."
+          fi
       - run: npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
       - uses: actions/upload-artifact@v4
         with:
