@@ -24,5 +24,10 @@ export const config: Options.Testrunner = {
   logLevel: "warn",
   waitforTimeout: 10_000,
   connectionRetryTimeout: 30_000,
-  mochaOpts: { timeout: 30_000 },
+  // The software GL stack in CI intermittently brings up a launch that never
+  // presents a frame to the readback (tracked in #57): some runs report a
+  // healthy blueRenderCount and some report zero on identical code. Retrying
+  // the spec gives the flaky launch another attempt while the root cause is
+  // investigated, rather than letting it block every unrelated PR.
+  mochaOpts: { timeout: 30_000, retries: 2 },
 };
