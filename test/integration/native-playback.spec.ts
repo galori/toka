@@ -55,6 +55,9 @@ describe("Toka native Linux playback", () => {
     } catch (error) {
       throw new Error(`${String(error)}\n[DEBUG-native-e2e] ${JSON.stringify(await nativeState())}`);
     }
+    // Log the final state on success too, so passing and failing launches can
+    // be compared (tracked in #57).
+    console.log(`[DEBUG-native-e2e-pass] ${JSON.stringify(await nativeState())}`);
 
     await $('button[aria-label="Pause"]').click();
     await $('button[aria-label="Play"]').click();
