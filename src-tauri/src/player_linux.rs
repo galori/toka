@@ -147,6 +147,9 @@ impl Mpv {
             render_count: 0,
         };
         player.set_option("vo", "libmpv")?;
+        #[cfg(feature = "native-e2e")]
+        player.set_option("hwdec", "no")?;
+        #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
         player.set_option("terminal", "no")?;
