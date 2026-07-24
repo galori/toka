@@ -258,11 +258,21 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       return;
     }
     void subtitleCues(video.id, option.track)
-      .then((cues) => setSubtitleCueUrl(`data:text/vtt;charset=utf-8,${encodeURIComponent(cues)}`))
+      .then((cues) => setSubtitleCueUrl(URL.createObjectURL(new Blob([cues], { type: "text/vtt" }))))
       .catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
   const toggleSubtitles = () => selectSubtitle(subtitleIndex >= 0 ? -1 : 0);
+
+  // WebKit refuses to load a track's cues from a data: URI (a long-standing
+  // CORS bug: https://bugs.webkit.org/show_bug.cgi?id=143284). A blob: URL is
+  // same-origin with the document, so it sidesteps the check; it just needs
+  // revoking whenever it's replaced or the player unmounts.
+  useEffect(() => {
+    return () => {
+      if (subtitleCueUrl) URL.revokeObjectURL(subtitleCueUrl);
+    };
+  }, [subtitleCueUrl]);
 
   // The web engine surfaces tracks carried inside the file itself; they join
   // the list beside the sidecar files Rust found.

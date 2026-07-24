@@ -37,9 +37,12 @@ describe("Toka subtitles", () => {
     await expect(track).toHaveAttribute("srclang", "en");
 
     // Rust converts SRT's comma-separated milliseconds into WebVTT's periods.
-    const cues = await browser.execute(() => {
+    // The track's src is a blob: URL (WebKit refuses to load cues from a
+    // data: URI — https://bugs.webkit.org/show_bug.cgi?id=143284), so read it
+    // back through fetch() rather than decoding it as a string.
+    const cues = await browser.execute(async () => {
       const source = document.querySelector("video track")?.getAttribute("src") ?? "";
-      return decodeURIComponent(source.replace(/^data:text\/vtt;charset=utf-8,/, ""));
+      return fetch(source).then((response) => response.text());
     });
     expect(cues).toContain("WEBVTT");
     expect(cues).toContain("00:00:00.000 --> 00:00:02.000");
