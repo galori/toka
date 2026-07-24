@@ -126,6 +126,21 @@ describe("Toka player controls", () => {
     await expectPressable('.player-utilities select[aria-label="Playback speed"]');
   });
 
+  it("shows the keyboard shortcut on the controls that have one", async () => {
+    const missing = await browser.execute(() =>
+      [...document.querySelectorAll(".player-controls [aria-keyshortcuts]")]
+        .filter((control) => {
+          const hint =
+            control.querySelector(".key-hint") ?? control.parentElement?.querySelector(".key-hint");
+          if (!hint) return true;
+          const box = hint.getBoundingClientRect();
+          return box.width === 0 || box.height === 0 || getComputedStyle(hint).visibility === "hidden";
+        })
+        .map((control) => control.getAttribute("aria-label") ?? control.tagName),
+    );
+    expect(missing).toEqual([]);
+  });
+
   it("shows the elapsed and total time", async () => {
     await expect($(".player-transport .time-display")).toHaveText(/^\d+:\d\d \/ \d+:\d\d$/);
   });

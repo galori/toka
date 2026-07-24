@@ -257,7 +257,7 @@ button:focus-visible {
 .player-heading h1 { font-size: 16px; }
 .back-button { padding: 9px 18px; font-size: 13px; font-weight: 600; line-height: 18px; }
 .playlist-toggle { margin-left: auto; padding: 9px 16px; font-size: 13px; font-weight: 600; line-height: 18px; }
-.playlist-toggle span {
+.playlist-toggle .playlist-count {
   margin-left: 6px;
   border-radius: 9px;
   padding: 1px 7px;
@@ -329,16 +329,34 @@ button:focus-visible {
   white-space: nowrap;
 }
 .player-controls .transport-button[aria-pressed="true"] { color: oklch(0.68 0.19 38); }
+/* A pill rather than the design's circle, so the primary control can carry its
+   shortcut like every other one. */
 .player-controls .play-button {
   min-width: 42px;
   height: 42px;
-  border-radius: 50%;
+  padding: 0 12px;
+  border-radius: 21px;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
 }
 .play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
 .pause-glyph { width: 14px; height: 16px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
 .player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+
+/* The shortcut sits beside the icon it belongs to, muted enough to read as a
+   label rather than as part of the control. */
+.key-hint {
+  margin-left: 5px;
+  color: oklch(0.62 0.02 60);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+.play-button .key-hint { color: oklch(0.3 0.03 40); }
+.playlist-toggle .key-hint, .back-button .key-hint { color: oklch(0.55 0.02 60); }
+.labelled-control { display: inline-flex; align-items: center; }
 .player-utilities select {
   height: 28px;
   border: 1px solid oklch(0.4 0.02 40 / 0.7);
