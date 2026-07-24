@@ -40,6 +40,17 @@ function formatTime(seconds: number): string {
   return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
 }
 
+export function playbackSource(filePath: string): string {
+  // Linux WebKitGTK does not load media from Tauri's custom asset protocol or
+  // file URLs in WebDriver. The E2E fixture server provides an HTTP media URL
+  // without changing production or macOS behavior.
+  if (import.meta.env.VITE_E2E === "1" && navigator.userAgent.includes("Linux")) {
+    const fileName = filePath.split(/[\\/]/).at(-1) ?? "";
+    return `http://127.0.0.1:1421/${encodeURIComponent(fileName)}`;
+  }
+  return convertFileSrc(filePath);
+}
+
 function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
@@ -245,6 +256,22 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, videos.length]);
 
+  if (error) {
+    const unsupported = error.includes("format") || error.includes("codec");
+    return (
+      <section className="player-error-state" aria-label={`Unable to play ${video.fileName}`}>
+        <div className="unsupported-icon" aria-hidden="true"><span /></div>
+        <h1>{unsupported ? "This video format isn't supported on your computer" : "This video could not be played"}</h1>
+        <p>{video.fileName}</p>
+        <p role="alert" className="sr-only">{error}</p>
+        <div className="error-actions">
+          <button type="button" className="back-button" onClick={onBack} aria-label="Back to results" aria-keyshortcuts="Escape">← Back to results</button>
+          {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}>Skip to next</button> : null}
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
@@ -274,7 +301,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           ) : (
             <video
               ref={element}
-              src={convertFileSrc(prepared.filePath)}
+              src={playbackSource(prepared.filePath)}
               aria-label={`Playing ${video.fileName}`}
               style={{ transform: `rotate(${rotation}deg)` }}
               onLoadedMetadata={(event) => {
@@ -300,8 +327,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">◀◀</button>
             <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
             <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
-            <button type="button" className="play-button" onClick={play} aria-keyshortcuts="Space">Play</button>
-            <button type="button" className="transport-button" onClick={pause} aria-keyshortcuts="Space">Pause</button>
+            <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">Play</button>
+            <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">Pause</button>
             <select
               aria-label="Playback speed"
               value={speed}
@@ -331,6 +358,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               {fullscreen ? "Exit fullscreen" : "Fullscreen"}
             </button>
             <input
+              className="player-timeline"
               aria-label="Video timeline"
               type="range"
               min="0"

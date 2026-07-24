@@ -1,5 +1,6 @@
 import { delimiter, resolve } from "node:path";
 import type { Options } from "@wdio/types";
+import { startFixtureServer, stopFixtureServer } from "./test/integration/fixture-server";
 
 const fixturePaths = [1, 2, 3, 4, 5].map((number) =>
   resolve("test/fixtures/sample" + number + ".mp4"),
@@ -27,4 +28,6 @@ export const config: Options.Testrunner = {
   waitforTimeout: 10_000,
   connectionRetryTimeout: 30_000,
   mochaOpts: { timeout: 30_000 },
+  onPrepare: () => startFixtureServer(fixturePaths),
+  onComplete: stopFixtureServer,
 };

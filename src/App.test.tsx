@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import App from "./App";
+import App, { playbackSource } from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -14,6 +14,26 @@ const convertFileSrcMock = vi.mocked(convertFileSrc);
 beforeEach(() => {
   invokeMock.mockReset();
   convertFileSrcMock.mockClear();
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
+test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
+  vi.stubEnv("VITE_E2E", "1");
+  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
+
+  expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:1421/clip%20%231.mp4");
+  expect(convertFileSrcMock).not.toHaveBeenCalled();
+});
+
+test("retains the asset protocol for E2E builds on platforms that support it", () => {
+  vi.stubEnv("VITE_E2E", "1");
+  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+
+  expect(playbackSource("/Videos/clip.mp4")).toBe("asset:///Videos/clip.mp4");
+  expect(convertFileSrcMock).toHaveBeenCalledWith("/Videos/clip.mp4");
 });
 
 test("starts with a focused search field and displays submitted results", async () => {
@@ -65,6 +85,43 @@ test("opens a selected result in the player and restores the grid on back", asyn
 
   await user.click(screen.getByRole("button", { name: "Back to results" }));
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
+});
+
+test("uses the overlay player controls from the design", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  const controls = await screen.findByLabelText("Video controls");
+  expect(controls).toHaveClass("player-controls");
+  expect(screen.getByLabelText("Video timeline")).toHaveClass("player-timeline");
+  expect(screen.getByRole("button", { name: "Play" })).toHaveClass("play-button");
+  expect(screen.getByRole("button", { name: "Pause" })).toHaveTextContent("Pause");
+});
+
+test("presents a dedicated unsupported-format state", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockRejectedValueOnce(new Error("This video format or codec is not supported on this computer."));
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  expect(await screen.findByRole("heading", { name: "This video format isn't supported on your computer" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Back to results" })).toBeVisible();
 });
 
 test("enters fullscreen mode for the player", async () => {

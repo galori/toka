@@ -218,7 +218,9 @@ pub fn run() {
 
     let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider())));
     #[cfg(target_os = "linux")]
-    let builder = {
+    let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
+        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video])
+    } else {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
         builder

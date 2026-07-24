@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { resolve } from "node:path";
 import type { Options } from "@wdio/types";
+import { startFixtureServer, stopFixtureServer } from "./test/integration/fixture-server";
 
 const fixturePath = resolve("/tmp/toka-e2e-happy-path.mp4");
 writeFileSync(
@@ -40,4 +41,6 @@ export const config: Options.Testrunner = {
   waitforTimeout: 10_000,
   connectionRetryTimeout: 30_000,
   mochaOpts: { timeout: 30_000 },
+  onPrepare: () => startFixtureServer([fixturePath]),
+  onComplete: stopFixtureServer,
 };

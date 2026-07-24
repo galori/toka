@@ -135,11 +135,11 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 ::selection { background: oklch(0.68 0.19 38); color: oklch(0.14 0.01 40); }
 
 .app {
-  width: min(1120px, calc(100% - 64px));
+  width: min(1120px, calc(100% - 80px));
   padding: 36px 0 64px;
 }
 
-.search-form { width: min(680px, 100%); margin-bottom: 32px; }
+.search-form { width: 100%; margin-bottom: 32px; }
 .initial .search-form { width: min(560px, 100%); }
 .search-field { position: relative; }
 
@@ -147,10 +147,10 @@ input[type="search"] {
   border: 1px solid oklch(0.3 0.02 40);
   border-radius: 12px;
   background: oklch(0.17 0.02 40);
-  /* Keep the native search control's text line centered in the design-height field. */
-  height: 56px;
-  padding: 0 48px 0 18px;
-  font-size: 17px;
+  appearance: none;
+  height: 64px;
+  padding: 19px 54px 19px 24px;
+  font-size: 18px;
   line-height: 24px;
   box-shadow: none;
 }
@@ -166,14 +166,25 @@ input[type="search"]:focus {
   top: 50%;
   right: 17px;
   transform: translateY(-50%);
+  color: oklch(0.68 0.19 38);
+}
+.clear-search {
   border: 0;
   padding: 4px;
   background: transparent;
-  color: oklch(0.6 0.02 60);
   font-size: 28px;
   line-height: 1;
 }
-.search-glyph { color: oklch(0.68 0.19 38); pointer-events: none; }
+.search-glyph {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  pointer-events: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 2;
+}
+.clear-search { color: oklch(0.6 0.02 60); }
 .clear-search:hover { color: oklch(0.95 0.01 90); }
 .clear-search:focus-visible,
 button:focus-visible {
@@ -193,7 +204,12 @@ button:focus-visible {
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
   padding: 10px 24px;
+  font-size: 14px;
+  line-height: 20px;
   font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .playlist-button,
 .pagination button,
@@ -218,7 +234,7 @@ button:focus-visible {
 }
 
 .video-grid {
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 24px;
   margin-top: 22px;
 }
@@ -243,7 +259,8 @@ button:focus-visible {
 
 .player-heading { gap: 16px; margin: 0 0 20px; }
 .player-heading h1 { font-size: 16px; }
-.playlist-toggle { margin-left: auto; padding: 9px 16px; font-weight: 600; }
+.back-button { padding: 9px 18px; font-size: 13px; font-weight: 600; line-height: 18px; }
+.playlist-toggle { margin-left: auto; padding: 9px 16px; font-size: 13px; font-weight: 600; line-height: 18px; }
 .playlist-toggle span {
   margin-left: 6px;
   border-radius: 9px;
@@ -259,28 +276,51 @@ button:focus-visible {
   border-radius: 12px;
   background: #000;
 }
+.player-shell video {
+  width: 100%;
+  height: min(420px, calc(100vh - 220px));
+  max-height: none;
+  object-fit: contain;
+}
+.native-video { height: min(420px, calc(100vh - 220px)); min-height: 0; }
 .player-shell:fullscreen { display: flex; flex-direction: column; justify-content: center; border: 0; border-radius: 0; }
 .player-shell:fullscreen video, .player-shell:fullscreen .native-video { max-height: calc(100vh - 58px); height: auto; }
 .player-controls {
-  gap: 12px;
-  padding: 14px 18px;
-  background: oklch(0.15 0.015 40);
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 20px 18px;
+  background: linear-gradient(transparent, rgb(0 0 0 / 75%));
 }
-.player-controls button { padding: 8px 11px; }
+.player-timeline { width: 100%; accent-color: oklch(0.68 0.19 38); }
+.player-transport { display: flex; align-items: center; gap: 18px; }
 .player-controls button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 36px;
+  width: 24px;
+  min-height: 24px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: oklch(0.9 0.01 90);
+  font-size: 16px;
   line-height: 1;
 }
 .player-controls .play-button {
-  border: 0;
+  width: 42px;
+  min-height: 42px;
+  border-radius: 50%;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
   font-weight: 700;
 }
-.player-controls input[type="range"] { accent-color: oklch(0.68 0.19 38); }
+.play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
+.player-utilities { display: flex; gap: 12px; margin-left: auto; }
 .time-display {
   color: oklch(0.7 0.01 90);
   font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -292,11 +332,11 @@ button:focus-visible {
   top: 0;
   right: 0;
   bottom: 0;
-  width: 280px;
+  width: min(280px, 45%);
   overflow: auto;
   border-left: 1px solid oklch(0.28 0.02 40);
   padding: 18px;
-  background: oklch(0.15 0.015 40);
+  background: oklch(0.15 0.015 40 / 0.98);
 }
 .playlist-drawer h2 {
   margin: 0 0 12px;
@@ -315,7 +355,7 @@ button:focus-visible {
   overflow: hidden;
   border: 0;
   border-radius: 8px;
-  padding: 9px 10px;
+  padding: 10px;
   background: transparent;
   color: oklch(0.65 0.02 60);
   text-align: left;
@@ -335,10 +375,50 @@ button:focus-visible {
 .playlist-status, .message { color: oklch(0.65 0.02 60); }
 .message.error { color: oklch(0.72 0.18 35); }
 
+.player-error-state {
+  min-height: min(460px, calc(100vh - 160px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  text-align: center;
+}
+.unsupported-icon {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+  background: oklch(0.2 0.02 40);
+}
+.unsupported-icon::before {
+  position: absolute;
+  inset: 18px;
+  border: 4px solid oklch(0.68 0.19 38);
+  border-radius: 8px;
+  content: "";
+}
+.unsupported-icon span {
+  position: absolute;
+  top: 23px;
+  left: 34px;
+  width: 4px;
+  height: 26px;
+  border-radius: 2px;
+  background: oklch(0.95 0.01 90);
+  transform: rotate(45deg);
+}
+.player-error-state h1 { margin: 0; font-size: 18px; }
+.player-error-state > p { margin: 0; color: oklch(0.6 0.02 60); font-size: 14px; }
+.error-actions { display: flex; gap: 12px; margin-top: 8px; }
+
 @media (max-width: 640px) {
   .app { width: min(100% - 24px, 1120px); padding-top: 20px; }
+  .video-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .results-summary { gap: 12px; }
   .playlist-drawer { width: 70%; }
   .player-heading h1 { font-size: 14px; }
   .time-display { width: 100%; text-align: right; }
+  .player-transport { flex-wrap: wrap; gap: 12px; }
+  .player-utilities { margin-left: 0; }
 }
