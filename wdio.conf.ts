@@ -27,12 +27,13 @@ function startFixtureServer(): Promise<void> {
     }
 
     const partial = Boolean(range);
-    response.writeHead(partial ? 206 : 200, {
+    const headers: Record<string, string | number> = {
       "Accept-Ranges": "bytes",
       "Content-Length": end - start + 1,
-      "Content-Range": partial ? `bytes ${start}-${end}/${size}` : undefined,
       "Content-Type": "video/mp4",
-    });
+    };
+    if (partial) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
+    response.writeHead(partial ? 206 : 200, headers);
     createReadStream(filePath, { start, end }).pipe(response);
   });
 
