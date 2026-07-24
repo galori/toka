@@ -62,7 +62,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mpv-e2e-log-${{ github.run_attempt }}
-          path: /tmp/toka-mpv-e2e.log
+          path: |
+            /tmp/toka-mpv-e2e.log
+            /tmp/toka-e2e-frame.png
           if-no-files-found: ignore
       - name: Dump mpv E2E log on failure
         if: failure() && runner.os == 'Linux'

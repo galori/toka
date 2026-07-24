@@ -157,6 +157,8 @@ struct Mpv {
     last_grid: Option<Vec<String>>,
     #[cfg(feature = "native-e2e")]
     last_grid_render_index: u64,
+    #[cfg(feature = "native-e2e")]
+    screenshot_requested: bool,
 }
 
 // libmpv serializes access to a handle. Toka additionally protects it with the mutex below.
@@ -199,6 +201,8 @@ impl Mpv {
             last_grid: None,
             #[cfg(feature = "native-e2e")]
             last_grid_render_index: 0,
+            #[cfg(feature = "native-e2e")]
+            screenshot_requested: false,
         };
         player.set_option("vo", "libmpv")?;
         #[cfg(feature = "native-e2e")]
@@ -207,6 +211,15 @@ impl Mpv {
         player.set_option("log-file", "/tmp/toka-mpv-e2e.log")?;
         #[cfg(feature = "native-e2e")]
         player.set_option("msg-level", "all=debug")?;
+        #[cfg(feature = "native-e2e")]
+        player.set_option("gpu-debug", "yes")?;
+        // llvmpipe renders mpv's multi-pass pipeline without any GL error yet
+        // presents black on some launches (#57). Dumb mode collapses rendering
+        // to one direct pass with no intermediate FBO textures, which is the
+        // suspected failure point; the E2E readback still exercises real
+        // decode, upload, draw, and readback.
+        #[cfg(feature = "native-e2e")]
+        player.set_option("gpu-dumb-mode", "yes")?;
         #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
@@ -499,6 +512,19 @@ impl Mpv {
                 blue > 180 && blue > red * 2 && blue > green * 2
             }) {
                 self.blue_render_count += 1;
+            }
+        }
+        // Once playback is well underway, capture the current decoded frame
+        // through mpv's software screenshot path. It bypasses OpenGL entirely,
+        // so comparing it with the GL readback splits decoder-side from
+        // GL-side failures (#57).
+        #[cfg(feature = "native-e2e")]
+        if self.render_count == 300 && !self.screenshot_requested {
+            self.screenshot_requested = true;
+            if let Err(error) =
+                self.command(&["screenshot-to-file", "/tmp/toka-e2e-frame.png", "video"])
+            {
+                eprintln!("E2E screenshot failed: {error}");
             }
         }
         Ok(())
