@@ -36,13 +36,27 @@ describe("Toka subtitles", () => {
     await expect(track).toHaveAttribute("label", "EN");
     await expect(track).toHaveAttribute("srclang", "en");
 
-    // Rust converts SRT's comma-separated milliseconds into WebVTT's periods.
-    const cues = await browser.execute(() => {
-      const source = document.querySelector("video track")?.getAttribute("src") ?? "";
-      return decodeURIComponent(source.replace(/^data:text\/vtt;charset=utf-8,/, ""));
+    // The media engine has to accept the track, not merely be handed one.
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() => {
+          const tracks = document.querySelector("video")?.textTracks;
+          const track = tracks?.[0];
+          return track?.mode === "showing" && (track.cues?.length ?? 0) > 0;
+        })) === true,
+      { timeout: 5_000, timeoutMsg: "the media engine never parsed the sidecar subtitle" },
+    );
+
+    // Rust converts SRT's comma-separated milliseconds into WebVTT's periods;
+    // a malformed timestamp would have kept the cue list above empty, so
+    // checking the parsed cue's timing here confirms the conversion worked.
+    const firstCue = await browser.execute(() => {
+      const cue = document.querySelector("video")?.textTracks?.[0]?.cues?.[0] as VTTCue | undefined;
+      return { start: cue?.startTime, end: cue?.endTime, text: cue?.text };
     });
-    expect(cues).toContain("WEBVTT");
-    expect(cues).toContain("00:00:00.000 --> 00:00:02.000");
+    expect(firstCue.start).toBe(0);
+    expect(firstCue.end).toBe(2);
+    expect(firstCue.text).toBe("Toka sidecar subtitle, first cue");
 
     await toggle.click();
     await expect(toggle).toHaveAttribute("aria-pressed", "false");

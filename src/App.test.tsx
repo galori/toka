@@ -168,7 +168,7 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
 
   const track = document.querySelector("track");
   expect(track).toHaveAttribute("label", "Subtitles");
-  expect(track?.getAttribute("src")).toContain("text/vtt");
+  expect(track?.getAttribute("src")).toMatch(/^blob:/);
 
   await user.click(screen.getByRole("button", { name: "Subtitles" }));
   expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");

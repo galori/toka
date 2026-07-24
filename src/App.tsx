@@ -187,8 +187,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     const surface = nativeSurface.current;
     let advancing = false;
     // mpv only knows the file's subtitle tracks once it has finished loading,
-    // so the list is refreshed alongside the playback poll until it settles.
-    let knownTrackCount = -1;
+    // so the playback poll also asks for them — until it finds some, or until
+    // the file has clearly had long enough to report that it has none.
+    let subtitleLookupsLeft = 20;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
       void setNativeVideoBounds({
@@ -221,15 +222,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
-      void nativeSubtitleTracks()
-        .then((tracks) => {
-          if (tracks.length === knownTrackCount) return;
-          knownTrackCount = tracks.length;
-          setNativeSubtitles(
-            tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
-          );
-        })
-        .catch(() => {});
+      if (subtitleLookupsLeft > 0) {
+        subtitleLookupsLeft -= 1;
+        void nativeSubtitleTracks()
+          .then((tracks) => {
+            if (tracks.length === 0) return;
+            subtitleLookupsLeft = 0;
+            setNativeSubtitles(
+              tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
+            );
+          })
+          .catch(() => {});
+      }
     }, 250);
     return () => {
       observer.disconnect();
@@ -310,11 +314,21 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       return;
     }
     void subtitleCues(video.id, option.track)
-      .then((cues) => setSubtitleCueUrl(`data:text/vtt;charset=utf-8,${encodeURIComponent(cues)}`))
+      .then((cues) => setSubtitleCueUrl(URL.createObjectURL(new Blob([cues], { type: "text/vtt" }))))
       .catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
   const toggleSubtitles = () => selectSubtitle(subtitleIndex >= 0 ? -1 : 0);
+
+  // WebKit refuses to load a track's cues from a data: URI (a long-standing
+  // CORS bug: https://bugs.webkit.org/show_bug.cgi?id=143284). A blob: URL is
+  // same-origin with the document, so it sidesteps the check; it just needs
+  // revoking whenever it's replaced or the player unmounts.
+  useEffect(() => {
+    return () => {
+      if (subtitleCueUrl) URL.revokeObjectURL(subtitleCueUrl);
+    };
+  }, [subtitleCueUrl]);
 
   // The web engine surfaces tracks carried inside the file itself; they join
   // the list beside the sidecar files Rust found.
