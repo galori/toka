@@ -18,6 +18,10 @@ const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 #[cfg(feature = "native-e2e")]
+const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
+#[cfg(feature = "native-e2e")]
+const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8CAA;
+#[cfg(feature = "native-e2e")]
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 #[cfg(feature = "native-e2e")]
 const GL_RGBA: u32 = 0x1908;
@@ -28,6 +32,8 @@ type GlGetIntegerv = unsafe extern "C" fn(u32, *mut c_int);
 #[cfg(feature = "native-e2e")]
 type GlReadPixels =
     unsafe extern "C" fn(c_int, c_int, c_int, c_int, u32, u32, *mut c_void);
+#[cfg(feature = "native-e2e")]
+type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
 
 #[repr(C)]
 struct MpvRenderParam {
@@ -325,9 +331,14 @@ impl Mpv {
         })?;
         #[cfg(feature = "native-e2e")]
         unsafe {
-            // GL's default pack alignment is four bytes. Reading RGB into a
-            // three-byte buffer overflows it, and rebinding the draw FBO can
-            // sample a different buffer from GTK's active read framebuffer.
+            // mpv's GL backend leaves framebuffer 0 bound after rendering, so
+            // the frame it just drew must be read through an explicit
+            // GL_READ_FRAMEBUFFER binding of the GLArea framebuffer it
+            // targeted; reading the ambient binding samples the never-drawn
+            // default framebuffer and always returns black.
+            let mut read_framebuffer: c_int = 0;
+            (EPOXY_GL_GET_INTEGERV)(GL_READ_FRAMEBUFFER_BINDING, &mut read_framebuffer);
+            (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, framebuffer as u32);
             let mut color = [0_u8; 4];
             (EPOXY_GL_READ_PIXELS)(
                 width / 2,
@@ -338,6 +349,7 @@ impl Mpv {
                 GL_UNSIGNED_BYTE,
                 color.as_mut_ptr().cast(),
             );
+            (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, read_framebuffer as u32);
             self.last_frame_color = Some(rgb_from_rgba(color));
         }
         Ok(())
@@ -365,6 +377,9 @@ extern "C" {
     #[cfg(feature = "native-e2e")]
     #[link_name = "epoxy_glReadPixels"]
     static EPOXY_GL_READ_PIXELS: GlReadPixels;
+    #[cfg(feature = "native-e2e")]
+    #[link_name = "epoxy_glBindFramebuffer"]
+    static EPOXY_GL_BIND_FRAMEBUFFER: GlBindFramebuffer;
 }
 
 #[link(name = "EGL")]
