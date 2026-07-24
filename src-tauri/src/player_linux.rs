@@ -205,8 +205,15 @@ impl Mpv {
         player.set_option("hwdec", "no")?;
         #[cfg(feature = "native-e2e")]
         player.set_option("log-file", "/tmp/toka-mpv-e2e.log")?;
+        // llvmpipe silently loses mpv's multi-pass pipeline (render into
+        // intermediate FBO textures, then a final scaled pass) on some
+        // launches: the whole process then presents black with zero GL
+        // errors (#57). Dumb mode collapses rendering to one direct pass
+        // with no intermediate textures, which made the E2E readback
+        // deterministic — pure blue every frame — while still exercising
+        // real decode, upload, draw, and readback.
         #[cfg(feature = "native-e2e")]
-        player.set_option("msg-level", "all=debug")?;
+        player.set_option("gpu-dumb-mode", "yes")?;
         #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
