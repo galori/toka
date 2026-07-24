@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import App, { playbackSource } from "./App";
@@ -310,6 +310,101 @@ test("enters fullscreen mode for the player", async () => {
   await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
 
   expect(requestFullscreen).toHaveBeenCalledOnce();
+});
+
+// jsdom never actually goes fullscreen, so these stand in for the browser
+// telling the player whether the request took effect.
+function reportFullscreen(active: boolean) {
+  Object.defineProperty(document, "fullscreenElement", {
+    configurable: true,
+    get: () => (active ? document.querySelector(".player-shell") : null),
+  });
+  act(() => void fireEvent(document, new Event("fullscreenchange")));
+}
+
+async function enterFullscreen(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+  reportFullscreen(true);
+}
+
+test("lets the fullscreen controls fade out and brings them back on movement", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    invokeMock
+      .mockResolvedValueOnce({
+        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      })
+      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      value: vi.fn().mockResolvedValue(undefined),
+    });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    const controls = await screen.findByLabelText("Video controls");
+    expect(controls).not.toHaveClass("idle");
+
+    await enterFullscreen(user);
+    expect(controls).not.toHaveClass("idle");
+
+    // Clicking the button left the pointer on the overlay, which pins it open;
+    // the viewer moving back to the picture is what starts the countdown.
+    act(() => void fireEvent.mouseLeave(controls));
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+
+    act(() => void fireEvent.mouseMove(window));
+    expect(controls).not.toHaveClass("idle");
+
+    // Leaving fullscreen has to restore them for good.
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+    reportFullscreen(false);
+    expect(controls).not.toHaveClass("idle");
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("keeps the fullscreen controls up while the pointer rests on them", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    invokeMock
+      .mockResolvedValueOnce({
+        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      })
+      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      value: vi.fn().mockResolvedValue(undefined),
+    });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+
+    act(() => void fireEvent.mouseEnter(controls));
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).not.toHaveClass("idle");
+
+    act(() => void fireEvent.mouseLeave(controls));
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
 });
 
 test("loops a single video when loop video is enabled", async () => {

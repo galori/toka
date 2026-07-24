@@ -279,8 +279,26 @@ button:focus-visible {
   object-fit: contain;
 }
 .native-video { height: min(420px, calc(100vh - 220px)); min-height: 0; }
-.player-shell:fullscreen { display: flex; flex-direction: column; justify-content: center; border: 0; border-radius: 0; }
-.player-shell:fullscreen video, .player-shell:fullscreen .native-video { max-height: calc(100vh - 58px); height: auto; }
+.player-shell:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  background: #000;
+}
+/* `height: auto` let the element fall back to the file's intrinsic size, so a
+   320x180 clip stayed 320x180 in the middle of the screen. */
+.player-shell:fullscreen video,
+.player-shell:fullscreen .native-video {
+  width: 100vw;
+  height: 100vh;
+  max-height: none;
+  object-fit: contain;
+}
+.player-shell:fullscreen.idle { cursor: none; }
+.player-controls { transition: opacity 220ms ease, visibility 220ms ease; }
+/* Only reachable in fullscreen, where the effect that sets it runs. */
+.player-controls.idle { opacity: 0; visibility: hidden; }
 .player-controls {
   position: absolute;
   right: 0;
