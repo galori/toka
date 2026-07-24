@@ -2,6 +2,7 @@
 mod player_linux;
 mod providers;
 mod search;
+mod subtitles;
 
 #[cfg(target_os = "macos")]
 use providers::MdfindSearchProvider;
@@ -17,6 +18,18 @@ use tauri::{Manager, State};
 struct PreparedVideo {
     file_path: String,
     playback_backend: &'static str,
+    subtitles: Vec<SubtitleTrack>,
+}
+
+/// A sidecar subtitle file found beside the video. `track` indexes back into
+/// the same detection order, so the frontend never handles a filesystem path.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubtitleTrack {
+    track: usize,
+    label: String,
+    language: Option<String>,
+    web_playable: bool,
 }
 
 #[derive(Serialize)]
@@ -65,6 +78,16 @@ fn prepare_video(
     app.asset_protocol_scope()
         .allow_file(&path)
         .map_err(|_| CommandError::from(SearchError::VideoUnavailable))?;
+    let subtitles = subtitles::sidecar_subtitles(&path)
+        .into_iter()
+        .enumerate()
+        .map(|(track, subtitle)| SubtitleTrack {
+            track,
+            label: subtitle.label,
+            language: subtitle.language,
+            web_playable: subtitle.web_playable,
+        })
+        .collect();
     Ok(PreparedVideo {
         file_path: path.to_string_lossy().into_owned(),
         playback_backend: if cfg!(all(
@@ -75,6 +98,39 @@ fn prepare_video(
         } else {
             "web"
         },
+        subtitles,
+    })
+}
+
+/// WebVTT cues for a sidecar subtitle, so the web media engine can attach a
+/// text track without the frontend ever seeing a filesystem path.
+#[tauri::command]
+fn subtitle_cues(
+    result_id: String,
+    track: usize,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<String, CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    let subtitle = subtitles::sidecar_subtitles(&path)
+        .into_iter()
+        .nth(track)
+        .ok_or_else(|| CommandError {
+            kind: "Subtitle",
+            message: "That subtitle file is no longer beside the video.".into(),
+        })?;
+    let extension = subtitle
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let source = std::fs::read_to_string(&subtitle.path).map_err(|error| CommandError {
+        kind: "Subtitle",
+        message: format!("The subtitle file could not be read: {error}"),
+    })?;
+    subtitles::to_web_vtt(&source, &extension).ok_or_else(|| CommandError {
+        kind: "Subtitle",
+        message: format!("{} subtitles are not supported by this player.", subtitle.label),
     })
 }
 
@@ -124,6 +180,23 @@ fn set_native_video_rotation(
     player: State<'_, Arc<player_linux::NativePlayer>>,
 ) -> Result<(), CommandError> {
     player_linux::set_rotation(player.inner(), degrees).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn native_subtitle_tracks(
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<Vec<player_linux::SubtitleTrack>, CommandError> {
+    player_linux::subtitle_tracks(player.inner()).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn set_native_subtitle(
+    id: Option<i64>,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::set_subtitle(player.inner(), id).map_err(playback_error)
 }
 
 #[cfg(target_os = "linux")]
@@ -219,7 +292,7 @@ pub fn run() {
     let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider())));
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video])
+        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video, subtitle_cues])
     } else {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
@@ -229,19 +302,23 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 search_videos,
                 prepare_video,
+                subtitle_cues,
                 load_native_video,
                 set_native_paused,
                 set_native_speed,
                 native_video_rotation,
                 set_native_video_rotation,
                 seek_native_video,
+                native_subtitle_tracks,
+                set_native_subtitle,
                 native_playback_state,
                 stop_native_video,
                 set_native_video_bounds
             ])
     };
     #[cfg(not(target_os = "linux"))]
-    let builder = builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video]);
+    let builder =
+        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video, subtitle_cues]);
 
     builder
         .run(tauri::generate_context!())

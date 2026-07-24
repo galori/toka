@@ -23,10 +23,39 @@ export function searchVideos(query: string, page: number): Promise<SearchPage> {
   });
 }
 
+export type SidecarSubtitle = {
+  track: number;
+  label: string;
+  language: string | null;
+  webPlayable: boolean;
+};
+
 export type PreparedVideo = {
   filePath: string;
   playbackBackend: "native" | "web";
+  subtitles?: SidecarSubtitle[];
 };
+
+// WebVTT for a sidecar subtitle. Rust reads the file so the frontend never
+// handles a filesystem path.
+export function subtitleCues(resultId: string, track: number): Promise<string> {
+  return invoke("subtitle_cues", { resultId, track });
+}
+
+export type NativeSubtitleTrack = {
+  id: number;
+  label: string;
+  external: boolean;
+};
+
+export function nativeSubtitleTracks(): Promise<NativeSubtitleTrack[]> {
+  return invoke("native_subtitle_tracks");
+}
+
+// `null` turns subtitles off.
+export function setNativeSubtitle(id: number | null): Promise<void> {
+  return invoke("set_native_subtitle", { id });
+}
 
 export type PlaybackState = {
   duration: number;
