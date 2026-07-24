@@ -7,6 +7,7 @@ describe("Toka native Linux playback", () => {
       return tauri.core.invoke("native_playback_state");
     }) as Promise<{
       currentTime: number;
+      blueRenderCount?: number;
       frameColor?: [number, number, number];
       framebuffer?: number;
       renderCount?: number;
@@ -30,10 +31,12 @@ describe("Toka native Linux playback", () => {
 
     expect(timeText).not.toMatch(/^0:00 \/ /);
     try {
-      await browser.waitUntil(async () => {
-        const [red = 0, green = 0, blue = 0] = (await nativeState()).frameColor ?? [];
-        return blue > 180 && blue > red * 2 && blue > green * 2;
-      }, {
+      // `frameColor` is whatever the last render happened to hold, so sampling
+      // it races the end of a four-second clip: the fixture really did present
+      // blue, then finished, and the poll read the black frame that followed.
+      // `blueRenderCount` records the same blue test at render time, so asking
+      // it answers the actual question — did the framebuffer ever show blue?
+      await browser.waitUntil(async () => ((await nativeState()).blueRenderCount ?? 0) > 0, {
         timeout: 5_000,
         timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
       });
