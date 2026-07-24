@@ -17,6 +17,7 @@ export const config: Options.Testrunner = {
     "./test/integration/happy-path.spec.ts",
     "./test/integration/player-controls.spec.ts",
     "./test/integration/subtitles.spec.ts",
+    "./test/integration/fullscreen.spec.ts",
   ],
   maxInstances: 1,
   framework: "mocha",

@@ -44,6 +44,9 @@ function VideoIcon() {
   );
 }
 
+// How long the fullscreen overlay waits after the last movement before fading.
+const CONTROLS_IDLE_DELAY = 2_500;
+
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
 // DOM key names are what `aria-keyshortcuts` wants; these are what a viewer
@@ -106,6 +109,8 @@ export function playbackSource(filePath: string): string {
 function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
+  const playerControls = useRef<HTMLDivElement>(null);
+  const pointerOverControls = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const [index, setIndex] = useState(0);
   const [prepared, setPrepared] = useState<PreparedVideo>();
@@ -113,6 +118,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
+  const [controlsIdle, setControlsIdle] = useState(false);
   const [loop, setLoop] = useState(false);
   const [speed, setSpeed] = useState(1);
   const [playingBack, setPlayingBack] = useState(false);
@@ -369,6 +375,37 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
 
+  // Fullscreen is for watching, so the overlay gets out of the way until the
+  // viewer reaches for it. Windowed playback always shows the controls.
+  useEffect(() => {
+    if (!fullscreen) {
+      setControlsIdle(false);
+      return;
+    }
+    let lastActivity = Date.now();
+    const wake = () => {
+      lastActivity = Date.now();
+      setControlsIdle(false);
+    };
+    wake();
+    // Polling rather than a one-shot timer so that moving the pointer off the
+    // controls re-arms the countdown without needing its own listener.
+    // Keyboard use keeps them up through the keydown listener below; focus is
+    // deliberately not consulted, because clicking a control focuses it and
+    // would then pin the overlay open for the rest of the session.
+    const tick = window.setInterval(() => {
+      if (pointerOverControls.current) lastActivity = Date.now();
+      else if (Date.now() - lastActivity >= CONTROLS_IDLE_DELAY) setControlsIdle(true);
+    }, 250);
+    window.addEventListener("mousemove", wake);
+    window.addEventListener("keydown", wake);
+    return () => {
+      window.clearInterval(tick);
+      window.removeEventListener("mousemove", wake);
+      window.removeEventListener("keydown", wake);
+    };
+  }, [fullscreen]);
+
   const toggleFullscreen = () => {
     if (document.fullscreenElement) {
       const exiting = document.exitFullscreen?.();
@@ -467,7 +504,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       {error ? <p role="alert" className="message error">{error}</p> : null}
       {!prepared && !error ? <p className="message">Preparing video…</p> : null}
       {prepared ? (
-        <div ref={playerShell} className="player-shell">
+        <div ref={playerShell} className={controlsIdle ? "player-shell idle" : "player-shell"}>
           {native ? (
             <div ref={nativeSurface} className="native-video" aria-label={`Playing ${video.fileName}`} />
           ) : (
@@ -505,7 +542,17 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               ) : null}
             </video>
           )}
-          <div className="player-controls" aria-label="Video controls">
+          <div
+            ref={playerControls}
+            className={controlsIdle ? "player-controls idle" : "player-controls"}
+            aria-label="Video controls"
+            onMouseEnter={() => {
+              pointerOverControls.current = true;
+            }}
+            onMouseLeave={() => {
+              pointerOverControls.current = false;
+            }}
+          >
             <input
               className="player-timeline"
               aria-label="Video timeline"
