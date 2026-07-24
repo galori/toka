@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ButtonHTMLAttributes, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   loadNativeVideo,
@@ -41,6 +41,48 @@ function VideoIcon() {
       <rect x="7" y="12" width="50" height="40" rx="8" />
       <path d="m27 23 16 9-16 9Z" />
     </svg>
+  );
+}
+
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+// DOM key names are what `aria-keyshortcuts` wants; these are what a viewer
+// should read on the button itself.
+const KEY_GLYPHS: Record<string, string> = {
+  Escape: "Esc",
+  Space: "Space",
+  ArrowLeft: "←",
+  ArrowRight: "→",
+  Shift: "⇧",
+};
+
+function KeyHint({ shortcut }: { shortcut: string }) {
+  const label = shortcut
+    .split(" ")
+    .map((combination) =>
+      combination
+        .split("+")
+        .map((key) => KEY_GLYPHS[key] ?? key)
+        .join(""),
+    )
+    .join("/");
+  // Assistive technology already gets this from aria-keyshortcuts.
+  return <span className="key-hint" aria-hidden="true">{label}</span>;
+}
+
+// Pairs the declared shortcut with the one shown on the control, so the two
+// cannot drift apart as bindings change.
+function ControlButton({
+  shortcut,
+  className = "transport-button",
+  children,
+  ...rest
+}: { shortcut: string } & ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button type="button" className={className} aria-keyshortcuts={shortcut} {...rest}>
+      {children}
+      <KeyHint shortcut={shortcut} />
+    </button>
   );
 }
 
@@ -241,6 +283,20 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
   };
 
+  const applySpeed = (next: number) => {
+    setSpeed(next);
+    if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
+    else if (element.current) element.current.playbackRate = next;
+  };
+
+  // Holds at the ends of the range rather than wrapping, so holding the key
+  // down cannot jump from slowest straight back to fastest.
+  const stepSpeed = (direction: number) => {
+    const at = SPEEDS.indexOf(speed);
+    const next = SPEEDS[Math.min(SPEEDS.length - 1, Math.max(0, (at < 0 ? SPEEDS.indexOf(1) : at) + direction))];
+    if (next !== speed) applySpeed(next);
+  };
+
   const selectSubtitle = (nextIndex: number) => {
     const option = subtitles[nextIndex];
     setSubtitleIndex(option ? nextIndex : -1);
@@ -353,6 +409,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         run(() => selectVideo(index - 1));
       } else if (event.shiftKey && event.key === "ArrowRight" && index < videos.length - 1) {
         run(() => selectVideo(index + 1));
+      } else if (event.key === "-") {
+        run(() => stepSpeed(-1));
+      } else if (event.key === "=" || event.key === "+") {
+        run(() => stepSpeed(1));
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -367,7 +427,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, subtitleIndex, subtitles, videos.length]);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, speed, subtitleIndex, subtitles, videos.length]);
 
   if (error) {
     const unsupported = error.includes("format") || error.includes("codec");
@@ -378,7 +438,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         <p>{video.fileName}</p>
         <p role="alert" className="sr-only">{error}</p>
         <div className="error-actions">
-          <button type="button" className="back-button" onClick={onBack} aria-label="Back to results" aria-keyshortcuts="Escape">← Back to results</button>
+          <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">← Back to results</ControlButton>
           {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}>Skip to next</button> : null}
         </div>
       </section>
@@ -388,20 +448,19 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   return (
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
-        <button type="button" className="back-button" onClick={onBack} aria-label="Back to results" aria-keyshortcuts="Escape">
+        <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">
           ← Back
-        </button>
+        </ControlButton>
         <h1 title={video.fileName}>{video.fileName}</h1>
         {videos.length > 1 ? (
-          <button
-            type="button"
+          <ControlButton
+            shortcut="P"
             className="playlist-toggle"
             aria-expanded={playlistOpen}
-            aria-keyshortcuts="P"
             onClick={() => setPlaylistOpen((open) => !open)}
           >
-            Playlist <span>{videos.length}</span>
-          </button>
+            Playlist <span className="playlist-count">{videos.length}</span>
+          </ControlButton>
         ) : null}
       </div>
 
@@ -463,29 +522,27 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               }}
             />
             <div className="player-transport">
-              <button type="button" className="transport-button" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video" aria-keyshortcuts="Shift+ArrowLeft">⏮</button>
-              <button type="button" className="transport-button" onClick={() => skip(-10)} aria-label="Skip back 10 seconds" aria-keyshortcuts=",">−10</button>
-              <button type="button" className="play-button" onClick={play} aria-label="Play" aria-keyshortcuts="Space">
+              <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video">⏮</ControlButton>
+              <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds">−10</ControlButton>
+              <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
                 <span className="play-glyph" aria-hidden="true" />
-              </button>
-              <button type="button" className="transport-button" onClick={pause} aria-label="Pause" aria-keyshortcuts="Space">
+              </ControlButton>
+              <ControlButton shortcut="Space" onClick={pause} aria-label="Pause">
                 <span className="pause-glyph" aria-hidden="true" />
-              </button>
-              <button type="button" className="transport-button" onClick={() => skip(10)} aria-label="Skip forward 10 seconds" aria-keyshortcuts=".">+10</button>
-              <button type="button" className="transport-button" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video" aria-keyshortcuts="Shift+ArrowRight">⏭</button>
+              </ControlButton>
+              <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds">+10</ControlButton>
+              <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">⏭</ControlButton>
               <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
               <div className="player-utilities">
-                <button
-                  type="button"
-                  className="transport-button"
+                <ControlButton
+                  shortcut="S"
                   onClick={toggleSubtitles}
                   disabled={subtitles.length === 0}
                   aria-label="Subtitles"
                   aria-pressed={subtitleIndex >= 0}
-                  aria-keyshortcuts="S"
                 >
                   CC
-                </button>
+                </ControlButton>
                 {subtitles.length > 1 ? (
                   <select
                     aria-label="Subtitle track"
@@ -500,33 +557,30 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                     ))}
                   </select>
                 ) : null}
-                <select
-                  aria-label="Playback speed"
-                  value={speed}
-                  onChange={(event) => {
-                    const next = Number(event.currentTarget.value);
-                    setSpeed(next);
-                    if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
-                    else if (element.current) element.current.playbackRate = next;
-                  }}
-                >
-                  {[0.5, 0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
-                </select>
-                <button type="button" className="transport-button" onClick={() => rotate(-90)} aria-label="Rotate left" aria-keyshortcuts="[">↶</button>
-                <button type="button" className="transport-button" onClick={() => rotate(90)} aria-label="Rotate right" aria-keyshortcuts="]">↷</button>
-                <button
-                  type="button"
-                  className="transport-button"
+                <span className="labelled-control">
+                  <select
+                    aria-label="Playback speed"
+                    aria-keyshortcuts="- ="
+                    value={speed}
+                    onChange={(event) => applySpeed(Number(event.currentTarget.value))}
+                  >
+                    {SPEEDS.map((value) => <option key={value} value={value}>{value}×</option>)}
+                  </select>
+                  <KeyHint shortcut="- =" />
+                </span>
+                <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left">↶</ControlButton>
+                <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right">↷</ControlButton>
+                <ControlButton
+                  shortcut="L"
                   onClick={() => setLoop((enabled) => !enabled)}
                   aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
                   aria-pressed={loop}
-                  aria-keyshortcuts="L"
                 >
                   ⟳
-                </button>
-                <button type="button" className="transport-button" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"} aria-keyshortcuts="F">
+                </ControlButton>
+                <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                   {fullscreen ? "⤡" : "⛶"}
-                </button>
+                </ControlButton>
               </div>
             </div>
           </div>
