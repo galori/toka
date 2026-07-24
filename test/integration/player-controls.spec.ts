@@ -67,10 +67,17 @@ async function expectUsable(selector: string) {
 
 describe("Toka player controls", () => {
   before(async () => {
-    const search = await $("#video-search");
-    await search.click();
-    await browser.keys("sample");
-    await browser.execute(() => document.querySelector("form")?.requestSubmit());
+    // Typed keys need the app window to hold focus, which a second WebDriver
+    // session does not reliably get. Driving React's controlled input directly
+    // keeps this spec about the controls rather than about window focus.
+    await browser.execute(() => {
+      const search = document.querySelector<HTMLInputElement>("#video-search");
+      if (!search) throw new Error("The search field is missing");
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(search, "sample");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector("form")?.requestSubmit();
+    });
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
     await $("button=Play all").click();
     await $(".player-controls").waitForDisplayed();
