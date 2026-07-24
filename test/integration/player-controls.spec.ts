@@ -12,7 +12,13 @@ const transportControls = [
   "Next video",
 ];
 
-const utilityControls = ["Rotate left", "Rotate right", "Loop playlist", "Enter fullscreen"];
+const utilityControls = [
+  "Subtitles",
+  "Rotate left",
+  "Rotate right",
+  "Loop playlist",
+  "Enter fullscreen",
+];
 
 type Metrics = {
   width: number;
