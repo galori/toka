@@ -44,6 +44,17 @@ describe("Toka subtitles", () => {
     expect(cues).toContain("WEBVTT");
     expect(cues).toContain("00:00:00.000 --> 00:00:02.000");
 
+    // The media engine has to accept the track, not merely be handed one.
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(() => {
+          const tracks = document.querySelector("video")?.textTracks;
+          const track = tracks?.[0];
+          return track?.mode === "showing" && (track.cues?.length ?? 0) > 0;
+        })) === true,
+      { timeout: 5_000, timeoutMsg: "the media engine never parsed the sidecar subtitle" },
+    );
+
     await toggle.click();
     await expect(toggle).toHaveAttribute("aria-pressed", "false");
     await expect($$("video track")).toBeElementsArrayOfSize(0);
