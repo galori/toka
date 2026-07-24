@@ -131,6 +131,151 @@ test("uses the overlay player controls from the design", async () => {
   expect(screen.getByRole("button", { name: "Pause" }).querySelector(".pause-glyph")).toBeInTheDocument();
 });
 
+test("shows a sidecar subtitle track and turns it off again", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/clip.mp4",
+        subtitles: [
+          { track: 0, label: "Subtitles", language: null, webPlayable: true },
+          { track: 1, label: "EN", language: "en", webPlayable: true },
+        ],
+      });
+    }
+    if (command === "subtitle_cues") return Promise.resolve("WEBVTT\n\n00:01.000 --> 00:02.000\nHi");
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  const toggle = await screen.findByRole("button", { name: "Subtitles" });
+  expect(toggle).toHaveAttribute("aria-pressed", "false");
+  expect(toggle).toHaveAttribute("aria-keyshortcuts", "S");
+  expect(toggle).toBeEnabled();
+
+  await user.click(toggle);
+  await waitFor(() => expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "true"));
+  expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 0 });
+
+  const track = document.querySelector("track");
+  expect(track).toHaveAttribute("label", "Subtitles");
+  expect(track?.getAttribute("src")).toContain("text/vtt");
+
+  await user.click(screen.getByRole("button", { name: "Subtitles" }));
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");
+  expect(document.querySelector("track")).not.toBeInTheDocument();
+});
+
+test("switches between the subtitle tracks found beside the video", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/clip.mp4",
+        subtitles: [
+          { track: 0, label: "Subtitles", language: null, webPlayable: true },
+          { track: 1, label: "EN", language: "en", webPlayable: true },
+          { track: 2, label: "Styled", language: null, webPlayable: false },
+        ],
+      });
+    }
+    if (command === "subtitle_cues") return Promise.resolve("WEBVTT");
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(await screen.findByRole("button", { name: "Subtitles" }));
+
+  const chooser = await screen.findByRole("combobox", { name: "Subtitle track" });
+  // The .ass sidecar is listed by Rust but the web engine cannot render it.
+  expect([...chooser.querySelectorAll("option")].map((option) => option.textContent)).toEqual([
+    "Off",
+    "Subtitles",
+    "EN",
+  ]);
+
+  await user.selectOptions(chooser, "1");
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 1 }));
+  expect(document.querySelector("track")).toHaveAttribute("srclang", "en");
+});
+
+test("toggles subtitles with the keyboard and disables the control without tracks", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4", subtitles: [] });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+
+  // Visible but inert, so the feature stays discoverable when a video has none.
+  const toggle = await screen.findByRole("button", { name: "Subtitles" });
+  expect(toggle).toBeVisible();
+  expect(toggle).toBeDisabled();
+
+  fireEvent.keyDown(window, { key: "s" });
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");
+  expect(screen.queryByRole("combobox", { name: "Subtitle track" })).not.toBeInTheDocument();
+});
+
+test("selects and clears the mpv subtitle track for native playback", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        results: [{ id: "native-1", fileName: "native.mkv", extension: "mkv" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({ filePath: "/Videos/native.mkv", playbackBackend: "native", subtitles: [] });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+    }
+    if (command === "native_subtitle_tracks") {
+      return Promise.resolve([{ id: 1, label: "English", external: false }]);
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play native.mkv" }));
+
+  // mpv reports embedded tracks only once the file has loaded.
+  await waitFor(() => expect(screen.getByRole("button", { name: "Subtitles" })).toBeEnabled());
+
+  fireEvent.keyDown(window, { key: "s" });
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: 1 }));
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.keyDown(window, { key: "s" });
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: null }));
+});
+
 test("presents a dedicated unsupported-format state", async () => {
   invokeMock
     .mockResolvedValueOnce({

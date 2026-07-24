@@ -9,7 +9,6 @@ use std::{
 };
 use tauri::{App, Manager};
 
-#[cfg(feature = "native-e2e")]
 const MPV_FORMAT_STRING: c_int = 1;
 const MPV_FORMAT_FLAG: c_int = 3;
 const MPV_FORMAT_INT64: c_int = 4;
@@ -70,7 +69,6 @@ type MpvSetProperty =
 type MpvGetProperty =
     unsafe extern "C" fn(*mut MpvHandle, *const c_char, c_int, *mut c_void) -> c_int;
 type MpvErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
-#[cfg(feature = "native-e2e")]
 type MpvFree = unsafe extern "C" fn(*mut c_void);
 type MpvRenderContextCreate =
     unsafe extern "C" fn(*mut *mut MpvRenderContext, *mut MpvHandle, *mut MpvRenderParam) -> c_int;
@@ -88,7 +86,6 @@ struct MpvApi {
     set_property: MpvSetProperty,
     get_property: MpvGetProperty,
     error_string: MpvErrorString,
-    #[cfg(feature = "native-e2e")]
     free: MpvFree,
     render_context_create: MpvRenderContextCreate,
     render_context_render: MpvRenderContextRender,
@@ -115,7 +112,6 @@ impl MpvApi {
             set_property: symbol!("mpv_set_property", MpvSetProperty),
             get_property: symbol!("mpv_get_property", MpvGetProperty),
             error_string: symbol!("mpv_error_string", MpvErrorString),
-            #[cfg(feature = "native-e2e")]
             free: symbol!("mpv_free", MpvFree),
             render_context_create: symbol!("mpv_render_context_create", MpvRenderContextCreate),
             render_context_render: symbol!("mpv_render_context_render", MpvRenderContextRender),
@@ -192,6 +188,9 @@ impl Mpv {
         #[cfg(not(feature = "native-e2e"))]
         player.set_option("hwdec", "auto-safe")?;
         player.set_option("keep-open", "yes")?;
+        // Pick up `talk.en.srt` beside `talk.mp4`, matching Toka's own sidecar
+        // detection rather than only exact filename matches.
+        player.set_option("sub-auto", "fuzzy")?;
         player.set_option("terminal", "no")?;
         player.set_option("input-default-bindings", "no")?;
         player.check(unsafe { (player.api.initialize)(player.handle) })?;
@@ -284,7 +283,6 @@ impl Mpv {
         (code >= 0).then_some(value != 0)
     }
 
-    #[cfg(feature = "native-e2e")]
     fn get_string(&self, name: &str) -> Option<String> {
         let name = CString::new(name).ok()?;
         let mut value: *mut c_char = ptr::null_mut();
@@ -716,6 +714,60 @@ pub fn set_rotation(player: &NativePlayer, degrees: i32) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.set_i64("video-rotate", i64::from(degrees.rem_euclid(360))))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubtitleTrack {
+    pub id: i64,
+    pub label: String,
+    pub external: bool,
+}
+
+/// Every subtitle track mpv knows about for the loaded file: embedded streams
+/// and the sidecar files `sub-auto` picked up beside it.
+pub fn subtitle_tracks(player: &NativePlayer) -> Result<Vec<SubtitleTrack>, String> {
+    player.with_mpv(|mpv| {
+        let count = mpv.get_i64("track-list/count").unwrap_or(0).max(0);
+        let mut tracks = Vec::new();
+        for index in 0..count {
+            if mpv.get_string(&format!("track-list/{index}/type")).as_deref() != Some("sub") {
+                continue;
+            }
+            let Some(id) = mpv.get_i64(&format!("track-list/{index}/id")) else {
+                continue;
+            };
+            tracks.push(SubtitleTrack {
+                id,
+                label: subtitle_label(
+                    mpv.get_string(&format!("track-list/{index}/title")).as_deref(),
+                    mpv.get_string(&format!("track-list/{index}/lang")).as_deref(),
+                    id,
+                ),
+                external: mpv
+                    .get_flag(&format!("track-list/{index}/external"))
+                    .unwrap_or(false),
+            });
+        }
+        Ok(tracks)
+    })
+}
+
+fn subtitle_label(title: Option<&str>, language: Option<&str>, id: i64) -> String {
+    let title = title.filter(|value| !value.is_empty());
+    let language = language.filter(|value| !value.is_empty());
+    match (title, language) {
+        (Some(title), Some(language)) => format!("{title} ({})", language.to_uppercase()),
+        (Some(title), None) => title.to_owned(),
+        (None, Some(language)) => language.to_uppercase(),
+        (None, None) => format!("Track {id}"),
+    }
+}
+
+/// Selects a subtitle track, or turns subtitles off when given `None`.
+pub fn set_subtitle(player: &NativePlayer, id: Option<i64>) -> Result<(), String> {
+    let value = id.map_or_else(|| "no".to_owned(), |id| id.to_string());
+    player.with_mpv(|mpv| mpv.command(&["set", "sid", &value]))
+}
+
 pub fn seek(player: &NativePlayer, seconds: f64) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.command(&["seek", &seconds.max(0.0).to_string(), "absolute+exact"]))
 }
@@ -776,10 +828,18 @@ fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::rgb_from_rgba;
+    use super::{rgb_from_rgba, subtitle_label};
 
     #[test]
     fn extracts_rgb_from_an_aligned_rgba_pixel() {
         assert_eq!(rgb_from_rgba([12, 34, 56, 255]), [12, 34, 56]);
+    }
+
+    #[test]
+    fn names_subtitle_tracks_from_whatever_metadata_the_file_carries() {
+        assert_eq!(subtitle_label(Some("Forced"), Some("en"), 1), "Forced (EN)");
+        assert_eq!(subtitle_label(Some("Commentary"), None, 1), "Commentary");
+        assert_eq!(subtitle_label(None, Some("pt"), 2), "PT");
+        assert_eq!(subtitle_label(Some(""), Some(""), 3), "Track 3");
     }
 }

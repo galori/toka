@@ -13,7 +13,11 @@ const binaryPath = resolve(
 
 export const config: Options.Testrunner = {
   runner: "local",
-  specs: ["./test/integration/happy-path.spec.ts", "./test/integration/player-controls.spec.ts"],
+  specs: [
+    "./test/integration/happy-path.spec.ts",
+    "./test/integration/player-controls.spec.ts",
+    "./test/integration/subtitles.spec.ts",
+  ],
   maxInstances: 1,
   framework: "mocha",
   reporters: ["spec"],
