@@ -36,6 +36,8 @@ type GlReadPixels =
     unsafe extern "C" fn(c_int, c_int, c_int, c_int, u32, u32, *mut c_void);
 #[cfg(feature = "native-e2e")]
 type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
+#[cfg(feature = "native-e2e")]
+type GlGetError = unsafe extern "C" fn() -> u32;
 
 #[repr(C)]
 struct MpvRenderParam {
@@ -135,6 +137,16 @@ struct Mpv {
     last_framebuffer: Option<c_int>,
     #[cfg(feature = "native-e2e")]
     render_count: u64,
+    #[cfg(feature = "native-e2e")]
+    last_probe_colors: Option<[[u8; 3]; 5]>,
+    #[cfg(feature = "native-e2e")]
+    max_center_color: [u8; 3],
+    #[cfg(feature = "native-e2e")]
+    max_any_color: [u8; 3],
+    #[cfg(feature = "native-e2e")]
+    blue_render_count: u64,
+    #[cfg(feature = "native-e2e")]
+    last_gl_error: u32,
 }
 
 // libmpv serializes access to a handle. Toka additionally protects it with the mutex below.
@@ -159,6 +171,16 @@ impl Mpv {
             last_framebuffer: None,
             #[cfg(feature = "native-e2e")]
             render_count: 0,
+            #[cfg(feature = "native-e2e")]
+            last_probe_colors: None,
+            #[cfg(feature = "native-e2e")]
+            max_center_color: [0; 3],
+            #[cfg(feature = "native-e2e")]
+            max_any_color: [0; 3],
+            #[cfg(feature = "native-e2e")]
+            blue_render_count: 0,
+            #[cfg(feature = "native-e2e")]
+            last_gl_error: 0,
         };
         player.set_option("vo", "libmpv")?;
         #[cfg(feature = "native-e2e")]
@@ -371,18 +393,44 @@ impl Mpv {
             let mut read_framebuffer: c_int = 0;
             (EPOXY_GL_GET_INTEGERV)(GL_READ_FRAMEBUFFER_BINDING, &mut read_framebuffer);
             (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, framebuffer as u32);
-            let mut color = [0_u8; 4];
-            (EPOXY_GL_READ_PIXELS)(
-                width / 2,
-                height / 2,
-                1,
-                1,
-                GL_RGBA,
-                GL_UNSIGNED_BYTE,
-                color.as_mut_ptr().cast(),
-            );
+            let points = [
+                [width / 2, height / 2],
+                [width / 4, height / 2],
+                [3 * width / 4, height / 2],
+                [width / 2, height / 4],
+                [width / 2, 3 * height / 4],
+            ];
+            let mut colors = [[0_u8; 3]; 5];
+            for (point, slot) in points.iter().zip(colors.iter_mut()) {
+                let mut color = [0_u8; 4];
+                (EPOXY_GL_READ_PIXELS)(
+                    point[0],
+                    point[1],
+                    1,
+                    1,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    color.as_mut_ptr().cast(),
+                );
+                *slot = rgb_from_rgba(color);
+            }
+            self.last_gl_error = (EPOXY_GL_GET_ERROR)();
             (EPOXY_GL_BIND_FRAMEBUFFER)(GL_READ_FRAMEBUFFER, read_framebuffer as u32);
-            self.last_frame_color = Some(rgb_from_rgba(color));
+            let center = colors[0];
+            self.last_frame_color = Some(center);
+            self.last_probe_colors = Some(colors);
+            for channel in 0..3 {
+                self.max_center_color[channel] = self.max_center_color[channel].max(center[channel]);
+                for color in &colors {
+                    self.max_any_color[channel] = self.max_any_color[channel].max(color[channel]);
+                }
+            }
+            if colors.iter().any(|c| {
+                let (red, green, blue) = (u16::from(c[0]), u16::from(c[1]), u16::from(c[2]));
+                blue > 180 && blue > red * 2 && blue > green * 2
+            }) {
+                self.blue_render_count += 1;
+            }
         }
         Ok(())
     }
@@ -412,6 +460,9 @@ extern "C" {
     #[cfg(feature = "native-e2e")]
     #[link_name = "epoxy_glBindFramebuffer"]
     static EPOXY_GL_BIND_FRAMEBUFFER: GlBindFramebuffer;
+    #[cfg(feature = "native-e2e")]
+    #[link_name = "epoxy_glGetError"]
+    static EPOXY_GL_GET_ERROR: GlGetError;
 }
 
 #[link(name = "EGL")]
@@ -628,6 +679,16 @@ pub struct PlaybackState {
     decoder_frame_drops: Option<i64>,
     #[cfg(feature = "native-e2e")]
     vo_frame_drops: Option<i64>,
+    #[cfg(feature = "native-e2e")]
+    probe_colors: Option<[[u8; 3]; 5]>,
+    #[cfg(feature = "native-e2e")]
+    max_center_color: [u8; 3],
+    #[cfg(feature = "native-e2e")]
+    max_any_color: [u8; 3],
+    #[cfg(feature = "native-e2e")]
+    blue_render_count: u64,
+    #[cfg(feature = "native-e2e")]
+    gl_error: u32,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -690,6 +751,16 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             decoder_frame_drops: mpv.get_i64("decoder-frame-drop-count"),
             #[cfg(feature = "native-e2e")]
             vo_frame_drops: mpv.get_i64("frame-drop-count"),
+            #[cfg(feature = "native-e2e")]
+            probe_colors: mpv.last_probe_colors,
+            #[cfg(feature = "native-e2e")]
+            max_center_color: mpv.max_center_color,
+            #[cfg(feature = "native-e2e")]
+            max_any_color: mpv.max_any_color,
+            #[cfg(feature = "native-e2e")]
+            blue_render_count: mpv.blue_render_count,
+            #[cfg(feature = "native-e2e")]
+            gl_error: mpv.last_gl_error,
         })
     })
 }
