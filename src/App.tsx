@@ -27,12 +27,59 @@ type SubtitleOption =
   | { source: "native"; label: string; id: number }
   | { source: "embedded"; label: string; textTrack: TextTrack };
 
+type ParsedCue = { startTime: number; endTime: number; text: string };
+
 function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
   if (error && typeof error === "object" && "message" in error) {
     return String(error.message);
   }
   return "Something went wrong while searching for videos.";
+}
+
+function parseWebVttTimestamp(timestamp: string): number | undefined {
+  const parts = timestamp.trim().split(":");
+  if (parts.length < 2 || parts.length > 3) return undefined;
+  const seconds = Number(parts.at(-1));
+  const minutes = Number(parts.at(-2));
+  const hours = parts.length === 3 ? Number(parts[0]) : 0;
+  if (![hours, minutes, seconds].every(Number.isFinite)) return undefined;
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function parseWebVttCues(source: string): ParsedCue[] {
+  const lines = source.replace(/^\uFEFF/, "").split(/\r?\n/);
+  const cues: ParsedCue[] = [];
+  let position = lines[0]?.trim() === "WEBVTT" ? 1 : 0;
+
+  while (position < lines.length) {
+    while (position < lines.length && lines[position].trim() === "") position += 1;
+    if (position >= lines.length) break;
+
+    let timing = lines[position].trim();
+    if (!timing.includes("-->")) {
+      position += 1;
+      timing = lines[position]?.trim() ?? "";
+    }
+
+    const [start, endWithSettings] = timing.split(/\s+-->\s+/, 2);
+    const end = endWithSettings?.split(/\s+/, 1)[0];
+    const startTime = parseWebVttTimestamp(start ?? "");
+    const endTime = parseWebVttTimestamp(end ?? "");
+    position += 1;
+
+    const text: string[] = [];
+    while (position < lines.length && lines[position].trim() !== "") {
+      text.push(lines[position]);
+      position += 1;
+    }
+
+    if (startTime !== undefined && endTime !== undefined && text.length > 0) {
+      cues.push({ startTime, endTime, text: text.join("\n") });
+    }
+  }
+
+  return cues;
 }
 
 function VideoIcon() {
@@ -112,6 +159,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const playerControls = useRef<HTMLDivElement>(null);
   const pointerOverControls = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
+  const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(0);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
@@ -128,7 +176,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [nativeSubtitles, setNativeSubtitles] = useState<SubtitleOption[]>([]);
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
-  const [subtitleCueUrl, setSubtitleCueUrl] = useState<string>();
+  const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
   const video = videos[index];
 
   useEffect(() => {
@@ -145,7 +193,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setNativeSubtitles([]);
     setEmbeddedSubtitles([]);
     setSubtitleIndex(-1);
-    setSubtitleCueUrl(undefined);
+    setSidecarTextTrack(undefined);
+    sidecarTracks.current = [];
     prepareVideo(video.id)
       .then(async (result) => {
         if (!active) return;
@@ -193,8 +242,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     const surface = nativeSurface.current;
     let advancing = false;
     // mpv only knows the file's subtitle tracks once it has finished loading,
-    // so the list is refreshed alongside the playback poll until it settles.
-    let knownTrackCount = -1;
+    // so the playback poll also asks for them — until it finds some, or until
+    // the file has clearly had long enough to report that it has none.
+    let subtitleLookupsLeft = 20;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
       void setNativeVideoBounds({
@@ -227,15 +277,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
-      void nativeSubtitleTracks()
-        .then((tracks) => {
-          if (tracks.length === knownTrackCount) return;
-          knownTrackCount = tracks.length;
-          setNativeSubtitles(
-            tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
-          );
-        })
-        .catch(() => {});
+      if (subtitleLookupsLeft > 0) {
+        subtitleLookupsLeft -= 1;
+        void nativeSubtitleTracks()
+          .then((tracks) => {
+            if (tracks.length === 0) return;
+            subtitleLookupsLeft = 0;
+            setNativeSubtitles(
+              tracks.map((track) => ({ source: "native", label: track.label, id: track.id })),
+            );
+          })
+          .catch(() => {});
+      }
     }, 250);
     return () => {
       observer.disconnect();
@@ -312,11 +365,21 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       return;
     }
     if (option?.source !== "sidecar") {
-      setSubtitleCueUrl(undefined);
+      setSidecarTextTrack(undefined);
       return;
     }
+    setSidecarTextTrack(undefined);
     void subtitleCues(video.id, option.track)
-      .then((cues) => setSubtitleCueUrl(`data:text/vtt;charset=utf-8,${encodeURIComponent(cues)}`))
+      .then((cues) => {
+        const media = element.current;
+        if (!media) return;
+        const textTrack = media.addTextTrack("subtitles", option.label, option.language ?? "");
+        sidecarTracks.current.push(textTrack);
+        for (const cue of parseWebVttCues(cues)) {
+          textTrack.addCue(new VTTCue(cue.startTime, cue.endTime, cue.text));
+        }
+        setSidecarTextTrack(textTrack);
+      })
       .catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
@@ -332,7 +395,13 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       const found: SubtitleOption[] = [];
       for (let position = 0; position < media.textTracks.length; position += 1) {
         const textTrack = media.textTracks[position];
-        if (textTrack === own || (textTrack.kind !== "subtitles" && textTrack.kind !== "captions")) continue;
+        if (
+          textTrack === own ||
+          sidecarTracks.current.includes(textTrack) ||
+          (textTrack.kind !== "subtitles" && textTrack.kind !== "captions")
+        ) {
+          continue;
+        }
         found.push({
           source: "embedded",
           label: textTrack.label || textTrack.language.toUpperCase() || `Track ${position + 1}`,
@@ -363,11 +432,11 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       const textTrack = media.textTracks[position];
       const showing =
         selectedSubtitle?.source === "sidecar"
-          ? textTrack === own
+          ? textTrack === sidecarTextTrack || textTrack === own
           : selectedSubtitle?.source === "embedded" && selectedSubtitle.textTrack === textTrack;
       textTrack.mode = showing ? "showing" : "disabled";
     }
-  }, [native, selectedSubtitle, subtitleCueUrl]);
+  }, [native, selectedSubtitle, sidecarTextTrack]);
 
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerShell.current);
@@ -531,15 +600,6 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               }}
               onError={() => setError("This video format or codec is not supported on this computer.")}
             >
-              {subtitleCueUrl && selectedSubtitle?.source === "sidecar" ? (
-                <track
-                  kind="subtitles"
-                  src={subtitleCueUrl}
-                  label={selectedSubtitle.label}
-                  srcLang={selectedSubtitle.language ?? undefined}
-                  default
-                />
-              ) : null}
             </video>
           )}
           <div

@@ -166,13 +166,14 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
   await waitFor(() => expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "true"));
   expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 0 });
 
-  const track = document.querySelector("track");
-  expect(track).toHaveAttribute("label", "Subtitles");
-  expect(track?.getAttribute("src")).toContain("text/vtt");
+  const track = document.querySelector("video")?.textTracks[0];
+  expect(track?.label).toBe("Subtitles");
+  expect(track?.mode).toBe("showing");
+  expect((track?.cues?.[0] as VTTCue | undefined)?.text).toBe("Hi");
 
   await user.click(screen.getByRole("button", { name: "Subtitles" }));
   expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");
-  expect(document.querySelector("track")).not.toBeInTheDocument();
+  expect(track?.mode).toBe("disabled");
 });
 
 test("switches between the subtitle tracks found beside the video", async () => {
@@ -213,7 +214,8 @@ test("switches between the subtitle tracks found beside the video", async () => 
 
   await user.selectOptions(chooser, "1");
   await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 1 }));
-  expect(document.querySelector("track")).toHaveAttribute("srclang", "en");
+  const tracks = document.querySelector("video")?.textTracks;
+  expect(tracks?.[tracks.length - 1]?.language).toBe("en");
 });
 
 test("toggles subtitles with the keyboard and disables the control without tracks", async () => {
