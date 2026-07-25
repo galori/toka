@@ -1,5 +1,5 @@
 describe("Toka native Linux playback", () => {
-  it("decodes and renders a blue video frame", async () => {
+  it("renders a video frame without covering the player controls", async () => {
     const nativeState = () => browser.execute(() => {
       const tauri = (window as typeof window & {
         __TAURI__: { core: { invoke: (command: string) => Promise<unknown> } };
@@ -58,6 +58,22 @@ describe("Toka native Linux playback", () => {
     // Log the final state on success too, so passing and failing launches can
     // be compared (tracked in #57).
     console.log(`[DEBUG-native-e2e-pass] ${JSON.stringify(await nativeState())}`);
+
+    const layout = await browser.execute(() => {
+      const surface = document.querySelector<HTMLElement>(".native-video")?.getBoundingClientRect();
+      const controls = document.querySelector<HTMLElement>(".player-controls")?.getBoundingClientRect();
+      if (!surface || !controls) return undefined;
+      return {
+        controlsTopWithinSurface: controls.top - surface.top,
+        devicePixelRatio: window.devicePixelRatio,
+      };
+    });
+    if (!layout) throw new Error("The native video surface or player controls are missing");
+    const renderSize = (await nativeState()).renderSize;
+    if (!renderSize) throw new Error("The native renderer did not report its size");
+    expect(renderSize[1]).toBeLessThanOrEqual(
+      Math.ceil(layout.controlsTopWithinSurface * layout.devicePixelRatio),
+    );
 
     await $('button[aria-label="Pause"]').click();
     await $('button[aria-label="Play"]').click();

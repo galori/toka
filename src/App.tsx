@@ -197,12 +197,21 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     let knownTrackCount = -1;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
+      const controls = playerControls.current?.getBoundingClientRect();
+      // GTK overlays the native mpv surface above the WebView, irrespective of
+      // CSS z-index. Keep that surface out of the HTML controls' region while
+      // they are visible so Linux composites the controls instead of video
+      // over them. Fullscreen idle mode can reclaim the whole player.
+      const visibleHeight =
+        controls && !controlsIdle
+          ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
+          : bounds.height;
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
         width: Math.round(bounds.width),
-        height: Math.round(bounds.height),
-        visible: bounds.width > 0 && bounds.height > 0,
+        height: Math.round(visibleHeight),
+        visible: bounds.width > 0 && visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -242,7 +251,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [index, loop, native, videos.length]);
+  }, [controlsIdle, index, loop, native, videos.length]);
 
   const play = () => {
     if (native) {
