@@ -27,12 +27,59 @@ type SubtitleOption =
   | { source: "native"; label: string; id: number }
   | { source: "embedded"; label: string; textTrack: TextTrack };
 
+type ParsedCue = { startTime: number; endTime: number; text: string };
+
 function errorMessage(error: unknown): string {
   if (typeof error === "string") return error;
   if (error && typeof error === "object" && "message" in error) {
     return String(error.message);
   }
   return "Something went wrong while searching for videos.";
+}
+
+function parseWebVttTimestamp(timestamp: string): number | undefined {
+  const parts = timestamp.trim().split(":");
+  if (parts.length < 2 || parts.length > 3) return undefined;
+  const seconds = Number(parts.at(-1));
+  const minutes = Number(parts.at(-2));
+  const hours = parts.length === 3 ? Number(parts[0]) : 0;
+  if (![hours, minutes, seconds].every(Number.isFinite)) return undefined;
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
+function parseWebVttCues(source: string): ParsedCue[] {
+  const lines = source.replace(/^\uFEFF/, "").split(/\r?\n/);
+  const cues: ParsedCue[] = [];
+  let position = lines[0]?.trim() === "WEBVTT" ? 1 : 0;
+
+  while (position < lines.length) {
+    while (position < lines.length && lines[position].trim() === "") position += 1;
+    if (position >= lines.length) break;
+
+    let timing = lines[position].trim();
+    if (!timing.includes("-->")) {
+      position += 1;
+      timing = lines[position]?.trim() ?? "";
+    }
+
+    const [start, endWithSettings] = timing.split(/\s+-->\s+/, 2);
+    const end = endWithSettings?.split(/\s+/, 1)[0];
+    const startTime = parseWebVttTimestamp(start ?? "");
+    const endTime = parseWebVttTimestamp(end ?? "");
+    position += 1;
+
+    const text: string[] = [];
+    while (position < lines.length && lines[position].trim() !== "") {
+      text.push(lines[position]);
+      position += 1;
+    }
+
+    if (startTime !== undefined && endTime !== undefined && text.length > 0) {
+      cues.push({ startTime, endTime, text: text.join("\n") });
+    }
+  }
+
+  return cues;
 }
 
 function VideoIcon() {
@@ -65,6 +112,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
   const nativeSurface = useRef<HTMLDivElement>(null);
+  const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(0);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
@@ -80,7 +128,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [nativeSubtitles, setNativeSubtitles] = useState<SubtitleOption[]>([]);
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
-  const [subtitleCueUrl, setSubtitleCueUrl] = useState<string>();
+  const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
   const video = videos[index];
 
   useEffect(() => {
@@ -97,7 +145,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setNativeSubtitles([]);
     setEmbeddedSubtitles([]);
     setSubtitleIndex(-1);
-    setSubtitleCueUrl(undefined);
+    setSidecarTextTrack(undefined);
+    sidecarTracks.current = [];
     prepareVideo(video.id)
       .then(async (result) => {
         if (!active) return;
@@ -254,25 +303,25 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       return;
     }
     if (option?.source !== "sidecar") {
-      setSubtitleCueUrl(undefined);
+      setSidecarTextTrack(undefined);
       return;
     }
+    setSidecarTextTrack(undefined);
     void subtitleCues(video.id, option.track)
-      .then((cues) => setSubtitleCueUrl(URL.createObjectURL(new Blob([cues], { type: "text/vtt" }))))
+      .then((cues) => {
+        const media = element.current;
+        if (!media) return;
+        const textTrack = media.addTextTrack("subtitles", option.label, option.language ?? "");
+        sidecarTracks.current.push(textTrack);
+        for (const cue of parseWebVttCues(cues)) {
+          textTrack.addCue(new VTTCue(cue.startTime, cue.endTime, cue.text));
+        }
+        setSidecarTextTrack(textTrack);
+      })
       .catch((reason: unknown) => setError(errorMessage(reason)));
   };
 
   const toggleSubtitles = () => selectSubtitle(subtitleIndex >= 0 ? -1 : 0);
-
-  // WebKit refuses to load a track's cues from a data: URI (a long-standing
-  // CORS bug: https://bugs.webkit.org/show_bug.cgi?id=143284). A blob: URL is
-  // same-origin with the document, so it sidesteps the check; it just needs
-  // revoking whenever it's replaced or the player unmounts.
-  useEffect(() => {
-    return () => {
-      if (subtitleCueUrl) URL.revokeObjectURL(subtitleCueUrl);
-    };
-  }, [subtitleCueUrl]);
 
   // The web engine surfaces tracks carried inside the file itself; they join
   // the list beside the sidecar files Rust found.
@@ -284,7 +333,13 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       const found: SubtitleOption[] = [];
       for (let position = 0; position < media.textTracks.length; position += 1) {
         const textTrack = media.textTracks[position];
-        if (textTrack === own || (textTrack.kind !== "subtitles" && textTrack.kind !== "captions")) continue;
+        if (
+          textTrack === own ||
+          sidecarTracks.current.includes(textTrack) ||
+          (textTrack.kind !== "subtitles" && textTrack.kind !== "captions")
+        ) {
+          continue;
+        }
         found.push({
           source: "embedded",
           label: textTrack.label || textTrack.language.toUpperCase() || `Track ${position + 1}`,
@@ -315,11 +370,11 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       const textTrack = media.textTracks[position];
       const showing =
         selectedSubtitle?.source === "sidecar"
-          ? textTrack === own
+          ? textTrack === sidecarTextTrack || textTrack === own
           : selectedSubtitle?.source === "embedded" && selectedSubtitle.textTrack === textTrack;
       textTrack.mode = showing ? "showing" : "disabled";
     }
-  }, [native, selectedSubtitle, subtitleCueUrl]);
+  }, [native, selectedSubtitle, sidecarTextTrack]);
 
   useEffect(() => {
     const updateFullscreen = () => setFullscreen(document.fullscreenElement === playerShell.current);
@@ -449,15 +504,6 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               }}
               onError={() => setError("This video format or codec is not supported on this computer.")}
             >
-              {subtitleCueUrl && selectedSubtitle?.source === "sidecar" ? (
-                <track
-                  kind="subtitles"
-                  src={subtitleCueUrl}
-                  label={selectedSubtitle.label}
-                  srcLang={selectedSubtitle.language ?? undefined}
-                  default
-                />
-              ) : null}
             </video>
           )}
           <div className="player-controls" aria-label="Video controls">
