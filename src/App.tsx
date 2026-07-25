@@ -91,6 +91,82 @@ function VideoIcon() {
   );
 }
 
+function SearchIcon() {
+  return (
+    <svg viewBox="0 0 24 24" className="search-glyph" aria-hidden="true">
+      <circle cx="10.75" cy="10.75" r="6.25" />
+      <path d="m16 16 4 4" />
+    </svg>
+  );
+}
+
+// Text-glyph icons (⏮ ⌕ ↶ …) fall back to whichever font a Linux system has
+// installed for that codepoint, which can render far smaller and thinner
+// than the same character on macOS. Drawing these as SVG keeps their size
+// and weight identical everywhere.
+function PreviousIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <polygon points="19 20 9 12 19 4 19 20" fill="currentColor" stroke="none" />
+      <line x1="5" y1="19" x2="5" y2="5" />
+    </svg>
+  );
+}
+
+function NextIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <polygon points="5 4 15 12 5 20 5 4" fill="currentColor" stroke="none" />
+      <line x1="19" y1="5" x2="19" y2="19" />
+    </svg>
+  );
+}
+
+function RotateLeftIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <polyline points="1 4 1 10 7 10" />
+      <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+    </svg>
+  );
+}
+
+function RotateRightIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <polyline points="23 4 23 10 17 10" />
+      <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
+    </svg>
+  );
+}
+
+function LoopIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <polyline points="17 1 21 5 17 9" />
+      <path d="M3 11V9a4 4 0 0 1 4-4h14" />
+      <polyline points="7 23 3 19 7 15" />
+      <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+    </svg>
+  );
+}
+
+function FullscreenEnterIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+    </svg>
+  );
+}
+
+function FullscreenExitIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3" />
+    </svg>
+  );
+}
+
 // How long the fullscreen overlay waits after the last movement before fading.
 const CONTROLS_IDLE_DELAY = 2_500;
 
@@ -638,7 +714,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               }}
             />
             <div className="player-transport">
-              <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video">⏮</ControlButton>
+              <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
               <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds">−10</ControlButton>
               <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
                 <span className="play-glyph" aria-hidden="true" />
@@ -647,7 +723,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 <span className="pause-glyph" aria-hidden="true" />
               </ControlButton>
               <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds">+10</ControlButton>
-              <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video">⏭</ControlButton>
+              <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
               <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
               <div className="player-utilities">
                 <ControlButton
@@ -684,18 +760,18 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                   </select>
                   <KeyHint shortcut="- =" />
                 </span>
-                <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left">↶</ControlButton>
-                <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right">↷</ControlButton>
+                <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left"><RotateLeftIcon /></ControlButton>
+                <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right"><RotateRightIcon /></ControlButton>
                 <ControlButton
                   shortcut="L"
                   onClick={() => setLoop((enabled) => !enabled)}
                   aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
                   aria-pressed={loop}
                 >
-                  ⟳
+                  <LoopIcon />
                 </ControlButton>
                 <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-                  {fullscreen ? "⤡" : "⛶"}
+                  {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
                 </ControlButton>
               </div>
             </div>
@@ -781,7 +857,7 @@ export default function App() {
             autoComplete="off"
             autoFocus
           />
-          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <span className="search-glyph" aria-hidden="true">⌕</span>}
+          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <SearchIcon />}
         </div>
       </form>
 
