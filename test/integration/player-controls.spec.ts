@@ -3,11 +3,11 @@
 // collapsed into an unusable column that overflowed the player. Presence in the
 // DOM is therefore not enough — each control is also measured.
 
+// Play and pause are one control that renames itself, so the transport is
+// measured through whichever of the two names it is wearing.
 const transportControls = [
   "Previous video",
   "Skip back 10 seconds",
-  "Play",
-  "Pause",
   "Skip forward 10 seconds",
   "Next video",
 ];
@@ -16,7 +16,7 @@ const utilityControls = [
   "Subtitles",
   "Rotate left",
   "Rotate right",
-  "Loop playlist",
+  "Loop: playlist",
   "Enter fullscreen",
 ];
 
@@ -116,6 +116,19 @@ describe("Toka player controls", () => {
     });
   }
 
+  it("shows a single play/pause control", async () => {
+    await expectPressable(".player-transport > button.play-button");
+    // One action, one button: the pair used to sit side by side, with whichever
+    // one did not apply still taking up room and still clickable.
+    const names = await browser.execute(() =>
+      [...document.querySelectorAll('.player-transport > button[aria-label="Play"], .player-transport > button[aria-label="Pause"]')].map(
+        (button) => button.getAttribute("aria-label"),
+      ),
+    );
+    expect(names).toHaveLength(1);
+    expect(["Play", "Pause"]).toContain(names[0]);
+  });
+
   for (const label of utilityControls) {
     it(`shows the ${label.toLowerCase()} control`, async () => {
       await expectPressable(`.player-utilities button[aria-label="${label}"]`);
@@ -145,9 +158,43 @@ describe("Toka player controls", () => {
     await expect($(".player-transport .time-display")).toHaveText(/^\d+:\d\d \/ \d+:\d\d$/);
   });
 
-  it("pauses and resumes from the overlay buttons", async () => {
-    await $('.player-transport button[aria-label="Pause"]').click();
-    await $('.player-transport button[aria-label="Play"]').click();
+  it("pauses and resumes from the one overlay button", async () => {
+    const pill = () =>
+      browser.execute(() => {
+        const button = document.querySelector<HTMLElement>(".player-transport button.play-button");
+        const box = button?.getBoundingClientRect();
+        return {
+          label: button?.getAttribute("aria-label") ?? "",
+          glyph: button?.querySelector(".play-glyph")
+            ? "play"
+            : button?.querySelector(".pause-glyph")
+              ? "pause"
+              : "none",
+          width: box?.width ?? 0,
+          left: box?.left ?? 0,
+        };
+      });
+
+    const toggle = await $(".player-transport button.play-button");
+    const before = await pill();
+    expect(before.glyph).toBe(before.label === "Pause" ? "pause" : "play");
+
+    await toggle.click();
+    // The same element swaps its name and its glyph rather than handing over to
+    // a second button.
+    await browser.waitUntil(async () => (await pill()).label !== before.label, {
+      timeoutMsg: `The play/pause control stayed on "${before.label}" after being clicked`,
+    });
+    const after = await pill();
+    expect(after.glyph).toBe(after.label === "Pause" ? "pause" : "play");
+    // Swapping the glyph must not resize the pill or shove the row sideways.
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
+
+    await toggle.click();
+    await browser.waitUntil(async () => (await pill()).label === before.label, {
+      timeoutMsg: "The play/pause control did not come back to its first state",
+    });
     await expect($(".player-controls")).toBeDisplayed();
   });
 });

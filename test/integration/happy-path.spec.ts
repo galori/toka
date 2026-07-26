@@ -89,8 +89,10 @@ describe("Toka playlist", () => {
       }
     }
 
-    await $('button[aria-label="Pause"]').click();
-    await $('button[aria-label="Play"]').click();
+    // One control for both directions now, so it is clicked twice rather than
+    // one button being clicked after the other.
+    await $("button.play-button").click();
+    await $("button.play-button").click();
     await $("button[aria-label=\"Back to results\"]").click();
     await expect($("button=Play all")).toBeDisplayed();
   });

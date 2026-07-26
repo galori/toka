@@ -121,10 +121,20 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 }
 
 /* Toka design system */
+/* Arial leads the Helvetica stack because of the caret in the search field.
+   A text input's caret is drawn from the font's own ascent and descent, and
+   nothing in CSS can move it relative to the text: `line-height`, `text-box`
+   and padding all shift the caret and the glyphs together. "Helvetica"
+   resolves on Linux to Nimbus Sans, which reports an ascent of 13px at 18px
+   against ink that is also 13px tall — so the caret can never reach above the
+   letters while it still hangs five pixels below the baseline, which is what
+   made it read as mis-aligned. Arial (Liberation Sans on Linux) reports 16px
+   over the same 13px of ink and centres on the text to within half a pixel.
+   All three faces share Helvetica's advance widths, so nothing reflows. */
 :root {
   color: oklch(0.95 0.01 90);
   background: oklch(0.11 0.01 40);
-  font-family: Helvetica, Arial, ui-sans-serif, system-ui, sans-serif;
+  font-family: Arial, "Liberation Sans", Helvetica, ui-sans-serif, system-ui, sans-serif;
   color-scheme: dark;
 }
 
@@ -382,7 +392,10 @@ button:focus-visible {
   color: oklch(0.14 0.01 40);
 }
 .play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
-.pause-glyph { width: 14px; height: 16px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
+/* The same 17px of box as the triangle, split either side so the bars stay
+   centred: one button now carries both, and it must not change width when it
+   swaps them. */
+.pause-glyph { width: 14px; height: 16px; margin-inline: 1.5px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
 /* 2.4 units in a 24-unit viewBox is a whole device pixel at this size; a
    thinner stroke is resampled into grey and reads as a faded icon. */
 .control-icon {
@@ -396,6 +409,11 @@ button:focus-visible {
   stroke-linejoin: round;
 }
 .control-icon.solid { fill: currentColor; stroke: none; }
+.control-icon .loop-one { fill: currentColor; stroke: none; }
+/* Loop has three states, so it cannot say which one it is in with
+   `aria-pressed`; the two that are on carry the accent colour, and the "1"
+   inside the icon is what separates repeating one video from the whole list. */
+.player-controls .loop-button.on { color: oklch(0.68 0.19 38); }
 /* An icon faded by opacity reads as badly drawn rather than as unavailable,
    because the shape blurs into the picture behind it. Dimming the colour at
    full opacity keeps the edges crisp and puts real contrast between the two

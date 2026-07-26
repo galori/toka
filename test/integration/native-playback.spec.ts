@@ -75,7 +75,8 @@ describe("Toka native Linux playback", () => {
       Math.ceil(layout.controlsTopWithinSurface * layout.devicePixelRatio),
     );
 
-    await $('button[aria-label="Pause"]').click();
-    await $('button[aria-label="Play"]').click();
+    // Playing and pausing share one control that renames itself.
+    await $("button.play-button").click();
+    await $("button.play-button").click();
   });
 });
