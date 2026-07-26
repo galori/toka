@@ -467,6 +467,25 @@ test("enters fullscreen mode for the player", async () => {
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
 
+test("shows fullscreen path and time overlays and toggles them with I", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    await enterFullscreen(user);
+
+    expect(screen.getByRole("region", { name: "Fullscreen video information" })).toBeVisible();
+    expect(screen.getByText("/Videos/clip.mp4")).toBeVisible();
+    expect(screen.getByRole("region", { name: "Fullscreen video information" })).toHaveTextContent("0:00 / 0:00");
+    expect(screen.getByRole("button", { name: "Hide fullscreen information" })).toHaveAttribute("aria-keyshortcuts", "I");
+
+    fireEvent.keyDown(window, { key: "i" });
+    expect(screen.queryByRole("region", { name: "Fullscreen video information" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show fullscreen information" })).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 // jsdom never actually goes fullscreen, so these stand in for the browser
 // telling the player whether the request took effect.
 function reportFullscreen(active: boolean) {
