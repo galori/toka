@@ -306,10 +306,13 @@ test("shows its keyboard shortcut on every control that has one", async () => {
   expect(rotateRight).toHaveAttribute("aria-keyshortcuts", "]");
   expect(rotateRight.querySelector(".key-hint")).toHaveTextContent("]");
 
-  // Chords are shown as glyphs rather than raw DOM key names.
+  // Hints read as key names rather than raw DOM ones.
   expect(
     screen.getByRole("button", { name: "Next video" }).querySelector(".key-hint"),
-  ).toHaveTextContent("⇧→");
+  ).toHaveTextContent("PgDn");
+  expect(
+    screen.getByRole("button", { name: "Previous video" }).querySelector(".key-hint"),
+  ).toHaveTextContent("PgUp");
   expect(
     screen.getByRole("button", { name: "Back to results" }).querySelector(".key-hint"),
   ).toHaveTextContent("Esc");
@@ -580,9 +583,9 @@ test("keyboard shortcuts control player actions without hijacking search input",
 
   fireEvent.keyDown(window, { key: "]" });
   expect(video).toHaveStyle({ transform: "rotate(90deg)" });
-  fireEvent.keyDown(window, { key: "ArrowRight", shiftKey: true });
+  fireEvent.keyDown(window, { key: "PageDown" });
   expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
-  fireEvent.keyDown(window, { key: "ArrowLeft", shiftKey: true });
+  fireEvent.keyDown(window, { key: "PageUp" });
   expect(await screen.findByLabelText("Playing clip-1.mp4")).toBeVisible();
   fireEvent.keyDown(window, { key: "l" });
   expect(screen.getByRole("button", { name: "Loop playlist" })).toHaveAttribute("aria-pressed", "true");
@@ -720,6 +723,275 @@ test("opens the playlist drawer and plays a selected playlist item", async () =>
 
   expect(await screen.findByLabelText("Playing playlist-3.mp4")).toBeVisible();
   expect(screen.getByRole("button", { name: "playlist-3.mp4" })).toHaveAttribute("aria-current", "true");
+});
+
+test("keeps the chosen playback speed when the playlist advances", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+
+  const first = await screen.findByLabelText("Playing playlist-1.mp4");
+  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  expect(first).toHaveProperty("playbackRate", 1.5);
+
+  fireEvent.ended(first);
+  const second = await screen.findByLabelText("Playing playlist-2.mp4");
+  fireEvent.loadedMetadata(second);
+
+  // Choosing a speed is a decision about the sitting, not about one file.
+  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue("1.5");
+  expect(second).toHaveProperty("playbackRate", 1.5);
+});
+
+test("re-applies the chosen playback speed to the next native video", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `native-${number}`,
+    fileName: `native-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Playing native-1.mp4");
+  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }));
+
+  invokeMock.mockClear();
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  await screen.findByLabelText("Playing native-2.mp4");
+
+  // mpv starts every file at 1x, so the retained speed has to be sent again.
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }));
+  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue("1.5");
+});
+
+test("stays fullscreen when the playlist advances to the next video", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: vi.fn().mockResolvedValue(undefined),
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play all" }));
+    const first = await screen.findByLabelText("Playing playlist-1.mp4");
+    await enterFullscreen(user);
+    const shell = document.querySelector(".player-shell");
+    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+
+    fireEvent.ended(first);
+    await screen.findByLabelText("Playing playlist-2.mp4");
+
+    // The browser drops out of fullscreen the moment the element it promoted
+    // leaves the document, so the shell has to outlive the video inside it.
+    expect(document.querySelector(".player-shell")).toBe(shell);
+    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+  } finally {
+    reportFullscreen(false);
+  }
+});
+
+test("keeps the native video surface clear of the playlist drawer", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `native-${number}`,
+    fileName: `native-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+    }
+    return Promise.resolve();
+  });
+  // jsdom has no layout, so the player is handed the geometry a real window
+  // would have: an 800x400 picture, the overlay along the bottom 80px and the
+  // drawer down the right-hand 240px.
+  const layout: Record<string, Partial<DOMRect>> = {
+    "native-video": { x: 0, y: 0, top: 0, left: 0, right: 800, bottom: 400, width: 800, height: 400 },
+    "player-controls": { x: 0, y: 320, top: 320, left: 0, right: 800, bottom: 400, width: 800, height: 80 },
+    "playlist-drawer": { x: 560, y: 0, top: 0, left: 560, right: 800, bottom: 400, width: 240, height: 400 },
+  };
+  const boxes = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    const named = Object.keys(layout).find((name) => this.classList.contains(name));
+    const empty = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    return { ...empty, ...(named ? layout[named] : {}) } as DOMRect;
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "native{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play all" }));
+    await screen.findByLabelText("Playing native-1.mp4");
+
+    // GTK puts the mpv surface above the WebView whatever the z-index says, so
+    // the drawer is only visible if the surface stops short of it.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0,
+        y: 0,
+        width: 560,
+        height: 320,
+        visible: true,
+      }),
+    );
+
+    invokeMock.mockClear();
+    await user.click(screen.getByRole("button", { name: "Playlist 2" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 320,
+        visible: true,
+      }),
+    );
+  } finally {
+    boxes.mockRestore();
+  }
+});
+
+test("draws the heading controls without font-dependent glyphs", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+
+  // A bare "←" is substituted from whichever font the system has for that
+  // codepoint, which lands off the label's baseline on Linux.
+  const back = await screen.findByRole("button", { name: "Back to results" });
+  expect(back.querySelector("svg.back-arrow")).toBeInTheDocument();
+  expect(back).not.toHaveTextContent("←");
+  expect(back).toHaveTextContent("Back");
+
+  for (const name of ["Previous video", "Next video"]) {
+    expect(screen.getByRole("button", { name }).querySelector("svg.control-icon")).toBeInTheDocument();
+  }
+});
+
+test("enables the skip controls everywhere except the ends of the playlist", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Playing playlist-1.mp4");
+
+  const previous = () => screen.getByRole("button", { name: "Previous video" });
+  const next = () => screen.getByRole("button", { name: "Next video" });
+  expect(previous()).toBeDisabled();
+  expect(next()).toBeEnabled();
+
+  // In the middle of a playlist both directions are available.
+  fireEvent.keyDown(window, { key: "PageDown" });
+  await screen.findByLabelText("Playing playlist-2.mp4");
+  expect(previous()).toBeEnabled();
+  expect(next()).toBeEnabled();
+
+  fireEvent.keyDown(window, { key: "PageDown" });
+  await screen.findByLabelText("Playing playlist-3.mp4");
+  expect(previous()).toBeEnabled();
+  expect(next()).toBeDisabled();
+
+  fireEvent.keyDown(window, { key: "PageUp" });
+  expect(await screen.findByLabelText("Playing playlist-2.mp4")).toBeVisible();
+});
+
+test("wraps every button label so the stylesheet can trim it", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Video controls");
+
+  // A loose run of text in a flex row is an anonymous box the stylesheet cannot
+  // reach, so its line box — descender space and all — is what gets centred,
+  // and the label reads a few pixels above the icon beside it.
+  const loose = [...document.querySelectorAll<HTMLElement>(".player-controls button, .back-button, .playlist-toggle")]
+    .filter((control) =>
+      [...control.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()),
+    )
+    .map((control) => control.getAttribute("aria-label") ?? control.textContent);
+  expect(loose).toEqual([]);
+
+  for (const name of ["Back to results", "Skip back 10 seconds", "Skip forward 10 seconds", "Subtitles"]) {
+    expect(screen.getByRole("button", { name }).querySelector(".control-label")).toBeInTheDocument();
+  }
+  expect(screen.getByRole("button", { name: "Playlist 2" }).querySelector(".playlist-count .control-label"))
+    .toHaveTextContent("2");
 });
 
 test("native playlist advances when libmpv reports end of file", async () => {

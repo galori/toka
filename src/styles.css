@@ -199,6 +199,7 @@ button:focus-visible {
   border: 0;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
+  min-height: 40px;
   padding: 10px 24px;
   font-size: 14px;
   line-height: 20px;
@@ -255,15 +256,47 @@ button:focus-visible {
 
 .player-heading { gap: 16px; margin: 0 0 20px; }
 .player-heading h1 { font-size: 16px; }
-.back-button { padding: 9px 18px; font-size: 13px; font-weight: 600; line-height: 18px; }
-.playlist-toggle { margin-left: auto; padding: 9px 16px; font-size: 13px; font-weight: 600; line-height: 18px; }
+/* Laid out as a flex row rather than a line of inline text: the label, the
+   arrow and the shortcut hint are three different sizes, and on a baseline
+   they sit visibly off-centre inside the button. */
+.back-button, .playlist-toggle {
+  display: inline-flex;
+  align-items: center;
+  /* Trimming the labels takes the line box out of the height, so the design's
+     38px comes from the button rather than from the text inside it. */
+  min-height: 38px;
+  padding: 9px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+}
+.back-arrow {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-right: 7px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.playlist-toggle { margin-left: auto; padding: 9px 16px; }
 .playlist-toggle .playlist-count {
-  margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 8px;
   border-radius: 9px;
-  padding: 1px 7px;
+  padding: 0 5px;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
   font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .player-shell {
@@ -279,6 +312,15 @@ button:focus-visible {
   object-fit: contain;
 }
 .native-video { height: min(420px, calc(100vh - 220px)); min-height: 0; }
+/* Holds the shell's shape while the next video is prepared, so the picture
+   does not collapse and reflow between playlist items. */
+.preparing-video {
+  display: grid;
+  place-items: center;
+  height: min(420px, calc(100vh - 220px));
+  margin: 0;
+}
+.player-shell:fullscreen .preparing-video { height: 100vh; }
 .player-shell:fullscreen {
   width: 100vw;
   height: 100vh;
@@ -341,17 +383,38 @@ button:focus-visible {
 }
 .play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
 .pause-glyph { width: 14px; height: 16px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
+/* 2.4 units in a 24-unit viewBox is a whole device pixel at this size; a
+   thinner stroke is resampled into grey and reads as a faded icon. */
 .control-icon {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   flex: none;
   fill: none;
   stroke: currentColor;
-  stroke-width: 2;
+  stroke-width: 2.4;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
+.control-icon.solid { fill: currentColor; stroke: none; }
+/* An icon faded by opacity reads as badly drawn rather than as unavailable,
+   because the shape blurs into the picture behind it. Dimming the colour at
+   full opacity keeps the edges crisp and puts real contrast between the two
+   ends of a playlist and the middle of one. */
+.player-controls button:disabled { opacity: 1; color: oklch(0.42 0.015 60); }
+.player-controls button:disabled .key-hint { color: oklch(0.34 0.012 60); }
 .player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+/* The drawer comes later in the markup, so without an explicit order it paints
+   over the right of the overlay and buries the rotate, loop and fullscreen
+   controls. The bar keeps its full width and runs in front of the drawer
+   instead; narrowing it would push the transport row off the left edge. */
+.player-controls { z-index: 2; }
+
+/* Centring a flex item centres its line box, and a line box reserves descender
+   space that a label like "Back" or "Space" never uses — which left every piece
+   of text sitting two to three pixels above the icon next to it. Trimming the
+   box down to the cap band makes the ink itself what gets centred. Engines
+   without the property fall back to the untrimmed line box. */
+.control-label { text-box: trim-both cap alphabetic; }
 
 /* The shortcut sits beside the icon it belongs to, muted enough to read as a
    label rather than as part of the control. */
@@ -388,10 +451,12 @@ button:focus-visible {
   top: 0;
   right: 0;
   bottom: 0;
+  z-index: 1;
   width: min(280px, 45%);
   overflow: auto;
   border-left: 1px solid oklch(0.28 0.02 40);
-  padding: 18px;
+  /* Deep enough that the last entry scrolls clear of the control bar. */
+  padding: 18px 18px 108px;
   background: oklch(0.15 0.015 40 / 0.98);
 }
 .playlist-drawer h2 {
