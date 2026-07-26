@@ -929,6 +929,28 @@ test("skips web playback by ten seconds", async () => {
   fireEvent.timeUpdate(video); await user.click(screen.getByRole("button", { name: "Skip forward 10 seconds" })); expect((video as HTMLVideoElement).currentTime).toBe(30);
 });
 
+test("uses left and right arrows for ten-second seeking", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  fireEvent.timeUpdate(video);
+
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(video).toHaveProperty("currentTime", 10);
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 20);
+  expect(screen.getByRole("button", { name: "Skip back 10 seconds" })).toHaveAttribute("aria-keyshortcuts", "ArrowLeft");
+  expect(screen.getByRole("button", { name: "Skip forward 10 seconds" })).toHaveAttribute("aria-keyshortcuts", "ArrowRight");
+});
+
 test("changes volume with the discoverable keyboard shortcuts", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,

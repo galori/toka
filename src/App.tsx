@@ -795,9 +795,9 @@ function Player({
         run(() => rotate(-90));
       } else if (event.key === "]") {
         run(() => rotate(90));
-      } else if (event.key === ",") {
+      } else if (event.key === "ArrowLeft") {
         run(() => skip(-10));
-      } else if (event.key === ".") {
+      } else if (event.key === "ArrowRight") {
         run(() => skip(10));
       } else if (event.key === "PageUp" && index > 0) {
         run(() => selectVideo(index - 1));
@@ -934,7 +934,7 @@ function Player({
           />
           <div className="player-transport">
             <ControlButton shortcut="PageUp" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
-            <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
+            <ControlButton shortcut="ArrowLeft" onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
             {/* Playing and pausing are one action whose meaning follows the
                 state, so they are one control rather than two, the way every
                 other player draws them. */}
@@ -946,7 +946,7 @@ function Player({
             >
               <span className={playingBack ? "pause-glyph" : "play-glyph"} aria-hidden="true" />
             </ControlButton>
-            <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
+            <ControlButton shortcut="ArrowRight" onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
             <ControlButton shortcut="PageDown" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
             <span className="time-display control-label">{formatTime(currentTime)} / {formatTime(duration)}</span>
             <div className="player-utilities">
