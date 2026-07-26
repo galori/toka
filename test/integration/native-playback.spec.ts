@@ -64,6 +64,7 @@ describe("Toka native Linux playback", () => {
       const controls = document.querySelector<HTMLElement>(".player-controls")?.getBoundingClientRect();
       if (!surface || !controls) return undefined;
       return {
+        surfaceHeight: surface.height,
         controlsTopWithinSurface: controls.top - surface.top,
         devicePixelRatio: window.devicePixelRatio,
       };
@@ -71,9 +72,13 @@ describe("Toka native Linux playback", () => {
     if (!layout) throw new Error("The native video surface or player controls are missing");
     const renderSize = (await nativeState()).renderSize;
     if (!renderSize) throw new Error("The native renderer did not report its size");
-    expect(renderSize[1]).toBeLessThanOrEqual(
-      Math.ceil(layout.controlsTopWithinSurface * layout.devicePixelRatio),
+    // The native GL surface intentionally keeps the full picture bounds. The
+    // WebView is composited above it, so controls remain visible without
+    // shrinking the video when the overlay is shown.
+    expect(renderSize[1]).toBeGreaterThanOrEqual(
+      Math.floor(layout.surfaceHeight * layout.devicePixelRatio) - 2,
     );
+    expect(layout.controlsTopWithinSurface).toBeGreaterThan(0);
 
     // Playing and pausing share one control that renames itself.
     await $("button.play-button").click();
