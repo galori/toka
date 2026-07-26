@@ -17,6 +17,9 @@ const utilityControls = [
   "Rotate left",
   "Rotate right",
   "Loop: playlist",
+  // The heading's playlist toggle is out of reach in fullscreen, so the overlay
+  // carries one of its own.
+  "Playlist",
   "Enter fullscreen",
 ];
 
