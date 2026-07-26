@@ -296,29 +296,44 @@ describe("Toka playlist interface", () => {
         };
       });
 
+    const cycleTo = async (label: string) => {
+      await $(".player-controls .loop-button").click();
+      await browser.waitUntil(async () => (await shade()).label === label, {
+        timeoutMsg: `The loop control never reached ${label}`,
+      });
+      return shade();
+    };
+    // The stylesheet transitions `color` over 140ms and getComputedStyle reports
+    // the animated value, so the colour is waited on rather than read once.
+    const settlesTo = (accent: boolean, previous: number[]) =>
+      browser.waitUntil(
+        async () => (String((await shade()).colour) === String(previous)) === accent,
+        {
+          timeoutMsg: accent
+            ? "The loop control lost the accent colour of the states that are on"
+            : "Loop off kept the accent colour of the states that are on",
+        },
+      );
+
     const playlist = await shade();
     expect(playlist.found).toBe(true);
     expect(playlist.label).toBe("Loop: playlist");
     expect(playlist.badge).toEqual([0, 0]);
+    const accent = playlist.colour;
 
-    await $(".player-controls .loop-button").click();
-    const one = await shade();
-    expect(one.label).toBe("Loop: this video");
+    const one = await cycleTo("Loop: this video");
     // The "1" between the arrows is what separates this state from the one
     // before it, so it has to be drawn and be big enough to read.
     expect(one.badge[0]).toBeGreaterThan(2);
     expect(one.badge[1]).toBeGreaterThan(4);
-    expect(one.colour).toEqual(playlist.colour);
+    await settlesTo(true, accent);
 
-    await $(".player-controls .loop-button").click();
-    const off = await shade();
-    expect(off.label).toBe("Loop: off");
+    const off = await cycleTo("Loop: off");
     expect(off.badge).toEqual([0, 0]);
     // Off is the plain control colour, the two that are on carry the accent.
-    expect(off.colour).not.toEqual(playlist.colour);
+    await settlesTo(false, accent);
 
-    await $(".player-controls .loop-button").click();
-    expect((await shade()).label).toBe("Loop: playlist");
+    await cycleTo("Loop: playlist");
   });
 
   it("keeps the chosen speed when the playlist moves to the next video", async () => {
