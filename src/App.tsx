@@ -215,7 +215,7 @@ const PLAYLIST_HIDE_DELAY = 800;
 // leaves, or until P is pressed again.
 type FullscreenPlaylist = "hidden" | "peek" | "held";
 
-const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
@@ -270,8 +270,10 @@ function ControlButton({
   children,
   ...rest
 }: { shortcut: string } & ButtonHTMLAttributes<HTMLButtonElement>) {
+  const { title, ...buttonProps } = rest;
+  const tooltip = title ?? (typeof buttonProps["aria-label"] === "string" ? buttonProps["aria-label"] : undefined);
   return (
-    <button type="button" className={className} aria-keyshortcuts={shortcut} {...rest}>
+    <button type="button" className={className} aria-keyshortcuts={shortcut} title={tooltip} {...buttonProps}>
       {children}
       <KeyHint shortcut={shortcut} />
     </button>
@@ -808,7 +810,7 @@ function Player({
             <BackArrowIcon />
             <Label>Back to results</Label>
           </ControlButton>
-          {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}><Label>Skip to next</Label></button> : null}
+          {index < videos.length - 1 ? <button type="button" className="playlist-button" title="Skip to next video" onClick={() => setIndex((current) => current + 1)}><Label>Skip to next</Label></button> : null}
         </div>
       </section>
     );
@@ -826,6 +828,7 @@ function Player({
           shortcut="P"
           className="playlist-toggle"
           aria-expanded={drawerOpen}
+          title="Toggle playlist"
           onClick={togglePlaylist}
         >
           <Label>Playlist</Label>
@@ -881,6 +884,7 @@ function Player({
           <input
             className="player-timeline"
             aria-label="Video timeline"
+            title="Video timeline"
             type="range"
             min="0"
             max={duration || 0}
@@ -927,6 +931,7 @@ function Player({
               {subtitles.length > 1 ? (
                 <select
                   aria-label="Subtitle track"
+                  title="Subtitle track"
                   value={subtitleIndex}
                   onChange={(event) => selectSubtitle(Number(event.currentTarget.value))}
                 >
@@ -942,6 +947,7 @@ function Player({
                 <select
                   aria-label="Playback speed"
                   aria-keyshortcuts="- ="
+                  title="Playback speed"
                   value={speed}
                   onChange={(event) => applySpeed(Number(event.currentTarget.value))}
                 >
@@ -1000,8 +1006,8 @@ function Player({
                     type="button"
                     className={itemIndex === index ? "active" : undefined}
                     aria-current={itemIndex === index ? "true" : undefined}
+                    title={`Play ${item.fileName}`}
                     onClick={() => selectVideo(itemIndex)}
-                    title={item.fileName}
                   >
                     <span className="playlist-marker" />
                     <span>{item.fileName}</span>
@@ -1070,7 +1076,7 @@ export default function App() {
             autoComplete="off"
             autoFocus
           />
-          {query ? <button type="button" className="clear-search" aria-label="Clear search" onClick={() => setQuery("")}>×</button> : <SearchIcon />}
+          {query ? <button type="button" className="clear-search" aria-label="Clear search" title="Clear search" onClick={() => setQuery("")}>×</button> : <SearchIcon />}
         </div>
       </form>
 
@@ -1092,6 +1098,7 @@ export default function App() {
               <button
                 type="button"
                 className="playlist-button"
+                title="Play all videos"
                 onClick={() => setPlaying({ videos: page.results, startIndex: 0 })}
               >
                 <Label>Play all</Label>
@@ -1107,7 +1114,7 @@ export default function App() {
                     type="button"
                     className="video-tile"
                     aria-label={`Play ${video.fileName}`}
-                    title={video.fileName}
+                    title={`Play ${video.fileName}`}
                     onClick={() => setPlaying({ videos: page.results, startIndex: position })}
                   >
                     <span className="video-art"><VideoIcon /></span>
@@ -1125,6 +1132,7 @@ export default function App() {
                 type="button"
                 disabled={page.page <= 1}
                 aria-label="Previous page"
+                title="Previous page"
                 onClick={() => void runSearch(page.query, page.page - 1)}
               >
                 Previous
@@ -1134,6 +1142,7 @@ export default function App() {
                 type="button"
                 disabled={page.page >= page.totalPages}
                 aria-label="Next page"
+                title="Next page"
                 onClick={() => void runSearch(page.query, page.page + 1)}
               >
                 Next

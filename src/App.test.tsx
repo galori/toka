@@ -411,7 +411,7 @@ test("steps playback speed with the keyboard", async () => {
   // The ends of the range hold rather than wrapping around.
   fireEvent.keyDown(window, { key: "-" });
   fireEvent.keyDown(window, { key: "-" });
-  expect(speed).toHaveValue("0.5");
+  expect(speed).toHaveValue("0.25");
 });
 
 test("presents a dedicated unsupported-format state", async () => {
@@ -845,6 +845,63 @@ test("changes playback speed for web video", async () => {
   const video = await screen.findByLabelText("Playing clip.mp4");
   await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
   expect(video).toHaveProperty("playbackRate", 1.5);
+});
+
+test("offers tooltips for every actionable result and player control", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 2,
+      results: [
+        { id: "video-1", fileName: "clip.mp4", extension: "mp4" },
+        { id: "video-2", fileName: "other.mp4", extension: "mp4" },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  expect(screen.getByRole("button", { name: "Clear search" })).toHaveAttribute("title", "Clear search");
+  expect(screen.getByRole("button", { name: "Play all" })).toHaveAttribute("title", "Play all videos");
+  expect(screen.getByRole("button", { name: "Play clip.mp4" })).toHaveAttribute("title", "Play clip.mp4");
+  expect(screen.getByRole("button", { name: "Previous page" })).toHaveAttribute("title", "Previous page");
+  expect(screen.getByRole("button", { name: "Next page" })).toHaveAttribute("title", "Next page");
+
+  await user.click(screen.getByRole("button", { name: "Play clip.mp4" }));
+  const controls = await screen.findByLabelText("Video controls");
+  for (const control of controls.querySelectorAll<HTMLButtonElement | HTMLSelectElement>("button, select")) {
+    expect(control, `${control.getAttribute("aria-label")} has no tooltip`).toHaveAttribute("title");
+    expect(control.title).not.toBe("");
+  }
+  expect(screen.getByRole("button", { name: "Back to results" })).toHaveAttribute("title", "Back to results");
+  expect(screen.getByRole("button", { name: "clip.mp4" })).toHaveAttribute("title", "Play clip.mp4");
+});
+
+test("supports playback speeds from 0.1x through 4x", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const speed = screen.getByRole("combobox", { name: "Playback speed" });
+
+  expect(speed).toHaveValue("1");
+  expect(speed.querySelector("option:first-child")).toHaveValue("0.1");
+  expect(speed.querySelector("option:last-child")).toHaveValue("4");
+  await user.selectOptions(speed, "0.1");
+  expect(speed).toHaveValue("0.1");
+  fireEvent.keyDown(window, { key: "=" });
+  expect(speed).toHaveValue("0.25");
+  await user.selectOptions(speed, "4");
+  expect(speed).toHaveValue("4");
+  fireEvent.keyDown(window, { key: "-" });
+  expect(speed).toHaveValue("3");
 });
 
 test("skips web playback by ten seconds", async () => {
