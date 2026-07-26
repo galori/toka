@@ -16,6 +16,7 @@ import {
   setNativeVideoBounds,
   stopNativeVideo,
   subtitleCues,
+  videoThumbnail,
   type PreparedVideo,
   type SearchPage,
   type VideoResult,
@@ -93,12 +94,27 @@ function VideoIcon() {
 }
 
 function VideoThumbnail({ video }: { video: VideoResult }) {
+  const container = useRef<HTMLSpanElement>(null);
+  const [thumbnailPath, setThumbnailPath] = useState(video.thumbnailPath);
+
+  useEffect(() => {
+    if (thumbnailPath || !container.current || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void videoThumbnail(video.id).then(setThumbnailPath).catch(() => {});
+    }, { rootMargin: "200px" });
+    observer.observe(container.current);
+    return () => observer.disconnect();
+  }, [thumbnailPath, video.id]);
+
   return (
     <span
+      ref={container}
       className="video-art"
-      style={video.thumbnailPath ? { backgroundImage: `url(${convertFileSrc(video.thumbnailPath)})` } : undefined}
+      style={thumbnailPath ? { backgroundImage: `url(${convertFileSrc(thumbnailPath)})` } : undefined}
     >
-      {video.thumbnailPath ? <span className="thumbnail-overlay" aria-hidden="true" /> : <VideoIcon />}
+      {thumbnailPath ? <span className="thumbnail-overlay" aria-hidden="true" /> : <VideoIcon />}
     </span>
   );
 }
@@ -1083,9 +1099,11 @@ export default function App() {
   // them, positioned at the one that was chosen.
   const [playing, setPlaying] = useState<{ videos: VideoResult[]; startIndex: number }>();
   const [playlistLoading, setPlaylistLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const requestNumber = useRef(0);
+  const loadMoreMarker = useRef<HTMLDivElement>(null);
 
   const runSearch = async (submittedQuery: string, requestedPage: number) => {
     const trimmed = submittedQuery.trim();
@@ -1107,28 +1125,50 @@ export default function App() {
     }
   };
 
+  const loadMore = async () => {
+    if (!page || loadingMore || page.results.length >= page.totalResults) return;
+    const loadedPages = page.page;
+    if (loadedPages >= page.totalPages) return;
+    setLoadingMore(true);
+    try {
+      const next = await searchVideos(page.query, loadedPages + 1);
+      setPage((current) => current && current.query === next.query
+        ? { ...next, results: [...current.results, ...next.results] }
+        : current);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!page || !loadMoreMarker.current || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) void loadMore();
+    }, { rootMargin: "400px" });
+    observer.observe(loadMoreMarker.current);
+    return () => observer.disconnect();
+  }, [page, loadingMore]);
+
   const playSearchResults = async (position: number) => {
     if (!page) return;
     setPlaylistLoading(true);
     setError(undefined);
     try {
-      const totalResults = page.totalResults || page.results.length;
       const totalPages = Math.max(1, page.totalPages || 1);
-      const needsAdditionalPages = totalPages > 1 && page.results.length < totalResults;
+      const loadedPages = Math.max(1, page.page);
+      const needsAdditionalPages = page.results.length < page.totalResults && totalPages > loadedPages;
       const pages = needsAdditionalPages
         ? await Promise.all(
-            Array.from({ length: totalPages }, (_, offset) => {
-              const requestedPage = offset + 1;
-              return requestedPage === page.page
-                ? Promise.resolve(page.results)
-                : searchVideos(page.query, requestedPage).then((response) => response?.results ?? []);
-            }),
+            Array.from({ length: totalPages - loadedPages }, (_, offset) =>
+              searchVideos(page.query, loadedPages + offset + 1).then((response) => response?.results ?? [])),
           )
-        : [page.results];
-      const videos = pages.flat();
+        : [];
+      const videos = [page.results, ...pages].flat();
       setPlaying({
         videos,
-        startIndex: (page.page - 1) * page.pageSize + position,
+        startIndex: position,
       });
     } catch (reason) {
       setError(errorMessage(reason));
@@ -1187,7 +1227,7 @@ export default function App() {
                 <Label>{playlistLoading ? "Loading playlist…" : "Play all"}</Label>
               </button>
             ) : null}
-            {page.totalPages > 0 ? <p>Page {page.page} of {page.totalPages}</p> : null}
+            <p>{page.results.length} of {page.totalResults} loaded</p>
           </div>
           {page.results.length ? (
             <ul className="video-grid" aria-label="Video results">
@@ -1209,28 +1249,10 @@ export default function App() {
           ) : (
             <p className="message">No matching videos found.</p>
           )}
-          {page.totalPages > 1 ? (
-            <nav className="pagination" aria-label="Search result pages">
-              <button
-                type="button"
-                disabled={page.page <= 1}
-                aria-label="Previous page"
-                title="Previous page"
-                onClick={() => void runSearch(page.query, page.page - 1)}
-              >
-                Previous
-              </button>
-              <span>Page {page.page} of {page.totalPages}</span>
-              <button
-                type="button"
-                disabled={page.page >= page.totalPages}
-                aria-label="Next page"
-                title="Next page"
-                onClick={() => void runSearch(page.query, page.page + 1)}
-              >
-                Next
-              </button>
-            </nav>
+          {page.results.length < page.totalResults ? (
+            <div ref={loadMoreMarker} className="load-more-marker" aria-live="polite">
+              {loadingMore ? "Loading more videos…" : "Scroll for more videos"}
+            </div>
           ) : null}
         </section>
       ) : null}
