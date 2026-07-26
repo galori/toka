@@ -306,10 +306,13 @@ test("shows its keyboard shortcut on every control that has one", async () => {
   expect(rotateRight).toHaveAttribute("aria-keyshortcuts", "]");
   expect(rotateRight.querySelector(".key-hint")).toHaveTextContent("]");
 
-  // Chords are shown as glyphs rather than raw DOM key names.
+  // Hints read as key names rather than raw DOM ones.
   expect(
     screen.getByRole("button", { name: "Next video" }).querySelector(".key-hint"),
-  ).toHaveTextContent("⇧→");
+  ).toHaveTextContent("PgDn");
+  expect(
+    screen.getByRole("button", { name: "Previous video" }).querySelector(".key-hint"),
+  ).toHaveTextContent("PgUp");
   expect(
     screen.getByRole("button", { name: "Back to results" }).querySelector(".key-hint"),
   ).toHaveTextContent("Esc");
@@ -580,9 +583,9 @@ test("keyboard shortcuts control player actions without hijacking search input",
 
   fireEvent.keyDown(window, { key: "]" });
   expect(video).toHaveStyle({ transform: "rotate(90deg)" });
-  fireEvent.keyDown(window, { key: "ArrowRight", shiftKey: true });
+  fireEvent.keyDown(window, { key: "PageDown" });
   expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
-  fireEvent.keyDown(window, { key: "ArrowLeft", shiftKey: true });
+  fireEvent.keyDown(window, { key: "PageUp" });
   expect(await screen.findByLabelText("Playing clip-1.mp4")).toBeVisible();
   fireEvent.keyDown(window, { key: "l" });
   expect(screen.getByRole("button", { name: "Loop playlist" })).toHaveAttribute("aria-pressed", "true");
@@ -920,6 +923,42 @@ test("draws the heading controls without font-dependent glyphs", async () => {
   for (const name of ["Previous video", "Next video"]) {
     expect(screen.getByRole("button", { name }).querySelector("svg.control-icon")).toBeInTheDocument();
   }
+});
+
+test("enables the skip controls everywhere except the ends of the playlist", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Playing playlist-1.mp4");
+
+  const previous = () => screen.getByRole("button", { name: "Previous video" });
+  const next = () => screen.getByRole("button", { name: "Next video" });
+  expect(previous()).toBeDisabled();
+  expect(next()).toBeEnabled();
+
+  // In the middle of a playlist both directions are available.
+  fireEvent.keyDown(window, { key: "PageDown" });
+  await screen.findByLabelText("Playing playlist-2.mp4");
+  expect(previous()).toBeEnabled();
+  expect(next()).toBeEnabled();
+
+  fireEvent.keyDown(window, { key: "PageDown" });
+  await screen.findByLabelText("Playing playlist-3.mp4");
+  expect(previous()).toBeEnabled();
+  expect(next()).toBeDisabled();
+
+  fireEvent.keyDown(window, { key: "PageUp" });
+  expect(await screen.findByLabelText("Playing playlist-2.mp4")).toBeVisible();
 });
 
 test("wraps every button label so the stylesheet can trim it", async () => {

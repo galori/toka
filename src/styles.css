@@ -396,8 +396,12 @@ button:focus-visible {
   stroke-linejoin: round;
 }
 .control-icon.solid { fill: currentColor; stroke: none; }
-/* Disabled ends of a playlist still have to be legible, not nearly invisible. */
-.player-controls button:disabled { opacity: 0.55; }
+/* An icon faded by opacity reads as badly drawn rather than as unavailable,
+   because the shape blurs into the picture behind it. Dimming the colour at
+   full opacity keeps the edges crisp and puts real contrast between the two
+   ends of a playlist and the middle of one. */
+.player-controls button:disabled { opacity: 1; color: oklch(0.42 0.015 60); }
+.player-controls button:disabled .key-hint { color: oklch(0.34 0.012 60); }
 .player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 /* The drawer comes later in the markup, so without an explicit order it paints
    over the right of the overlay and buries the rotate, loop and fullscreen

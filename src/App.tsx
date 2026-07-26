@@ -191,7 +191,8 @@ const KEY_GLYPHS: Record<string, string> = {
   Space: "Space",
   ArrowLeft: "←",
   ArrowRight: "→",
-  Shift: "⇧",
+  PageUp: "PgUp",
+  PageDown: "PgDn",
 };
 
 function KeyHint({ shortcut }: { shortcut: string }) {
@@ -631,9 +632,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         run(() => skip(-10));
       } else if (event.key === ".") {
         run(() => skip(10));
-      } else if (event.shiftKey && event.key === "ArrowLeft" && index > 0) {
+      } else if (event.key === "PageUp" && index > 0) {
         run(() => selectVideo(index - 1));
-      } else if (event.shiftKey && event.key === "ArrowRight" && index < videos.length - 1) {
+      } else if (event.key === "PageDown" && index < videos.length - 1) {
         run(() => selectVideo(index + 1));
       } else if (event.key === "-") {
         run(() => stepSpeed(-1));
@@ -757,7 +758,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             }}
           />
           <div className="player-transport">
-            <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
+            <ControlButton shortcut="PageUp" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
             <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
             <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
               <span className="play-glyph" aria-hidden="true" />
@@ -766,7 +767,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               <span className="pause-glyph" aria-hidden="true" />
             </ControlButton>
             <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
-            <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
+            <ControlButton shortcut="PageDown" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
             <span className="time-display control-label">{formatTime(currentTime)} / {formatTime(duration)}</span>
             <div className="player-utilities">
               <ControlButton

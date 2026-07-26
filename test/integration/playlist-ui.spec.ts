@@ -178,6 +178,44 @@ describe("Toka playlist interface", () => {
     }
   });
 
+  it("tells a disabled skip control apart from an enabled one", async () => {
+    // At the head of a playlist "Previous video" is off and "Next video" is on.
+    // Fading by opacity made the two nearly indistinguishable against the
+    // picture, so the difference is measured as rendered luminance.
+    const shades = await browser.execute(() => {
+      // Painted onto black through a canvas rather than parsed: the stylesheet
+      // is written in oklch, and only the engine can say what that resolves to.
+      function luminance(selector: string) {
+        const button = document.querySelector<HTMLElement>(selector);
+        if (!button) return undefined;
+        const style = getComputedStyle(button);
+        const canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        const context = canvas.getContext("2d");
+        if (!context) return undefined;
+        context.fillStyle = "#000";
+        context.fillRect(0, 0, 1, 1);
+        context.globalAlpha = Number(style.opacity);
+        context.fillStyle = style.color;
+        context.fillRect(0, 0, 1, 1);
+        const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+        return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+      }
+      return {
+        off: luminance('.player-transport button[aria-label="Previous video"]'),
+        on: luminance('.player-transport button[aria-label="Next video"]'),
+        disabled: document
+          .querySelector('.player-transport button[aria-label="Previous video"]')
+          ?.hasAttribute("disabled"),
+      };
+    });
+
+    expect(shades.disabled).toBe(true);
+    if (shades.off === undefined || shades.on === undefined) throw new Error("No skip controls found");
+    expect(shades.on - shades.off).toBeGreaterThan(0.25);
+  });
+
   it("gives the heading buttons a single height", async () => {
     const heights = await browser.execute(() =>
       [".back-button", ".playlist-toggle"].map(
