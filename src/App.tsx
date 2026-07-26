@@ -103,21 +103,24 @@ function SearchIcon() {
 // Text-glyph icons (⏮ ⌕ ↶ …) fall back to whichever font a Linux system has
 // installed for that codepoint, which can render far smaller and thinner
 // than the same character on macOS. Drawing these as SVG keeps their size
-// and weight identical everywhere.
+// and weight identical everywhere. The skip icons are filled rather than
+// stroked on top of that: a 2-unit stroke in a 24-unit viewBox lands on less
+// than a device pixel here, which WebKitGTK renders as a grey smear beside the
+// solid triangle it sits next to.
 function PreviousIcon() {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
-      <polygon points="19 20 9 12 19 4 19 20" fill="currentColor" stroke="none" />
-      <line x1="5" y1="19" x2="5" y2="5" />
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon solid">
+      <polygon points="20 19.5 8.5 12 20 4.5 20 19.5" />
+      <rect x="4" y="4.5" width="3" height="15" rx="1.5" />
     </svg>
   );
 }
 
 function NextIcon() {
   return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
-      <polygon points="5 4 15 12 5 20 5 4" fill="currentColor" stroke="none" />
-      <line x1="19" y1="5" x2="19" y2="19" />
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon solid">
+      <polygon points="4 4.5 15.5 12 4 19.5 4 4.5" />
+      <rect x="17" y="4.5" width="3" height="15" rx="1.5" />
     </svg>
   );
 }
@@ -163,6 +166,15 @@ function FullscreenExitIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
       <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3" />
+    </svg>
+  );
+}
+
+function BackArrowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="back-arrow">
+      <path d="M10.5 5 3.5 12l7 7" />
+      <path d="M3.5 12h17" />
     </svg>
   );
 }
@@ -235,6 +247,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const playerControls = useRef<HTMLDivElement>(null);
   const pointerOverControls = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
+  const playlistDrawer = useRef<HTMLElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(0);
   const [prepared, setPrepared] = useState<PreparedVideo>();
@@ -254,6 +267,13 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
   const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
   const video = videos[index];
+  // Speed is a choice about the sitting rather than about one file, so it
+  // outlives each video. Read through a ref so loading the next one does not
+  // have to depend on it and restart playback whenever it changes.
+  const chosenSpeed = useRef(speed);
+  useEffect(() => {
+    chosenSpeed.current = speed;
+  }, [speed]);
 
   useEffect(() => {
     let active = true;
@@ -262,7 +282,6 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
-    setSpeed(1);
     setPlayingBack(false);
     setRotation(0);
     setNativeBaseRotation(0);
@@ -279,6 +298,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           await loadNativeVideo(result.filePath);
           const baseRotation = await nativeVideoRotation();
           if (active) setNativeBaseRotation(baseRotation);
+          // mpv starts every file at 1x.
+          if (chosenSpeed.current !== 1) await setNativeSpeed(chosenSpeed.current);
           await setNativePaused(false);
           if (active) setPlayingBack(true);
         }
@@ -297,6 +318,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   }, [video.id]);
 
   const native = prepared?.playbackBackend === "native";
+  const drawerOpen = videos.length > 1 && playlistOpen;
 
   const subtitles = useMemo<SubtitleOption[]>(() => {
     if (native) return nativeSubtitles;
@@ -324,6 +346,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
       const controls = playerControls.current?.getBoundingClientRect();
+      const drawer = playlistDrawer.current?.getBoundingClientRect();
       // GTK overlays the native mpv surface above the WebView, irrespective of
       // CSS z-index. Keep that surface out of the HTML controls' region while
       // they are visible so Linux composites the controls instead of video
@@ -332,12 +355,17 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         controls && !controlsIdle
           ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
           : bounds.height;
+      // The playlist drawer is overlaid the same way, down the right-hand edge,
+      // and disappears behind the picture unless the surface stops short of it.
+      const visibleWidth = drawer
+        ? Math.max(1, Math.min(bounds.width, drawer.left - bounds.left))
+        : bounds.width;
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
-        width: Math.round(bounds.width),
+        width: Math.round(visibleWidth),
         height: Math.round(visibleHeight),
-        visible: bounds.width > 0 && visibleHeight > 0,
+        visible: visibleWidth > 0 && visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -380,7 +408,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, index, loop, native, videos.length]);
+  }, [controlsIdle, index, loop, native, playlistOpen, videos.length]);
 
   const play = () => {
     if (native) {
@@ -629,7 +657,10 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         <p>{video.fileName}</p>
         <p role="alert" className="sr-only">{error}</p>
         <div className="error-actions">
-          <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">← Back to results</ControlButton>
+          <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">
+            <BackArrowIcon />
+            Back to results
+          </ControlButton>
           {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}>Skip to next</button> : null}
         </div>
       </section>
@@ -640,7 +671,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
     <section className="player-view" aria-label={`Player for ${video.fileName}`}>
       <div className="player-heading">
         <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">
-          ← Back
+          <BackArrowIcon />
+          Back
         </ControlButton>
         <h1 title={video.fileName}>{video.fileName}</h1>
         {videos.length > 1 ? (
@@ -656,149 +688,151 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       </div>
 
       {error ? <p role="alert" className="message error">{error}</p> : null}
-      {!prepared && !error ? <p className="message">Preparing video…</p> : null}
-      {prepared ? (
-        <div ref={playerShell} className={controlsIdle ? "player-shell idle" : "player-shell"}>
-          {native ? (
-            <div ref={nativeSurface} className="native-video" aria-label={`Playing ${video.fileName}`} />
-          ) : (
-            <video
-              ref={element}
-              src={playbackSource(prepared.filePath)}
-              aria-label={`Playing ${video.fileName}`}
-              style={{ transform: `rotate(${rotation}deg)` }}
-              onLoadedMetadata={(event) => {
-                setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
-                event.currentTarget.playbackRate = speed;
+      {/* The shell outlives each video: it is the element the browser promotes
+          to fullscreen, and unmounting it between playlist items dropped the
+          window back out of fullscreen. */}
+      <div ref={playerShell} className={controlsIdle ? "player-shell idle" : "player-shell"}>
+        {!prepared ? (
+          <p className="message preparing-video">Preparing video…</p>
+        ) : native ? (
+          <div ref={nativeSurface} className="native-video" aria-label={`Playing ${video.fileName}`} />
+        ) : (
+          <video
+            ref={element}
+            src={playbackSource(prepared.filePath)}
+            aria-label={`Playing ${video.fileName}`}
+            style={{ transform: `rotate(${rotation}deg)` }}
+            onLoadedMetadata={(event) => {
+              setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
+              event.currentTarget.playbackRate = speed;
+              play();
+            }}
+            onPlay={() => setPlayingBack(true)}
+            onPause={() => setPlayingBack(false)}
+            onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            onEnded={() => {
+              if (index < videos.length - 1) setIndex((current) => current + 1);
+              else if (loop && videos.length > 1) setIndex(0);
+              else if (loop && element.current) {
+                element.current.currentTime = 0;
                 play();
-              }}
-              onPlay={() => setPlayingBack(true)}
-              onPause={() => setPlayingBack(false)}
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-              onEnded={() => {
-                if (index < videos.length - 1) setIndex((current) => current + 1);
-                else if (loop && videos.length > 1) setIndex(0);
-                else if (loop && element.current) {
-                  element.current.currentTime = 0;
-                  play();
-                }
-              }}
-              onError={() => setError("This video format or codec is not supported on this computer.")}
-            >
-            </video>
-          )}
-          <div
-            ref={playerControls}
-            className={controlsIdle ? "player-controls idle" : "player-controls"}
-            aria-label="Video controls"
-            onMouseEnter={() => {
-              pointerOverControls.current = true;
+              }
             }}
-            onMouseLeave={() => {
-              pointerOverControls.current = false;
-            }}
+            onError={() => setError("This video format or codec is not supported on this computer.")}
           >
-            <input
-              className="player-timeline"
-              aria-label="Video timeline"
-              type="range"
-              min="0"
-              max={duration || 0}
-              step="0.1"
-              value={Math.min(currentTime, duration || 0)}
-              onChange={(event) => {
-                const nextTime = Number(event.currentTarget.value);
-                if (native) void seekNativeVideo(nextTime).catch((reason: unknown) => setError(errorMessage(reason)));
-                else if (element.current) element.current.currentTime = nextTime;
-                setCurrentTime(nextTime);
-              }}
-            />
-            <div className="player-transport">
-              <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
-              <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds">−10</ControlButton>
-              <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
-                <span className="play-glyph" aria-hidden="true" />
+          </video>
+        )}
+        <div
+          ref={playerControls}
+          className={controlsIdle ? "player-controls idle" : "player-controls"}
+          aria-label="Video controls"
+          onMouseEnter={() => {
+            pointerOverControls.current = true;
+          }}
+          onMouseLeave={() => {
+            pointerOverControls.current = false;
+          }}
+        >
+          <input
+            className="player-timeline"
+            aria-label="Video timeline"
+            type="range"
+            min="0"
+            max={duration || 0}
+            step="0.1"
+            value={Math.min(currentTime, duration || 0)}
+            onChange={(event) => {
+              const nextTime = Number(event.currentTarget.value);
+              if (native) void seekNativeVideo(nextTime).catch((reason: unknown) => setError(errorMessage(reason)));
+              else if (element.current) element.current.currentTime = nextTime;
+              setCurrentTime(nextTime);
+            }}
+          />
+          <div className="player-transport">
+            <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
+            <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds">−10</ControlButton>
+            <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
+              <span className="play-glyph" aria-hidden="true" />
+            </ControlButton>
+            <ControlButton shortcut="Space" onClick={pause} aria-label="Pause">
+              <span className="pause-glyph" aria-hidden="true" />
+            </ControlButton>
+            <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds">+10</ControlButton>
+            <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
+            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+            <div className="player-utilities">
+              <ControlButton
+                shortcut="S"
+                onClick={toggleSubtitles}
+                disabled={subtitles.length === 0}
+                aria-label="Subtitles"
+                aria-pressed={subtitleIndex >= 0}
+              >
+                CC
               </ControlButton>
-              <ControlButton shortcut="Space" onClick={pause} aria-label="Pause">
-                <span className="pause-glyph" aria-hidden="true" />
+              {subtitles.length > 1 ? (
+                <select
+                  aria-label="Subtitle track"
+                  value={subtitleIndex}
+                  onChange={(event) => selectSubtitle(Number(event.currentTarget.value))}
+                >
+                  <option value={-1}>Off</option>
+                  {subtitles.map((option, position) => (
+                    <option key={option.label + position} value={position}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
+              <span className="labelled-control">
+                <select
+                  aria-label="Playback speed"
+                  aria-keyshortcuts="- ="
+                  value={speed}
+                  onChange={(event) => applySpeed(Number(event.currentTarget.value))}
+                >
+                  {SPEEDS.map((value) => <option key={value} value={value}>{value}×</option>)}
+                </select>
+                <KeyHint shortcut="- =" />
+              </span>
+              <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left"><RotateLeftIcon /></ControlButton>
+              <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right"><RotateRightIcon /></ControlButton>
+              <ControlButton
+                shortcut="L"
+                onClick={() => setLoop((enabled) => !enabled)}
+                aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
+                aria-pressed={loop}
+              >
+                <LoopIcon />
               </ControlButton>
-              <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds">+10</ControlButton>
-              <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
-              <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
-              <div className="player-utilities">
-                <ControlButton
-                  shortcut="S"
-                  onClick={toggleSubtitles}
-                  disabled={subtitles.length === 0}
-                  aria-label="Subtitles"
-                  aria-pressed={subtitleIndex >= 0}
-                >
-                  CC
-                </ControlButton>
-                {subtitles.length > 1 ? (
-                  <select
-                    aria-label="Subtitle track"
-                    value={subtitleIndex}
-                    onChange={(event) => selectSubtitle(Number(event.currentTarget.value))}
-                  >
-                    <option value={-1}>Off</option>
-                    {subtitles.map((option, position) => (
-                      <option key={option.label + position} value={position}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
-                <span className="labelled-control">
-                  <select
-                    aria-label="Playback speed"
-                    aria-keyshortcuts="- ="
-                    value={speed}
-                    onChange={(event) => applySpeed(Number(event.currentTarget.value))}
-                  >
-                    {SPEEDS.map((value) => <option key={value} value={value}>{value}×</option>)}
-                  </select>
-                  <KeyHint shortcut="- =" />
-                </span>
-                <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left"><RotateLeftIcon /></ControlButton>
-                <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right"><RotateRightIcon /></ControlButton>
-                <ControlButton
-                  shortcut="L"
-                  onClick={() => setLoop((enabled) => !enabled)}
-                  aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
-                  aria-pressed={loop}
-                >
-                  <LoopIcon />
-                </ControlButton>
-                <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
-                  {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
-                </ControlButton>
-              </div>
+              <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
+                {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+              </ControlButton>
             </div>
           </div>
-          {videos.length > 1 && playlistOpen ? (
-            <aside className="playlist-drawer" aria-label="Playlist">
-              <h2>Up next</h2>
-              <ol>
-                {videos.map((item, itemIndex) => (
-                  <li key={item.id}>
-                    <button
-                      type="button"
-                      className={itemIndex === index ? "active" : undefined}
-                      aria-current={itemIndex === index ? "true" : undefined}
-                      onClick={() => selectVideo(itemIndex)}
-                      title={item.fileName}
-                    >
-                      <span className="playlist-marker" />
-                      <span>{item.fileName}</span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
-            </aside>
-          ) : null}
         </div>
-      ) : null}
+        {drawerOpen ? (
+          <aside ref={playlistDrawer} className="playlist-drawer" aria-label="Playlist">
+            <h2>Up next</h2>
+            <ol>
+              {videos.map((item, itemIndex) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    className={itemIndex === index ? "active" : undefined}
+                    aria-current={itemIndex === index ? "true" : undefined}
+                    onClick={() => selectVideo(itemIndex)}
+                    title={item.fileName}
+                  >
+                    <span className="playlist-marker" />
+                    <span>{item.fileName}</span>
+                  </button>
+                </li>
+              ))}
+            </ol>
+          </aside>
+        ) : null}
+      </div>
       {videos.length > 1 ? (
         <p className="playlist-status" aria-live="polite">
           Playlist video {index + 1} of {videos.length}

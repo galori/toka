@@ -16,6 +16,7 @@ export const config: Options.Testrunner = {
   specs: [
     "./test/integration/happy-path.spec.ts",
     "./test/integration/player-controls.spec.ts",
+    "./test/integration/playlist-ui.spec.ts",
     "./test/integration/subtitles.spec.ts",
     "./test/integration/fullscreen.spec.ts",
   ],
