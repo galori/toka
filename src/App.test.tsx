@@ -1491,7 +1491,7 @@ test("draws the heading controls without font-dependent glyphs", async () => {
   }
 });
 
-test("enables the skip controls everywhere except the ends of the playlist", async () => {
+test("wraps playlist navigation at both ends", async () => {
   const results = [1, 2, 3].map((number) => ({
     id: `video-${number}`,
     fileName: `playlist-${number}.mp4`,
@@ -1509,7 +1509,7 @@ test("enables the skip controls everywhere except the ends of the playlist", asy
 
   const previous = () => screen.getByRole("button", { name: "Previous video" });
   const next = () => screen.getByRole("button", { name: "Next video" });
-  expect(previous()).toBeDisabled();
+  expect(previous()).toBeEnabled();
   expect(next()).toBeEnabled();
 
   // In the middle of a playlist both directions are available.
@@ -1521,10 +1521,13 @@ test("enables the skip controls everywhere except the ends of the playlist", asy
   fireEvent.keyDown(window, { key: "PageDown" });
   await screen.findByLabelText("Playing playlist-3.mp4");
   expect(previous()).toBeEnabled();
-  expect(next()).toBeDisabled();
+  expect(next()).toBeEnabled();
+
+  fireEvent.keyDown(window, { key: "PageDown" });
+  expect(await screen.findByLabelText("Playing playlist-1.mp4")).toBeVisible();
 
   fireEvent.keyDown(window, { key: "PageUp" });
-  expect(await screen.findByLabelText("Playing playlist-2.mp4")).toBeVisible();
+  expect(await screen.findByLabelText("Playing playlist-3.mp4")).toBeVisible();
 });
 
 test("wraps every button label so the stylesheet can trim it", async () => {
