@@ -429,6 +429,9 @@ describe("Toka playlist interface", () => {
     await browser.execute(() => {
       const video = document.querySelector<HTMLVideoElement>("video");
       if (!video) throw new Error("The video element is missing");
+      // Held still, so a real timeupdate cannot land in the middle of the
+      // measurement and move the bar back off the end.
+      video.pause();
       video.currentTime = Math.max(0, video.duration * 0.9);
       video.dispatchEvent(new Event("timeupdate"));
     });
