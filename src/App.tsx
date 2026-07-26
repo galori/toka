@@ -329,6 +329,7 @@ function Player({
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
+  const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   const [controlsIdle, setControlsIdle] = useState(false);
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
@@ -823,6 +824,8 @@ function Player({
         run(togglePlaylist);
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
+      } else if (event.key.toLowerCase() === "i") {
+        run(() => setShowFullscreenInfo((visible) => !visible));
       } else if (event.key === "Escape") {
         run(fullscreen ? toggleFullscreen : onBack);
       }
@@ -905,6 +908,12 @@ function Player({
           >
           </video>
         )}
+        {fullscreen && showFullscreenInfo ? (
+          <div className="fullscreen-info" role="region" aria-label="Fullscreen video information">
+            <div className="fullscreen-file-path">{prepared?.filePath ?? video.fileName}</div>
+            <div className="fullscreen-time">{formatTime(currentTime)} / {formatTime(duration)}</div>
+          </div>
+        ) : null}
         <div
           ref={playerControls}
           className={controlsIdle ? "player-controls idle" : "player-controls"}
@@ -1029,6 +1038,14 @@ function Player({
               </ControlButton>
               <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
+              </ControlButton>
+              <ControlButton
+                shortcut="I"
+                onClick={() => setShowFullscreenInfo((visible) => !visible)}
+                aria-label={showFullscreenInfo ? "Hide fullscreen information" : "Show fullscreen information"}
+                aria-pressed={showFullscreenInfo}
+              >
+                <Label>Info</Label>
               </ControlButton>
             </div>
           </div>
