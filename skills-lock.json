@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "design-compare": {
+      "source": "artemnovichkov/skills",
+      "sourceType": "github",
+      "skillPath": "skills/design-compare/SKILL.md",
+      "computedHash": "544af5dd3e2935c56af56f13ae4a69ae5797df09a8703a706a796f8d45b0540f"
+    },
     "diagnosing-bugs": {
       "source": "mattpocock/skills",
       "sourceType": "github",

@@ -341,6 +341,16 @@ button:focus-visible {
 }
 .play-glyph { width: 0; height: 0; margin-left: 3px; border-block: 9px solid transparent; border-left: 14px solid currentColor; }
 .pause-glyph { width: 14px; height: 16px; border-left: 4px solid currentColor; border-right: 4px solid currentColor; }
+.control-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 
 /* The shortcut sits beside the icon it belongs to, muted enough to read as a
@@ -404,6 +414,7 @@ button:focus-visible {
   padding: 10px;
   background: transparent;
   color: oklch(0.65 0.02 60);
+  font-size: 13px;
   text-align: left;
 }
 .playlist-drawer button.active {
