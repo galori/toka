@@ -1082,6 +1082,7 @@ export default function App() {
   // Playback is always a playlist: choosing one result starts the whole page of
   // them, positioned at the one that was chosen.
   const [playing, setPlaying] = useState<{ videos: VideoResult[]; startIndex: number }>();
+  const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const requestNumber = useRef(0);
@@ -1103,6 +1104,36 @@ export default function App() {
       }
     } finally {
       if (currentRequest === requestNumber.current) setLoading(false);
+    }
+  };
+
+  const playSearchResults = async (position: number) => {
+    if (!page) return;
+    setPlaylistLoading(true);
+    setError(undefined);
+    try {
+      const totalResults = page.totalResults || page.results.length;
+      const totalPages = Math.max(1, page.totalPages || 1);
+      const needsAdditionalPages = totalPages > 1 && page.results.length < totalResults;
+      const pages = needsAdditionalPages
+        ? await Promise.all(
+            Array.from({ length: totalPages }, (_, offset) => {
+              const requestedPage = offset + 1;
+              return requestedPage === page.page
+                ? Promise.resolve(page.results)
+                : searchVideos(page.query, requestedPage).then((response) => response?.results ?? []);
+            }),
+          )
+        : [page.results];
+      const videos = pages.flat();
+      setPlaying({
+        videos,
+        startIndex: (page.page - 1) * page.pageSize + position,
+      });
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setPlaylistLoading(false);
     }
   };
 
@@ -1150,9 +1181,10 @@ export default function App() {
                 type="button"
                 className="playlist-button"
                 title="Play all videos"
-                onClick={() => setPlaying({ videos: page.results, startIndex: 0 })}
+                disabled={playlistLoading}
+                onClick={() => void playSearchResults(0)}
               >
-                <Label>Play all</Label>
+                <Label>{playlistLoading ? "Loading playlist…" : "Play all"}</Label>
               </button>
             ) : null}
             {page.totalPages > 0 ? <p>Page {page.page} of {page.totalPages}</p> : null}
@@ -1166,7 +1198,7 @@ export default function App() {
                     className="video-tile"
                     aria-label={`Play ${video.fileName}`}
                     title={`Play ${video.fileName}`}
-                    onClick={() => setPlaying({ videos: page.results, startIndex: position })}
+                    onClick={() => void playSearchResults(position)}
                   >
                     <VideoThumbnail video={video} />
                     <span className="video-name">{video.fileName}</span>

@@ -1115,6 +1115,33 @@ test("paginates and reports provider failures", async () => {
   await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("broken"));
 });
 
+test("loads every search page into the playlist before playing all", async () => {
+  const firstPage = Array.from({ length: 24 }, (_, index) => ({
+    id: `video-${index + 1}`,
+    fileName: `clip-${index + 1}.mp4`,
+    extension: "mp4",
+  }));
+  const last = { id: "video-25", fileName: "clip-25.mp4", extension: "mp4" };
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 25, totalPages: 2,
+      results: firstPage,
+    })
+    .mockResolvedValueOnce({
+      query: "clip", page: 2, pageSize: 24, totalResults: 25, totalPages: 2,
+      results: [last],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const playlist = await screen.findByRole("complementary", { name: "Playlist" });
+  expect(playlist.querySelectorAll("li")).toHaveLength(25);
+  expect(screen.getByText("Playlist video 1 of 25")).toBeVisible();
+});
+
 test("playlist mode advances through every search result", async () => {
   const results = [1, 2, 3].map((number) => ({
     id: `video-${number}`,
