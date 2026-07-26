@@ -600,6 +600,35 @@ test("uses Tauri window fullscreen first on macOS", async () => {
   }
 });
 
+test("keeps player keyboard shortcuts live after leaving fullscreen from the keyboard", async () => {
+  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    const video = await screen.findByLabelText("Playing clip.mp4");
+
+    fireEvent.keyDown(window, { key: "f" });
+    await screen.findByRole("button", { name: "Exit fullscreen" });
+    fireEvent.keyDown(window, { key: "f" });
+    await screen.findByRole("button", { name: "Enter fullscreen" });
+
+    expect(document.activeElement).toHaveClass("player-shell");
+    fireEvent.keyDown(document.activeElement ?? window, { key: "]" });
+    expect(video).toHaveStyle({ transform: "rotate(90deg)" });
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
 // jsdom never actually goes fullscreen, so these stand in for the browser
 // telling the player whether the request took effect.
 function reportFullscreen(active: boolean) {

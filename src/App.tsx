@@ -835,13 +835,21 @@ function Player({
     };
   }, [fullscreen]);
 
+  const focusPlayerShell = () => {
+    playerShell.current?.focus({ preventScroll: true });
+  };
+
   const toggleFullscreen = () => {
     setFullscreenError(undefined);
     if (document.fullscreenElement) {
       const exiting = document.exitFullscreen?.();
       if (exiting) {
         void exiting
-          .catch(() => getCurrentWindow().setFullscreen(false).then(() => setFullscreen(false)))
+          .then(focusPlayerShell)
+          .catch(() => getCurrentWindow().setFullscreen(false).then(() => {
+            setFullscreen(false);
+            focusPlayerShell();
+          }))
           .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
       }
       return;
@@ -849,7 +857,10 @@ function Player({
     if (fullscreen) {
       void getCurrentWindow()
         .setFullscreen(false)
-        .then(() => setFullscreen(false))
+        .then(() => {
+          setFullscreen(false);
+          focusPlayerShell();
+        })
         .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
       return;
     }
@@ -857,7 +868,10 @@ function Player({
     const enterWindowFullscreen = () =>
       getCurrentWindow()
         .setFullscreen(true)
-        .then(() => setFullscreen(true));
+        .then(() => {
+          setFullscreen(true);
+          focusPlayerShell();
+        });
     const enterDocumentFullscreen = () => {
       if (!shell?.requestFullscreen) return Promise.reject(new Error("Fullscreen mode is not supported by this system."));
       return shell.requestFullscreen();
@@ -865,7 +879,7 @@ function Player({
     const entering = prefersWindowFullscreen()
       ? enterWindowFullscreen().catch(enterDocumentFullscreen)
       : enterDocumentFullscreen().catch(enterWindowFullscreen);
-    void entering.catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+    void entering.then(focusPlayerShell).catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
   };
 
   useEffect(() => {
@@ -975,6 +989,7 @@ function Player({
       <div
         ref={playerShell}
         className={`player-shell${fullscreen ? " fullscreen" : ""}${controlsIdle ? " idle" : ""}`}
+        tabIndex={-1}
       >
         {!prepared ? (
           <p className="message preparing-video">Preparing video…</p>
