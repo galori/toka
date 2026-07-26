@@ -415,24 +415,41 @@ describe("Toka playlist interface", () => {
     for (let click = 0; click < 2; click += 1) await $(".player-controls .loop-button").click();
     await expect($(".player-controls .loop-button")).toHaveAttribute("aria-label", "Loop: off");
 
+    // Each step is its own round trip, so React has flushed the state behind
+    // the bar before it is read.
+    const readBar = () =>
+      browser.execute(() => {
+        const range = document.querySelector<HTMLInputElement>(".player-timeline");
+        if (!range) return undefined;
+        return { value: Number(range.value), max: Number(range.max), step: Number(range.step) };
+      });
+
+    // A tenth of the clip left to run: roughly what the engine last reports
+    // before it gives up on a video, and where the bar used to stop.
     await browser.execute(() => {
       const video = document.querySelector<HTMLVideoElement>("video");
       if (!video) throw new Error("The video element is missing");
-      video.currentTime = Math.max(0, video.duration - 0.4);
+      video.currentTime = Math.max(0, video.duration * 0.9);
       video.dispatchEvent(new Event("timeupdate"));
-      video.dispatchEvent(new Event("ended"));
     });
+    const short = await readBar();
+    if (!short) throw new Error("No timeline found");
+    expect(short.max).toBeGreaterThan(0);
+    expect(short.value).toBeLessThan(short.max);
 
-    const bar = await browser.execute(() => {
-      const range = document.querySelector<HTMLInputElement>(".player-timeline");
-      const video = document.querySelector<HTMLVideoElement>("video");
-      if (!range || !video) return undefined;
-      return { value: Number(range.value), max: Number(range.max), duration: video.duration };
+    await browser.execute(() => {
+      document.querySelector("video")?.dispatchEvent(new Event("ended"));
     });
-    if (!bar) throw new Error("No timeline or video found");
-    expect(bar.max).toBeGreaterThan(0);
-    expect(bar.max - bar.value).toBeLessThanOrEqual(0.05);
-    expect(bar.duration - bar.value).toBeLessThanOrEqual(0.05);
+    // The bar can only land on a step, so within one step of the end is as full
+    // as a range input gets.
+    await browser.waitUntil(
+      async () => {
+        const bar = await readBar();
+        if (!bar) return false;
+        return bar.max - bar.value <= (bar.step || 0.1);
+      },
+      { timeoutMsg: "The scrubber never reached the end of the bar" },
+    );
   });
 });
 
