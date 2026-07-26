@@ -60,6 +60,23 @@ test("starts with a focused search field and displays submitted results", async 
   });
 });
 
+test("displays an app-generated thumbnail when search returns one", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+    results: [{
+      id: "video-1", fileName: "clip.mp4", extension: "mp4",
+      thumbnailPath: "/tmp/toka-thumbnails/clip.jpg",
+    }],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
+  expect(await screen.findByRole("button", { name: "Play clip.mp4" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Play clip.mp4" }).querySelector(".video-art"))
+    .toHaveStyle({ backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")' });
+});
+
 test("opens a selected result in the player and restores the grid on back", async () => {
   invokeMock
     .mockResolvedValueOnce({

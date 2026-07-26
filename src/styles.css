@@ -68,6 +68,7 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 .video-tile { display: block; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; }
 
 .video-art {
+  position: relative;
   display: grid;
   place-items: center;
   aspect-ratio: 1;
@@ -75,6 +76,16 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
   border-radius: 18px;
   background: linear-gradient(145deg, #202632, #141820);
   transition: border-color 140ms ease, transform 140ms ease;
+}
+.video-art[style] {
+  background-position: center;
+  background-size: cover;
+}
+.thumbnail-overlay {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, transparent 55%, rgb(0 0 0 / 35%));
 }
 
 .video-tile:hover .video-art, .video-tile:focus-visible .video-art { border-color: #69a8ff; transform: translateY(-2px); }

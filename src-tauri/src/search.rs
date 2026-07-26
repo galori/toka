@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
+use crate::thumbnails;
 
 pub const PAGE_SIZE: usize = 24;
 
@@ -22,6 +23,7 @@ pub struct VideoResult {
     pub id: String,
     pub file_name: String,
     pub extension: String,
+    pub thumbnail_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -124,6 +126,8 @@ impl SearchEngine {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_lowercase(),
+                    thumbnail_path: thumbnails::generate(&path)
+                        .map(|thumbnail| thumbnail.to_string_lossy().into_owned()),
                 };
                 known_paths.insert(id, path);
                 result

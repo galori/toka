@@ -91,6 +91,17 @@ function VideoIcon() {
   );
 }
 
+function VideoThumbnail({ video }: { video: VideoResult }) {
+  return (
+    <span
+      className="video-art"
+      style={video.thumbnailPath ? { backgroundImage: `url(${convertFileSrc(video.thumbnailPath)})` } : undefined}
+    >
+      {video.thumbnailPath ? <span className="thumbnail-overlay" aria-hidden="true" /> : <VideoIcon />}
+    </span>
+  );
+}
+
 function SearchIcon() {
   return (
     <svg viewBox="0 0 24 24" className="search-glyph" aria-hidden="true">
@@ -1117,7 +1128,7 @@ export default function App() {
                     title={`Play ${video.fileName}`}
                     onClick={() => setPlaying({ videos: page.results, startIndex: position })}
                   >
-                    <span className="video-art"><VideoIcon /></span>
+                    <VideoThumbnail video={video} />
                     <span className="video-name">{video.fileName}</span>
                   </button>
                 </li>
