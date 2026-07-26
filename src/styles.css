@@ -314,6 +314,11 @@ button:focus-visible {
   border-color: oklch(0.28 0.02 40);
   border-radius: 12px;
   background: #000;
+  /* How much of the bottom of a fullscreen player belongs to the scrubber
+     rather than to the picture. It is the one thing the overlay is allowed to
+     take off the video, so that a viewer watching with everything hidden can
+     still see how far in they are. */
+  --scrubber-sliver: 6px;
 }
 .player-shell video {
   width: 100%;
@@ -330,8 +335,10 @@ button:focus-visible {
   height: min(420px, calc(100vh - 220px));
   margin: 0;
 }
-.player-shell:fullscreen .preparing-video { height: 100vh; }
-.player-shell:fullscreen {
+.player-shell:fullscreen .preparing-video,
+.player-shell.fullscreen .preparing-video { height: 100vh; }
+.player-shell:fullscreen,
+.player-shell.fullscreen {
   width: 100vw;
   height: 100vh;
   border: 0;
@@ -339,18 +346,52 @@ button:focus-visible {
   background: #000;
 }
 /* `height: auto` let the element fall back to the file's intrinsic size, so a
-   320x180 clip stayed 320x180 in the middle of the screen. */
+   320x180 clip stayed 320x180 in the middle of the screen. The sliver is the
+   only thing taken off it: this height does not change as the overlay comes and
+   goes, which is what keeps the picture's size, place and aspect ratio put
+   while the controls and the playlist slide over the top of it. */
 .player-shell:fullscreen video,
-.player-shell:fullscreen .native-video {
+.player-shell:fullscreen .native-video,
+.player-shell.fullscreen video,
+.player-shell.fullscreen .native-video {
   width: 100vw;
-  height: 100vh;
+  height: calc(100vh - var(--scrubber-sliver));
   max-height: none;
   object-fit: contain;
 }
-.player-shell:fullscreen.idle { cursor: none; }
-.player-controls { transition: opacity 220ms ease, visibility 220ms ease; }
-/* Only reachable in fullscreen, where the effect that sets it runs. */
-.player-controls.idle { opacity: 0; visibility: hidden; }
+.player-shell:fullscreen.idle,
+.player-shell.fullscreen.idle { cursor: none; }
+/* Only reachable in fullscreen, where the effect that sets it runs. The bar
+   collapses onto the scrubber rather than disappearing outright, and the
+   scrubber drops into the sliver the picture left for it along the bottom. */
+.player-controls.idle {
+  gap: 0;
+  padding: 0;
+  background: none;
+  pointer-events: none;
+}
+.player-controls.idle .player-transport { display: none; }
+.player-controls.idle .player-timeline {
+  appearance: none;
+  /* A range input carries 2px of margin of its own, which would put the sliver
+     back over the bottom of the picture. */
+  margin: 0;
+  height: var(--scrubber-sliver);
+  background: linear-gradient(
+    to right,
+    oklch(0.68 0.19 38) 0 var(--progress, 0%),
+    oklch(1 0 0 / 0.24) var(--progress, 0%) 100%
+  );
+}
+.player-controls.idle .player-timeline::-webkit-slider-runnable-track {
+  height: 100%;
+  background: transparent;
+}
+.player-controls.idle .player-timeline::-webkit-slider-thumb {
+  appearance: none;
+  width: 0;
+  height: 0;
+}
 .player-controls {
   position: absolute;
   right: 0;
@@ -363,7 +404,10 @@ button:focus-visible {
   background: linear-gradient(transparent, rgb(0 0 0 / 75%));
 }
 .player-timeline { width: 100%; accent-color: oklch(0.68 0.19 38); }
-.player-transport { display: flex; align-items: center; gap: 18px; }
+/* Wrapping rather than overflowing: the row carries a lot of controls, and
+   below roughly a thousand pixels the ones on either end used to be pushed
+   outside the bar and off the picture. */
+.player-transport { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; }
 .player-controls button {
   display: inline-flex;
   flex: none;
@@ -409,7 +453,8 @@ button:focus-visible {
   stroke-linejoin: round;
 }
 .control-icon.solid { fill: currentColor; stroke: none; }
-.control-icon .loop-one { fill: currentColor; stroke: none; }
+.control-icon .loop-one,
+.control-icon .playlist-cue { fill: currentColor; stroke: none; }
 /* Loop has three states, so it cannot say which one it is in with
    `aria-pressed`; the two that are on carry the accent colour, and the "1"
    inside the icon is what separates repeating one video from the whole list. */

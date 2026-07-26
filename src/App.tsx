@@ -1,4 +1,4 @@
-import { ButtonHTMLAttributes, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ButtonHTMLAttributes, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   loadNativeVideo,
@@ -180,6 +180,17 @@ function FullscreenExitIcon() {
   );
 }
 
+function PlaylistIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M3 6h13M3 12h13M3 18h7" />
+      {/* Filled rather than stroked, for the same reason as the skip icons: a
+          triangle this small stroked at the icon's weight closes up. */}
+      <polygon className="playlist-cue" points="15.5 13.4 22 17 15.5 20.6" />
+    </svg>
+  );
+}
+
 function BackArrowIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="back-arrow">
@@ -191,6 +202,18 @@ function BackArrowIcon() {
 
 // How long the fullscreen overlay waits after the last movement before fading.
 const CONTROLS_IDLE_DELAY = 2_500;
+
+// How near the right-hand edge of the screen the pointer has to come before the
+// playlist slides in over the picture, and how long the drawer waits after the
+// pointer has left it before sliding back out.
+const PLAYLIST_EDGE_MARGIN = 24;
+const PLAYLIST_HIDE_DELAY = 800;
+
+// What the playlist is doing while the player is fullscreen. It starts hidden;
+// the right-hand edge of the screen peeks it out for as long as the pointer
+// stays with it, and the P key holds it open until the pointer visits and
+// leaves, or until P is pressed again.
+type FullscreenPlaylist = "hidden" | "peek" | "held";
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
 
@@ -281,6 +304,7 @@ function Player({
   const playerShell = useRef<HTMLDivElement>(null);
   const playerControls = useRef<HTMLDivElement>(null);
   const pointerOverControls = useRef(false);
+  const pointerOverPlaylist = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const playlistDrawer = useRef<HTMLElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
@@ -297,6 +321,7 @@ function Player({
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(true);
+  const [fullscreenPlaylist, setFullscreenPlaylist] = useState<FullscreenPlaylist>("hidden");
   const [nativeSubtitles, setNativeSubtitles] = useState<SubtitleOption[]>([]);
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
@@ -353,7 +378,18 @@ function Player({
   }, [video.id]);
 
   const native = prepared?.playbackBackend === "native";
-  const drawerOpen = playlistOpen;
+  // Windowed playback keeps the drawer permanently; fullscreen is for watching,
+  // so there it starts hidden and is summoned instead.
+  const drawerOpen = fullscreen ? fullscreenPlaylist !== "hidden" : playlistOpen;
+
+  const togglePlaylist = () => {
+    if (fullscreen) setFullscreenPlaylist((state) => (state === "hidden" ? "held" : "hidden"));
+    else setPlaylistOpen((open) => !open);
+  };
+
+  // How far through the video the scrubber is, as the sliver it collapses to in
+  // fullscreen has to paint its own fill.
+  const elapsedShare = duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
 
   const subtitles = useMemo<SubtitleOption[]>(() => {
     if (native) return nativeSubtitles;
@@ -383,9 +419,10 @@ function Player({
       const controls = playerControls.current?.getBoundingClientRect();
       const drawer = playlistDrawer.current?.getBoundingClientRect();
       // GTK overlays the native mpv surface above the WebView, irrespective of
-      // CSS z-index. Keep that surface out of the HTML controls' region while
-      // they are visible so Linux composites the controls instead of video
-      // over them. Fullscreen idle mode can reclaim the whole player.
+      // CSS z-index, so an overlay is only ever seen on Linux if the surface
+      // stops short of it. The surface's own box already excludes the scrubber
+      // sliver in fullscreen — the stylesheet takes that off the picture — so
+      // hiding the rest of the overlay hands the whole of the rest back.
       const visibleHeight =
         controls && !controlsIdle
           ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
@@ -437,7 +474,7 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, index, native, playlistOpen]);
+  }, [controlsIdle, drawerOpen, fullscreen, index, native]);
 
   const play = () => {
     if (native) {
@@ -630,19 +667,26 @@ function Player({
     return () => document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
 
-  // Fullscreen is for watching, so the overlay gets out of the way until the
-  // viewer reaches for it. Windowed playback always shows the controls.
+  // Fullscreen is for watching, so the overlay gets out of the way at once and
+  // stays away until the viewer reaches for it — only the scrubber is left, as
+  // a sliver along the very bottom. Windowed playback always shows the controls.
   useEffect(() => {
     if (!fullscreen) {
       setControlsIdle(false);
+      setFullscreenPlaylist("hidden");
+      pointerOverPlaylist.current = false;
       return;
     }
-    let lastActivity = Date.now();
+    // Fullscreen is entered by clicking a control or pressing a key, either of
+    // which leaves the pointer resting on the overlay it is about to hide; that
+    // would otherwise pin the bar open until the viewer moved the mouse away.
+    pointerOverControls.current = false;
+    setControlsIdle(true);
+    let lastActivity = 0;
     const wake = () => {
       lastActivity = Date.now();
       setControlsIdle(false);
     };
-    wake();
     // Polling rather than a one-shot timer so that moving the pointer off the
     // controls re-arms the countdown without needing its own listener.
     // Keyboard use keeps them up through the keydown listener below; focus is
@@ -658,6 +702,36 @@ function Player({
       window.clearInterval(tick);
       window.removeEventListener("mousemove", wake);
       window.removeEventListener("keydown", wake);
+    };
+  }, [fullscreen]);
+
+  // Bringing the pointer all the way to the right-hand edge of the screen slides
+  // the playlist out over the picture; it stays for as long as the pointer is on
+  // it and goes again shortly after the pointer leaves.
+  useEffect(() => {
+    if (!fullscreen) return;
+    let lastNearPlaylist = 0;
+    const follow = (event: MouseEvent) => {
+      if (event.clientX < window.innerWidth - PLAYLIST_EDGE_MARGIN) return;
+      lastNearPlaylist = Date.now();
+      setFullscreenPlaylist((state) => (state === "hidden" ? "peek" : state));
+    };
+    // Polled for the same reason the controls are: the pointer resting on the
+    // drawer has to hold it open without a listener of its own re-arming a
+    // one-shot timer on every movement.
+    const tick = window.setInterval(() => {
+      if (pointerOverPlaylist.current) {
+        lastNearPlaylist = Date.now();
+        return;
+      }
+      if (Date.now() - lastNearPlaylist >= PLAYLIST_HIDE_DELAY) {
+        setFullscreenPlaylist((state) => (state === "peek" ? "hidden" : state));
+      }
+    }, 100);
+    window.addEventListener("mousemove", follow);
+    return () => {
+      window.clearInterval(tick);
+      window.removeEventListener("mousemove", follow);
     };
   }, [fullscreen]);
 
@@ -710,7 +784,7 @@ function Player({
       } else if (event.key.toLowerCase() === "l") {
         run(cycleLoop);
       } else if (event.key.toLowerCase() === "p") {
-        run(() => setPlaylistOpen((open) => !open));
+        run(togglePlaylist);
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
       } else if (event.key === "Escape") {
@@ -751,8 +825,8 @@ function Player({
         <ControlButton
           shortcut="P"
           className="playlist-toggle"
-          aria-expanded={playlistOpen}
-          onClick={() => setPlaylistOpen((open) => !open)}
+          aria-expanded={drawerOpen}
+          onClick={togglePlaylist}
         >
           <Label>Playlist</Label>
           <span className="playlist-count"><Label>{String(videos.length)}</Label></span>
@@ -763,7 +837,13 @@ function Player({
       {/* The shell outlives each video: it is the element the browser promotes
           to fullscreen, and unmounting it between playlist items dropped the
           window back out of fullscreen. */}
-      <div ref={playerShell} className={controlsIdle ? "player-shell idle" : "player-shell"}>
+      {/* The `fullscreen` class carries the same rules as `:fullscreen`, so the
+          layout can be driven and measured without asking an engine that may
+          refuse the request to grant it. */}
+      <div
+        ref={playerShell}
+        className={`player-shell${fullscreen ? " fullscreen" : ""}${controlsIdle ? " idle" : ""}`}
+      >
         {!prepared ? (
           <p className="message preparing-video">Preparing video…</p>
         ) : native ? (
@@ -806,6 +886,10 @@ function Player({
             max={duration || 0}
             step="0.1"
             value={Math.min(currentTime, duration || 0)}
+            // The sliver the bar collapses to in fullscreen paints its own fill:
+            // a range input's track and thumb cannot be drawn legibly at six
+            // pixels, so the progress is handed to the stylesheet instead.
+            style={{ "--progress": `${elapsedShare}%` } as CSSProperties}
             onChange={(event) => {
               const nextTime = Number(event.currentTarget.value);
               if (native) void seekNativeVideo(nextTime).catch((reason: unknown) => setError(errorMessage(reason)));
@@ -875,6 +959,17 @@ function Player({
               >
                 <LoopIcon single={loop === "one"} />
               </ControlButton>
+              {/* The heading's playlist toggle is out of reach in fullscreen,
+                  which is exactly where the drawer has to be summoned, so the
+                  overlay carries the control and its shortcut too. */}
+              <ControlButton
+                shortcut="P"
+                onClick={togglePlaylist}
+                aria-label="Playlist"
+                aria-expanded={drawerOpen}
+              >
+                <PlaylistIcon />
+              </ControlButton>
               <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
               </ControlButton>
@@ -882,7 +977,21 @@ function Player({
           </div>
         </div>
         {drawerOpen ? (
-          <aside ref={playlistDrawer} className="playlist-drawer" aria-label="Playlist">
+          <aside
+            ref={playlistDrawer}
+            className="playlist-drawer"
+            aria-label="Playlist"
+            onMouseEnter={() => {
+              pointerOverPlaylist.current = true;
+            }}
+            onMouseLeave={() => {
+              pointerOverPlaylist.current = false;
+              // A drawer the keyboard held open goes back to behaving like one
+              // the pointer summoned once the pointer has actually visited it,
+              // so walking away from it is enough to dismiss it.
+              setFullscreenPlaylist((state) => (state === "held" ? "peek" : state));
+            }}
+          >
             <h2>Up next</h2>
             <ol>
               {videos.map((item, itemIndex) => (

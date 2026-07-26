@@ -465,37 +465,82 @@ async function enterFullscreen(user: ReturnType<typeof userEvent.setup>) {
   reportFullscreen(true);
 }
 
+// The three fullscreen behaviours all need a player, fake timers and an engine
+// that says yes to a fullscreen request, so they share one setup.
+async function playForFullscreen(names = ["clip.mp4"]) {
+  const results = names.map((fileName, position) => ({
+    id: `video-${position + 1}`,
+    fileName,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: results.length, totalPages: 1, results,
+    })
+    .mockResolvedValue({ filePath: `/Videos/${names[0]}` });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: vi.fn().mockResolvedValue(undefined),
+  });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: names.length > 1 ? "Play all" : `Play ${names[0]}` }));
+  return user;
+}
+
+// Moving the pointer is what wakes the overlay, and how far to the right it has
+// come is what summons the playlist.
+function movePointer(clientX = 10) {
+  act(() => void fireEvent.mouseMove(window, { clientX, clientY: 10 }));
+}
+
+test("clears the whole overlay the moment fullscreen starts, leaving the scrubber", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    expect(controls).not.toHaveClass("idle");
+    expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
+
+    await enterFullscreen(user);
+
+    // Straight away, not after the idle delay: fullscreen is for watching.
+    expect(controls).toHaveClass("idle");
+    expect(screen.queryByRole("complementary", { name: "Playlist" })).not.toBeInTheDocument();
+    // Everything except the scrubber goes; it is the only feedback left about
+    // how far into the video the viewer is.
+    expect(screen.getByLabelText("Video timeline")).toBeInTheDocument();
+    expect(controls).toContainElement(screen.getByLabelText("Video timeline"));
+
+    // Coming back out restores the windowed player as it was left.
+    reportFullscreen(false);
+    expect(controls).not.toHaveClass("idle");
+    expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
 test("lets the fullscreen controls fade out and brings them back on movement", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
-    invokeMock
-      .mockResolvedValueOnce({
-        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
-      })
-      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-      configurable: true,
-      value: vi.fn().mockResolvedValue(undefined),
-    });
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-    render(<App />);
-
-    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    const user = await playForFullscreen();
     const controls = await screen.findByLabelText("Video controls");
     expect(controls).not.toHaveClass("idle");
 
     await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
+
+    movePointer();
     expect(controls).not.toHaveClass("idle");
 
-    // Clicking the button left the pointer on the overlay, which pins it open;
-    // the viewer moving back to the picture is what starts the countdown.
-    act(() => void fireEvent.mouseLeave(controls));
     act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
 
-    act(() => void fireEvent.mouseMove(window));
+    movePointer();
     expect(controls).not.toHaveClass("idle");
 
     // Leaving fullscreen has to restore them for good.
@@ -514,24 +559,11 @@ test("lets the fullscreen controls fade out and brings them back on movement", a
 test("keeps the fullscreen controls up while the pointer rests on them", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
-    invokeMock
-      .mockResolvedValueOnce({
-        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
-      })
-      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-      configurable: true,
-      value: vi.fn().mockResolvedValue(undefined),
-    });
-    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-    render(<App />);
-
-    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    const user = await playForFullscreen();
     const controls = await screen.findByLabelText("Video controls");
     await enterFullscreen(user);
 
+    movePointer();
     act(() => void fireEvent.mouseEnter(controls));
     act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).not.toHaveClass("idle");
@@ -541,6 +573,84 @@ test("keeps the fullscreen controls up while the pointer rests on them", async (
     expect(controls).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+const playlistDrawer = () => screen.queryByRole("complementary", { name: "Playlist" });
+
+test("summons the fullscreen playlist from the right edge and dismisses it again", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen(["clip-1.mp4", "clip-2.mp4"]);
+    await enterFullscreen(user);
+    expect(playlistDrawer()).not.toBeInTheDocument();
+
+    // Anywhere else on the picture wakes the controls without the playlist.
+    movePointer(Math.round(window.innerWidth / 2));
+    expect(playlistDrawer()).not.toBeInTheDocument();
+
+    movePointer(window.innerWidth - 1);
+    const drawer = playlistDrawer();
+    expect(drawer).toBeVisible();
+
+    // It stays for as long as the pointer is on it, however long that is.
+    act(() => void fireEvent.mouseEnter(drawer as HTMLElement));
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(playlistDrawer()).toBeVisible();
+
+    act(() => void fireEvent.mouseLeave(drawer as HTMLElement));
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(playlistDrawer()).not.toBeInTheDocument();
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("holds the fullscreen playlist open from the keyboard until the pointer leaves it", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen(["clip-1.mp4", "clip-2.mp4"]);
+    await enterFullscreen(user);
+    expect(playlistDrawer()).not.toBeInTheDocument();
+
+    // The heading's toggle is out of reach in fullscreen, so the overlay carries
+    // the same control and the same shortcut.
+    expect(screen.getByRole("button", { name: "Playlist" })).toHaveAttribute("aria-keyshortcuts", "P");
+
+    act(() => void fireEvent.keyDown(window, { key: "p" }));
+    const drawer = playlistDrawer();
+    expect(drawer).toBeVisible();
+
+    // A drawer nobody pointed at is not taken away underneath them.
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(playlistDrawer()).toBeVisible();
+
+    act(() => void fireEvent.mouseEnter(drawer as HTMLElement));
+    act(() => void fireEvent.mouseLeave(drawer as HTMLElement));
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(playlistDrawer()).not.toBeInTheDocument();
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("leaves windowed playback with its permanent playlist and its controls up", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    await playForFullscreen(["clip-1.mp4", "clip-2.mp4"]);
+    const controls = await screen.findByLabelText("Video controls");
+
+    // None of the fullscreen rules run windowed: the drawer stays put, the
+    // right-hand edge does nothing, and the overlay never fades.
+    expect(playlistDrawer()).toBeVisible();
+    movePointer(window.innerWidth - 1);
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(playlistDrawer()).toBeVisible();
+    expect(controls).not.toHaveClass("idle");
+  } finally {
     vi.useRealTimers();
   }
 });
@@ -1108,6 +1218,86 @@ test("keeps the native video surface clear of the playlist drawer", async () => 
     );
   } finally {
     boxes.mockRestore();
+  }
+});
+
+test("hands the fullscreen native surface everything but the scrubber sliver", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const results = [1, 2].map((number) => ({
+    id: `native-${number}`,
+    fileName: `native-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+    }
+    return Promise.resolve();
+  });
+  // jsdom has no layout, so a 1200x800 fullscreen window is described here: the
+  // stylesheet keeps the picture 6px clear of the bottom for the scrubber, the
+  // collapsed overlay is exactly that sliver, and the full overlay is 96px tall.
+  const box = (left: number, top: number, width: number, height: number) =>
+    ({ x: left, y: top, top, left, right: left + width, bottom: top + height, width, height }) as DOMRect;
+  const boxes = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    if (this.classList.contains("native-video")) return box(0, 0, 1200, 794);
+    if (this.classList.contains("player-controls")) {
+      return this.classList.contains("idle") ? box(0, 794, 1200, 6) : box(0, 704, 1200, 96);
+    }
+    if (this.classList.contains("playlist-drawer")) return box(920, 0, 280, 800);
+    return box(0, 0, 0, 0);
+  });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: vi.fn().mockResolvedValue(undefined),
+  });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "native{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play all" }));
+    await screen.findByLabelText("Playing native-1.mp4");
+    await enterFullscreen(user);
+
+    // Nothing is showing, so the picture reaches everything except the sliver
+    // the scrubber sits in — the one strip fullscreen takes off the video.
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0, y: 0, width: 1200, height: 794, visible: true,
+      }),
+    );
+
+    // GTK composites the mpv surface above the WebView whatever the z-index
+    // says, so a revealed overlay is only seen on Linux if the surface stops
+    // short of it. Every other engine overlays it without moving the picture.
+    invokeMock.mockClear();
+    movePointer();
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0, y: 0, width: 1200, height: 704, visible: true,
+      }),
+    );
+
+    invokeMock.mockClear();
+    movePointer(window.innerWidth - 1);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0, y: 0, width: 920, height: 704, visible: true,
+      }),
+    );
+  } finally {
+    reportFullscreen(false);
+    boxes.mockRestore();
+    vi.useRealTimers();
   }
 });
 
