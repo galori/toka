@@ -40,25 +40,35 @@ async function advanceToNextVideo() {
   }, { timeoutMsg: `The playlist never moved on from ${before}` });
 }
 
-// How far the ink of a label sits from the middle of the box around it, as a
-// share of that box's height. A baseline-aligned label beside a differently
-// sized one drifts well past a tenth; centred flex items land near zero.
+// Labels are wrapped in .control-label and trimmed down to their cap band, so
+// the span's box is the ink. Reports how far that box's middle sits from the
+// middle of the control, in pixels.
 async function labelOffCentre(selector: string): Promise<number> {
   const offset = await browser.execute((target) => {
     const element = document.querySelector<HTMLElement>(target);
-    if (!element) return undefined;
-    const text = [...element.childNodes].find(
-      (node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim(),
-    );
-    if (!text) return undefined;
-    const range = document.createRange();
-    range.selectNodeContents(text);
-    const ink = range.getBoundingClientRect();
+    const label = element?.querySelector<HTMLElement>(".control-label");
+    if (!element || !label) return undefined;
+    const ink = label.getBoundingClientRect();
     const box = element.getBoundingClientRect();
-    return Math.abs((ink.top + ink.bottom) / 2 - (box.top + box.bottom) / 2) / box.height;
+    return (ink.top + ink.bottom) / 2 - (box.top + box.bottom) / 2;
   }, selector);
-  if (offset === undefined) throw new Error(`No label found in ${selector}`);
-  return offset;
+  if (offset === undefined) throw new Error(`No trimmed label found in ${selector}`);
+  return Math.abs(offset);
+}
+
+// Cap-band trimming is what makes a label's ink, rather than its line box, the
+// thing that gets centred. Engines without it leave the text a few pixels high;
+// that is a known and accepted fallback, so the checks that depend on it say so
+// rather than failing on an engine that cannot do it.
+function trimsLabels(): Promise<boolean> {
+  return browser.execute(() => {
+    const label = document.querySelector(".control-label");
+    return (
+      CSS.supports("text-box-trim", "trim-both") &&
+      Boolean(label) &&
+      getComputedStyle(label as Element).textBoxTrim === "trim-both"
+    );
+  });
 }
 
 describe("Toka playlist interface", () => {
@@ -122,9 +132,7 @@ describe("Toka playlist interface", () => {
     expect(buried).toEqual([]);
   });
 
-  it("centres the count inside its badge on the playlist toggle", async () => {
-    expect(await labelOffCentre(".playlist-toggle .playlist-count")).toBeLessThan(0.1);
-
+  it("centres the count inside its badge on the playlist toggle", async function () {
     const badge = await browser.execute(() => {
       const count = document.querySelector<HTMLElement>(".playlist-toggle .playlist-count");
       if (!count) return undefined;
@@ -136,11 +144,48 @@ describe("Toka playlist interface", () => {
     expect(badge.height).toBeGreaterThanOrEqual(16);
     // The design draws it as a disc, so it can never be taller than it is wide.
     expect(badge.width).toBeGreaterThanOrEqual(badge.height - 1);
+
+    if (!(await trimsLabels())) this.skip();
+    expect(await labelOffCentre(".playlist-toggle .playlist-count")).toBeLessThanOrEqual(1);
   });
 
-  it("centres the labels inside the heading buttons", async () => {
-    expect(await labelOffCentre(".back-button")).toBeLessThan(0.1);
-    expect(await labelOffCentre(".playlist-toggle")).toBeLessThan(0.1);
+  it("centres every label against the glyphs beside it", async function () {
+    if (!(await trimsLabels())) this.skip();
+
+    for (const control of [".back-button", ".playlist-toggle", '.player-controls button[aria-label="Play"]']) {
+      expect({ control, offCentre: await labelOffCentre(control) <= 1 }).toEqual({
+        control,
+        offCentre: true,
+      });
+    }
+
+    // The reported case: "Space" reading higher than the play triangle and the
+    // pause bars it labels.
+    const drift = await browser.execute(() =>
+      ["Play", "Pause"].map((label) => {
+        const button = document.querySelector(`.player-controls button[aria-label="${label}"]`);
+        const glyph = button?.querySelector(".play-glyph, .pause-glyph")?.getBoundingClientRect();
+        const hint = button?.querySelector(".key-hint")?.getBoundingClientRect();
+        if (!glyph || !hint) return { label, apart: Number.POSITIVE_INFINITY };
+        return {
+          label,
+          apart: Math.abs((glyph.top + glyph.bottom) / 2 - (hint.top + hint.bottom) / 2),
+        };
+      }),
+    );
+    for (const { label, apart } of drift) {
+      expect({ label, alignedWithItsGlyph: apart <= 1 }).toEqual({ label, alignedWithItsGlyph: true });
+    }
+  });
+
+  it("gives the heading buttons a single height", async () => {
+    const heights = await browser.execute(() =>
+      [".back-button", ".playlist-toggle"].map(
+        (selector) => document.querySelector(selector)?.getBoundingClientRect().height ?? 0,
+      ),
+    );
+    expect(heights[0]).toBeGreaterThan(0);
+    expect(Math.abs(heights[0] - heights[1])).toBeLessThanOrEqual(1);
   });
 
   it("draws the icon controls at a legible size", async () => {

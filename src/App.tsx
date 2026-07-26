@@ -110,8 +110,8 @@ function SearchIcon() {
 function PreviousIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon solid">
-      <polygon points="20 19.5 8.5 12 20 4.5 20 19.5" />
-      <rect x="4" y="4.5" width="3" height="15" rx="1.5" />
+      <polygon points="21 2 8 12 21 22 21 2" />
+      <rect x="3" y="2" width="3.4" height="20" rx="1.7" />
     </svg>
   );
 }
@@ -119,8 +119,8 @@ function PreviousIcon() {
 function NextIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon solid">
-      <polygon points="4 4.5 15.5 12 4 19.5 4 4.5" />
-      <rect x="17" y="4.5" width="3" height="15" rx="1.5" />
+      <polygon points="3 2 16 12 3 22 3 2" />
+      <rect x="17.6" y="2" width="3.4" height="20" rx="1.7" />
     </svg>
   );
 }
@@ -205,7 +205,14 @@ function KeyHint({ shortcut }: { shortcut: string }) {
     )
     .join("/");
   // Assistive technology already gets this from aria-keyshortcuts.
-  return <span className="key-hint" aria-hidden="true">{label}</span>;
+  return <span className="key-hint control-label" aria-hidden="true">{label}</span>;
+}
+
+// A label centred beside an icon has to be a box of its own: centring an
+// anonymous run of text centres its line box, and the descender space in that
+// line box pushes the ink a few pixels above the icon it sits next to.
+function Label({ children }: { children: string }) {
+  return <span className="control-label">{children}</span>;
 }
 
 // Pairs the declared shortcut with the one shown on the control, so the two
@@ -659,9 +666,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
         <div className="error-actions">
           <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">
             <BackArrowIcon />
-            Back to results
+            <Label>Back to results</Label>
           </ControlButton>
-          {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}>Skip to next</button> : null}
+          {index < videos.length - 1 ? <button type="button" className="playlist-button" onClick={() => setIndex((current) => current + 1)}><Label>Skip to next</Label></button> : null}
         </div>
       </section>
     );
@@ -672,7 +679,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       <div className="player-heading">
         <ControlButton shortcut="Escape" className="back-button" onClick={onBack} aria-label="Back to results">
           <BackArrowIcon />
-          Back
+          <Label>Back</Label>
         </ControlButton>
         <h1 title={video.fileName}>{video.fileName}</h1>
         {videos.length > 1 ? (
@@ -682,7 +689,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             aria-expanded={playlistOpen}
             onClick={() => setPlaylistOpen((open) => !open)}
           >
-            Playlist <span className="playlist-count">{videos.length}</span>
+            <Label>Playlist</Label>
+            <span className="playlist-count"><Label>{String(videos.length)}</Label></span>
           </ControlButton>
         ) : null}
       </div>
@@ -750,16 +758,16 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           />
           <div className="player-transport">
             <ControlButton shortcut="Shift+ArrowLeft" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
-            <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds">−10</ControlButton>
+            <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
             <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
               <span className="play-glyph" aria-hidden="true" />
             </ControlButton>
             <ControlButton shortcut="Space" onClick={pause} aria-label="Pause">
               <span className="pause-glyph" aria-hidden="true" />
             </ControlButton>
-            <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds">+10</ControlButton>
+            <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
             <ControlButton shortcut="Shift+ArrowRight" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
-            <span className="time-display">{formatTime(currentTime)} / {formatTime(duration)}</span>
+            <span className="time-display control-label">{formatTime(currentTime)} / {formatTime(duration)}</span>
             <div className="player-utilities">
               <ControlButton
                 shortcut="S"
@@ -768,7 +776,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
                 aria-label="Subtitles"
                 aria-pressed={subtitleIndex >= 0}
               >
-                CC
+                <Label>CC</Label>
               </ControlButton>
               {subtitles.length > 1 ? (
                 <select
@@ -905,7 +913,7 @@ export default function App() {
             <p>{page.totalResults} {page.totalResults === 1 ? "video" : "videos"}</p>
             {page.results.length > 1 ? (
               <button type="button" className="playlist-button" onClick={() => setPlaying(page.results)}>
-                Play all
+                <Label>Play all</Label>
               </button>
             ) : null}
             {page.totalPages > 0 ? <p>Page {page.page} of {page.totalPages}</p> : null}

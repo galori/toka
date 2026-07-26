@@ -922,6 +922,39 @@ test("draws the heading controls without font-dependent glyphs", async () => {
   }
 });
 
+test("wraps every button label so the stylesheet can trim it", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Video controls");
+
+  // A loose run of text in a flex row is an anonymous box the stylesheet cannot
+  // reach, so its line box — descender space and all — is what gets centred,
+  // and the label reads a few pixels above the icon beside it.
+  const loose = [...document.querySelectorAll<HTMLElement>(".player-controls button, .back-button, .playlist-toggle")]
+    .filter((control) =>
+      [...control.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()),
+    )
+    .map((control) => control.getAttribute("aria-label") ?? control.textContent);
+  expect(loose).toEqual([]);
+
+  for (const name of ["Back to results", "Skip back 10 seconds", "Skip forward 10 seconds", "Subtitles"]) {
+    expect(screen.getByRole("button", { name }).querySelector(".control-label")).toBeInTheDocument();
+  }
+  expect(screen.getByRole("button", { name: "Playlist 2" }).querySelector(".playlist-count .control-label"))
+    .toHaveTextContent("2");
+});
+
 test("native playlist advances when libmpv reports end of file", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,

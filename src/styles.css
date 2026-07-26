@@ -199,6 +199,7 @@ button:focus-visible {
   border: 0;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
+  min-height: 40px;
   padding: 10px 24px;
   font-size: 14px;
   line-height: 20px;
@@ -261,6 +262,9 @@ button:focus-visible {
 .back-button, .playlist-toggle {
   display: inline-flex;
   align-items: center;
+  /* Trimming the labels takes the line box out of the height, so the design's
+     38px comes from the button rather than from the text inside it. */
+  min-height: 38px;
   padding: 9px 18px;
   font-size: 13px;
   font-weight: 600;
@@ -283,11 +287,11 @@ button:focus-visible {
   align-items: center;
   justify-content: center;
   flex: none;
-  min-width: 20px;
-  height: 20px;
+  min-width: 18px;
+  height: 18px;
   margin-left: 8px;
-  border-radius: 10px;
-  padding: 0 6px;
+  border-radius: 9px;
+  padding: 0 5px;
   background: oklch(0.68 0.19 38);
   color: oklch(0.14 0.01 40);
   font-size: 11px;
@@ -400,6 +404,13 @@ button:focus-visible {
    controls. The bar keeps its full width and runs in front of the drawer
    instead; narrowing it would push the transport row off the left edge. */
 .player-controls { z-index: 2; }
+
+/* Centring a flex item centres its line box, and a line box reserves descender
+   space that a label like "Back" or "Space" never uses — which left every piece
+   of text sitting two to three pixels above the icon next to it. Trimming the
+   box down to the cap band makes the ink itself what gets centred. Engines
+   without the property fall back to the untrimmed line box. */
+.control-label { text-box: trim-both cap alphabetic; }
 
 /* The shortcut sits beside the icon it belongs to, muted enough to read as a
    label rather than as part of the control. */
