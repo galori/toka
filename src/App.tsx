@@ -756,7 +756,7 @@ function Player({
       const target = event.target;
       if (
         event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey ||
-        (target instanceof Element && target.closest("input, textarea, select, button, [contenteditable], [role=textbox]"))
+        (target instanceof Element && target.closest("input, textarea, select, [contenteditable], [role=textbox]"))
       ) return;
 
       const run = (action: () => void) => {
