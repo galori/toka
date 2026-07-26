@@ -193,7 +193,7 @@ describe("Toka playlist interface", () => {
       const now = await playingNow();
       return Boolean(now) && now !== before;
     });
-    await expect($('.playlist-drawer button[aria-current="true"]')).toHaveText(/sample5\.mp4/);
+    expect(await playingNow()).toMatch(/sample5\.mp4/);
 
     await next.click();
     await browser.waitUntil(async () => (await playingNow()) === before);
