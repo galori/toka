@@ -586,6 +586,11 @@ function Player({
     if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
   };
 
+  const moveVideo = (direction: -1 | 1) => {
+    if (videos.length === 0) return;
+    setIndex((current) => (current + direction + videos.length) % videos.length);
+  };
+
   const applySpeed = (next: number) => {
     setSpeed(next);
     if (native) void setNativeSpeed(next).catch((reason: unknown) => setError(errorMessage(reason)));
@@ -803,10 +808,10 @@ function Player({
         run(() => skip(-10));
       } else if (event.key === "ArrowRight") {
         run(() => skip(10));
-      } else if (event.key === "PageUp" && index > 0) {
-        run(() => selectVideo(index - 1));
-      } else if (event.key === "PageDown" && index < videos.length - 1) {
-        run(() => selectVideo(index + 1));
+      } else if (event.key === "PageUp") {
+        run(() => moveVideo(-1));
+      } else if (event.key === "PageDown") {
+        run(() => moveVideo(1));
       } else if (event.key === "-") {
         run(() => stepSpeed(-1));
       } else if (event.key === "=" || event.key === "+") {
@@ -937,7 +942,7 @@ function Player({
             }}
           />
           <div className="player-transport">
-            <ControlButton shortcut="PageUp" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
+            <ControlButton shortcut="PageUp" onClick={() => moveVideo(-1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
             <ControlButton shortcut="ArrowLeft" onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
             {/* Playing and pausing are one action whose meaning follows the
                 state, so they are one control rather than two, the way every
@@ -951,7 +956,7 @@ function Player({
               <span className={playingBack ? "pause-glyph" : "play-glyph"} aria-hidden="true" />
             </ControlButton>
             <ControlButton shortcut="ArrowRight" onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
-            <ControlButton shortcut="PageDown" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
+            <ControlButton shortcut="PageDown" onClick={() => moveVideo(1)} aria-label="Next video"><NextIcon /></ControlButton>
             <span className="time-display control-label">{formatTime(currentTime)} / {formatTime(duration)}</span>
             <div className="player-utilities">
               <ControlButton
