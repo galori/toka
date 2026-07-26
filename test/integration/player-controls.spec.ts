@@ -159,16 +159,40 @@ describe("Toka player controls", () => {
   });
 
   it("pauses and resumes from the one overlay button", async () => {
+    const pill = () =>
+      browser.execute(() => {
+        const button = document.querySelector<HTMLElement>(".player-transport button.play-button");
+        const box = button?.getBoundingClientRect();
+        return {
+          label: button?.getAttribute("aria-label") ?? "",
+          glyph: button?.querySelector(".play-glyph")
+            ? "play"
+            : button?.querySelector(".pause-glyph")
+              ? "pause"
+              : "none",
+          width: box?.width ?? 0,
+          left: box?.left ?? 0,
+        };
+      });
+
     const toggle = await $(".player-transport button.play-button");
-    const before = await toggle.getAttribute("aria-label");
+    const before = await pill();
+    expect(before.glyph).toBe(before.label === "Pause" ? "pause" : "play");
+
     await toggle.click();
     // The same element swaps its name and its glyph rather than handing over to
     // a second button.
-    await browser.waitUntil(async () => (await toggle.getAttribute("aria-label")) !== before, {
-      timeoutMsg: `The play/pause control stayed on "${before}" after being clicked`,
+    await browser.waitUntil(async () => (await pill()).label !== before.label, {
+      timeoutMsg: `The play/pause control stayed on "${before.label}" after being clicked`,
     });
+    const after = await pill();
+    expect(after.glyph).toBe(after.label === "Pause" ? "pause" : "play");
+    // Swapping the glyph must not resize the pill or shove the row sideways.
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
+
     await toggle.click();
-    await browser.waitUntil(async () => (await toggle.getAttribute("aria-label")) === before, {
+    await browser.waitUntil(async () => (await pill()).label === before.label, {
       timeoutMsg: "The play/pause control did not come back to its first state",
     });
     await expect($(".player-controls")).toBeDisplayed();
