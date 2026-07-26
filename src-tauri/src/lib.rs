@@ -3,6 +3,7 @@ mod player_linux;
 mod providers;
 mod search;
 mod subtitles;
+mod thumbnails;
 
 #[cfg(target_os = "macos")]
 use providers::MdfindSearchProvider;
@@ -56,6 +57,7 @@ impl From<SearchError> for CommandError {
 #[tauri::command]
 async fn search_videos(
     request: SearchRequest,
+    app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<SearchPage, CommandError> {
     let engine = Arc::clone(engine.inner());
@@ -64,8 +66,19 @@ async fn search_videos(
         .map_err(|error| CommandError {
             kind: "Provider",
             message: format!("The search worker stopped unexpectedly: {error}"),
-        })?
+    })?
         .map_err(Into::into)
+        .and_then(|page| {
+            for result in &page.results {
+                if let Some(path) = &result.thumbnail_path {
+                    app.asset_protocol_scope().allow_file(path).map_err(|_| CommandError {
+                        kind: "Thumbnail",
+                        message: "The video thumbnail could not be exposed.".into(),
+                    })?;
+                }
+            }
+            Ok(page)
+        })
 }
 
 #[tauri::command]

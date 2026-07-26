@@ -6,6 +6,7 @@ export type VideoResult = {
   id: string;
   fileName: string;
   extension: string;
+  thumbnailPath?: string;
 };
 
 export type SearchPage = {
