@@ -792,6 +792,10 @@ pub fn set_speed(player: &NativePlayer, speed: f64) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.set_double("speed", speed))
 }
 
+pub fn set_volume(player: &NativePlayer, volume: f64) -> Result<(), String> {
+    player.with_mpv(|mpv| mpv.set_double("volume", volume.clamp(0.0, 100.0)))
+}
+
 pub fn rotation(player: &NativePlayer) -> Result<i32, String> {
     player.with_mpv(|mpv| {
         Ok(mpv

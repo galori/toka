@@ -502,6 +502,10 @@ button:focus-visible {
   color: oklch(0.9 0.01 90);
   font: 700 13px inherit;
 }
+.volume-slider {
+  width: 92px;
+  accent-color: oklch(0.68 0.19 38);
+}
 .time-display {
   margin-left: 6px;
   color: oklch(0.75 0.01 90);

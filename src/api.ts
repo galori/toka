@@ -77,6 +77,10 @@ export function setNativePaused(paused: boolean): Promise<void> {
 }
 export function setNativeSpeed(speed: number): Promise<void> { return invoke("set_native_speed", { speed }); }
 
+export function setNativeVolume(volume: number): Promise<void> {
+  return invoke("set_native_volume", { volume });
+}
+
 export function nativeVideoRotation(): Promise<number> {
   return invoke("native_video_rotation");
 }
