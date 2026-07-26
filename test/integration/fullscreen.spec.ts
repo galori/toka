@@ -19,6 +19,10 @@ describe("Toka fullscreen", () => {
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
     await $('button[aria-label="Play sample1.mp4"]').click();
     await $(".player-controls").waitForDisplayed();
+    // Every result page is a playlist now, so the drawer opens over the right
+    // of the overlay; close it so the controls are driven against the picture.
+    await $(".playlist-toggle").click();
+    await $(".playlist-drawer").waitForExist({ reverse: true });
   });
 
   after(async () => {

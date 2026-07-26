@@ -115,12 +115,12 @@ test("uses the overlay player controls from the design", async () => {
   expect(transport).toBeInTheDocument();
   expect(utilities).toBeInTheDocument();
 
-  for (const name of ["Previous video", "Skip back 10 seconds", "Play", "Pause", "Skip forward 10 seconds", "Next video"]) {
+  for (const name of ["Previous video", "Skip back 10 seconds", "Play", "Skip forward 10 seconds", "Next video"]) {
     expect(transport).toContainElement(screen.getByRole("button", { name }));
   }
   expect(transport).toContainElement(screen.getByText("0:00 / 0:00"));
 
-  for (const name of ["Rotate left", "Rotate right", "Loop video", "Enter fullscreen"]) {
+  for (const name of ["Rotate left", "Rotate right", "Loop: playlist", "Enter fullscreen"]) {
     expect(utilities).toContainElement(screen.getByRole("button", { name }));
   }
   expect(utilities).toContainElement(screen.getByRole("combobox", { name: "Playback speed" }));
@@ -128,7 +128,74 @@ test("uses the overlay player controls from the design", async () => {
   const play = screen.getByRole("button", { name: "Play" });
   expect(play).toHaveClass("play-button");
   expect(play.querySelector(".play-glyph")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "Pause" }).querySelector(".pause-glyph")).toBeInTheDocument();
+});
+
+test("uses one control for playing and pausing", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+
+  // Playing and pausing are the same action read through the current state, so
+  // only ever one of the two is on screen.
+  const transport = document.querySelector(".player-transport");
+  expect(transport?.querySelectorAll(".play-button")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+
+  fireEvent.play(video);
+  const pause = screen.getByRole("button", { name: "Pause" });
+  expect(pause).toHaveClass("play-button");
+  expect(pause.querySelector(".pause-glyph")).toBeInTheDocument();
+  expect(pause).toHaveAttribute("aria-keyshortcuts", "Space");
+  expect(screen.queryByRole("button", { name: "Play" })).not.toBeInTheDocument();
+
+  // The one button drives both directions, from the pointer and from Space.
+  const paused = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  await user.click(pause);
+  expect(paused).toHaveBeenCalled();
+  fireEvent.pause(video);
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+
+  const played = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  fireEvent.keyDown(window, { key: " " });
+  expect(played).toHaveBeenCalled();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Pause" })).toBeVisible());
+});
+
+test("starts the whole result page as a playlist positioned at the chosen video", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-2.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play playlist-2.mp4" }));
+
+  // Choosing one result drops the viewer into the page's playlist at that spot
+  // rather than playing it on its own.
+  expect(await screen.findByLabelText("Playing playlist-2.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 2 of 3")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Playlist 3" })).toBeVisible();
+  expect(screen.getAllByRole("listitem")).toHaveLength(3);
+  expect(screen.getByRole("button", { name: "playlist-2.mp4" })).toHaveAttribute("aria-current", "true");
+
+  // And the rest of the page is reachable from there in both directions.
+  expect(screen.getByRole("button", { name: "Previous video" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Next video" })).toBeEnabled();
 });
 
 test("shows a sidecar subtitle track and turns it off again", async () => {
@@ -478,7 +545,51 @@ test("keeps the fullscreen controls up while the pointer rests on them", async (
   }
 });
 
-test("loops a single video when loop video is enabled", async () => {
+// A three-state control cannot say which state it is in with `aria-pressed`,
+// so its name is what the tests read.
+function loopControl() {
+  return screen.getByRole("button", { name: /^Loop: / });
+}
+
+test("cycles the loop control through the playlist, one video and off", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await screen.findByLabelText("Video controls");
+
+  // Looping the whole playlist is the default, so a sitting keeps going.
+  expect(loopControl()).toHaveAccessibleName("Loop: playlist");
+  expect(loopControl()).toHaveClass("loop-button", "on");
+  expect(loopControl().querySelector(".loop-one")).not.toBeInTheDocument();
+
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: this video");
+  expect(loopControl()).toHaveClass("on");
+  // VLC's marker for repeating one video: a "1" drawn between the arrows.
+  expect(loopControl().querySelector(".loop-one")).toBeInTheDocument();
+
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: off");
+  expect(loopControl()).not.toHaveClass("on");
+
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: playlist");
+
+  // The keyboard cycles the same way.
+  fireEvent.keyDown(window, { key: "l" });
+  expect(loopControl()).toHaveAccessibleName("Loop: this video");
+  expect(loopControl()).toHaveAttribute("aria-keyshortcuts", "L");
+});
+
+test("replays a one-entry playlist rather than stopping at its end", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
@@ -491,11 +602,108 @@ test("loops a single video when loop video is enabled", async () => {
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
   const video = await screen.findByLabelText("Playing clip.mp4");
+
+  // Looping a playlist of one means playing that one again; wrapping to the
+  // index it is already on is a state change React would throw away.
   const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
-  await user.click(screen.getByRole("button", { name: "Loop video" }));
-  expect(screen.getByRole("button", { name: "Loop video" })).toHaveAttribute("aria-pressed", "true");
+  play.mockClear();
   fireEvent.ended(video);
   expect(play).toHaveBeenCalled();
+  expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
+});
+
+test("repeats the current video in loop-one mode without leaving the playlist", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const video = await screen.findByLabelText("Playing playlist-1.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  fireEvent.loadedMetadata(video);
+
+  await user.click(loopControl());
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  play.mockClear();
+  fireEvent.ended(video);
+
+  // The first entry starts again rather than the playlist moving on.
+  expect(play).toHaveBeenCalled();
+  expect(screen.getByLabelText("Playing playlist-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
+  expect(screen.getByLabelText("Video timeline")).toHaveValue("0");
+});
+
+test("stops instead of advancing when looping is off", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const video = await screen.findByLabelText("Playing playlist-1.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  fireEvent.loadedMetadata(video);
+
+  await user.click(loopControl());
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: off");
+
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  play.mockClear();
+  fireEvent.ended(video);
+
+  // "Off" means this one video and then nothing, even in the middle of a list.
+  expect(screen.getByLabelText("Playing playlist-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
+  expect(play).not.toHaveBeenCalled();
+});
+
+test("fills the scrubber to the whole duration when a video ends", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const video = await screen.findByLabelText("Playing playlist-1.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  fireEvent.loadedMetadata(video);
+
+  // The engine stops reporting time a little short of the end, which left the
+  // bar visibly unfinished and made every video look as though it had been cut.
+  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 112 });
+  fireEvent.timeUpdate(video);
+  const timeline = screen.getByLabelText("Video timeline");
+  expect(timeline).toHaveValue("112");
+
+  await user.click(loopControl());
+  await user.click(loopControl());
+  fireEvent.ended(video);
+  expect(timeline).toHaveValue("120");
+  expect(screen.getByText("2:00 / 2:00")).toBeVisible();
 });
 
 test("rotates web playback clockwise and counter-clockwise", async () => {
@@ -588,7 +796,7 @@ test("keyboard shortcuts control player actions without hijacking search input",
   fireEvent.keyDown(window, { key: "PageUp" });
   expect(await screen.findByLabelText("Playing clip-1.mp4")).toBeVisible();
   fireEvent.keyDown(window, { key: "l" });
-  expect(screen.getByRole("button", { name: "Loop playlist" })).toHaveAttribute("aria-pressed", "true");
+  expect(loopControl()).toHaveAccessibleName("Loop: this video");
   fireEvent.keyDown(window, { key: "f" });
   expect(requestFullscreen).toHaveBeenCalledOnce();
 
@@ -609,10 +817,12 @@ test("loops a playlist back to its first video", async () => {
 
   await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
-  await user.click(await screen.findByRole("button", { name: "Loop playlist" }));
+  // Looping the playlist is the default, so nothing has to be turned on first.
+  expect(loopControl()).toHaveAccessibleName("Loop: playlist");
   fireEvent.ended(await screen.findByLabelText("Playing playlist-1.mp4"));
   fireEvent.ended(await screen.findByLabelText("Playing playlist-2.mp4"));
   expect(await screen.findByLabelText("Playing playlist-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
 });
 
 test("paginates and reports provider failures", async () => {
@@ -667,7 +877,8 @@ test("playlist mode advances through every search result", async () => {
     })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" })
-    .mockResolvedValueOnce({ filePath: "/Videos/playlist-3.mp4" });
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-3.mp4" })
+    .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
 
@@ -684,8 +895,10 @@ test("playlist mode advances through every search result", async () => {
   expect(screen.getByText("Playlist video 3 of 3")).toBeVisible();
   fireEvent.ended(third);
 
-  expect(screen.getByLabelText("Playing playlist-3.mp4")).toBeVisible();
-  expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-3" });
+  // The end of the last entry wraps round to the first rather than stopping.
+  expect(await screen.findByLabelText("Playing playlist-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 3")).toBeVisible();
+  expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-1" });
 });
 
 test("opens the playlist drawer and plays a selected playlist item", async () => {
@@ -1000,6 +1213,7 @@ test("native playlist advances when libmpv reports end of file", async () => {
     fileName: `native-${number}.mp4`,
     extension: "mp4",
   }));
+  let loaded = "";
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
       return Promise.resolve({
@@ -1015,8 +1229,15 @@ test("native playlist advances when libmpv reports end of file", async () => {
       const resultId = (args as { resultId: string }).resultId;
       return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
     }
+    if (command === "load_native_video") {
+      loaded = String((args as { filePath: string }).filePath);
+      return Promise.resolve();
+    }
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 1, currentTime: 1, paused: true, ended: true });
+      // Only the first file has run out, so the playlist has somewhere to go
+      // and the test is not racing a second advance.
+      const ended = loaded.includes("native-1");
+      return Promise.resolve({ duration: 30, currentTime: ended ? 28 : 1, paused: ended, ended });
     }
     return Promise.resolve();
   });
@@ -1032,4 +1253,47 @@ test("native playlist advances when libmpv reports end of file", async () => {
   });
   expect(await screen.findByLabelText("Playing native-2.mp4", {}, { timeout: 1_000 })).toBeVisible();
   expect(screen.getByText("Playlist video 2 of 2")).toBeVisible();
+});
+
+test("runs the native scrubber to the end and honours loop off", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `native-${number}`,
+    fileName: `native-${number}.mp4`,
+    extension: "mp4",
+  }));
+  let ended = false;
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      // mpv's last reported position falls short of the duration, which is what
+      // stopped the scrubber before the end of the bar.
+      return Promise.resolve({ duration: 30, currentTime: ended ? 28 : 4, paused: ended, ended });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Playing native-1.mp4");
+  await waitFor(() => expect(screen.getByLabelText("Video timeline")).toHaveValue("4"));
+
+  await user.click(loopControl());
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: off");
+
+  ended = true;
+  await waitFor(() => expect(screen.getByLabelText("Video timeline")).toHaveValue("30"), { timeout: 2_000 });
+  expect(screen.getByText("0:30 / 0:30")).toBeVisible();
+  // "Off" holds at the end of this video rather than starting the next one.
+  expect(screen.getByLabelText("Playing native-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
 });

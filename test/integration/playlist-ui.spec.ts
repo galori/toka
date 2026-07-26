@@ -158,30 +158,27 @@ describe("Toka playlist interface", () => {
   it("centres every label against the glyphs beside it", async function () {
     if (!(await trimsLabels())) this.skip();
 
-    for (const control of [".back-button", ".playlist-toggle", '.player-controls button[aria-label="Play"]']) {
+    for (const control of [".back-button", ".playlist-toggle", ".player-controls button.play-button"]) {
       expect({ control, offCentre: await labelOffCentre(control) <= 1 }).toEqual({
         control,
         offCentre: true,
       });
     }
 
-    // The reported case: "Space" reading higher than the play triangle and the
-    // pause bars it labels.
-    const drift = await browser.execute(() =>
-      ["Play", "Pause"].map((label) => {
-        const button = document.querySelector(`.player-controls button[aria-label="${label}"]`);
-        const glyph = button?.querySelector(".play-glyph, .pause-glyph")?.getBoundingClientRect();
-        const hint = button?.querySelector(".key-hint")?.getBoundingClientRect();
-        if (!glyph || !hint) return { label, apart: Number.POSITIVE_INFINITY };
-        return {
-          label,
-          apart: Math.abs((glyph.top + glyph.bottom) / 2 - (hint.top + hint.bottom) / 2),
-        };
-      }),
-    );
-    for (const { label, apart } of drift) {
-      expect({ label, alignedWithItsGlyph: apart <= 1 }).toEqual({ label, alignedWithItsGlyph: true });
-    }
+    // The reported case: "Space" reading higher than the triangle or the bars
+    // it labels, whichever the one control is currently showing.
+    const drift = await browser.execute(() => {
+      const button = document.querySelector(".player-controls button.play-button");
+      const label = button?.getAttribute("aria-label") ?? "missing";
+      const glyph = button?.querySelector(".play-glyph, .pause-glyph")?.getBoundingClientRect();
+      const hint = button?.querySelector(".key-hint")?.getBoundingClientRect();
+      if (!glyph || !hint) return { label, apart: Number.POSITIVE_INFINITY };
+      return { label, apart: Math.abs((glyph.top + glyph.bottom) / 2 - (hint.top + hint.bottom) / 2) };
+    });
+    expect({ label: drift.label, alignedWithItsGlyph: drift.apart <= 1 }).toEqual({
+      label: drift.label,
+      alignedWithItsGlyph: true,
+    });
   });
 
   it("tells a disabled skip control apart from an enabled one", async () => {
@@ -234,7 +231,7 @@ describe("Toka playlist interface", () => {
 
   it("draws the icon controls at a legible size", async () => {
     const icons = await browser.execute(() =>
-      ["Previous video", "Next video", "Loop playlist", "Enter fullscreen"].map((label) => {
+      ["Previous video", "Next video", "Loop: playlist", "Enter fullscreen"].map((label) => {
         const box = document
           .querySelector(`.player-controls button[aria-label="${label}"]`)
           ?.querySelector("svg")
@@ -243,6 +240,109 @@ describe("Toka playlist interface", () => {
       }),
     );
     expect(icons).toEqual(icons.map(({ label }) => ({ label, tooSmall: false })));
+  });
+
+  it("shows one play/pause control that swaps its glyph", async () => {
+    // Two buttons for one action left whichever of them did not apply sitting
+    // in the row, taking up width and still clickable.
+    const before = await browser.execute(() => {
+      const buttons = [...document.querySelectorAll(".player-transport > button")].map((button) =>
+        button.getAttribute("aria-label"),
+      );
+      const pill = document.querySelector<HTMLElement>(".player-transport button.play-button");
+      const box = pill?.getBoundingClientRect();
+      return {
+        transport: buttons,
+        label: pill?.getAttribute("aria-label"),
+        glyph: pill?.querySelector(".play-glyph") ? "play" : pill?.querySelector(".pause-glyph") ? "pause" : "none",
+        width: box?.width ?? 0,
+        left: box?.left ?? 0,
+      };
+    });
+    expect(before.transport.filter((label) => label === "Play" || label === "Pause")).toHaveLength(1);
+    expect(before.glyph).toBe(before.label === "Pause" ? "pause" : "play");
+
+    await $(".player-transport button.play-button").click();
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => document.querySelector(".player-transport button.play-button")?.getAttribute("aria-label"),
+        )) !== before.label,
+      { timeoutMsg: "The play/pause control never changed state" },
+    );
+
+    const after = await browser.execute(() => {
+      const pill = document.querySelector<HTMLElement>(".player-transport button.play-button");
+      const box = pill?.getBoundingClientRect();
+      return {
+        label: pill?.getAttribute("aria-label"),
+        glyph: pill?.querySelector(".play-glyph") ? "play" : pill?.querySelector(".pause-glyph") ? "pause" : "none",
+        width: box?.width ?? 0,
+        left: box?.left ?? 0,
+      };
+    });
+    expect(after.glyph).toBe(after.label === "Pause" ? "pause" : "play");
+    // Swapping the glyph must not resize the pill or shove the row sideways.
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
+
+    // Leave the transport as it was found for the tests that follow.
+    await $(".player-transport button.play-button").click();
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => document.querySelector(".player-transport button.play-button")?.getAttribute("aria-label"),
+        )) === before.label,
+      { timeoutMsg: "The play/pause control did not come back to its first state" },
+    );
+  });
+
+  it("draws the three loop states apart from one another", async () => {
+    // Painted onto black rather than parsed: the stylesheet is written in oklch
+    // and only the engine can say what that resolves to.
+    const shade = () =>
+      browser.execute(() => {
+        const button = document.querySelector<HTMLElement>(".player-controls .loop-button");
+        if (!button) return undefined;
+        const canvas = document.createElement("canvas");
+        canvas.width = 1;
+        canvas.height = 1;
+        const context = canvas.getContext("2d");
+        if (!context) return undefined;
+        context.fillStyle = getComputedStyle(button).color;
+        context.fillRect(0, 0, 1, 1);
+        const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+        const badge = button.querySelector(".loop-one")?.getBoundingClientRect();
+        return {
+          label: button.getAttribute("aria-label"),
+          colour: [r, g, b] as [number, number, number],
+          badge: badge ? { width: badge.width, height: badge.height } : undefined,
+        };
+      });
+
+    const playlist = await shade();
+    expect(playlist?.label).toBe("Loop: playlist");
+    expect(playlist?.badge).toBeUndefined();
+
+    await $(".player-controls .loop-button").click();
+    const one = await shade();
+    expect(one?.label).toBe("Loop: this video");
+    // The "1" between the arrows is what separates this state from the one
+    // before it, so it has to be drawn and be big enough to read.
+    if (!one?.badge) throw new Error("No 1 was drawn inside the loop icon");
+    expect(one.badge.width).toBeGreaterThan(2);
+    expect(one.badge.height).toBeGreaterThan(4);
+    expect(one.colour).toEqual(playlist?.colour);
+
+    await $(".player-controls .loop-button").click();
+    const off = await shade();
+    expect(off?.label).toBe("Loop: off");
+    expect(off?.badge).toBeUndefined();
+    // Off is the plain control colour, the two that are on carry the accent.
+    expect(off?.colour).not.toEqual(playlist?.colour);
+
+    await $(".player-controls .loop-button").click();
+    expect((await shade())?.label).toBe("Loop: playlist");
   });
 
   it("keeps the chosen speed when the playlist moves to the next video", async () => {
@@ -298,5 +398,77 @@ describe("Toka playlist interface", () => {
     await expect($('.player-controls button[aria-label="Exit fullscreen"]')).toExist();
 
     await leaveFullscreen();
+  });
+
+  it("runs the scrubber all the way to the end of the bar", async function () {
+    // Reported as "the playlist skips the end of every clip": the engine's last
+    // reported time falls short of the duration, so the bar stopped five to ten
+    // percent early just before the next video started.
+    const ready = await browser.execute(() => {
+      const video = document.querySelector<HTMLVideoElement>("video");
+      return Boolean(video) && Number.isFinite(video?.duration) && (video?.duration ?? 0) > 0;
+    });
+    if (!ready) this.skip();
+
+    // Looping off, so the player holds at the end instead of racing the next
+    // video's metadata into the same measurement.
+    for (let click = 0; click < 2; click += 1) await $(".player-controls .loop-button").click();
+    await expect($(".player-controls .loop-button")).toHaveAttribute("aria-label", "Loop: off");
+
+    await browser.execute(() => {
+      const video = document.querySelector<HTMLVideoElement>("video");
+      if (!video) throw new Error("The video element is missing");
+      video.currentTime = Math.max(0, video.duration - 0.4);
+      video.dispatchEvent(new Event("timeupdate"));
+      video.dispatchEvent(new Event("ended"));
+    });
+
+    const bar = await browser.execute(() => {
+      const range = document.querySelector<HTMLInputElement>(".player-timeline");
+      const video = document.querySelector<HTMLVideoElement>("video");
+      if (!range || !video) return undefined;
+      return { value: Number(range.value), max: Number(range.max), duration: video.duration };
+    });
+    if (!bar) throw new Error("No timeline or video found");
+    expect(bar.max).toBeGreaterThan(0);
+    expect(bar.max - bar.value).toBeLessThanOrEqual(0.05);
+    expect(bar.duration - bar.value).toBeLessThanOrEqual(0.05);
+  });
+});
+
+describe("Toka permanent playlist mode", () => {
+  before(async () => {
+    await $('.player-heading button[aria-label="Back to results"]').click();
+    await browser.waitUntil(async () => (await $$(".video-tile")).length === 5, {
+      timeoutMsg: "The results grid never came back",
+    });
+  });
+
+  after(leaveFullscreen);
+
+  it("opens the whole page of results when one of them is chosen", async () => {
+    // There is no such thing as playing one video on its own any more: a tile
+    // drops the viewer into the page's playlist at that tile's place.
+    await $('button[aria-label="Play sample3.mp4"]').click();
+    await $(".player-controls").waitForDisplayed();
+
+    await expect($(".playlist-status")).toHaveText("Playlist video 3 of 5");
+    expect((await $$(".playlist-drawer li button")).length).toBe(5);
+    await expect($('.playlist-drawer button[aria-current="true"]')).toHaveText(/sample3\.mp4/);
+    await expect($(".playlist-toggle")).toHaveText(/5/);
+
+    // Both directions are reachable from the middle of the list.
+    const ends = await browser.execute(() =>
+      ["Previous video", "Next video"].map((label) => ({
+        label,
+        disabled: document
+          .querySelector(`.player-transport button[aria-label="${label}"]`)
+          ?.hasAttribute("disabled"),
+      })),
+    );
+    expect(ends).toEqual([
+      { label: "Previous video", disabled: false },
+      { label: "Next video", disabled: false },
+    ]);
   });
 });

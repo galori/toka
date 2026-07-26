@@ -11,8 +11,9 @@ describe("Toka real plocate provider", () => {
 
     const player = await $('video[aria-label="Playing toka-e2e-happy-path.mp4"]');
     await player.waitForDisplayed();
-    await $('button[aria-label="Pause"]').click();
-    await $('button[aria-label="Play"]').click();
+    // Playing and pausing share one control that renames itself.
+    await $("button.play-button").click();
+    await $("button.play-button").click();
     await $('button[aria-label="Back to results"]').click();
 
     await expect(await $('button[aria-label="Play toka-e2e-happy-path.mp4"]')).toBeDisplayed();

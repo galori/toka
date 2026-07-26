@@ -143,13 +143,23 @@ function RotateRightIcon() {
   );
 }
 
-function LoopIcon() {
+function LoopIcon({ single = false }: { single?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
       <polyline points="17 1 21 5 17 9" />
       <path d="M3 11V9a4 4 0 0 1 4-4h14" />
       <polyline points="7 23 3 19 7 15" />
       <path d="M21 13v2a4 4 0 0 1-4 4H3" />
+      {/* VLC marks "repeat this one video" with a 1 drawn between the arrows.
+          Filled rather than stroked: a digit this small stroked at the icon's
+          weight closes up, and a thinner stroke lands under a device pixel and
+          is resampled into a grey smudge by WebKitGTK. */}
+      {single ? (
+        <polygon
+          className="loop-one"
+          points="10.4 9.9 13.2 8.2 14.2 8.2 14.2 15.8 12.4 15.8 12.4 10.5 11.2 11.2"
+        />
+      ) : null}
     </svg>
   );
 }
@@ -183,6 +193,19 @@ function BackArrowIcon() {
 const CONTROLS_IDLE_DELAY = 2_500;
 
 const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+// Every result page is a playlist now, so looping has VLC's three states rather
+// than a single on/off. Three states cannot be expressed with `aria-pressed`,
+// so the control names the one it is in and the pointer or the L key cycles.
+type LoopMode = "playlist" | "one" | "off";
+
+const LOOP_MODES: LoopMode[] = ["playlist", "one", "off"];
+
+const LOOP_LABELS: Record<LoopMode, string> = {
+  playlist: "Loop: playlist",
+  one: "Loop: this video",
+  off: "Loop: off",
+};
 
 // DOM key names are what `aria-keyshortcuts` wants; these are what a viewer
 // should read on the button itself.
@@ -249,7 +272,11 @@ export function playbackSource(filePath: string): string {
   return convertFileSrc(filePath);
 }
 
-function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void }) {
+function Player({
+  videos,
+  startIndex,
+  onBack,
+}: { videos: VideoResult[]; startIndex: number; onBack: () => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
   const playerControls = useRef<HTMLDivElement>(null);
@@ -257,19 +284,19 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   const nativeSurface = useRef<HTMLDivElement>(null);
   const playlistDrawer = useRef<HTMLElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
-  const [index, setIndex] = useState(0);
+  const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [controlsIdle, setControlsIdle] = useState(false);
-  const [loop, setLoop] = useState(false);
+  const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
   const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
-  const [playlistOpen, setPlaylistOpen] = useState(videos.length > 1);
+  const [playlistOpen, setPlaylistOpen] = useState(true);
   const [nativeSubtitles, setNativeSubtitles] = useState<SubtitleOption[]>([]);
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
@@ -326,7 +353,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
   }, [video.id]);
 
   const native = prepared?.playbackBackend === "native";
-  const drawerOpen = videos.length > 1 && playlistOpen;
+  const drawerOpen = playlistOpen;
 
   const subtitles = useMemo<SubtitleOption[]>(() => {
     if (native) return nativeSubtitles;
@@ -388,13 +415,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           if (!state.ended) advancing = false;
           if (state.ended && !advancing) {
             advancing = true;
-            if (index < videos.length - 1) setIndex((current) => current + 1);
-            else if (loop && videos.length > 1) setIndex(0);
-            else if (loop) {
-              void seekNativeVideo(0)
-                .then(() => setNativePaused(false))
-                .catch((reason: unknown) => setError(errorMessage(reason)));
-            }
+            finishVideo.current(state.duration);
           }
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
@@ -416,7 +437,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, index, loop, native, playlistOpen, videos.length]);
+  }, [controlsIdle, index, native, playlistOpen]);
 
   const play = () => {
     if (native) {
@@ -440,6 +461,50 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       setPlayingBack(false);
     }
   };
+
+  const restart = () => {
+    if (native) {
+      void seekNativeVideo(0)
+        .then(() => setNativePaused(false))
+        .then(() => setPlayingBack(true))
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+    } else if (element.current) {
+      element.current.currentTime = 0;
+      play();
+    }
+    setCurrentTime(0);
+  };
+
+  // What happens when the current video runs out. Both backends end a video the
+  // same way, but the native one only finds out by polling, so the poll reaches
+  // this through a ref rather than rebuilding its interval whenever the loop
+  // mode or the position in the playlist changes.
+  const endOfVideo = (endTime: number) => {
+    // Neither engine reports a final time that quite reaches the duration, so
+    // the scrubber stopped five to ten percent short and made every video look
+    // as though its ending had been skipped.
+    if (endTime > 0) setCurrentTime(endTime);
+    if (loop === "one") {
+      restart();
+      return;
+    }
+    // "Off" means play the video the viewer is on and stop there, so it does
+    // not move on to the next entry even in the middle of a playlist.
+    if (loop === "off") return;
+    const next = index < videos.length - 1 ? index + 1 : 0;
+    // Wrapping a one-entry playlist lands back on the video that just ended,
+    // and React drops a state change that changes nothing, so that entry has to
+    // be started again rather than waited on.
+    if (next === index) restart();
+    else setIndex(next);
+  };
+  const finishVideo = useRef(endOfVideo);
+  useEffect(() => {
+    finishVideo.current = endOfVideo;
+  });
+
+  const cycleLoop = () =>
+    setLoop((mode) => LOOP_MODES[(LOOP_MODES.indexOf(mode) + 1) % LOOP_MODES.length]);
 
   const rotate = (amount: number) => {
     setRotation((current) => {
@@ -643,8 +708,8 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
-        run(() => setLoop((enabled) => !enabled));
-      } else if (event.key.toLowerCase() === "p" && videos.length > 1) {
+        run(cycleLoop);
+      } else if (event.key.toLowerCase() === "p") {
         run(() => setPlaylistOpen((open) => !open));
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
@@ -683,17 +748,15 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           <Label>Back</Label>
         </ControlButton>
         <h1 title={video.fileName}>{video.fileName}</h1>
-        {videos.length > 1 ? (
-          <ControlButton
-            shortcut="P"
-            className="playlist-toggle"
-            aria-expanded={playlistOpen}
-            onClick={() => setPlaylistOpen((open) => !open)}
-          >
-            <Label>Playlist</Label>
-            <span className="playlist-count"><Label>{String(videos.length)}</Label></span>
-          </ControlButton>
-        ) : null}
+        <ControlButton
+          shortcut="P"
+          className="playlist-toggle"
+          aria-expanded={playlistOpen}
+          onClick={() => setPlaylistOpen((open) => !open)}
+        >
+          <Label>Playlist</Label>
+          <span className="playlist-count"><Label>{String(videos.length)}</Label></span>
+        </ControlButton>
       </div>
 
       {error ? <p role="alert" className="message error">{error}</p> : null}
@@ -719,14 +782,7 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
             onPlay={() => setPlayingBack(true)}
             onPause={() => setPlayingBack(false)}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-            onEnded={() => {
-              if (index < videos.length - 1) setIndex((current) => current + 1);
-              else if (loop && videos.length > 1) setIndex(0);
-              else if (loop && element.current) {
-                element.current.currentTime = 0;
-                play();
-              }
-            }}
+            onEnded={(event) => endOfVideo(duration || event.currentTarget.duration || 0)}
             onError={() => setError("This video format or codec is not supported on this computer.")}
           >
           </video>
@@ -760,11 +816,16 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           <div className="player-transport">
             <ControlButton shortcut="PageUp" disabled={index === 0} onClick={() => selectVideo(index - 1)} aria-label="Previous video"><PreviousIcon /></ControlButton>
             <ControlButton shortcut="," onClick={() => skip(-10)} aria-label="Skip back 10 seconds"><Label>−10</Label></ControlButton>
-            <ControlButton shortcut="Space" className="play-button" onClick={play} aria-label="Play">
-              <span className="play-glyph" aria-hidden="true" />
-            </ControlButton>
-            <ControlButton shortcut="Space" onClick={pause} aria-label="Pause">
-              <span className="pause-glyph" aria-hidden="true" />
+            {/* Playing and pausing are one action whose meaning follows the
+                state, so they are one control rather than two, the way every
+                other player draws them. */}
+            <ControlButton
+              shortcut="Space"
+              className="play-button"
+              onClick={playingBack ? pause : play}
+              aria-label={playingBack ? "Pause" : "Play"}
+            >
+              <span className={playingBack ? "pause-glyph" : "play-glyph"} aria-hidden="true" />
             </ControlButton>
             <ControlButton shortcut="." onClick={() => skip(10)} aria-label="Skip forward 10 seconds"><Label>+10</Label></ControlButton>
             <ControlButton shortcut="PageDown" disabled={index === videos.length - 1} onClick={() => selectVideo(index + 1)} aria-label="Next video"><NextIcon /></ControlButton>
@@ -808,11 +869,11 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
               <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right"><RotateRightIcon /></ControlButton>
               <ControlButton
                 shortcut="L"
-                onClick={() => setLoop((enabled) => !enabled)}
-                aria-label={videos.length > 1 ? "Loop playlist" : "Loop video"}
-                aria-pressed={loop}
+                className={loop === "off" ? "transport-button loop-button" : "transport-button loop-button on"}
+                onClick={cycleLoop}
+                aria-label={LOOP_LABELS[loop]}
               >
-                <LoopIcon />
+                <LoopIcon single={loop === "one"} />
               </ControlButton>
               <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
@@ -842,11 +903,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
           </aside>
         ) : null}
       </div>
-      {videos.length > 1 ? (
-        <p className="playlist-status" aria-live="polite">
-          Playlist video {index + 1} of {videos.length}
-        </p>
-      ) : null}
+      <p className="playlist-status" aria-live="polite">
+        Playlist video {index + 1} of {videos.length}
+      </p>
     </section>
   );
 }
@@ -854,7 +913,9 @@ function Player({ videos, onBack }: { videos: VideoResult[]; onBack: () => void 
 export default function App() {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState<SearchPage>();
-  const [playing, setPlaying] = useState<VideoResult[]>();
+  // Playback is always a playlist: choosing one result starts the whole page of
+  // them, positioned at the one that was chosen.
+  const [playing, setPlaying] = useState<{ videos: VideoResult[]; startIndex: number }>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const requestNumber = useRef(0);
@@ -906,14 +967,24 @@ export default function App() {
 
       {loading ? <p className="message" aria-live="polite">Searching…</p> : null}
       {error ? <p role="alert" className="message error">{error}</p> : null}
-      {playing && page ? <Player videos={playing} onBack={() => setPlaying(undefined)} /> : null}
+      {playing && page ? (
+        <Player
+          videos={playing.videos}
+          startIndex={playing.startIndex}
+          onBack={() => setPlaying(undefined)}
+        />
+      ) : null}
 
       {!loading && !playing && page ? (
         <section className="results">
           <div className="results-summary">
             <p>{page.totalResults} {page.totalResults === 1 ? "video" : "videos"}</p>
             {page.results.length > 1 ? (
-              <button type="button" className="playlist-button" onClick={() => setPlaying(page.results)}>
+              <button
+                type="button"
+                className="playlist-button"
+                onClick={() => setPlaying({ videos: page.results, startIndex: 0 })}
+              >
                 <Label>Play all</Label>
               </button>
             ) : null}
@@ -921,14 +992,14 @@ export default function App() {
           </div>
           {page.results.length ? (
             <ul className="video-grid" aria-label="Video results">
-              {page.results.map((video) => (
+              {page.results.map((video, position) => (
                 <li key={video.id}>
                   <button
                     type="button"
                     className="video-tile"
                     aria-label={`Play ${video.fileName}`}
                     title={video.fileName}
-                    onClick={() => setPlaying([video])}
+                    onClick={() => setPlaying({ videos: page.results, startIndex: position })}
                   >
                     <span className="video-art"><VideoIcon /></span>
                     <span className="video-name">{video.fileName}</span>
