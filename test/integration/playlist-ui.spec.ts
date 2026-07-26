@@ -25,6 +25,14 @@ function playingNow(): Promise<string | undefined> {
   );
 }
 
+// Asking an engine that is not in fullscreen to leave it is an error, not a
+// no-op, so an unconditional call in a cleanup hook fails the whole suite.
+function leaveFullscreen() {
+  return browser.execute(() => {
+    if (document.fullscreenElement) document.exitFullscreen?.();
+  });
+}
+
 async function advanceToNextVideo() {
   const before = await playingNow();
   // Clicked through the DOM: in fullscreen there is no window chrome to
@@ -79,9 +87,7 @@ describe("Toka playlist interface", () => {
     await $(".player-controls").waitForDisplayed();
   });
 
-  after(async () => {
-    await browser.execute(() => document.exitFullscreen?.());
-  });
+  after(leaveFullscreen);
 
   it("opens the playlist drawer over the picture", async () => {
     // On Linux the mpv surface is composited above the WebView whatever the
@@ -245,10 +251,21 @@ describe("Toka playlist interface", () => {
     await $(".playlist-toggle").click();
     await $(".playlist-drawer").waitForExist({ reverse: true });
 
-    const speed = await $('select[aria-label="Playback speed"]');
-    await speed.selectByAttribute("value", "1.5");
-    await advanceToNextVideo();
+    // Driven through React's own value setter rather than WebDriver's select
+    // handling, which sets the DOM value without the controlled component ever
+    // seeing a change — the same approach this suite uses for the search field.
+    await browser.execute(() => {
+      const select = document.querySelector<HTMLSelectElement>('select[aria-label="Playback speed"]');
+      if (!select) throw new Error("The playback speed control is missing");
+      const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set;
+      setValue?.call(select, "1.5");
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    // Asserted before advancing, so a failure says whether the speed never took
+    // or whether the next video threw it away.
+    await expect($('select[aria-label="Playback speed"]')).toHaveValue("1.5");
 
+    await advanceToNextVideo();
     await expect($('select[aria-label="Playback speed"]')).toHaveValue("1.5");
     await browser.waitUntil(
       async () => (await browser.execute(() => document.querySelector("video")?.playbackRate)) === 1.5,
@@ -280,6 +297,6 @@ describe("Toka playlist interface", () => {
     ).toBe(true);
     await expect($('.player-controls button[aria-label="Exit fullscreen"]')).toExist();
 
-    await browser.execute(() => document.exitFullscreen?.());
+    await leaveFullscreen();
   });
 });
