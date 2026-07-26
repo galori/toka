@@ -972,6 +972,31 @@ test("keyboard shortcuts control player actions without hijacking search input",
   expect(screen.getByLabelText("Playing clip-1.mp4")).toHaveStyle({ transform: "rotate(0deg)" });
 });
 
+test("keeps keyboard shortcuts active after a transport button receives focus", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  fireEvent.timeUpdate(video);
+
+  const skipBack = screen.getByRole("button", { name: "Skip back 10 seconds" });
+  await user.click(skipBack);
+  expect(skipBack).toHaveFocus();
+  fireEvent.keyDown(skipBack, { key: " " });
+
+  expect(video).toHaveProperty("paused", true);
+});
+
 test("loops a playlist back to its first video", async () => {
   const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `playlist-${number}.mp4`, extension: "mp4" }));
   invokeMock
