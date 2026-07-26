@@ -665,16 +665,18 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     vbox.remove(&webview);
 
     let overlay = gtk::Overlay::new();
-    overlay.add(&webview);
-    vbox.pack_start(&overlay, true, true, 0);
-
     let video_area = gtk::GLArea::new();
     video_area.set_auto_render(false);
     video_area.set_has_alpha(false);
     video_area.set_halign(gtk::Align::Start);
     video_area.set_valign(gtk::Align::Start);
     video_area.set_size_request(1, 1);
-    overlay.add_overlay(&video_area);
+    // Put the GL area below the WebView in the GTK overlay. This lets the
+    // WebView controls and playlist remain transparent overlays while mpv keeps
+    // rendering into one fixed rectangle beneath them.
+    overlay.add(&video_area);
+    overlay.add_overlay(&webview);
+    vbox.pack_start(&overlay, true, true, 0);
 
     let realize_player = player.clone();
     video_area.connect_realize(move |area| {
