@@ -10,6 +10,7 @@ import {
   seekNativeVideo,
   setNativePaused,
   setNativeSpeed,
+  setNativeVolume,
   setNativeSubtitle,
   setNativeVideoRotation,
   setNativeVideoBounds,
@@ -216,6 +217,7 @@ const PLAYLIST_HIDE_DELAY = 800;
 type FullscreenPlaylist = "hidden" | "peek" | "held";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
+const VOLUME_STEP = 5;
 
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
@@ -319,6 +321,7 @@ function Player({
   const [controlsIdle, setControlsIdle] = useState(false);
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
+  const [volume, setVolume] = useState(100);
   const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
@@ -333,9 +336,13 @@ function Player({
   // outlives each video. Read through a ref so loading the next one does not
   // have to depend on it and restart playback whenever it changes.
   const chosenSpeed = useRef(speed);
+  const chosenVolume = useRef(volume);
   useEffect(() => {
     chosenSpeed.current = speed;
   }, [speed]);
+  useEffect(() => {
+    chosenVolume.current = volume;
+  }, [volume]);
 
   useEffect(() => {
     let active = true;
@@ -362,6 +369,7 @@ function Player({
           if (active) setNativeBaseRotation(baseRotation);
           // mpv starts every file at 1x.
           if (chosenSpeed.current !== 1) await setNativeSpeed(chosenSpeed.current);
+          if (chosenVolume.current !== 100) await setNativeVolume(chosenVolume.current);
           await setNativePaused(false);
           if (active) setPlayingBack(true);
         }
@@ -573,6 +581,13 @@ function Player({
     else if (element.current) element.current.playbackRate = next;
   };
 
+  const applyVolume = (next: number) => {
+    const clamped = Math.max(0, Math.min(100, next));
+    setVolume(clamped);
+    if (native) void setNativeVolume(clamped).catch((reason: unknown) => setError(errorMessage(reason)));
+    else if (element.current) element.current.volume = clamped / 100;
+  };
+
   // Holds at the ends of the range rather than wrapping, so holding the key
   // down cannot jump from slowest straight back to fastest.
   const stepSpeed = (direction: number) => {
@@ -781,6 +796,10 @@ function Player({
         run(() => stepSpeed(-1));
       } else if (event.key === "=" || event.key === "+") {
         run(() => stepSpeed(1));
+      } else if (event.key === "9") {
+        run(() => applyVolume(volume - VOLUME_STEP));
+      } else if (event.key === "0") {
+        run(() => applyVolume(volume + VOLUME_STEP));
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -795,7 +814,7 @@ function Player({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, speed, subtitleIndex, subtitles, videos.length]);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, speed, subtitleIndex, subtitles, videos.length, volume]);
 
   if (error) {
     const unsupported = error.includes("format") || error.includes("codec");
@@ -860,6 +879,7 @@ function Player({
             onLoadedMetadata={(event) => {
               setDuration(Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0);
               event.currentTarget.playbackRate = speed;
+              event.currentTarget.volume = volume / 100;
               play();
             }}
             onPlay={() => setPlayingBack(true)}
@@ -955,6 +975,22 @@ function Player({
                 </select>
                 <KeyHint shortcut="- =" />
               </span>
+              <ControlButton shortcut="9" onClick={() => applyVolume(volume - VOLUME_STEP)} aria-label="Decrease volume">
+                <Label>Vol −</Label>
+              </ControlButton>
+              <input
+                className="volume-slider"
+                aria-label="Volume"
+                type="range"
+                min="0"
+                max="100"
+                step="5"
+                value={volume}
+                onChange={(event) => applyVolume(Number(event.currentTarget.value))}
+              />
+              <ControlButton shortcut="0" onClick={() => applyVolume(volume + VOLUME_STEP)} aria-label="Increase volume">
+                <Label>Vol +</Label>
+              </ControlButton>
               <ControlButton shortcut="[" onClick={() => rotate(-90)} aria-label="Rotate left"><RotateLeftIcon /></ControlButton>
               <ControlButton shortcut="]" onClick={() => rotate(90)} aria-label="Rotate right"><RotateRightIcon /></ControlButton>
               <ControlButton
