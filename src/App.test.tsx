@@ -543,6 +543,11 @@ test("lets the fullscreen controls fade out and brings them back on movement", a
     movePointer();
     expect(controls).not.toHaveClass("idle");
 
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+    act(() => void fireEvent.mouseMove(document, { clientX: 10, clientY: 10 }));
+    expect(controls).not.toHaveClass("idle");
+
     // Leaving fullscreen has to restore them for good.
     act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
@@ -1250,6 +1255,24 @@ test("stays fullscreen when the playlist advances to the next video", async () =
     expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
   } finally {
     reportFullscreen(false);
+  }
+});
+
+test("keeps fullscreen controls hidden when autoplay advances the playlist", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen(["clip-1.mp4", "clip-2.mp4"]);
+    await enterFullscreen(user);
+    const controls = await screen.findByLabelText("Video controls");
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+
+    fireEvent.ended(await screen.findByLabelText("Playing clip-1.mp4"));
+    await screen.findByLabelText("Playing clip-2.mp4");
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
   }
 });
 

@@ -714,10 +714,14 @@ function Player({
       else if (Date.now() - lastActivity >= CONTROLS_IDLE_DELAY) setControlsIdle(true);
     }, 250);
     window.addEventListener("mousemove", wake);
+    document.addEventListener("mousemove", wake);
+    document.addEventListener("pointermove", wake);
     window.addEventListener("keydown", wake);
     return () => {
       window.clearInterval(tick);
       window.removeEventListener("mousemove", wake);
+      document.removeEventListener("mousemove", wake);
+      document.removeEventListener("pointermove", wake);
       window.removeEventListener("keydown", wake);
     };
   }, [fullscreen]);
