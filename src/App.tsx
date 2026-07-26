@@ -1,5 +1,6 @@
 import { ButtonHTMLAttributes, CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   loadNativeVideo,
   nativePlaybackState,
@@ -337,6 +338,10 @@ export function playbackSource(filePath: string): string {
   return convertFileSrc(filePath);
 }
 
+function prefersWindowFullscreen(): boolean {
+  return navigator.userAgent.includes("Mac OS X");
+}
+
 function Player({
   videos,
   startIndex,
@@ -355,6 +360,7 @@ function Player({
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
+  const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   const [controlsIdle, setControlsIdle] = useState(false);
@@ -397,6 +403,7 @@ function Player({
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
+    setFullscreenError(undefined);
     setPlayingBack(false);
     setRotation(0);
     setNativeBaseRotation(0);
@@ -829,17 +836,36 @@ function Player({
   }, [fullscreen]);
 
   const toggleFullscreen = () => {
+    setFullscreenError(undefined);
     if (document.fullscreenElement) {
       const exiting = document.exitFullscreen?.();
-      if (exiting) void exiting.catch((reason: unknown) => setError(errorMessage(reason)));
+      if (exiting) {
+        void exiting
+          .catch(() => getCurrentWindow().setFullscreen(false).then(() => setFullscreen(false)))
+          .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+      }
+      return;
+    }
+    if (fullscreen) {
+      void getCurrentWindow()
+        .setFullscreen(false)
+        .then(() => setFullscreen(false))
+        .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
       return;
     }
     const shell = playerShell.current;
-    if (!shell?.requestFullscreen) {
-      setError("Fullscreen mode is not supported by this system.");
-      return;
-    }
-    void shell.requestFullscreen().catch((reason: unknown) => setError(errorMessage(reason)));
+    const enterWindowFullscreen = () =>
+      getCurrentWindow()
+        .setFullscreen(true)
+        .then(() => setFullscreen(true));
+    const enterDocumentFullscreen = () => {
+      if (!shell?.requestFullscreen) return Promise.reject(new Error("Fullscreen mode is not supported by this system."));
+      return shell.requestFullscreen();
+    };
+    const entering = prefersWindowFullscreen()
+      ? enterWindowFullscreen().catch(enterDocumentFullscreen)
+      : enterDocumentFullscreen().catch(enterWindowFullscreen);
+    void entering.catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
   };
 
   useEffect(() => {
@@ -939,7 +965,7 @@ function Player({
         </ControlButton>
       </div>
 
-      {error ? <p role="alert" className="message error">{error}</p> : null}
+      {fullscreenError ? <p role="alert" className="message error">{fullscreenError}</p> : null}
       {/* The shell outlives each video: it is the element the browser promotes
           to fullscreen, and unmounting it between playlist items dropped the
           window back out of fullscreen. */}

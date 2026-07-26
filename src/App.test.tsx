@@ -3,9 +3,18 @@ import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import App, { playbackSource, shuffleVideos } from "./App";
 
+const windowApiMock = vi.hoisted(() => ({
+  isFullscreen: vi.fn(),
+  setFullscreen: vi.fn(),
+}));
+
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
   convertFileSrc: vi.fn((path: string) => `asset://${path}`),
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => windowApiMock,
 }));
 
 const invokeMock = vi.mocked(invoke);
@@ -23,6 +32,10 @@ beforeEach(() => {
   invokeMock.mockReset();
   convertFileSrcMock.mockClear();
   randomMock.mockReset().mockReturnValue(0.999999);
+  windowApiMock.isFullscreen.mockReset();
+  windowApiMock.setFullscreen.mockReset();
+  windowApiMock.isFullscreen.mockResolvedValue(false);
+  windowApiMock.setFullscreen.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -32,18 +45,26 @@ afterEach(() => {
 
 test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
   vi.stubEnv("VITE_E2E", "1");
-  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
+  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
 
-  expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:1421/clip%20%231.mp4");
-  expect(convertFileSrcMock).not.toHaveBeenCalled();
+  try {
+    expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:1421/clip%20%231.mp4");
+    expect(convertFileSrcMock).not.toHaveBeenCalled();
+  } finally {
+    userAgent.mockRestore();
+  }
 });
 
 test("retains the asset protocol for E2E builds on platforms that support it", () => {
   vi.stubEnv("VITE_E2E", "1");
-  vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
 
-  expect(playbackSource("/Videos/clip.mp4")).toBe("asset:///Videos/clip.mp4");
-  expect(convertFileSrcMock).toHaveBeenCalledWith("/Videos/clip.mp4");
+  try {
+    expect(playbackSource("/Videos/clip.mp4")).toBe("asset:///Videos/clip.mp4");
+    expect(convertFileSrcMock).toHaveBeenCalledWith("/Videos/clip.mp4");
+  } finally {
+    userAgent.mockRestore();
+  }
 });
 
 test("starts with a focused search field and displays submitted results", async () => {
@@ -527,6 +548,55 @@ test("shows fullscreen path and time overlays and toggles them with I", async ()
     expect(screen.getByRole("button", { name: "Show fullscreen information" })).toBeVisible();
   } finally {
     vi.useRealTimers();
+  }
+});
+
+test("uses Tauri window fullscreen when the web fullscreen request fails", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const requestFullscreen = vi.fn().mockRejectedValue(new Error("Web fullscreen failed"));
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+
+  await waitFor(() => expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true));
+  expect(screen.queryByRole("heading", { name: "This video could not be played" })).not.toBeInTheDocument();
+  expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+});
+
+test("uses Tauri window fullscreen first on macOS", async () => {
+  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+
+    await waitFor(() => expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true));
+    expect(requestFullscreen).not.toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: "This video could not be played" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
+  } finally {
+    userAgent.mockRestore();
   }
 });
 
