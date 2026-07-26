@@ -1356,14 +1356,14 @@ test("keeps the native video surface clear of the playlist drawer", async () => 
     await user.click(await screen.findByRole("button", { name: "Play all" }));
     await screen.findByLabelText("Playing native-1.mp4");
 
-    // GTK puts the mpv surface above the WebView whatever the z-index says, so
-    // the drawer is only visible if the surface stops short of it.
+    // The native surface stays at the full picture bounds; the WebView is
+    // composited above it so the drawer does not require resizing mpv.
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
         x: 0,
         y: 0,
-        width: 560,
-        height: 320,
+        width: 800,
+        height: 400,
         visible: true,
       }),
     );
@@ -1375,7 +1375,7 @@ test("keeps the native video surface clear of the playlist drawer", async () => 
         x: 0,
         y: 0,
         width: 800,
-        height: 320,
+        height: 400,
         visible: true,
       }),
     );
@@ -1439,14 +1439,13 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
       }),
     );
 
-    // GTK composites the mpv surface above the WebView whatever the z-index
-    // says, so a revealed overlay is only seen on Linux if the surface stops
-    // short of it. Every other engine overlays it without moving the picture.
+    // Revealing controls or the drawer never changes the native surface
+    // bounds, so mpv does not resize or re-center the picture.
     invokeMock.mockClear();
     movePointer();
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 1200, height: 704, visible: true,
+        x: 0, y: 0, width: 1200, height: 794, visible: true,
       }),
     );
 
@@ -1454,7 +1453,7 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     movePointer(window.innerWidth - 1);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 920, height: 704, visible: true,
+        x: 0, y: 0, width: 1200, height: 794, visible: true,
       }),
     );
   } finally {
