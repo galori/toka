@@ -76,6 +76,11 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 }
 
 .video-tile { display: block; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; }
+.video-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: 6px; }
+.tag-pill, .tag-add { border: 1px solid #40506a; border-radius: 999px; padding: 2px 7px; color: #dbe7f7; background: #172235; font: inherit; font-size: 0.78rem; cursor: pointer; }
+.tag-pill:hover, .tag-pill:focus-visible, .tag-add:hover, .tag-add:focus-visible { border-color: #69a8ff; }
+.tag-add { min-width: 24px; }
+.video-tags input { min-width: 80px; max-width: 120px; border: 1px solid #69a8ff; border-radius: 999px; padding: 3px 7px; color: inherit; background: #111a29; }
 
 .video-art {
   position: relative;

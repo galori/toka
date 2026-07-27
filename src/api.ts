@@ -7,6 +7,7 @@ export type VideoResult = {
   fileName: string;
   extension: string;
   thumbnailPath?: string;
+  tags?: string[];
 };
 
 export type SearchPage = {
@@ -75,6 +76,10 @@ export function prepareVideo(resultId: string): Promise<PreparedVideo> {
 
 export function deleteVideo(resultId: string): Promise<void> { return invoke("delete_video", { resultId }); }
 export function undoDelete(): Promise<void> { return invoke("undo_delete"); }
+
+export function setVideoTags(resultId: string, tags: string[]): Promise<string[]> {
+  return invoke("set_video_tags", { resultId, tags });
+}
 
 export function loadNativeVideo(filePath: string): Promise<void> {
   return invoke("load_native_video", { filePath });

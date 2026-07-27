@@ -3,6 +3,7 @@ mod player_linux;
 mod providers;
 mod search;
 mod subtitles;
+mod tags;
 mod thumbnails;
 
 #[cfg(target_os = "macos")]
@@ -41,6 +42,12 @@ struct CommandError {
 
 struct DeletedVideo {
     trash_name: String,
+}
+
+#[derive(Serialize)]
+struct TagsError {
+    kind: &'static str,
+    message: String,
 }
 
 impl From<SearchError> for CommandError {
@@ -129,6 +136,19 @@ fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), Co
     let output = std::process::Command::new("osascript").args(["-e", &format!("tell application \"Finder\" to move POSIX file \"{}\" to original location", item.trash_name)]).output();
     let output = output.map_err(|error| CommandError { kind: "Delete", message: format!("The deleted video could not be restored: {error}") })?;
     if output.status.success() { Ok(()) } else { Err(CommandError { kind: "Delete", message: "The deleted video could not be restored.".into() }) }
+}
+
+#[tauri::command]
+fn set_video_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<Vec<String>, TagsError> {
+    let path = engine.video_path(&result_id).map_err(|error| TagsError {
+        kind: "VideoUnavailable",
+        message: error.to_string(),
+    })?;
+    tags::set(&path, &tags).map_err(|message| TagsError { kind: "Tags", message })
 }
 
 #[tauri::command]
@@ -360,10 +380,20 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
 
-    let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider()))).manage(Mutex::new(None::<DeletedVideo>));
+    let builder = builder
+        .manage(Arc::new(SearchEngine::new(platform_provider())))
+        .manage(Mutex::new(None::<DeletedVideo>));
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, delete_video, undo_delete, prepare_video, subtitle_cues])
+        builder.invoke_handler(tauri::generate_handler![
+            search_videos,
+            video_thumbnail,
+            delete_video,
+            undo_delete,
+            set_video_tags,
+            prepare_video,
+            subtitle_cues
+        ])
     } else {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
@@ -375,6 +405,7 @@ pub fn run() {
                 video_thumbnail,
                 delete_video,
                 undo_delete,
+                set_video_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -392,8 +423,15 @@ pub fn run() {
             ])
     };
     #[cfg(not(target_os = "linux"))]
-    let builder =
-        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, delete_video, undo_delete, prepare_video, subtitle_cues]);
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        search_videos,
+        video_thumbnail,
+        delete_video,
+        undo_delete,
+        set_video_tags,
+        prepare_video,
+        subtitle_cues
+    ]);
 
     builder
         .run(tauri::generate_context!())

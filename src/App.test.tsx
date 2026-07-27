@@ -137,6 +137,23 @@ test("displays an app-generated thumbnail when search returns one", async () => 
     .toHaveStyle({ backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")' });
 });
 
+test("shows video tags and edits them with the tag helper", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "tagged", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+    results: [{ id: "video-1", fileName: "tagged.mp4", extension: "mp4", tags: ["work"] }],
+  }).mockResolvedValueOnce(["work", "review"]).mockResolvedValueOnce(["review"]);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  expect(await screen.findByRole("button", { name: "Remove tag work" })).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Add tag to tagged.mp4" }));
+  await user.type(screen.getByRole("textbox", { name: "Add tag to tagged.mp4" }), "review{Enter}");
+  expect(await screen.findByRole("button", { name: "Remove tag review" })).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["work", "review"] });
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["review"] });
+});
+
 test("opens a selected result in the player and restores the grid on back", async () => {
   invokeMock
     .mockResolvedValueOnce({

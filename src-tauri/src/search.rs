@@ -6,6 +6,7 @@ use std::{
 };
 use uuid::Uuid;
 use crate::thumbnails;
+use crate::tags;
 
 pub const PAGE_SIZE: usize = 24;
 
@@ -24,6 +25,7 @@ pub struct VideoResult {
     pub file_name: String,
     pub extension: String,
     pub thumbnail_path: Option<String>,
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -127,6 +129,7 @@ impl SearchEngine {
                         .to_string_lossy()
                         .to_lowercase(),
                     thumbnail_path: None,
+                    tags: tags::get(&path),
                 };
                 known_paths.insert(id, path);
                 result

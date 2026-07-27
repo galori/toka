@@ -19,6 +19,7 @@ import {
   subtitleCues,
   deleteVideo,
   undoDelete,
+  setVideoTags,
   videoThumbnail,
   type PreparedVideo,
   type SearchPage,
@@ -120,6 +121,51 @@ function VideoThumbnail({ video }: { video: VideoResult }) {
     >
       {thumbnailPath ? <span className="thumbnail-overlay" aria-hidden="true" /> : <VideoIcon />}
     </span>
+  );
+}
+
+function VideoTags({ video, onChange }: { video: VideoResult; onChange: (tags: string[]) => void }) {
+  const [draft, setDraft] = useState("");
+  const [adding, setAdding] = useState(false);
+  const tags = video.tags ?? [];
+  const save = async (next: string[]) => {
+    try {
+      onChange(await setVideoTags(video.id, next));
+    } catch {
+      // Tags are optional metadata; keep the search result usable if the helper is unavailable.
+    }
+  };
+  const add = () => {
+    const tag = draft.trim();
+    if (!tag || tags.includes(tag)) return;
+    void save([...tags, tag]);
+    setDraft("");
+    setAdding(false);
+  };
+  return (
+    <div className="video-tags" aria-label={`Tags for ${video.fileName}`}>
+      {tags.map((tag) => (
+        <button key={tag} type="button" className="tag-pill" aria-label={`Remove tag ${tag}`} onClick={() => void save(tags.filter((current) => current !== tag))}>
+          {tag} <span aria-hidden="true">×</span>
+        </button>
+      ))}
+      {adding ? (
+        <input
+          aria-label={`Add tag to ${video.fileName}`}
+          value={draft}
+          autoFocus
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") add();
+            if (event.key === "Escape") setAdding(false);
+          }}
+        />
+      ) : (
+        <ControlButton shortcut="T" className="tag-add" aria-label={`Add tag to ${video.fileName}`} onClick={() => setAdding(true)}>
+          <Label>+</Label>
+        </ControlButton>
+      )}
+    </div>
   );
 }
 
@@ -1296,6 +1342,13 @@ export default function App() {
     void runSearch(query, 1);
   };
 
+  const updateTags = (videoId: string, tags: string[]) => {
+    setPage((current) => current ? {
+      ...current,
+      results: current.results.map((video) => video.id === videoId ? { ...video, tags } : video),
+    } : current);
+  };
+
   const hasSubmitted = loading || Boolean(page) || Boolean(error) || Boolean(playing);
 
   return (
@@ -1370,6 +1423,7 @@ export default function App() {
                     <VideoThumbnail video={video} />
                     <span className="video-name">{video.fileName}</span>
                   </button>
+                  <VideoTags video={video} onChange={(tags) => updateTags(video.id, tags)} />
                 </li>
               ))}
             </ul>
