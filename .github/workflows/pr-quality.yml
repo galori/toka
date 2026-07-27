@@ -1,0 +1,43 @@
+name: PR Quality
+
+on:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libgtk-3-dev libepoxy-dev libegl1-mesa-dev libglx-dev librsvg2-dev libmpv2 patchelf
+
+      - run: npm ci
+
+      - name: Pre-commit checks
+        run: npm run check:precommit
+
+      - name: Check changed-file formatting
+        run: |
+          npx lint-staged --diff="origin/${{ github.base_ref }}...HEAD" --diff-filter=ACMR
+          git diff --exit-code
+
+      - name: Build and test
+        run: |
+          npm run build
+          npm test
+          npm run rust:test
+          npm run rust:clippy

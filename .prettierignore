@@ -1,0 +1,9 @@
+dist
+design
+logs
+node_modules
+src-tauri/gen
+src-tauri/target
+.worktrees
+.agents
+.claude
