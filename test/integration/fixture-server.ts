@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http";
 import { basename } from "node:path";
 
 export const fixtureServerHost = "127.0.0.1";
-export const fixtureServerPort = 1421;
+export const fixtureServerPort = Number(process.env.TOKA_E2E_FIXTURE_SERVER_PORT ?? "1421");
 let fixtureServer: Server | undefined;
 
 export function startFixtureServer(filePaths: string[]): Promise<void> {

@@ -23,7 +23,12 @@ const build = spawnSync("npm", ["run", "tauri", "build", "--", "--bundles", bund
 if (build.status !== 0) process.exit(build.status ?? 1);
 
 if (target === "linux") {
-  const install = spawnSync("node", ["scripts/install-linux.mjs"], { cwd: root, stdio: "inherit" });
+  // Installation updates the user's shared application directory rather than
+  // this worktree. Keep builds parallel, but serialize that final operation.
+  const install = spawnSync("flock", ["/tmp/toka-linux-app-install.lock", "node", "scripts/install-linux.mjs"], {
+    cwd: root,
+    stdio: "inherit",
+  });
   process.exit(install.status ?? 1);
 }
 

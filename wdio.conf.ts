@@ -7,7 +7,7 @@ const fixturePaths = [1, 2, 3, 4, 5].map((number) =>
 );
 process.env.TOKA_E2E_VIDEOS = fixturePaths.join(delimiter);
 
-const binaryPath = resolve(
+const binaryPath = process.env.TOKA_E2E_BINARY ?? resolve(
   `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
 );
 

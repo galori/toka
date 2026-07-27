@@ -203,7 +203,9 @@ impl Mpv {
         #[cfg(feature = "native-e2e")]
         player.set_option("hwdec", "no")?;
         #[cfg(feature = "native-e2e")]
-        player.set_option("log-file", "/tmp/toka-mpv-e2e.log")?;
+        let e2e_log_file = std::env::var("TOKA_E2E_MPV_LOG")
+            .unwrap_or_else(|_| "/tmp/toka-mpv-e2e.log".to_owned());
+        player.set_option("log-file", &e2e_log_file)?;
         // llvmpipe silently loses mpv's multi-pass pipeline (render into
         // intermediate FBO textures, then a final scaled pass) on some
         // launches: the whole process then presents black with zero GL
