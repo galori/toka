@@ -380,7 +380,8 @@ export function playbackSource(filePath: string): string {
   // without changing production or macOS behavior.
   if (import.meta.env.VITE_E2E === "1" && navigator.userAgent.includes("Linux")) {
     const fileName = filePath.split(/[\\/]/).at(-1) ?? "";
-    return `http://127.0.0.1:1421/${encodeURIComponent(fileName)}`;
+    const fixturePort = import.meta.env.VITE_E2E_FIXTURE_SERVER_PORT ?? "1421";
+    return `http://127.0.0.1:${fixturePort}/${encodeURIComponent(fileName)}`;
   }
   return convertFileSrc(filePath);
 }

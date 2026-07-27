@@ -1,10 +1,12 @@
-import { writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { resolve } from "node:path";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import type { Options } from "@wdio/types";
 import { startFixtureServer, stopFixtureServer } from "./test/integration/fixture-server";
 
-const fixturePath = resolve("/tmp/toka-e2e-happy-path.mp4");
+const temporaryDirectory = mkdtempSync(join(tmpdir(), "toka-e2e-plocate-"));
+const fixturePath = join(temporaryDirectory, "toka-e2e-happy-path.mp4");
 writeFileSync(
   fixturePath,
   Buffer.from(
@@ -13,14 +15,14 @@ writeFileSync(
   ),
 );
 process.env.TOKA_E2E_VIDEO = fixturePath;
-const databaseInput = resolve("/tmp/toka-e2e-plocate-input.txt");
-const databasePath = resolve("/tmp/toka-e2e-plocate.db");
+const databaseInput = join(temporaryDirectory, "plocate-input.txt");
+const databasePath = join(temporaryDirectory, "plocate.db");
 writeFileSync(databaseInput, fixturePath + "\n");
 execFileSync("plocate-build", ["-p", databaseInput, databasePath]);
 process.env.TOKA_SEARCH_PROVIDER = "plocate";
 process.env.LOCATE_PATH = databasePath;
 
-const binaryPath = resolve(
+const binaryPath = process.env.TOKA_E2E_BINARY ?? resolve(
   `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
 );
 
@@ -42,5 +44,8 @@ export const config: Options.Testrunner = {
   connectionRetryTimeout: 30_000,
   mochaOpts: { timeout: 30_000 },
   onPrepare: () => startFixtureServer([fixturePath]),
-  onComplete: stopFixtureServer,
+  onComplete: async () => {
+    await stopFixtureServer();
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  },
 };
