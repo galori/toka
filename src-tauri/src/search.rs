@@ -86,8 +86,7 @@ impl SearchEngine {
             .provider
             .candidates(query)?
             .into_iter()
-            .filter_map(|path| path.canonicalize().ok())
-            .filter(|path| path.is_file() && is_supported_video(path))
+            .filter(|path| is_supported_video(path))
             .filter(|path| {
                 let name = path
                     .file_name()
@@ -221,6 +220,26 @@ mod tests {
     }
 
     #[test]
+    fn search_lists_provider_video_paths_without_filesystem_access() {
+        let protected = PathBuf::from("/protected/Downloads/Untitled.mov");
+        let provider = Arc::new(FakeProvider {
+            paths: Mutex::new(vec![protected.clone()]),
+        });
+
+        let page = SearchEngine::new(provider)
+            .search(SearchRequest {
+                query: "untitled".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "Untitled.mov");
+        assert_eq!(page.results[0].extension, "mov");
+    }
+
+    #[test]
     fn search_sorts_deduplicates_and_paginates_results() {
         let directory = tempdir().unwrap();
         let mut paths = Vec::new();
@@ -278,7 +297,7 @@ mod tests {
 
         assert_eq!(
             engine.video_path(&first_page.results[0].id).unwrap(),
-            first_path.canonicalize().unwrap()
+            first_path
         );
     }
 }
