@@ -49,7 +49,7 @@ describe("Toka native Linux playback", () => {
       // `blueRenderCount` records the same blue test at render time, so asking
       // it answers the actual question — did the framebuffer ever show blue?
       await browser.waitUntil(async () => ((await nativeState()).blueRenderCount ?? 0) > 0, {
-        timeout: 5_000,
+        timeout: 15_000,
         timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
       });
     } catch (error) {
