@@ -11,7 +11,7 @@ use providers::MdfindSearchProvider;
 use providers::{PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
 #[derive(Serialize)]
@@ -37,6 +37,10 @@ struct SubtitleTrack {
 struct CommandError {
     kind: &'static str,
     message: String,
+}
+
+struct DeletedVideo {
+    trash_name: String,
 }
 
 impl From<SearchError> for CommandError {
@@ -93,6 +97,38 @@ fn video_thumbnail(
         message: "The video thumbnail could not be exposed.".into(),
     })?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
+    #[cfg(target_os = "linux")]
+    let output = std::process::Command::new("gio").args(["trash", path.to_string_lossy().as_ref()]).output();
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("osascript").args(["-e", &format!("tell application \"Finder\" to delete POSIX file \"{}\"", path.display())]).output();
+    let output = output.map_err(|error| CommandError { kind: "Delete", message: format!("The video could not be moved to the trash: {error}") })?;
+    if output.status.success() {
+        Ok(path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+    } else {
+        Err(CommandError { kind: "Delete", message: String::from_utf8_lossy(&output.stderr).trim().to_owned() })
+    }
+}
+
+#[tauri::command]
+fn delete_video(result_id: String, engine: State<'_, Arc<SearchEngine>>, deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    let trash_name = move_to_trash(&path)?;
+    *deleted.lock().unwrap() = Some(DeletedVideo { trash_name });
+    Ok(())
+}
+
+#[tauri::command]
+fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
+    let item = deleted.lock().unwrap().take().ok_or_else(|| CommandError { kind: "Delete", message: "There is no video deletion to undo.".into() })?;
+    #[cfg(target_os = "linux")]
+    let output = std::process::Command::new("gio").args(["trash", "--restore", &format!("trash:///{}", item.trash_name)]).output();
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("osascript").args(["-e", &format!("tell application \"Finder\" to move POSIX file \"{}\" to original location", item.trash_name)]).output();
+    let output = output.map_err(|error| CommandError { kind: "Delete", message: format!("The deleted video could not be restored: {error}") })?;
+    if output.status.success() { Ok(()) } else { Err(CommandError { kind: "Delete", message: "The deleted video could not be restored.".into() }) }
 }
 
 #[tauri::command]
@@ -324,10 +360,10 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
 
-    let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider())));
+    let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider()))).manage(Mutex::new(None::<DeletedVideo>));
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, prepare_video, subtitle_cues])
+        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, delete_video, undo_delete, prepare_video, subtitle_cues])
     } else {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
@@ -337,6 +373,8 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 search_videos,
                 video_thumbnail,
+                delete_video,
+                undo_delete,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -355,7 +393,7 @@ pub fn run() {
     };
     #[cfg(not(target_os = "linux"))]
     let builder =
-        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, prepare_video, subtitle_cues]);
+        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, delete_video, undo_delete, prepare_video, subtitle_cues]);
 
     builder
         .run(tauri::generate_context!())

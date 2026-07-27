@@ -73,6 +73,9 @@ export function prepareVideo(resultId: string): Promise<PreparedVideo> {
   return invoke("prepare_video", { resultId });
 }
 
+export function deleteVideo(resultId: string): Promise<void> { return invoke("delete_video", { resultId }); }
+export function undoDelete(): Promise<void> { return invoke("undo_delete"); }
+
 export function loadNativeVideo(filePath: string): Promise<void> {
   return invoke("load_native_video", { filePath });
 }
