@@ -82,6 +82,7 @@ test("offers a results shuffle control and restarts a shuffled playlist with R",
   await user.click(screen.getByRole("button", { name: "Play shuffle-2.mp4" }));
   expect(await screen.findByLabelText("Playing shuffle-2.mp4")).toBeVisible();
   expect(screen.getByRole("button", { name: "Shuffle playlist" })).toHaveAttribute("aria-keyshortcuts", "R");
+  randomMock.mockReturnValueOnce(0.999999).mockReturnValueOnce(0.999999);
   fireEvent.keyDown(window, { key: "r" });
   expect(await screen.findByLabelText("Playing shuffle-1.mp4")).toBeVisible();
 });

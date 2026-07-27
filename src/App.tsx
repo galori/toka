@@ -1186,7 +1186,7 @@ export default function App() {
     setPlaying(undefined);
     try {
       const response = await searchVideos(trimmed, requestedPage);
-      if (currentRequest === requestNumber.current) setPage({ ...response, results: shuffleVideos(response.results) });
+      if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
       if (currentRequest === requestNumber.current) {
         setPage(undefined);
