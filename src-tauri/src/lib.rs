@@ -306,7 +306,10 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct InvalidProvider(String);
+
+#[cfg(target_os = "linux")]
 impl SearchProvider for InvalidProvider {
     fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
         Err(SearchError::Provider(self.0.clone()))
