@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import App, { playbackSource } from "./App";
+import App, { playbackSource, shuffleVideos } from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -10,10 +10,19 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 const invokeMock = vi.mocked(invoke);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
+const randomMock = vi.spyOn(Math, "random");
+
+test("shuffles without mutating the original video list", () => {
+  const videos = [1, 2, 3].map((id) => ({ id: String(id), fileName: `${id}.mp4`, extension: "mp4" }));
+  randomMock.mockReturnValueOnce(0).mockReturnValueOnce(0);
+  expect(shuffleVideos(videos).map((video) => video.id)).toEqual(["2", "3", "1"]);
+  expect(videos.map((video) => video.id)).toEqual(["1", "2", "3"]);
+});
 
 beforeEach(() => {
   invokeMock.mockReset();
   convertFileSrcMock.mockClear();
+  randomMock.mockReset().mockReturnValue(0.999999);
 });
 
 afterEach(() => {
@@ -59,6 +68,22 @@ test("starts with a focused search field and displays submitted results", async 
   expect(invokeMock).toHaveBeenCalledWith("search_videos", {
     request: { query: "summer vacation", page: 1, pageSize: 24 },
   });
+});
+
+test("offers a results shuffle control and restarts a shuffled playlist with R", async () => {
+  const results = [1, 2, 3].map((number) => ({ id: `video-${number}`, fileName: `shuffle-${number}.mp4`, extension: "mp4" }));
+  invokeMock.mockResolvedValueOnce({ query: "shuffle", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/shuffle.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "shuffle{Enter}");
+  const resultsButton = await screen.findByRole("button", { name: "Shuffle results" });
+  expect(resultsButton).toHaveAttribute("aria-keyshortcuts", "R");
+  await user.click(screen.getByRole("button", { name: "Play shuffle-2.mp4" }));
+  expect(await screen.findByLabelText("Playing shuffle-2.mp4")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Shuffle playlist" })).toHaveAttribute("aria-keyshortcuts", "R");
+  fireEvent.keyDown(window, { key: "r" });
+  expect(await screen.findByLabelText("Playing shuffle-1.mp4")).toBeVisible();
 });
 
 test("displays an app-generated thumbnail when search returns one", async () => {
