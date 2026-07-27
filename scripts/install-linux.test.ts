@@ -9,11 +9,13 @@ describe("linux build script", () => {
       await readFile(path.resolve("package.json"), "utf8"),
     );
     const buildScript = await readFile(path.resolve("bin/build.mjs"), "utf8");
+    const installScript = await readFile(path.resolve("scripts/install-linux.mjs"), "utf8");
 
     expect(packageJson.scripts["build:linux"]).toBe("node bin/build.mjs linux");
     expect(buildScript).toContain('target === "linux" ? "appimage" : "app,dmg"');
     expect(buildScript).toContain('"scripts/install-linux.mjs"');
     expect(buildScript).not.toContain('"sudo"');
+    expect(installScript).toContain("await rename(temporaryAppImage, installedAppImage)");
   });
 });
 

@@ -1,4 +1,4 @@
-import { chmod, copyFile, mkdir, readdir, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,11 +23,13 @@ export async function installAppImage({ bundleDir, homeDir, iconPath }) {
   const applicationsDir = path.join(homeDir, ".local", "share", "applications");
   const iconsDir = path.join(homeDir, ".local", "share", "icons", "hicolor", "128x128", "apps");
   const installedAppImage = path.join(installDir, `${appName}.AppImage`);
+  const temporaryAppImage = path.join(installDir, `${appName}.AppImage.new`);
 
   await mkdir(installDir, { recursive: true });
   await mkdir(applicationsDir, { recursive: true });
-  await copyFile(path.join(bundleDir, appImages.at(-1)), installedAppImage);
-  await chmod(installedAppImage, 0o755);
+  await copyFile(path.join(bundleDir, appImages.at(-1)), temporaryAppImage);
+  await chmod(temporaryAppImage, 0o755);
+  await rename(temporaryAppImage, installedAppImage);
 
   let iconName = "application-x-executable";
   try {
