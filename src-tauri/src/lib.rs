@@ -77,15 +77,17 @@ async fn search_videos(
         .map_err(|error| CommandError {
             kind: "Provider",
             message: format!("The search worker stopped unexpectedly: {error}"),
-    })?
+        })?
         .map_err(Into::into)
         .and_then(|page| {
             for result in &page.results {
                 if let Some(path) = &result.thumbnail_path {
-                    app.asset_protocol_scope().allow_file(path).map_err(|_| CommandError {
-                        kind: "Thumbnail",
-                        message: "The video thumbnail could not be exposed.".into(),
-                    })?;
+                    app.asset_protocol_scope()
+                        .allow_file(path)
+                        .map_err(|_| CommandError {
+                            kind: "Thumbnail",
+                            message: "The video thumbnail could not be exposed.".into(),
+                        })?;
                 }
             }
             Ok(page)
@@ -98,29 +100,57 @@ fn video_thumbnail(
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<String, CommandError> {
-    let path = engine.thumbnail_path(&result_id).map_err(CommandError::from)?;
-    app.asset_protocol_scope().allow_file(&path).map_err(|_| CommandError {
-        kind: "Thumbnail",
-        message: "The video thumbnail could not be exposed.".into(),
-    })?;
+    let path = engine
+        .thumbnail_path(&result_id)
+        .map_err(CommandError::from)?;
+    app.asset_protocol_scope()
+        .allow_file(&path)
+        .map_err(|_| CommandError {
+            kind: "Thumbnail",
+            message: "The video thumbnail could not be exposed.".into(),
+        })?;
     Ok(path.to_string_lossy().into_owned())
 }
 
 fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
     #[cfg(target_os = "linux")]
-    let output = std::process::Command::new("gio").args(["trash", path.to_string_lossy().as_ref()]).output();
+    let output = std::process::Command::new("gio")
+        .args(["trash", path.to_string_lossy().as_ref()])
+        .output();
     #[cfg(target_os = "macos")]
-    let output = std::process::Command::new("osascript").args(["-e", &format!("tell application \"Finder\" to delete POSIX file \"{}\"", path.display())]).output();
-    let output = output.map_err(|error| CommandError { kind: "Delete", message: format!("The video could not be moved to the trash: {error}") })?;
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "tell application \"Finder\" to delete POSIX file \"{}\"",
+                path.display()
+            ),
+        ])
+        .output();
+    let output = output.map_err(|error| CommandError {
+        kind: "Delete",
+        message: format!("The video could not be moved to the trash: {error}"),
+    })?;
     if output.status.success() {
-        Ok(path.file_name().unwrap_or_default().to_string_lossy().into_owned())
+        Ok(path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned())
     } else {
-        Err(CommandError { kind: "Delete", message: String::from_utf8_lossy(&output.stderr).trim().to_owned() })
+        Err(CommandError {
+            kind: "Delete",
+            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
     }
 }
 
 #[tauri::command]
-fn delete_video(result_id: String, engine: State<'_, Arc<SearchEngine>>, deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
+fn delete_video(
+    result_id: String,
+    engine: State<'_, Arc<SearchEngine>>,
+    deleted: State<'_, Mutex<Option<DeletedVideo>>>,
+) -> Result<(), CommandError> {
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
     let trash_name = move_to_trash(&path)?;
     *deleted.lock().unwrap() = Some(DeletedVideo { trash_name });
@@ -129,13 +159,40 @@ fn delete_video(result_id: String, engine: State<'_, Arc<SearchEngine>>, deleted
 
 #[tauri::command]
 fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
-    let item = deleted.lock().unwrap().take().ok_or_else(|| CommandError { kind: "Delete", message: "There is no video deletion to undo.".into() })?;
+    let item = deleted.lock().unwrap().take().ok_or_else(|| CommandError {
+        kind: "Delete",
+        message: "There is no video deletion to undo.".into(),
+    })?;
     #[cfg(target_os = "linux")]
-    let output = std::process::Command::new("gio").args(["trash", "--restore", &format!("trash:///{}", item.trash_name)]).output();
+    let output = std::process::Command::new("gio")
+        .args([
+            "trash",
+            "--restore",
+            &format!("trash:///{}", item.trash_name),
+        ])
+        .output();
     #[cfg(target_os = "macos")]
-    let output = std::process::Command::new("osascript").args(["-e", &format!("tell application \"Finder\" to move POSIX file \"{}\" to original location", item.trash_name)]).output();
-    let output = output.map_err(|error| CommandError { kind: "Delete", message: format!("The deleted video could not be restored: {error}") })?;
-    if output.status.success() { Ok(()) } else { Err(CommandError { kind: "Delete", message: "The deleted video could not be restored.".into() }) }
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "tell application \"Finder\" to move POSIX file \"{}\" to original location",
+                item.trash_name
+            ),
+        ])
+        .output();
+    let output = output.map_err(|error| CommandError {
+        kind: "Delete",
+        message: format!("The deleted video could not be restored: {error}"),
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CommandError {
+            kind: "Delete",
+            message: "The deleted video could not be restored.".into(),
+        })
+    }
 }
 
 #[tauri::command]
@@ -148,7 +205,10 @@ fn set_video_tags(
         kind: "VideoUnavailable",
         message: error.to_string(),
     })?;
-    tags::set(&path, &tags).map_err(|message| TagsError { kind: "Tags", message })
+    tags::set(&path, &tags).map_err(|message| TagsError {
+        kind: "Tags",
+        message,
+    })
 }
 
 #[tauri::command]
@@ -213,7 +273,10 @@ fn subtitle_cues(
     })?;
     subtitles::to_web_vtt(&source, &extension).ok_or_else(|| CommandError {
         kind: "Subtitle",
-        message: format!("{} subtitles are not supported by this player.", subtitle.label),
+        message: format!(
+            "{} subtitles are not supported by this player.",
+            subtitle.label
+        ),
     })
 }
 
@@ -244,12 +307,18 @@ fn set_native_paused(
 }
 #[cfg(target_os = "linux")]
 #[tauri::command]
-fn set_native_speed(speed: f64, player: State<'_, Arc<player_linux::NativePlayer>>) -> Result<(), CommandError> {
+fn set_native_speed(
+    speed: f64,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
     player_linux::set_speed(player.inner(), speed).map_err(playback_error)
 }
 #[cfg(target_os = "linux")]
 #[tauri::command]
-fn set_native_volume(volume: f64, player: State<'_, Arc<player_linux::NativePlayer>>) -> Result<(), CommandError> {
+fn set_native_volume(
+    volume: f64,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
     player_linux::set_volume(player.inner(), volume).map_err(playback_error)
 }
 

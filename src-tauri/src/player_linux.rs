@@ -31,8 +31,7 @@ type MpvHandle = c_void;
 type MpvRenderContext = c_void;
 type GlGetIntegerv = unsafe extern "C" fn(u32, *mut c_int);
 #[cfg(feature = "native-e2e")]
-type GlReadPixels =
-    unsafe extern "C" fn(c_int, c_int, c_int, c_int, u32, u32, *mut c_void);
+type GlReadPixels = unsafe extern "C" fn(c_int, c_int, c_int, c_int, u32, u32, *mut c_void);
 #[cfg(feature = "native-e2e")]
 type GlBindFramebuffer = unsafe extern "C" fn(u32, u32);
 #[cfg(feature = "native-e2e")]
@@ -280,8 +279,16 @@ impl Mpv {
         })
     }
     fn set_double(&mut self, name: &str, value: f64) -> Result<(), String> {
-        let name = CString::new(name).unwrap(); let mut value = value;
-        self.check(unsafe { (self.api.set_property)(self.handle, name.as_ptr(), MPV_FORMAT_DOUBLE, (&mut value as *mut f64).cast()) })
+        let name = CString::new(name).unwrap();
+        let mut value = value;
+        self.check(unsafe {
+            (self.api.set_property)(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_DOUBLE,
+                (&mut value as *mut f64).cast(),
+            )
+        })
     }
 
     fn get_double(&self, name: &str) -> Option<f64> {
@@ -326,7 +333,9 @@ impl Mpv {
         if code < 0 || value.is_null() {
             return None;
         }
-        let text = unsafe { CStr::from_ptr(value) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { (self.api.free)(value.cast()) };
         Some(text)
     }
@@ -476,8 +485,11 @@ impl Mpv {
                             GL_UNSIGNED_BYTE,
                             color.as_mut_ptr().cast(),
                         );
-                        let (red, green, blue) =
-                            (u16::from(color[0]), u16::from(color[1]), u16::from(color[2]));
+                        let (red, green, blue) = (
+                            u16::from(color[0]),
+                            u16::from(color[1]),
+                            u16::from(color[2]),
+                        );
                         line.push(if blue > 180 && blue > red * 2 && blue > green * 2 {
                             'B'
                         } else if red < 8 && green < 8 && blue < 8 {
@@ -496,7 +508,8 @@ impl Mpv {
             self.last_frame_color = Some(center);
             self.last_probe_colors = Some(colors);
             for channel in 0..3 {
-                self.max_center_color[channel] = self.max_center_color[channel].max(center[channel]);
+                self.max_center_color[channel] =
+                    self.max_center_color[channel].max(center[channel]);
                 for color in &colors {
                     self.max_any_color[channel] = self.max_any_color[channel].max(color[channel]);
                 }
@@ -787,10 +800,12 @@ pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
 }
 
 pub fn set_paused(player: &NativePlayer, paused: bool) -> Result<(), String> {
-  player.with_mpv(|mpv| mpv.set_flag("pause", paused))
+    player.with_mpv(|mpv| mpv.set_flag("pause", paused))
 }
 pub fn set_speed(player: &NativePlayer, speed: f64) -> Result<(), String> {
-    if !speed.is_finite() || !(0.5..=2.0).contains(&speed) { return Err("Playback speed must be between 0.5× and 2×.".into()); }
+    if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
+        return Err("Playback speed must be between 0.5× and 2×.".into());
+    }
     player.with_mpv(|mpv| mpv.set_double("speed", speed))
 }
 
@@ -799,12 +814,7 @@ pub fn set_volume(player: &NativePlayer, volume: f64) -> Result<(), String> {
 }
 
 pub fn rotation(player: &NativePlayer) -> Result<i32, String> {
-    player.with_mpv(|mpv| {
-        Ok(mpv
-            .get_i64("video-rotate")
-            .unwrap_or(0)
-            .rem_euclid(360) as i32)
-    })
+    player.with_mpv(|mpv| Ok(mpv.get_i64("video-rotate").unwrap_or(0).rem_euclid(360) as i32))
 }
 
 pub fn set_rotation(player: &NativePlayer, degrees: i32) -> Result<(), String> {
@@ -826,7 +836,11 @@ pub fn subtitle_tracks(player: &NativePlayer) -> Result<Vec<SubtitleTrack>, Stri
         let count = mpv.get_i64("track-list/count").unwrap_or(0).max(0);
         let mut tracks = Vec::new();
         for index in 0..count {
-            if mpv.get_string(&format!("track-list/{index}/type")).as_deref() != Some("sub") {
+            if mpv
+                .get_string(&format!("track-list/{index}/type"))
+                .as_deref()
+                != Some("sub")
+            {
                 continue;
             }
             let Some(id) = mpv.get_i64(&format!("track-list/{index}/id")) else {
@@ -835,8 +849,10 @@ pub fn subtitle_tracks(player: &NativePlayer) -> Result<Vec<SubtitleTrack>, Stri
             tracks.push(SubtitleTrack {
                 id,
                 label: subtitle_label(
-                    mpv.get_string(&format!("track-list/{index}/title")).as_deref(),
-                    mpv.get_string(&format!("track-list/{index}/lang")).as_deref(),
+                    mpv.get_string(&format!("track-list/{index}/title"))
+                        .as_deref(),
+                    mpv.get_string(&format!("track-list/{index}/lang"))
+                        .as_deref(),
                     id,
                 ),
                 external: mpv

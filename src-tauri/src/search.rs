@@ -1,3 +1,5 @@
+use crate::tags;
+use crate::thumbnails;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -5,8 +7,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 use uuid::Uuid;
-use crate::thumbnails;
-use crate::tags;
 
 pub const PAGE_SIZE: usize = 24;
 

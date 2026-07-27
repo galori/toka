@@ -293,6 +293,9 @@ mod tests {
             runner: Arc::new(FakeRunner::no_matches()),
         };
 
-        assert_eq!(provider.candidates("does-not-exist").unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            provider.candidates("does-not-exist").unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 }
