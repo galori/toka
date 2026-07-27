@@ -10,6 +10,8 @@ export type VideoResult = {
   tags?: string[];
 };
 
+export type VideoTagUpdate = Pick<VideoResult, "fileName" | "tags">;
+
 export type SearchPage = {
   query: string;
   page: number;
@@ -77,7 +79,7 @@ export function prepareVideo(resultId: string): Promise<PreparedVideo> {
 export function deleteVideo(resultId: string): Promise<void> { return invoke("delete_video", { resultId }); }
 export function undoDelete(): Promise<void> { return invoke("undo_delete"); }
 
-export function setVideoTags(resultId: string, tags: string[]): Promise<string[]> {
+export function setVideoTags(resultId: string, tags: string[]): Promise<VideoTagUpdate> {
   return invoke("set_video_tags", { resultId, tags });
 }
 

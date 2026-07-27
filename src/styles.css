@@ -81,6 +81,7 @@ input[type="search"]:focus { border-color: #69a8ff; box-shadow: 0 0 0 3px rgb(60
 .tag-pill:hover, .tag-pill:focus-visible, .tag-add:hover, .tag-add:focus-visible { border-color: #69a8ff; }
 .tag-add { min-width: 24px; }
 .video-tags input { min-width: 80px; max-width: 120px; border: 1px solid #69a8ff; border-radius: 999px; padding: 3px 7px; color: inherit; background: #111a29; }
+.tag-error { flex-basis: 100%; margin: 0; color: #ff9f9f; font-size: 0.78rem; }
 
 .video-art {
   position: relative;
@@ -506,6 +507,9 @@ button:focus-visible {
 .player-controls button:disabled { opacity: 1; color: oklch(0.42 0.015 60); }
 .player-controls button:disabled .key-hint { color: oklch(0.34 0.012 60); }
 .player-utilities { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.player-controls .video-tags { margin-top: 0; }
+.player-controls .tag-pill, .player-controls .tag-add { height: auto; min-width: 24px; border: 1px solid #40506a; border-radius: 999px; padding: 2px 7px; background: #172235; color: #dbe7f7; font-size: 0.78rem; }
+.player-controls .video-tags input { min-width: 80px; max-width: 120px; border: 1px solid #69a8ff; border-radius: 999px; padding: 3px 7px; color: inherit; background: #111a29; }
 /* The drawer comes later in the markup, so without an explicit order it paints
    over the right of the overlay and buries the rotate, loop and fullscreen
    controls. The bar keeps its full width and runs in front of the drawer

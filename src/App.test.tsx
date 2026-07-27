@@ -142,7 +142,7 @@ test("shows video tags and edits them with the tag helper", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "tagged", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
     results: [{ id: "video-1", fileName: "tagged.mp4", extension: "mp4", tags: ["work"] }],
-  }).mockResolvedValueOnce(["work", "review"]).mockResolvedValueOnce(["review"]);
+  }).mockResolvedValueOnce({ fileName: "tagged [work] [review].mp4", tags: ["work", "review"] }).mockResolvedValueOnce({ fileName: "tagged [review].mp4", tags: ["review"] });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
@@ -223,6 +223,34 @@ test("uses the overlay player controls from the design", async () => {
   const play = screen.getByRole("button", { name: "Play" });
   expect(play).toHaveClass("play-button");
   expect(play.querySelector(".play-glyph")).toBeInTheDocument();
+});
+
+test("edits the playing video's tags from the playback controls with T", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      results: [{ id: "video-1", fileName: "tagged.mp4", extension: "mp4", tags: ["work"] }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValueOnce({ fileName: "tagged [work] [review].mp4", tags: ["work", "review"] })
+    .mockResolvedValueOnce({ fileName: "tagged [review].mp4", tags: ["review"] });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play tagged.mp4" }));
+  const controls = await screen.findByLabelText("Video controls");
+  expect(controls).toContainElement(screen.getByRole("button", { name: "Remove tag work" }));
+
+  fireEvent.keyDown(window, { key: "t" });
+  const tagInput = screen.getByRole("textbox", { name: "Add tag to tagged.mp4" });
+  expect(tagInput).toBeVisible();
+  await user.type(tagInput, "review{Enter}");
+  expect(await screen.findByRole("button", { name: "Remove tag review" })).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["work", "review"] });
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["review"] });
 });
 
 test("uses one control for playing and pausing", async () => {

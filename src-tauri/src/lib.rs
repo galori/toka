@@ -50,6 +50,13 @@ struct TagsError {
     message: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoTagUpdate {
+    file_name: String,
+    tags: Vec<String>,
+}
+
 impl From<SearchError> for CommandError {
     fn from(error: SearchError) -> Self {
         let kind = match &error {
@@ -200,14 +207,22 @@ fn set_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-) -> Result<Vec<String>, TagsError> {
+) -> Result<VideoTagUpdate, TagsError> {
     let path = engine.video_path(&result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
         message: error.to_string(),
     })?;
-    tags::set(&path, &tags).map_err(|message| TagsError {
+    let update = tags::set(&path, &tags).map_err(|message| TagsError {
         kind: "Tags",
         message,
+    })?;
+    engine.update_video_path(&result_id, update.path.clone()).map_err(|error| TagsError {
+        kind: "VideoUnavailable",
+        message: error.to_string(),
+    })?;
+    Ok(VideoTagUpdate {
+        file_name: update.path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        tags: update.tags,
     })
 }
 

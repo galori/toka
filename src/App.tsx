@@ -124,15 +124,22 @@ function VideoThumbnail({ video }: { video: VideoResult }) {
   );
 }
 
-function VideoTags({ video, onChange }: { video: VideoResult; onChange: (tags: string[]) => void }) {
+function VideoTags({ video, onChange, adding: controlledAdding, onAddingChange }: { video: VideoResult; onChange: (update: Pick<VideoResult, "fileName" | "tags">) => void; adding?: boolean; onAddingChange?: (adding: boolean) => void }) {
   const [draft, setDraft] = useState("");
-  const [adding, setAdding] = useState(false);
+  const [uncontrolledAdding, setUncontrolledAdding] = useState(false);
+  const [error, setError] = useState<string>();
+  const adding = controlledAdding ?? uncontrolledAdding;
+  const setAdding = (next: boolean) => {
+    setUncontrolledAdding(next);
+    onAddingChange?.(next);
+  };
   const tags = video.tags ?? [];
   const save = async (next: string[]) => {
     try {
       onChange(await setVideoTags(video.id, next));
-    } catch {
-      // Tags are optional metadata; keep the search result usable if the helper is unavailable.
+      setError(undefined);
+    } catch (reason) {
+      setError(`Could not update tags: ${errorMessage(reason)}`);
     }
   };
   const add = () => {
@@ -165,6 +172,7 @@ function VideoTags({ video, onChange }: { video: VideoResult; onChange: (tags: s
           <Label>+</Label>
         </ControlButton>
       )}
+      {error ? <p className="tag-error" role="alert">{error}</p> : null}
     </div>
   );
 }
@@ -394,7 +402,8 @@ function Player({
   videos,
   startIndex,
   onBack,
-}: { videos: VideoResult[]; startIndex: number; onBack: () => void }) {
+  onTagsChange,
+}: { videos: VideoResult[]; startIndex: number; onBack: () => void; onTagsChange: (videoId: string, update: Pick<VideoResult, "fileName" | "tags">) => void }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
   const playerControls = useRef<HTMLDivElement>(null);
@@ -426,7 +435,12 @@ function Player({
   const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
   const [playlist, setPlaylist] = useState(videos);
   const [deletedVideo, setDeletedVideo] = useState<{ video: VideoResult; index: number }>();
+  const [addingTag, setAddingTag] = useState(false);
   const video = playlist[index];
+  const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
+    setPlaylist((current) => current.map((item) => item.id === video.id ? { ...item, ...update } : item));
+    onTagsChange(video.id, update);
+  };
   useEffect(() => {
     if (!deletedVideo) return;
     const timeout = window.setTimeout(() => setDeletedVideo(undefined), 5000);
@@ -970,6 +984,8 @@ function Player({
         run(() => applyVolume(volume - VOLUME_STEP));
       } else if (event.key === "0") {
         run(() => applyVolume(volume + VOLUME_STEP));
+      } else if (event.key.toLowerCase() === "t") {
+        run(() => setAddingTag(true));
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -1118,6 +1134,7 @@ function Player({
             <ControlButton shortcut="PageDown" onClick={() => moveVideo(1)} aria-label="Next video"><NextIcon /></ControlButton>
             <span className="time-display control-label">{formatTime(currentTime)} / {formatTime(duration)}</span>
             <div className="player-utilities">
+              <VideoTags video={video} onChange={updateVideoTags} adding={addingTag} onAddingChange={setAddingTag} />
               <ControlButton
                 shortcut="S"
                 onClick={toggleSubtitles}
@@ -1343,10 +1360,10 @@ export default function App() {
     void runSearch(query, 1);
   };
 
-  const updateTags = (videoId: string, tags: string[]) => {
+  const updateTags = (videoId: string, update: Pick<VideoResult, "fileName" | "tags">) => {
     setPage((current) => current ? {
       ...current,
-      results: current.results.map((video) => video.id === videoId ? { ...video, tags } : video),
+      results: current.results.map((video) => video.id === videoId ? { ...video, ...update } : video),
     } : current);
   };
 
@@ -1385,6 +1402,7 @@ export default function App() {
           videos={playing.videos}
           startIndex={playing.startIndex}
           onBack={() => setPlaying(undefined)}
+          onTagsChange={updateTags}
         />
       ) : null}
 
@@ -1424,7 +1442,7 @@ export default function App() {
                     <VideoThumbnail video={video} />
                     <span className="video-name">{video.fileName}</span>
                   </button>
-                  <VideoTags video={video} onChange={(tags) => updateTags(video.id, tags)} />
+                  <VideoTags video={video} onChange={(update) => updateTags(video.id, update)} />
                 </li>
               ))}
             </ul>
