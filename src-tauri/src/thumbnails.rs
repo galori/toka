@@ -1,4 +1,8 @@
-use std::{fs, path::{Path, PathBuf}, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 pub fn generate(video: &Path) -> Option<PathBuf> {
     let cache = std::env::temp_dir().join("toka-thumbnails");

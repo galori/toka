@@ -18,7 +18,8 @@ pub struct SidecarSubtitle {
 /// file stem (`talk.srt`) or the stem followed by a dotted suffix
 /// (`talk.en.srt`, `talk.en.forced.srt`), matched case-insensitively.
 pub fn sidecar_subtitles(video: &Path) -> Vec<SidecarSubtitle> {
-    let (Some(directory), Some(stem)) = (video.parent(), video.file_stem().and_then(|s| s.to_str()))
+    let (Some(directory), Some(stem)) =
+        (video.parent(), video.file_stem().and_then(|s| s.to_str()))
     else {
         return Vec::new();
     };
