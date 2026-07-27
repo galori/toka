@@ -454,28 +454,16 @@ function Player({
     let subtitleLookupsLeft = 20;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
-      const controls = playerControls.current?.getBoundingClientRect();
-      const drawer = playlistDrawer.current?.getBoundingClientRect();
-      // GTK overlays the native mpv surface above the WebView, irrespective of
-      // CSS z-index, so an overlay is only ever seen on Linux if the surface
-      // stops short of it. The surface's own box already excludes the scrubber
-      // sliver in fullscreen — the stylesheet takes that off the picture — so
-      // hiding the rest of the overlay hands the whole of the rest back.
-      const visibleHeight =
-        controls && !controlsIdle
-          ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
-          : bounds.height;
-      // The playlist drawer is overlaid the same way, down the right-hand edge,
-      // and disappears behind the picture unless the surface stops short of it.
-      const visibleWidth = drawer
-        ? Math.max(1, Math.min(bounds.width, drawer.left - bounds.left))
-        : bounds.width;
+      // The WebView is composited above the native GL area on Linux. Keep the
+      // GL area at the complete picture size while controls and the playlist
+      // paint as transparent WebView overlays, so revealing them never causes
+      // mpv to rescale or re-center the video.
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
-        width: Math.round(visibleWidth),
-        height: Math.round(visibleHeight),
-        visible: visibleWidth > 0 && visibleHeight > 0,
+        width: Math.round(bounds.width),
+        height: Math.round(bounds.height),
+        visible: bounds.width > 0 && bounds.height > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -512,7 +500,7 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, drawerOpen, fullscreen, index, native]);
+  }, [index, native]);
 
   const play = () => {
     if (native) {

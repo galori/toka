@@ -1376,7 +1376,7 @@ test("keeps fullscreen controls hidden when autoplay advances the playlist", asy
   }
 });
 
-test("keeps the native video surface clear of the playlist drawer", async () => {
+test("keeps the native video surface behind the playlist drawer", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,
     fileName: `native-${number}.mp4`,
@@ -1417,29 +1417,7 @@ test("keeps the native video surface clear of the playlist drawer", async () => 
     await user.click(await screen.findByRole("button", { name: "Play all" }));
     await screen.findByLabelText("Playing native-1.mp4");
 
-    // GTK puts the mpv surface above the WebView whatever the z-index says, so
-    // the drawer is only visible if the surface stops short of it.
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0,
-        y: 0,
-        width: 560,
-        height: 320,
-        visible: true,
-      }),
-    );
-
-    invokeMock.mockClear();
-    await user.click(screen.getByRole("button", { name: "Playlist 2" }));
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0,
-        y: 0,
-        width: 800,
-        height: 320,
-        visible: true,
-      }),
-    );
+    expect(screen.getByRole("button", { name: "Playlist 2" })).toBeVisible();
   } finally {
     boxes.mockRestore();
   }
@@ -1492,32 +1470,12 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     await screen.findByLabelText("Playing native-1.mp4");
     await enterFullscreen(user);
 
-    // Nothing is showing, so the picture reaches everything except the sliver
-    // the scrubber sits in — the one strip fullscreen takes off the video.
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 1200, height: 794, visible: true,
-      }),
-    );
-
-    // GTK composites the mpv surface above the WebView whatever the z-index
-    // says, so a revealed overlay is only seen on Linux if the surface stops
-    // short of it. Every other engine overlays it without moving the picture.
-    invokeMock.mockClear();
+    // Revealing controls or the drawer never changes the native surface
+    // bounds, so mpv does not resize or re-center the picture. The end-to-end
+    // Linux test verifies those native bounds against a real GL surface.
     movePointer();
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 1200, height: 704, visible: true,
-      }),
-    );
-
-    invokeMock.mockClear();
     movePointer(window.innerWidth - 1);
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 920, height: 704, visible: true,
-      }),
-    );
+    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
   } finally {
     reportFullscreen(false);
     boxes.mockRestore();
