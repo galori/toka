@@ -2,7 +2,7 @@
 /dist/
 /.local/
 /src-tauri/target/
+/src-tauri/build-info.json
 .DS_Store
 *.log
 .scratch
-
