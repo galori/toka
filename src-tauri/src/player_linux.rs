@@ -1,4 +1,6 @@
 use gtk::glib::translate::IntoGlib;
+#[cfg(feature = "native-e2e")]
+use gtk::gdk::prelude::WindowExtManual;
 use gtk::prelude::*;
 use libloading::Library;
 use serde::Serialize;
@@ -582,6 +584,12 @@ unsafe extern "C" fn get_proc_address(_context: *mut c_void, name: *const c_char
 pub struct NativePlayer {
     mpv: Mutex<Result<Mpv, String>>,
     render_error: Mutex<Option<String>>,
+    // Unlike the GL framebuffer probes, this is sampled from the GTK window
+    // after GTK has composited the GL area and WebView together.
+    #[cfg(feature = "native-e2e")]
+    composed_frame_color: Mutex<Option<[u8; 3]>>,
+    #[cfg(feature = "native-e2e")]
+    visible_blue_render_count: Mutex<u64>,
 }
 
 impl NativePlayer {
@@ -589,6 +597,10 @@ impl NativePlayer {
         Arc::new(Self {
             mpv: Mutex::new(Mpv::new()),
             render_error: Mutex::new(None),
+            #[cfg(feature = "native-e2e")]
+            composed_frame_color: Mutex::new(None),
+            #[cfg(feature = "native-e2e")]
+            visible_blue_render_count: Mutex::new(0),
         })
     }
 
@@ -624,6 +636,31 @@ impl NativePlayer {
         if let Ok(mut render_error) = self.render_error.lock() {
             *render_error = Some(error);
         }
+    }
+
+    #[cfg(feature = "native-e2e")]
+    fn record_composed_pixel(&self, color: [u8; 3]) {
+        if let Ok(mut last) = self.composed_frame_color.lock() {
+            *last = Some(color);
+        }
+        if color[2] > 180
+            && color[2] > color[0].saturating_mul(2)
+            && color[2] > color[1].saturating_mul(2)
+        {
+            if let Ok(mut count) = self.visible_blue_render_count.lock() {
+                *count += 1;
+            }
+        }
+    }
+
+    #[cfg(feature = "native-e2e")]
+    fn composed_frame_color(&self) -> Option<[u8; 3]> {
+        self.composed_frame_color.lock().ok()?.to_owned()
+    }
+
+    #[cfg(feature = "native-e2e")]
+    fn visible_blue_render_count(&self) -> u64 {
+        self.visible_blue_render_count.lock().map(|count| *count).unwrap_or(0)
     }
 }
 
@@ -687,11 +724,11 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     video_area.set_halign(gtk::Align::Start);
     video_area.set_valign(gtk::Align::Start);
     video_area.set_size_request(1, 1);
-    // Put the GL area below the WebView in the GTK overlay. This lets the
-    // WebView controls and playlist remain transparent overlays while mpv keeps
-    // rendering into one fixed rectangle beneath them.
-    overlay.add(&video_area);
-    overlay.add_overlay(&webview);
+    // WebKitGTK paints an opaque backing surface, including CSS-transparent
+    // regions. Keep the GL area above it or a healthy mpv framebuffer is still
+    // hidden behind the WebView's black player background.
+    overlay.add(&webview);
+    overlay.add_overlay(&video_area);
     vbox.pack_start(&overlay, true, true, 0);
 
     let realize_player = player.clone();
@@ -714,8 +751,24 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
         }
         gtk::glib::Propagation::Stop
     });
-    video_area.add_tick_callback(|area, _| {
+    #[cfg(feature = "native-e2e")]
+    let composed_pixel_player = player.clone();
+    #[cfg(feature = "native-e2e")]
+    let composed_pixel_overlay = overlay.clone();
+    video_area.add_tick_callback(move |area, _| {
         area.queue_render();
+        #[cfg(feature = "native-e2e")]
+        if let Some(window) = composed_pixel_overlay.window() {
+            let bounds = area.allocation();
+            let x = bounds.x() + bounds.width() / 2;
+            let y = bounds.y() + bounds.height() / 2;
+            if let Some(pixbuf) = window.pixbuf(x, y, 1, 1) {
+                let bytes = pixbuf.read_pixel_bytes();
+                if let Some(rgb) = bytes.as_ref().get(..3) {
+                    composed_pixel_player.record_composed_pixel([rgb[0], rgb[1], rgb[2]]);
+                }
+            }
+        }
         gtk::glib::ControlFlow::Continue
     });
 
@@ -796,6 +849,10 @@ pub struct PlaybackState {
     grid_render_index: u64,
     #[cfg(feature = "native-e2e")]
     video_rect_margins: Option<[i64; 4]>,
+    #[cfg(feature = "native-e2e")]
+    composed_frame_color: Option<[u8; 3]>,
+    #[cfg(feature = "native-e2e")]
+    visible_blue_render_count: u64,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -949,6 +1006,10 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
                 }
                 _ => None,
             },
+            #[cfg(feature = "native-e2e")]
+            composed_frame_color: player.composed_frame_color(),
+            #[cfg(feature = "native-e2e")]
+            visible_blue_render_count: player.visible_blue_render_count(),
         })
     })
 }

@@ -12,6 +12,8 @@ describe("Toka native Linux playback", () => {
       framebuffer?: number;
       renderCount?: number;
       renderSize?: [number, number];
+      composedFrameColor?: [number, number, number];
+      visibleBlueRenderCount?: number;
     }>;
     // Retries (see wdio.native.conf.ts) re-run this block in the same session,
     // where a previous attempt left the app in the player. Return to search
@@ -43,6 +45,13 @@ describe("Toka native Linux playback", () => {
 
     expect(timeText).not.toMatch(/^0:00 \/ /);
     try {
+      // This reads a pixel from GTK's composed application window, after the
+      // GL video surface and the WebView have both painted. A framebuffer-only
+      // probe can be blue while an opaque WebView covers the actual player.
+      await browser.waitUntil(async () => ((await nativeState()).visibleBlueRenderCount ?? 0) > 0, {
+        timeout: 15_000,
+        timeoutMsg: "the composed application window never presented the blue video",
+      });
       // `frameColor` is whatever the last render happened to hold, so sampling
       // it races the end of a four-second clip: the fixture really did present
       // blue, then finished, and the poll read the black frame that followed.

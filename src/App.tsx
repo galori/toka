@@ -527,16 +527,24 @@ function Player({
     let subtitleLookupsLeft = 20;
     const updateBounds = () => {
       const bounds = surface.getBoundingClientRect();
-      // The WebView is composited above the native GL area on Linux. Keep the
-      // GL area at the complete picture size while controls and the playlist
-      // paint as transparent WebView overlays, so revealing them never causes
-      // mpv to rescale or re-center the video.
+      const controls = playerControls.current?.getBoundingClientRect();
+      const drawer = playlistDrawer.current?.getBoundingClientRect();
+      // GTK renders the native GL area above the opaque WebView. Trim its
+      // bounds around WebView controls and the playlist so the real decoded
+      // picture remains visible without covering those interactive elements.
+      const visibleHeight =
+        controls && !controlsIdle
+          ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
+          : bounds.height;
+      const visibleWidth = drawer
+        ? Math.max(1, Math.min(bounds.width, drawer.left - bounds.left))
+        : bounds.width;
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
         y: Math.round(bounds.y),
-        width: Math.round(bounds.width),
-        height: Math.round(bounds.height),
-        visible: bounds.width > 0 && bounds.height > 0,
+        width: Math.round(visibleWidth),
+        height: Math.round(visibleHeight),
+        visible: visibleWidth > 0 && visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -573,7 +581,7 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [index, native]);
+  }, [controlsIdle, drawerOpen, fullscreen, index, native]);
 
   const play = () => {
     if (native) {

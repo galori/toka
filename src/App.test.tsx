@@ -1548,7 +1548,7 @@ test("keeps fullscreen controls hidden when autoplay advances the playlist", asy
   }
 });
 
-test("keeps the native video surface behind the playlist drawer", async () => {
+test("keeps native video clear of the player controls and playlist drawer", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,
     fileName: `native-${number}.mp4`,
@@ -1590,6 +1590,9 @@ test("keeps the native video surface behind the playlist drawer", async () => {
     await screen.findByLabelText("Playing native-1.mp4");
 
     expect(screen.getByRole("button", { name: "Playlist 2" })).toBeVisible();
+    expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+      x: 0, y: 0, width: 560, height: 320, visible: true,
+    });
   } finally {
     boxes.mockRestore();
   }
