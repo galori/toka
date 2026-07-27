@@ -29,5 +29,5 @@ export const config: Options.Testrunner = {
   // healthy blueRenderCount and some report zero on identical code. Retrying
   // the spec gives the flaky launch another attempt while the root cause is
   // investigated, rather than letting it block every unrelated PR.
-  mochaOpts: { timeout: 30_000, retries: 2 },
+  mochaOpts: { timeout: 90_000, retries: 2 },
 };
