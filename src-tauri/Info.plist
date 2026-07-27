@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Toka searches and plays videos from your Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Toka searches and plays videos from your Documents folder.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Toka searches and plays videos from your Downloads folder.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>Toka searches and plays videos from network volumes.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>Toka searches and plays videos from removable volumes.</string>
+</dict>
+</plist>

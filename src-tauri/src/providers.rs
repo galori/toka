@@ -49,7 +49,9 @@ impl SearchProvider for MdfindSearchProvider {
     fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
         let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
-        let predicate = format!("kMDItemFSName == \"*{escaped}*\"cd");
+        let predicate = format!(
+            "kMDItemDisplayName == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
+        );
         let output = self
             .runner
             .run("/usr/bin/mdfind", &[predicate])
@@ -212,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn mdfind_uses_longest_term_and_parses_paths() {
+    fn mdfind_uses_display_name_movie_search_with_longest_term_and_parses_paths() {
         let runner = Arc::new(FakeRunner::new(
             "/Videos/Summer Vacation.mp4\n/Videos/another.mov\n",
         ));
@@ -226,7 +228,10 @@ mod tests {
             *runner.invocation.lock().unwrap(),
             Some((
                 "/usr/bin/mdfind".into(),
-                vec!["kMDItemFSName == \"*vacation*\"cd".into()]
+                vec![
+                    "kMDItemDisplayName == \"*vacation*\"cd && kMDItemContentTypeTree == \"public.movie\""
+                        .into()
+                ]
             ))
         );
         assert_eq!(paths[0], PathBuf::from("/Videos/Summer Vacation.mp4"));
