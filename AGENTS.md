@@ -8,3 +8,4 @@
 - Use $diagnosing-bugs to help diagnose bugs
 - Every user-facing feature must include a discoverable keyboard shortcut and automated coverage for that shortcut. Build its control with `ControlButton`, which declares `aria-keyshortcuts` and renders the matching visible hint from the same value, so the two cannot drift apart.
 - After a task is complete and verified, build for the platform you're on (`npm run build:linux` on Linux, `npm run build:mac` on macOS) and launch the freshly built app. That way, when the user returns to check things out, an up-to-date instance is already running for them to look at.
+- If `gh` or GitHub network operations fail inside the sandbox, retry the same operation outside the sandbox with the required approval before treating GitHub as unavailable or marking the task blocked.
