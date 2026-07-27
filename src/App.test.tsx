@@ -57,10 +57,11 @@ afterEach(() => {
 
 test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
   vi.stubEnv("VITE_E2E", "1");
+  vi.stubEnv("VITE_E2E_FIXTURE_SERVER_PORT", "23142");
   const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
 
   try {
-    expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:1421/clip%20%231.mp4");
+    expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:23142/clip%20%231.mp4");
     expect(convertFileSrcMock).not.toHaveBeenCalled();
   } finally {
     userAgent.mockRestore();
