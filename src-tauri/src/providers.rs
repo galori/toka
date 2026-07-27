@@ -1,6 +1,10 @@
 use crate::search::{SearchError, SearchProvider};
+#[cfg(all(target_os = "macos", not(test)))]
+use std::sync::Once;
 use std::{path::PathBuf, sync::Arc};
 
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug)]
@@ -49,22 +53,92 @@ impl MdfindSearchProvider {
 #[cfg(any(target_os = "macos", test))]
 impl SearchProvider for MdfindSearchProvider {
     fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+        prepare_macos_downloads_folder_access();
         let term = longest_term(query)?;
         let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
         let predicate = format!(
             "kMDItemDisplayName == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
         );
-        let output = self
-            .runner
-            .run("/usr/bin/mdfind", &[predicate])
-            .map_err(|error| {
-                SearchError::Provider(format!(
-                    "Spotlight search could not start. Check macOS privacy and indexing settings: {error}"
-                ))
-            })?;
-        parse_output(output, "Spotlight search failed")
+        let mut paths = run_mdfind(&*self.runner, vec![predicate])?;
+        paths.extend(macos_download_candidates(query)?);
+        Ok(paths)
     }
 }
+
+#[cfg(any(target_os = "macos", test))]
+fn run_mdfind(runner: &dyn ProcessRunner, args: Vec<String>) -> Result<Vec<PathBuf>, SearchError> {
+    let output = runner.run("/usr/bin/mdfind", &args).map_err(|error| {
+        SearchError::Provider(format!(
+            "Spotlight search could not start. Check macOS privacy and indexing settings: {error}"
+        ))
+    })?;
+    parse_output(output, "Spotlight search failed")
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn macos_download_candidates(query: &str) -> Result<Vec<PathBuf>, SearchError> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(Vec::new());
+    };
+    Ok(download_folder_candidates(
+        &PathBuf::from(home).join("Downloads"),
+        query,
+    ))
+}
+
+#[cfg(test)]
+fn macos_download_candidates(_query: &str) -> Result<Vec<PathBuf>, SearchError> {
+    Ok(Vec::new())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
+    let Ok(term) = longest_term(query) else {
+        return Vec::new();
+    };
+    let term = term.to_lowercase();
+    let mut candidates = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+                .contains(&term)
+            {
+                candidates.push(path);
+            }
+        }
+    }
+
+    candidates
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn prepare_macos_downloads_folder_access() {
+    static DOWNLOADS_ACCESS: Once = Once::new();
+    DOWNLOADS_ACCESS.call_once(|| {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let _ = std::fs::read_dir(PathBuf::from(home).join("Downloads"));
+    });
+}
+
+#[cfg(test)]
+fn prepare_macos_downloads_folder_access() {}
 
 #[cfg(any(target_os = "linux", test))]
 pub struct RecollSearchProvider {
@@ -173,14 +247,14 @@ mod tests {
     use std::sync::Mutex;
 
     struct FakeRunner {
-        invocation: Mutex<Option<(String, Vec<String>)>>,
+        invocations: Mutex<Vec<(String, Vec<String>)>>,
         output: ProcessOutput,
     }
 
     impl FakeRunner {
         fn new(output: &str) -> Self {
             Self {
-                invocation: Mutex::new(None),
+                invocations: Mutex::new(Vec::new()),
                 output: ProcessOutput {
                     success: true,
                     exit_code: Some(0),
@@ -192,7 +266,7 @@ mod tests {
 
         fn no_matches() -> Self {
             Self {
-                invocation: Mutex::new(None),
+                invocations: Mutex::new(Vec::new()),
                 output: ProcessOutput {
                     success: false,
                     exit_code: Some(1),
@@ -205,7 +279,10 @@ mod tests {
 
     impl ProcessRunner for FakeRunner {
         fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
-            *self.invocation.lock().unwrap() = Some((program.into(), args.to_vec()));
+            self.invocations
+                .lock()
+                .unwrap()
+                .push((program.into(), args.to_vec()));
             Ok(ProcessOutput {
                 success: self.output.success,
                 exit_code: self.output.exit_code,
@@ -226,9 +303,10 @@ mod tests {
 
         let paths = provider.candidates("summer vacation").unwrap();
 
+        let invocations = runner.invocations.lock().unwrap();
         assert_eq!(
-            *runner.invocation.lock().unwrap(),
-            Some((
+            invocations.first(),
+            Some(&(
                 "/usr/bin/mdfind".into(),
                 vec![
                     "kMDItemDisplayName == \"*vacation*\"cd && kMDItemContentTypeTree == \"public.movie\""
@@ -249,8 +327,8 @@ mod tests {
         let paths = provider.candidates("summer vacation").unwrap();
 
         assert_eq!(
-            *runner.invocation.lock().unwrap(),
-            Some((
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
                 "recollq".into(),
                 vec!["-f", "-b", "--paths-only", "-C", "-n", "0", "*vacation*"]
                     .into_iter()
@@ -259,6 +337,22 @@ mod tests {
             ))
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
+    }
+
+    #[test]
+    fn downloads_fallback_finds_matching_names_recursively() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let matching = nested.join("Untitled.mov");
+        let missing_term = directory.path().join("Vacation.mov");
+        std::fs::write(&matching, b"test").unwrap();
+        std::fs::write(&missing_term, b"test").unwrap();
+
+        assert_eq!(
+            download_folder_candidates(directory.path(), "untitled"),
+            vec![matching]
+        );
     }
 
     #[test]
@@ -271,8 +365,8 @@ mod tests {
         let paths = provider.candidates("summer vacation").unwrap();
 
         assert_eq!(
-            *runner.invocation.lock().unwrap(),
-            Some((
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
                 "plocate".into(),
                 [
                     "--ignore-case",
