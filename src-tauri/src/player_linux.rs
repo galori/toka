@@ -769,12 +769,12 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
             let (_, origin_x, origin_y) = window.origin();
             let x = origin_x + bounds.x() + bounds.width() / 2;
             let y = origin_y + bounds.y() + bounds.height() / 2;
-            if let Some(root) = window.screen().root_window()
-                && let Some(pixbuf) = root.pixbuf(x, y, 1, 1)
-            {
-                let bytes = pixbuf.read_pixel_bytes();
-                if let Some(rgb) = bytes.as_ref().get(..3) {
-                    composed_pixel_player.record_composed_pixel([rgb[0], rgb[1], rgb[2]]);
+            if let Some(root) = window.screen().root_window() {
+                if let Some(pixbuf) = root.pixbuf(x, y, 1, 1) {
+                    let bytes = pixbuf.read_pixel_bytes();
+                    if let Some(rgb) = bytes.as_ref().get(..3) {
+                        composed_pixel_player.record_composed_pixel([rgb[0], rgb[1], rgb[2]]);
+                    }
                 }
             }
         }
