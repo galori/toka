@@ -34,6 +34,14 @@ function inFullscreen(): Promise<boolean> {
 // picture to measure. Reporting either rather than throwing lets each test skip
 // honestly instead of failing on something that says nothing about the layout.
 async function enterFullscreen(): Promise<boolean> {
+  try {
+    await browser.waitUntil(
+      async () => (await $(".player-error-state").isExisting()) || (await $('button[aria-label="Enter fullscreen"]').isExisting()),
+      { timeout: 5_000 },
+    );
+  } catch {
+    return false;
+  }
   if (await $(".player-error-state").isExisting()) return false;
   if (await inFullscreen()) return true;
   // A real user gesture, so the fullscreen request is allowed.
