@@ -1,6 +1,6 @@
-use gtk::glib::translate::IntoGlib;
 #[cfg(feature = "native-e2e")]
 use gtk::gdk::prelude::WindowExtManual;
+use gtk::glib::translate::IntoGlib;
 use gtk::prelude::*;
 use libloading::Library;
 use serde::Serialize;
@@ -660,7 +660,10 @@ impl NativePlayer {
 
     #[cfg(feature = "native-e2e")]
     fn visible_blue_render_count(&self) -> u64 {
-        self.visible_blue_render_count.lock().map(|count| *count).unwrap_or(0)
+        self.visible_blue_render_count
+            .lock()
+            .map(|count| *count)
+            .unwrap_or(0)
     }
 }
 
