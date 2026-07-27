@@ -45,7 +45,6 @@ impl MdfindSearchProvider {
 #[cfg(any(target_os = "macos", test))]
 impl SearchProvider for MdfindSearchProvider {
     fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
-        prepare_macos_protected_folder_access();
         let term = longest_term(query)?;
         let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
         let predicate = format!(
@@ -62,20 +61,6 @@ impl SearchProvider for MdfindSearchProvider {
         parse_output(output, "Spotlight search failed")
     }
 }
-
-#[cfg(target_os = "macos")]
-fn prepare_macos_protected_folder_access() {
-    let Some(home) = std::env::var_os("HOME") else {
-        return;
-    };
-    let home = PathBuf::from(home);
-    for folder in ["Desktop", "Documents", "Downloads"] {
-        let _ = std::fs::read_dir(home.join(folder));
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn prepare_macos_protected_folder_access() {}
 
 #[cfg(any(target_os = "linux", test))]
 pub struct RecollSearchProvider {
