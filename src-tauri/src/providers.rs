@@ -1,10 +1,10 @@
 use crate::search::{SearchError, SearchProvider};
+#[cfg(all(target_os = "macos", not(test)))]
+use std::sync::Once;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-#[cfg(all(target_os = "macos", not(test)))]
-use std::sync::Once;
 
 use std::process::Command;
 
@@ -67,10 +67,7 @@ impl SearchProvider for MdfindSearchProvider {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn run_mdfind(
-    runner: &dyn ProcessRunner,
-    args: Vec<String>,
-) -> Result<Vec<PathBuf>, SearchError> {
+fn run_mdfind(runner: &dyn ProcessRunner, args: Vec<String>) -> Result<Vec<PathBuf>, SearchError> {
     let output = runner.run("/usr/bin/mdfind", &args).map_err(|error| {
         SearchError::Provider(format!(
             "Spotlight search could not start. Check macOS privacy and indexing settings: {error}"
