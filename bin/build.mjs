@@ -14,7 +14,7 @@ const env = {
   VITE_BUILD_TIME: info.builtAt,
   VITE_GIT_SHA: info.gitSha,
 };
-const bundles = target === "linux" ? "deb" : "app,dmg";
+const bundles = target === "linux" ? "appimage" : "app,dmg";
 const build = spawnSync("npm", ["run", "tauri", "build", "--", "--bundles", bundles], {
   cwd: root,
   env,
@@ -23,9 +23,7 @@ const build = spawnSync("npm", ["run", "tauri", "build", "--", "--bundles", bund
 if (build.status !== 0) process.exit(build.status ?? 1);
 
 if (target === "linux") {
-  const architecture = spawnSync("dpkg", ["--print-architecture"], { encoding: "utf8" }).stdout.trim();
-  const deb = join(root, `src-tauri/target/release/bundle/deb/Toka_${info.version}_${architecture}.deb`);
-  const install = spawnSync("sudo", ["dpkg", "--install", deb], { cwd: root, stdio: "inherit" });
+  const install = spawnSync("node", ["scripts/install-linux.mjs"], { cwd: root, stdio: "inherit" });
   process.exit(install.status ?? 1);
 }
 
