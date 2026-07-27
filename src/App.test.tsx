@@ -18,6 +18,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
@@ -905,8 +906,7 @@ test("offers tooltips for every actionable result and player control", async () 
   expect(screen.getByRole("button", { name: "Clear search" })).toHaveAttribute("title", "Clear search");
   expect(screen.getByRole("button", { name: "Play all" })).toHaveAttribute("title", "Play all videos");
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toHaveAttribute("title", "Play clip.mp4");
-  expect(screen.getByRole("button", { name: "Previous page" })).toHaveAttribute("title", "Previous page");
-  expect(screen.getByRole("button", { name: "Next page" })).toHaveAttribute("title", "Next page");
+  expect(screen.getByText("2 of 2 loaded")).toBeVisible();
 
   await user.click(screen.getByRole("button", { name: "Play clip.mp4" }));
   const controls = await screen.findByLabelText("Video controls");
@@ -1099,7 +1099,7 @@ test("loops a playlist back to its first video", async () => {
   expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
 });
 
-test("paginates and reports provider failures", async () => {
+test("loads more results as the infinite list reaches its end and reports provider failures", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -1122,11 +1122,26 @@ test("paginates and reports provider failures", async () => {
       message: "Recoll search could not start.",
     });
   const user = userEvent.setup();
+  vi.stubGlobal("IntersectionObserver", class {
+    private readonly callback: IntersectionObserverCallback;
+    constructor(callback: IntersectionObserverCallback) { this.callback = callback; }
+    observe(target: Element) {
+      if (target.classList.contains("load-more-marker")) {
+        this.callback([{ isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+      }
+    }
+    disconnect() {}
+    unobserve() {}
+    takeRecords() { return []; }
+    root = null;
+    rootMargin = "0px";
+    thresholds = [];
+  });
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Next page" }));
-  expect((await screen.findAllByText("Page 2 of 2"))[0]).toBeVisible();
+  expect(await screen.findByRole("button", { name: "Play clip-24.mp4" })).toBeVisible();
+  expect(screen.getByText("2 of 25 loaded")).toBeVisible();
 
   await user.clear(screen.getByRole("searchbox"));
   await user.type(screen.getByRole("searchbox"), "broken{Enter}");

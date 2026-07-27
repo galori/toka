@@ -24,6 +24,10 @@ export function searchVideos(query: string, page: number): Promise<SearchPage> {
   });
 }
 
+export function videoThumbnail(resultId: string): Promise<string> {
+  return invoke<string>("video_thumbnail", { resultId });
+}
+
 export type SidecarSubtitle = {
   track: number;
   label: string;

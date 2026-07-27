@@ -126,8 +126,7 @@ impl SearchEngine {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_lowercase(),
-                    thumbnail_path: thumbnails::generate(&path)
-                        .map(|thumbnail| thumbnail.to_string_lossy().into_owned()),
+                    thumbnail_path: None,
                 };
                 known_paths.insert(id, path);
                 result
@@ -157,6 +156,11 @@ impl SearchEngine {
         } else {
             Err(SearchError::VideoUnavailable)
         }
+    }
+
+    pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
+        let path = self.video_path(result_id)?;
+        thumbnails::generate(&path).ok_or(SearchError::VideoUnavailable)
     }
 }
 

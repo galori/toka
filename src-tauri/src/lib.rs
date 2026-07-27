@@ -82,6 +82,20 @@ async fn search_videos(
 }
 
 #[tauri::command]
+fn video_thumbnail(
+    result_id: String,
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<String, CommandError> {
+    let path = engine.thumbnail_path(&result_id).map_err(CommandError::from)?;
+    app.asset_protocol_scope().allow_file(&path).map_err(|_| CommandError {
+        kind: "Thumbnail",
+        message: "The video thumbnail could not be exposed.".into(),
+    })?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 fn prepare_video(
     result_id: String,
     app: tauri::AppHandle,
@@ -310,7 +324,7 @@ pub fn run() {
     let builder = builder.manage(Arc::new(SearchEngine::new(platform_provider())));
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video, subtitle_cues])
+        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, prepare_video, subtitle_cues])
     } else {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
@@ -319,6 +333,7 @@ pub fn run() {
             .setup(move |app| player_linux::install(app, setup_player.clone()))
             .invoke_handler(tauri::generate_handler![
                 search_videos,
+                video_thumbnail,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -337,7 +352,7 @@ pub fn run() {
     };
     #[cfg(not(target_os = "linux"))]
     let builder =
-        builder.invoke_handler(tauri::generate_handler![search_videos, prepare_video, subtitle_cues]);
+        builder.invoke_handler(tauri::generate_handler![search_videos, video_thumbnail, prepare_video, subtitle_cues]);
 
     builder
         .run(tauri::generate_context!())
