@@ -70,6 +70,6 @@
       "prettier --write"
     ],
     "*.{css,html,json,jsonc,md,yml,yaml}": "prettier --write",
-    "*.rs": "rustfmt --check"
+    "*.rs": "rustfmt --check --edition 2021"
   }
 }
