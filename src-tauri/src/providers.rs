@@ -6,6 +6,7 @@ use std::process::Command;
 #[derive(Debug)]
 struct ProcessOutput {
     success: bool,
+    #[cfg(any(target_os = "linux", test))]
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
@@ -22,6 +23,7 @@ impl ProcessRunner for SystemProcessRunner {
         let output = Command::new(program).args(args).output()?;
         Ok(ProcessOutput {
             success: output.status.success(),
+            #[cfg(any(target_os = "linux", test))]
             exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -293,6 +295,9 @@ mod tests {
             runner: Arc::new(FakeRunner::no_matches()),
         };
 
-        assert_eq!(provider.candidates("does-not-exist").unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(
+            provider.candidates("does-not-exist").unwrap(),
+            Vec::<PathBuf>::new()
+        );
     }
 }
