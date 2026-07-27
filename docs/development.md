@@ -8,7 +8,7 @@ npm test                # React unit tests
 npm run test:integration # build, launch, and interact with the native app
 npm run build           # type-check and build only the web frontend
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run build:linux     # bump the patch version, package, install, and record provenance
+npm run build:linux     # package, install, and record provenance without modifying tracked files
 ```
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.

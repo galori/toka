@@ -1,6 +1,7 @@
 /node_modules/
 /dist/
 /.local/
+/.worktrees/
 /src-tauri/target/
 /src-tauri/build-info.json
 .DS_Store
