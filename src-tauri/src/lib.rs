@@ -216,12 +216,19 @@ fn set_video_tags(
         kind: "Tags",
         message,
     })?;
-    engine.update_video_path(&result_id, update.path.clone()).map_err(|error| TagsError {
-        kind: "VideoUnavailable",
-        message: error.to_string(),
-    })?;
+    engine
+        .update_video_path(&result_id, update.path.clone())
+        .map_err(|error| TagsError {
+            kind: "VideoUnavailable",
+            message: error.to_string(),
+        })?;
     Ok(VideoTagUpdate {
-        file_name: update.path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+        file_name: update
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         tags: update.tags,
     })
 }

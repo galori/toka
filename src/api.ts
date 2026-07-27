@@ -76,10 +76,17 @@ export function prepareVideo(resultId: string): Promise<PreparedVideo> {
   return invoke("prepare_video", { resultId });
 }
 
-export function deleteVideo(resultId: string): Promise<void> { return invoke("delete_video", { resultId }); }
-export function undoDelete(): Promise<void> { return invoke("undo_delete"); }
+export function deleteVideo(resultId: string): Promise<void> {
+  return invoke("delete_video", { resultId });
+}
+export function undoDelete(): Promise<void> {
+  return invoke("undo_delete");
+}
 
-export function setVideoTags(resultId: string, tags: string[]): Promise<VideoTagUpdate> {
+export function setVideoTags(
+  resultId: string,
+  tags: string[],
+): Promise<VideoTagUpdate> {
   return invoke("set_video_tags", { resultId, tags });
 }
 
@@ -90,7 +97,9 @@ export function loadNativeVideo(filePath: string): Promise<void> {
 export function setNativePaused(paused: boolean): Promise<void> {
   return invoke("set_native_paused", { paused });
 }
-export function setNativeSpeed(speed: number): Promise<void> { return invoke("set_native_speed", { speed }); }
+export function setNativeSpeed(speed: number): Promise<void> {
+  return invoke("set_native_speed", { speed });
+}
 
 export function setNativeVolume(volume: number): Promise<void> {
   return invoke("set_native_volume", { volume });

@@ -162,7 +162,9 @@ impl SearchEngine {
 
     pub fn update_video_path(&self, result_id: &str, path: PathBuf) -> Result<(), SearchError> {
         let mut known_paths = self.result_paths.lock().unwrap();
-        let known_path = known_paths.get_mut(result_id).ok_or(SearchError::VideoUnavailable)?;
+        let known_path = known_paths
+            .get_mut(result_id)
+            .ok_or(SearchError::VideoUnavailable)?;
         *known_path = path;
         Ok(())
     }
