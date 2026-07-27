@@ -39,6 +39,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  Object.defineProperty(document, "fullscreenElement", {
+    configurable: true,
+    get: () => null,
+  });
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
