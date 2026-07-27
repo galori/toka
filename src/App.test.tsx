@@ -216,6 +216,23 @@ test("starts the whole result page as a playlist positioned at the chosen video"
   expect(screen.getByRole("button", { name: "Next video" })).toBeEnabled();
 });
 
+test("deletes the current video, advances, and restores it with the undo shortcut", async () => {
+  const results = [1, 2, 3].map((number) => ({ id: `video-${number}`, fileName: `delete-${number}.mp4`, extension: "mp4" }));
+  invokeMock.mockResolvedValueOnce({ query: "delete", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValue({ filePath: "/Videos/delete.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "delete{Enter}");
+  await user.click(screen.getByRole("button", { name: "Play delete-2.mp4" }));
+  expect(await screen.findByLabelText("Playing delete-2.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Delete video" }));
+  expect(await screen.findByLabelText("Playing delete-3.mp4")).toBeVisible();
+  expect(invokeMock).toHaveBeenCalledWith("delete_video", { resultId: "video-2" });
+  fireEvent.keyDown(window, { key: "Delete", shiftKey: true, ctrlKey: true });
+  expect(await screen.findByLabelText("Playing delete-2.mp4")).toBeVisible();
+  expect(invokeMock).toHaveBeenCalledWith("undo_delete");
+});
+
 test("shows a sidecar subtitle track and turns it off again", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {

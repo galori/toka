@@ -16,6 +16,8 @@ import {
   setNativeVideoBounds,
   stopNativeVideo,
   subtitleCues,
+  deleteVideo,
+  undoDelete,
   videoThumbnail,
   type PreparedVideo,
   type SearchPage,
@@ -359,7 +361,14 @@ function Player({
   const [embeddedSubtitles, setEmbeddedSubtitles] = useState<SubtitleOption[]>([]);
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
   const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
-  const video = videos[index];
+  const [playlist, setPlaylist] = useState(videos);
+  const [deletedVideo, setDeletedVideo] = useState<{ video: VideoResult; index: number }>();
+  const video = playlist[index];
+  useEffect(() => {
+    if (!deletedVideo) return;
+    const timeout = window.setTimeout(() => setDeletedVideo(undefined), 5000);
+    return () => window.clearTimeout(timeout);
+  }, [deletedVideo]);
   // Speed is a choice about the sitting rather than about one file, so it
   // outlives each video. Read through a ref so loading the next one does not
   // have to depend on it and restart playback whenever it changes.
@@ -588,12 +597,40 @@ function Player({
   };
 
   const selectVideo = (nextIndex: number) => {
-    if (nextIndex >= 0 && nextIndex < videos.length) setIndex(nextIndex);
+    if (nextIndex >= 0 && nextIndex < playlist.length) setIndex(nextIndex);
   };
 
   const moveVideo = (direction: -1 | 1) => {
-    if (videos.length === 0) return;
-    setIndex((current) => (current + direction + videos.length) % videos.length);
+    if (playlist.length === 0) return;
+    setIndex((current) => (current + direction + playlist.length) % playlist.length);
+  };
+
+  const removeCurrentVideo = async () => {
+    const removed = playlist[index];
+    try {
+      await deleteVideo(removed.id);
+      setDeletedVideo({ video: removed, index });
+      if (playlist.length === 1) {
+        onBack();
+        return;
+      }
+      setPlaylist((current) => current.filter((item) => item.id !== removed.id));
+      setIndex((current) => Math.min(current, Math.max(0, playlist.length - 2)));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+
+  const restoreDeletedVideo = async () => {
+    if (!deletedVideo) return;
+    try {
+      await undoDelete();
+      setPlaylist((current) => [...current.slice(0, deletedVideo.index), deletedVideo.video, ...current.slice(deletedVideo.index)]);
+      setIndex(deletedVideo.index);
+      setDeletedVideo(undefined);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
   };
 
   const applySpeed = (next: number) => {
@@ -795,7 +832,7 @@ function Player({
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target;
       if (
-        event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey ||
+        event.defaultPrevented || (event.ctrlKey && !(event.shiftKey && event.key === "Delete")) || event.metaKey || event.altKey ||
         (target instanceof Element && target.closest("input, textarea, select, [contenteditable], [role=textbox]"))
       ) return;
 
@@ -817,6 +854,10 @@ function Player({
         run(() => moveVideo(-1));
       } else if (event.key === "PageDown") {
         run(() => moveVideo(1));
+      } else if (event.key === "Delete" && event.shiftKey && event.ctrlKey) {
+        run(() => void restoreDeletedVideo());
+      } else if (event.key === "Delete" && event.shiftKey) {
+        run(() => void removeCurrentVideo());
       } else if (event.key === "-") {
         run(() => stepSpeed(-1));
       } else if (event.key === "=" || event.key === "+") {
@@ -841,7 +882,7 @@ function Player({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, speed, subtitleIndex, subtitles, videos.length, volume]);
+  }, [currentTime, duration, fullscreen, index, native, nativeBaseRotation, onBack, playingBack, playlist.length, speed, subtitleIndex, subtitles, videos.length, volume]);
 
   if (error) {
     const unsupported = error.includes("format") || error.includes("codec");
@@ -856,7 +897,7 @@ function Player({
             <BackArrowIcon />
             <Label>Back to results</Label>
           </ControlButton>
-          {index < videos.length - 1 ? <button type="button" className="playlist-button" title="Skip to next video" onClick={() => setIndex((current) => current + 1)}><Label>Skip to next</Label></button> : null}
+          {index < playlist.length - 1 ? <button type="button" className="playlist-button" title="Skip to next video" onClick={() => setIndex((current) => current + 1)}><Label>Skip to next</Label></button> : null}
         </div>
       </section>
     );
@@ -1056,6 +1097,10 @@ function Player({
               >
                 <Label>Info</Label>
               </ControlButton>
+              <ControlButton shortcut="Shift+Delete" onClick={() => void removeCurrentVideo()} aria-label="Delete video">
+                <Label>Delete</Label>
+              </ControlButton>
+              {deletedVideo ? <ControlButton shortcut="Ctrl+Shift+Delete" onClick={() => void restoreDeletedVideo()} aria-label="Undo delete"><Label>Undo</Label></ControlButton> : null}
             </div>
           </div>
         </div>
@@ -1077,7 +1122,7 @@ function Player({
           >
             <h2>Up next</h2>
             <ol>
-              {videos.map((item, itemIndex) => (
+              {playlist.map((item, itemIndex) => (
                 <li key={item.id}>
                   <button
                     type="button"
@@ -1096,7 +1141,7 @@ function Player({
         ) : null}
       </div>
       <p className="playlist-status" aria-live="polite">
-        Playlist video {index + 1} of {videos.length}
+        Playlist video {index + 1} of {playlist.length}
       </p>
     </section>
   );
