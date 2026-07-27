@@ -293,6 +293,15 @@ function Label({ children }: { children: string }) {
   return <span className="control-label">{children}</span>;
 }
 
+export function shuffleVideos(videos: VideoResult[]): VideoResult[] {
+  const shuffled = [...videos];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
 // Pairs the declared shortcut with the one shown on the control, so the two
 // cannot drift apart as bindings change.
 function ControlButton({
@@ -563,7 +572,7 @@ function Player({
     // "Off" means play the video the viewer is on and stop there, so it does
     // not move on to the next entry even in the middle of a playlist.
     if (loop === "off") return;
-    const next = index < videos.length - 1 ? index + 1 : 0;
+    const next = index < playlist.length - 1 ? index + 1 : 0;
     // Wrapping a one-entry playlist lands back on the video that just ended,
     // and React drops a state change that changes nothing, so that entry has to
     // be started again rather than waited on.
@@ -598,6 +607,11 @@ function Player({
 
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < playlist.length) setIndex(nextIndex);
+  };
+
+  const shufflePlaylist = () => {
+    setPlaylist((current) => shuffleVideos(current));
+    setIndex(0);
   };
 
   const moveVideo = (direction: -1 | 1) => {
@@ -858,6 +872,8 @@ function Player({
         run(() => void restoreDeletedVideo());
       } else if (event.key === "Delete" && event.shiftKey) {
         run(() => void removeCurrentVideo());
+      } else if (event.key.toLowerCase() === "r") {
+        run(shufflePlaylist);
       } else if (event.key === "-") {
         run(() => stepSpeed(-1));
       } else if (event.key === "=" || event.key === "+") {
@@ -919,7 +935,7 @@ function Player({
           onClick={togglePlaylist}
         >
           <Label>Playlist</Label>
-          <span className="playlist-count"><Label>{String(videos.length)}</Label></span>
+          <span className="playlist-count"><Label>{String(playlist.length)}</Label></span>
         </ControlButton>
       </div>
 
@@ -1086,6 +1102,7 @@ function Player({
               >
                 <PlaylistIcon />
               </ControlButton>
+              <ControlButton shortcut="R" className="transport-button playlist-button" onClick={shufflePlaylist} aria-label="Shuffle playlist"><Label>Shuffle</Label></ControlButton>
               <ControlButton shortcut="F" onClick={toggleFullscreen} aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}>
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
               </ControlButton>
@@ -1281,6 +1298,11 @@ export default function App() {
               >
                 <Label>{playlistLoading ? "Loading playlist…" : "Play all"}</Label>
               </button>
+            ) : null}
+            {page.results.length > 1 ? (
+              <ControlButton shortcut="R" className="playlist-button" aria-label="Shuffle results" onClick={() => setPage((current) => current ? { ...current, results: shuffleVideos(current.results) } : current)}>
+                <Label>Shuffle</Label>
+              </ControlButton>
             ) : null}
             <p>{page.results.length} of {page.totalResults} loaded</p>
           </div>
