@@ -67,7 +67,18 @@ jobs:
           else
             echo "No mpv E2E log was written."
           fi
-      - run: npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+      - name: Package app
+        run: |
+          metadata=$(node bin/prepare-build.mjs)
+          export VITE_APP_VERSION=$(node -e 'console.log(JSON.parse(process.argv[1]).version)' "$metadata")
+          export VITE_BUILD_TIME=$(node -e 'console.log(JSON.parse(process.argv[1]).builtAt)' "$metadata")
+          export VITE_GIT_SHA=$(node -e 'console.log(JSON.parse(process.argv[1]).gitSha)' "$metadata")
+          {
+            echo "VITE_APP_VERSION=$VITE_APP_VERSION"
+            echo "VITE_BUILD_TIME=$VITE_BUILD_TIME"
+            echo "VITE_GIT_SHA=$VITE_GIT_SHA"
+          } >> "$GITHUB_ENV"
+          npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
       - uses: actions/upload-artifact@v4
         with:
           name: toka-${{ matrix.rust-target }}

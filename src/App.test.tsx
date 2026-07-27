@@ -28,6 +28,14 @@ test("shuffles without mutating the original video list", () => {
   expect(videos.map((video) => video.id)).toEqual(["1", "2", "3"]);
 });
 
+test("shows build provenance on the initial home screen", () => {
+  render(<App />);
+
+  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Version 0.1.0");
+  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Built");
+  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Git SHA");
+});
+
 beforeEach(() => {
   invokeMock.mockReset();
   convertFileSrcMock.mockClear();

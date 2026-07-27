@@ -24,6 +24,7 @@ import {
   type SearchPage,
   type VideoResult,
 } from "./api";
+import { buildInfo } from "./buildInfo";
 
 // A subtitle Toka can turn on, whichever backend supplies it: a sidecar file
 // detected by Rust, an mpv track, or a track the web engine found in the file.
@@ -1314,6 +1315,14 @@ export default function App() {
           {query ? <button type="button" className="clear-search" aria-label="Clear search" title="Clear search" onClick={() => setQuery("")}>×</button> : <SearchIcon />}
         </div>
       </form>
+
+      {!hasSubmitted ? (
+        <section className="build-info" aria-label="Build information">
+          <span>Version {buildInfo.version}</span>
+          <span>Built {buildInfo.builtAt}</span>
+          <span>Git SHA {buildInfo.gitSha}</span>
+        </section>
+      ) : null}
 
       {loading ? <p className="message" aria-live="polite">Searching…</p> : null}
       {error ? <p role="alert" className="message error">{error}</p> : null}

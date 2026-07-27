@@ -8,6 +8,7 @@ npm test                # React unit tests
 npm run test:integration # build, launch, and interact with the native app
 npm run build           # type-check and build only the web frontend
 cargo test --manifest-path src-tauri/Cargo.toml
+npm run build:linux     # bump the patch version, package, install, and record provenance
 ```
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.
@@ -26,6 +27,11 @@ The native integration test uses an embedded WebDriver and a generated video fix
 `docs/thumbnails.md` records the decided approach for result thumbnails.
 
 The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it.
+
+Release builds write `/usr/share/toka/build-info.json` into the Debian package.
+After installing Toka on Linux, run `bin/toka-freshness.mjs` from the repository
+to see its version, build age, Git SHA, and number of commits behind
+`origin/main`.
 
 ## Linux troubleshooting
 
