@@ -6,6 +6,7 @@ use std::process::Command;
 #[derive(Debug)]
 struct ProcessOutput {
     success: bool,
+    exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -21,6 +22,7 @@ impl ProcessRunner for SystemProcessRunner {
         let output = Command::new(program).args(args).output()?;
         Ok(ProcessOutput {
             success: output.status.success(),
+            exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
@@ -122,6 +124,11 @@ impl SearchProvider for PlocateSearchProvider {
             .map(String::from)
             .collect::<Vec<_>>();
         let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
+        // plocate uses exit status 1 to report a successful search with no
+        // matches. Other non-zero statuses still indicate a provider error.
+        if output.exit_code == Some(1) {
+            return Ok(Vec::new());
+        }
         parse_output(
             output,
             "plocate search failed. Ensure plocate is installed and its index has been built",
@@ -163,14 +170,31 @@ mod tests {
 
     struct FakeRunner {
         invocation: Mutex<Option<(String, Vec<String>)>>,
-        output: String,
+        output: ProcessOutput,
     }
 
     impl FakeRunner {
         fn new(output: &str) -> Self {
             Self {
                 invocation: Mutex::new(None),
-                output: output.into(),
+                output: ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: output.into(),
+                    stderr: String::new(),
+                },
+            }
+        }
+
+        fn no_matches() -> Self {
+            Self {
+                invocation: Mutex::new(None),
+                output: ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
             }
         }
     }
@@ -179,9 +203,10 @@ mod tests {
         fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
             *self.invocation.lock().unwrap() = Some((program.into(), args.to_vec()));
             Ok(ProcessOutput {
-                success: true,
-                stdout: self.output.clone(),
-                stderr: String::new(),
+                success: self.output.success,
+                exit_code: self.output.exit_code,
+                stdout: self.output.stdout.clone(),
+                stderr: self.output.stderr.clone(),
             })
         }
     }
@@ -255,5 +280,14 @@ mod tests {
             ))
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
+    }
+
+    #[test]
+    fn plocate_reports_no_matches_as_an_empty_result_set() {
+        let provider = PlocateSearchProvider {
+            runner: Arc::new(FakeRunner::no_matches()),
+        };
+
+        assert_eq!(provider.candidates("does-not-exist").unwrap(), Vec::<PathBuf>::new());
     }
 }
