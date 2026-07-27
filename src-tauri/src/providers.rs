@@ -1,11 +1,10 @@
 use crate::search::{SearchError, SearchProvider};
 #[cfg(all(target_os = "macos", not(test)))]
 use std::sync::Once;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
+#[cfg(any(target_os = "macos", test))]
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug)]
@@ -87,11 +86,12 @@ fn macos_download_candidates(query: &str) -> Result<Vec<PathBuf>, SearchError> {
     ))
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(test)]
 fn macos_download_candidates(_query: &str) -> Result<Vec<PathBuf>, SearchError> {
     Ok(Vec::new())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
     let Ok(term) = longest_term(query) else {
         return Vec::new();
@@ -137,7 +137,7 @@ fn prepare_macos_downloads_folder_access() {
     });
 }
 
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(test)]
 fn prepare_macos_downloads_folder_access() {}
 
 #[cfg(any(target_os = "linux", test))]
