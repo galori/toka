@@ -648,13 +648,18 @@ button:focus-visible {
 .player-shell.fullscreen.idle {
   cursor: none;
 }
+/* One row along the bottom rather than a band at either end. Two rows cost the
+   picture a strip top and bottom — on Linux literally, because GTK paints the
+   mpv surface over the WebView and the surface has to stop short of anything
+   meant to be read over it. Sharing the clock's row hands the top strip back. */
 .fullscreen-info {
   position: absolute;
   z-index: 3;
-  inset: 12px 16px 14px;
+  inset: auto 16px 14px;
   display: flex;
-  flex-direction: column;
+  align-items: baseline;
   justify-content: space-between;
+  gap: 16px;
   pointer-events: none;
   color: #fff;
   font:
@@ -668,14 +673,17 @@ button:focus-visible {
     1px -1px 0 #000,
     -1px 1px 0 #000;
 }
+/* The path is what gives way when the row is tight: the clock is short, fixed
+   and unreadable if it wraps or is clipped. */
 .fullscreen-file-path {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .fullscreen-time {
-  align-self: flex-end;
-  margin-bottom: var(--scrubber-sliver);
+  flex: none;
 }
 /* Only reachable in fullscreen, where the effect that sets it runs. The bar
    collapses onto the scrubber rather than disappearing outright, and the
