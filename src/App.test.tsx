@@ -1,4 +1,10 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import App, { playbackSource, shuffleVideos } from "./App";
@@ -22,18 +28,32 @@ const convertFileSrcMock = vi.mocked(convertFileSrc);
 const randomMock = vi.spyOn(Math, "random");
 
 test("shuffles without mutating the original video list", () => {
-  const videos = [1, 2, 3].map((id) => ({ id: String(id), fileName: `${id}.mp4`, extension: "mp4" }));
+  const videos = [1, 2, 3].map((id) => ({
+    id: String(id),
+    fileName: `${id}.mp4`,
+    extension: "mp4",
+  }));
   randomMock.mockReturnValueOnce(0).mockReturnValueOnce(0);
-  expect(shuffleVideos(videos).map((video) => video.id)).toEqual(["2", "3", "1"]);
+  expect(shuffleVideos(videos).map((video) => video.id)).toEqual([
+    "2",
+    "3",
+    "1",
+  ]);
   expect(videos.map((video) => video.id)).toEqual(["1", "2", "3"]);
 });
 
 test("shows build provenance on the initial home screen", () => {
   render(<App />);
 
-  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Version 0.1.0");
-  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Built");
-  expect(screen.getByRole("region", { name: "Build information" })).toHaveTextContent("Git SHA");
+  expect(
+    screen.getByRole("region", { name: "Build information" }),
+  ).toHaveTextContent("Version 0.1.0");
+  expect(
+    screen.getByRole("region", { name: "Build information" }),
+  ).toHaveTextContent("Built");
+  expect(
+    screen.getByRole("region", { name: "Build information" }),
+  ).toHaveTextContent("Git SHA");
 });
 
 beforeEach(() => {
@@ -58,10 +78,14 @@ afterEach(() => {
 test("uses the fixture server for the Linux web playback fallback in E2E builds", () => {
   vi.stubEnv("VITE_E2E", "1");
   vi.stubEnv("VITE_E2E_FIXTURE_SERVER_PORT", "23142");
-  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("WebKitGTK Linux");
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("WebKitGTK Linux");
 
   try {
-    expect(playbackSource("/Videos/clip #1.mp4")).toBe("http://127.0.0.1:23142/clip%20%231.mp4");
+    expect(playbackSource("/Videos/clip #1.mp4")).toBe(
+      "http://127.0.0.1:23142/clip%20%231.mp4",
+    );
     expect(convertFileSrcMock).not.toHaveBeenCalled();
   } finally {
     userAgent.mockRestore();
@@ -70,7 +94,9 @@ test("uses the fixture server for the Linux web playback fallback in E2E builds"
 
 test("retains the asset protocol for E2E builds on platforms that support it", () => {
   vi.stubEnv("VITE_E2E", "1");
-  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
 
   try {
     expect(playbackSource("/Videos/clip.mp4")).toBe("asset:///Videos/clip.mp4");
@@ -87,35 +113,57 @@ test("starts with a focused search field and displays submitted results", async 
     pageSize: 24,
     totalResults: 1,
     totalPages: 1,
-    results: [{ id: "video-1", fileName: "Summer Vacation.mp4", extension: "mp4" }],
+    results: [
+      { id: "video-1", fileName: "Summer Vacation.mp4", extension: "mp4" },
+    ],
   });
   const user = userEvent.setup();
   render(<App />);
 
   const search = screen.getByRole("searchbox", { name: "Search videos" });
   expect(search).toHaveFocus();
-  expect(screen.queryByRole("list", { name: "Video results" })).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("list", { name: "Video results" }),
+  ).not.toBeInTheDocument();
 
   await user.type(search, "summer vacation{Enter}");
 
-  expect(await screen.findByRole("button", { name: "Play Summer Vacation.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play Summer Vacation.mp4" }),
+  ).toBeVisible();
   expect(invokeMock).toHaveBeenCalledWith("search_videos", {
     request: { query: "summer vacation", page: 1, pageSize: 24 },
   });
 });
 
 test("offers a results shuffle control and restarts a shuffled playlist with R", async () => {
-  const results = [1, 2, 3].map((number) => ({ id: `video-${number}`, fileName: `shuffle-${number}.mp4`, extension: "mp4" }));
-  invokeMock.mockResolvedValueOnce({ query: "shuffle", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `shuffle-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "shuffle",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/shuffle.mp4" });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "shuffle{Enter}");
-  const resultsButton = await screen.findByRole("button", { name: "Shuffle results" });
+  const resultsButton = await screen.findByRole("button", {
+    name: "Shuffle results",
+  });
   expect(resultsButton).toHaveAttribute("aria-keyshortcuts", "R");
   await user.click(screen.getByRole("button", { name: "Play shuffle-2.mp4" }));
   expect(await screen.findByLabelText("Playing shuffle-2.mp4")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Shuffle playlist" })).toHaveAttribute("aria-keyshortcuts", "R");
+  expect(
+    screen.getByRole("button", { name: "Shuffle playlist" }),
+  ).toHaveAttribute("aria-keyshortcuts", "R");
   randomMock.mockReturnValueOnce(0.999999).mockReturnValueOnce(0.999999);
   fireEvent.keyDown(window, { key: "r" });
   expect(await screen.findByLabelText("Playing shuffle-1.mp4")).toBeVisible();
@@ -123,36 +171,86 @@ test("offers a results shuffle control and restarts a shuffled playlist with R",
 
 test("displays an app-generated thumbnail when search returns one", async () => {
   invokeMock.mockResolvedValueOnce({
-    query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-    results: [{
-      id: "video-1", fileName: "clip.mp4", extension: "mp4",
-      thumbnailPath: "/tmp/toka-thumbnails/clip.jpg",
-    }],
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [
+      {
+        id: "video-1",
+        fileName: "clip.mp4",
+        extension: "mp4",
+        thumbnailPath: "/tmp/toka-thumbnails/clip.jpg",
+      },
+    ],
   });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
 
-  expect(await screen.findByRole("button", { name: "Play clip.mp4" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Play clip.mp4" }).querySelector(".video-art"))
-    .toHaveStyle({ backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")' });
+  expect(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  ).toBeVisible();
+  expect(
+    screen
+      .getByRole("button", { name: "Play clip.mp4" })
+      .querySelector(".video-art"),
+  ).toHaveStyle({
+    backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")',
+  });
 });
 
 test("shows video tags and edits them with the tag helper", async () => {
-  invokeMock.mockResolvedValueOnce({
-    query: "tagged", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-    results: [{ id: "video-1", fileName: "tagged.mp4", extension: "mp4", tags: ["work"] }],
-  }).mockResolvedValueOnce(["work", "review"]).mockResolvedValueOnce(["review"]);
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({
+      fileName: "tagged [work] [review].mp4",
+      tags: ["work", "review"],
+    })
+    .mockResolvedValueOnce({
+      fileName: "tagged [review].mp4",
+      tags: ["review"],
+    });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
-  expect(await screen.findByRole("button", { name: "Remove tag work" })).toBeVisible();
-  await user.click(screen.getByRole("button", { name: "Add tag to tagged.mp4" }));
-  await user.type(screen.getByRole("textbox", { name: "Add tag to tagged.mp4" }), "review{Enter}");
-  expect(await screen.findByRole("button", { name: "Remove tag review" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Remove tag work" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Add tag to tagged.mp4" }),
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "Add tag to tagged.mp4" }),
+    "review{Enter}",
+  );
+  expect(
+    await screen.findByRole("button", { name: "Remove tag review" }),
+  ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove tag work" }));
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["work", "review"] });
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", { resultId: "video-1", tags: ["review"] });
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+    resultId: "video-1",
+    tags: ["work", "review"],
+  });
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+    resultId: "video-1",
+    tags: ["review"],
+  });
 });
 
 test("opens a selected result in the player and restores the grid on back", async () => {
@@ -170,7 +268,9 @@ test("opens a selected result in the player and restores the grid on back", asyn
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
 
   const video = await screen.findByLabelText("Playing clip.mp4");
   Object.defineProperty(video, "duration", { configurable: true, value: 120 });
@@ -185,7 +285,11 @@ test("opens a selected result in the player and restores the grid on back", asyn
 test("uses the overlay player controls from the design", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -193,7 +297,9 @@ test("uses the overlay player controls from the design", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
 
   const controls = await screen.findByLabelText("Video controls");
   expect(controls).toHaveClass("player-controls");
@@ -210,25 +316,101 @@ test("uses the overlay player controls from the design", async () => {
   expect(transport).toBeInTheDocument();
   expect(utilities).toBeInTheDocument();
 
-  for (const name of ["Previous video", "Skip back 10 seconds", "Play", "Skip forward 10 seconds", "Next video"]) {
+  for (const name of [
+    "Previous video",
+    "Skip back 10 seconds",
+    "Play",
+    "Skip forward 10 seconds",
+    "Next video",
+  ]) {
     expect(transport).toContainElement(screen.getByRole("button", { name }));
   }
   expect(transport).toContainElement(screen.getByText("0:00 / 0:00"));
 
-  for (const name of ["Rotate left", "Rotate right", "Loop: playlist", "Enter fullscreen"]) {
+  for (const name of [
+    "Rotate left",
+    "Rotate right",
+    "Loop: playlist",
+    "Enter fullscreen",
+  ]) {
     expect(utilities).toContainElement(screen.getByRole("button", { name }));
   }
-  expect(utilities).toContainElement(screen.getByRole("combobox", { name: "Playback speed" }));
+  expect(utilities).toContainElement(
+    screen.getByRole("combobox", { name: "Playback speed" }),
+  );
 
   const play = screen.getByRole("button", { name: "Play" });
   expect(play).toHaveClass("play-button");
   expect(play.querySelector(".play-glyph")).toBeInTheDocument();
 });
 
+test("edits the playing video's tags from the playback controls with T", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValueOnce({
+      fileName: "tagged [work] [review].mp4",
+      tags: ["work", "review"],
+    })
+    .mockResolvedValueOnce({
+      fileName: "tagged [review].mp4",
+      tags: ["review"],
+    });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const controls = await screen.findByLabelText("Video controls");
+  expect(controls).toContainElement(
+    screen.getByRole("button", { name: "Remove tag work" }),
+  );
+
+  fireEvent.keyDown(window, { key: "t" });
+  const tagInput = screen.getByRole("textbox", {
+    name: "Add tag to tagged.mp4",
+  });
+  expect(tagInput).toBeVisible();
+  await user.type(tagInput, "review{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Remove tag review" }),
+  ).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+    resultId: "video-1",
+    tags: ["work", "review"],
+  });
+  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+    resultId: "video-1",
+    tags: ["review"],
+  });
+});
+
 test("uses one control for playing and pausing", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -236,33 +418,45 @@ test("uses one control for playing and pausing", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
 
   // Playing and pausing are the same action read through the current state, so
   // only ever one of the two is on screen.
   const transport = document.querySelector(".player-transport");
   expect(transport?.querySelectorAll(".play-button")).toHaveLength(1);
-  expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Pause" }),
+  ).not.toBeInTheDocument();
 
   fireEvent.play(video);
   const pause = screen.getByRole("button", { name: "Pause" });
   expect(pause).toHaveClass("play-button");
   expect(pause.querySelector(".pause-glyph")).toBeInTheDocument();
   expect(pause).toHaveAttribute("aria-keyshortcuts", "Space");
-  expect(screen.queryByRole("button", { name: "Play" })).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Play" }),
+  ).not.toBeInTheDocument();
 
   // The one button drives both directions, from the pointer and from Space.
-  const paused = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  const paused = vi
+    .spyOn(HTMLMediaElement.prototype, "pause")
+    .mockImplementation(() => {});
   await user.click(pause);
   expect(paused).toHaveBeenCalled();
   fireEvent.pause(video);
   expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
 
-  const played = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  const played = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
   fireEvent.keyDown(window, { key: " " });
   expect(played).toHaveBeenCalled();
-  await waitFor(() => expect(screen.getByRole("button", { name: "Pause" })).toBeVisible());
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Pause" })).toBeVisible(),
+  );
 });
 
 test("starts the whole result page as a playlist positioned at the chosen video", async () => {
@@ -272,13 +466,22 @@ test("starts the whole result page as a playlist positioned at the chosen video"
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-2.mp4" });
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "playlist{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play playlist-2.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play playlist-2.mp4" }),
+  );
 
   // Choosing one result drops the viewer into the page's playlist at that spot
   // rather than playing it on its own.
@@ -286,7 +489,9 @@ test("starts the whole result page as a playlist positioned at the chosen video"
   expect(screen.getByText("Playlist video 2 of 3")).toBeVisible();
   expect(screen.getByRole("button", { name: "Playlist 3" })).toBeVisible();
   expect(screen.getAllByRole("listitem")).toHaveLength(3);
-  expect(screen.getByRole("button", { name: "playlist-2.mp4" })).toHaveAttribute("aria-current", "true");
+  expect(
+    screen.getByRole("button", { name: "playlist-2.mp4" }),
+  ).toHaveAttribute("aria-current", "true");
 
   // And the rest of the page is reachable from there in both directions.
   expect(screen.getByRole("button", { name: "Previous video" })).toBeEnabled();
@@ -294,8 +499,20 @@ test("starts the whole result page as a playlist positioned at the chosen video"
 });
 
 test("deletes the current video, advances, and restores it with the undo shortcut", async () => {
-  const results = [1, 2, 3].map((number) => ({ id: `video-${number}`, fileName: `delete-${number}.mp4`, extension: "mp4" }));
-  invokeMock.mockResolvedValueOnce({ query: "delete", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `delete-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "delete",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/delete.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -304,7 +521,9 @@ test("deletes the current video, advances, and restores it with the undo shortcu
   expect(await screen.findByLabelText("Playing delete-2.mp4")).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Delete video" }));
   expect(await screen.findByLabelText("Playing delete-3.mp4")).toBeVisible();
-  expect(invokeMock).toHaveBeenCalledWith("delete_video", { resultId: "video-2" });
+  expect(invokeMock).toHaveBeenCalledWith("delete_video", {
+    resultId: "video-2",
+  });
   fireEvent.keyDown(window, { key: "Delete", shiftKey: true, ctrlKey: true });
   expect(await screen.findByLabelText("Playing delete-2.mp4")).toBeVisible();
   expect(invokeMock).toHaveBeenCalledWith("undo_delete");
@@ -314,7 +533,11 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {
       return Promise.resolve({
-        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
         results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
       });
     }
@@ -327,14 +550,17 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
         ],
       });
     }
-    if (command === "subtitle_cues") return Promise.resolve("WEBVTT\n\n00:01.000 --> 00:02.000\nHi");
+    if (command === "subtitle_cues")
+      return Promise.resolve("WEBVTT\n\n00:01.000 --> 00:02.000\nHi");
     return Promise.resolve();
   });
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
 
   const toggle = await screen.findByRole("button", { name: "Subtitles" });
   expect(toggle).toHaveAttribute("aria-pressed", "false");
@@ -342,8 +568,16 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
   expect(toggle).toBeEnabled();
 
   await user.click(toggle);
-  await waitFor(() => expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "true"));
-  expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 0 });
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    ),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", {
+    resultId: "video-1",
+    track: 0,
+  });
 
   const track = document.querySelector("video")?.textTracks[0];
   expect(track?.label).toBe("Subtitles");
@@ -351,7 +585,10 @@ test("shows a sidecar subtitle track and turns it off again", async () => {
   expect((track?.cues?.[0] as VTTCue | undefined)?.text).toBe("Hi");
 
   await user.click(screen.getByRole("button", { name: "Subtitles" }));
-  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
   expect(track?.mode).toBe("disabled");
 });
 
@@ -359,7 +596,11 @@ test("switches between the subtitle tracks found beside the video", async () => 
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {
       return Promise.resolve({
-        query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
         results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
       });
     }
@@ -380,19 +621,26 @@ test("switches between the subtitle tracks found beside the video", async () => 
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   await user.click(await screen.findByRole("button", { name: "Subtitles" }));
 
-  const chooser = await screen.findByRole("combobox", { name: "Subtitle track" });
+  const chooser = await screen.findByRole("combobox", {
+    name: "Subtitle track",
+  });
   // The .ass sidecar is listed by Rust but the web engine cannot render it.
-  expect([...chooser.querySelectorAll("option")].map((option) => option.textContent)).toEqual([
-    "Off",
-    "Subtitles",
-    "EN",
-  ]);
+  expect(
+    [...chooser.querySelectorAll("option")].map((option) => option.textContent),
+  ).toEqual(["Off", "Subtitles", "EN"]);
 
   await user.selectOptions(chooser, "1");
-  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", { resultId: "video-1", track: 1 }));
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("subtitle_cues", {
+      resultId: "video-1",
+      track: 1,
+    }),
+  );
   const tracks = document.querySelector("video")?.textTracks;
   expect(tracks?.[tracks.length - 1]?.language).toBe("en");
 });
@@ -400,7 +648,11 @@ test("switches between the subtitle tracks found beside the video", async () => 
 test("toggles subtitles with the keyboard and disables the control without tracks", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4", subtitles: [] });
@@ -408,7 +660,9 @@ test("toggles subtitles with the keyboard and disables the control without track
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
 
   // Visible but inert, so the feature stays discoverable when a video has none.
   const toggle = await screen.findByRole("button", { name: "Subtitles" });
@@ -416,24 +670,42 @@ test("toggles subtitles with the keyboard and disables the control without track
   expect(toggle).toBeDisabled();
 
   fireEvent.keyDown(window, { key: "s" });
-  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "false");
-  expect(screen.queryByRole("combobox", { name: "Subtitle track" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  expect(
+    screen.queryByRole("combobox", { name: "Subtitle track" }),
+  ).not.toBeInTheDocument();
 });
 
 test("selects and clears the mpv subtitle track for native playback", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {
       return Promise.resolve({
-        query: "native", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
         results: [{ id: "native-1", fileName: "native.mkv", extension: "mkv" }],
       });
     }
     if (command === "prepare_video") {
-      return Promise.resolve({ filePath: "/Videos/native.mkv", playbackBackend: "native", subtitles: [] });
+      return Promise.resolve({
+        filePath: "/Videos/native.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
     }
     if (command === "native_subtitle_tracks") {
       return Promise.resolve([{ id: 1, label: "English", external: false }]);
@@ -444,24 +716,45 @@ test("selects and clears the mpv subtitle track for native playback", async () =
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "native{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play native.mkv" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mkv" }),
+  );
 
   // mpv reports embedded tracks only once the file has loaded.
-  await waitFor(() => expect(screen.getByRole("button", { name: "Subtitles" })).toBeEnabled());
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Subtitles" })).toBeEnabled(),
+  );
 
   fireEvent.keyDown(window, { key: "s" });
-  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: 1 }));
-  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute("aria-pressed", "true");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: 1 }),
+  );
+  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
 
   fireEvent.keyDown(window, { key: "s" });
-  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: null }));
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", {
+      id: null,
+    }),
+  );
 });
 
 test("shows its keyboard shortcut on every control that has one", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 1,
-      results: [1, 2].map((n) => ({ id: `video-${n}`, fileName: `clip-${n}.mp4`, extension: "mp4" })),
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results: [1, 2].map((n) => ({
+        id: `video-${n}`,
+        fileName: `clip-${n}.mp4`,
+        extension: "mp4",
+      })),
     })
     .mockResolvedValue({ filePath: "/Videos/clip-1.mp4" });
   const user = userEvent.setup();
@@ -476,8 +769,13 @@ test("shows its keyboard shortcut on every control that has one", async () => {
   expect(controls.length).toBeGreaterThan(10);
   for (const control of controls) {
     // A select cannot hold a child, so its hint sits beside it.
-    const hint = control.querySelector(".key-hint") ?? control.parentElement?.querySelector(".key-hint");
-    expect(hint, `${control.getAttribute("aria-label")} has no visible shortcut`).toBeTruthy();
+    const hint =
+      control.querySelector(".key-hint") ??
+      control.parentElement?.querySelector(".key-hint");
+    expect(
+      hint,
+      `${control.getAttribute("aria-label")} has no visible shortcut`,
+    ).toBeTruthy();
   }
 
   // The example from the issue: 'rotate right' is bound to ']' and says so.
@@ -487,20 +785,30 @@ test("shows its keyboard shortcut on every control that has one", async () => {
 
   // Hints read as key names rather than raw DOM ones.
   expect(
-    screen.getByRole("button", { name: "Next video" }).querySelector(".key-hint"),
+    screen
+      .getByRole("button", { name: "Next video" })
+      .querySelector(".key-hint"),
   ).toHaveTextContent("PgDn");
   expect(
-    screen.getByRole("button", { name: "Previous video" }).querySelector(".key-hint"),
+    screen
+      .getByRole("button", { name: "Previous video" })
+      .querySelector(".key-hint"),
   ).toHaveTextContent("PgUp");
   expect(
-    screen.getByRole("button", { name: "Back to results" }).querySelector(".key-hint"),
+    screen
+      .getByRole("button", { name: "Back to results" })
+      .querySelector(".key-hint"),
   ).toHaveTextContent("Esc");
 });
 
 test("steps playback speed with the keyboard", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -508,7 +816,9 @@ test("steps playback speed with the keyboard", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
   const speed = screen.getByRole("combobox", { name: "Playback speed" });
 
@@ -529,35 +839,60 @@ test("steps playback speed with the keyboard", async () => {
 test("presents a dedicated unsupported-format state", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
-    .mockRejectedValueOnce(new Error("This video format or codec is not supported on this computer."));
+    .mockRejectedValueOnce(
+      new Error(
+        "This video format or codec is not supported on this computer.",
+      ),
+    );
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
 
-  expect(await screen.findByRole("heading", { name: "This video format isn't supported on your computer" })).toBeVisible();
+  expect(
+    await screen.findByRole("heading", {
+      name: "This video format isn't supported on your computer",
+    }),
+  ).toBeVisible();
   expect(screen.getByRole("button", { name: "Back to results" })).toBeVisible();
 });
 
 test("enters fullscreen mode for the player", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
   const requestFullscreen = vi.fn().mockResolvedValue(undefined);
-  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
-  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Enter fullscreen" }),
+  );
 
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
@@ -568,14 +903,24 @@ test("shows fullscreen path and time overlays and toggles them with I", async ()
     const user = await playForFullscreen();
     await enterFullscreen(user);
 
-    expect(screen.getByRole("region", { name: "Fullscreen video information" })).toBeVisible();
+    expect(
+      screen.getByRole("region", { name: "Fullscreen video information" }),
+    ).toBeVisible();
     expect(screen.getByText("/Videos/clip.mp4")).toBeVisible();
-    expect(screen.getByRole("region", { name: "Fullscreen video information" })).toHaveTextContent("0:00 / 0:00");
-    expect(screen.getByRole("button", { name: "Hide fullscreen information" })).toHaveAttribute("aria-keyshortcuts", "I");
+    expect(
+      screen.getByRole("region", { name: "Fullscreen video information" }),
+    ).toHaveTextContent("0:00 / 0:00");
+    expect(
+      screen.getByRole("button", { name: "Hide fullscreen information" }),
+    ).toHaveAttribute("aria-keyshortcuts", "I");
 
     fireEvent.keyDown(window, { key: "i" });
-    expect(screen.queryByRole("region", { name: "Fullscreen video information" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Show fullscreen information" })).toBeVisible();
+    expect(
+      screen.queryByRole("region", { name: "Fullscreen video information" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Show fullscreen information" }),
+    ).toBeVisible();
   } finally {
     vi.useRealTimers();
   }
@@ -584,46 +929,80 @@ test("shows fullscreen path and time overlays and toggles them with I", async ()
 test("uses Tauri window fullscreen when the web fullscreen request fails", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-  const requestFullscreen = vi.fn().mockRejectedValue(new Error("Web fullscreen failed"));
-  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  const requestFullscreen = vi
+    .fn()
+    .mockRejectedValue(new Error("Web fullscreen failed"));
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
-  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Enter fullscreen" }),
+  );
 
-  await waitFor(() => expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true));
-  expect(screen.queryByRole("heading", { name: "This video could not be played" })).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
+  );
+  expect(
+    screen.queryByRole("heading", { name: "This video could not be played" }),
+  ).not.toBeInTheDocument();
   expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
   expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
 });
 
 test("uses Tauri window fullscreen first on macOS", async () => {
-  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
   const requestFullscreen = vi.fn().mockResolvedValue(undefined);
-  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
   const user = userEvent.setup();
   render(<App />);
 
   try {
     await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
-    await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "Enter fullscreen" }),
+    );
 
-    await waitFor(() => expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true));
+    await waitFor(() =>
+      expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
+    );
     expect(requestFullscreen).not.toHaveBeenCalled();
-    expect(screen.queryByRole("heading", { name: "This video could not be played" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "This video could not be played" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
   } finally {
     userAgent.mockRestore();
@@ -631,10 +1010,16 @@ test("uses Tauri window fullscreen first on macOS", async () => {
 });
 
 test("keeps player keyboard shortcuts live after leaving fullscreen from the keyboard", async () => {
-  const userAgent = vi.spyOn(window.navigator, "userAgent", "get").mockReturnValue("AppleWebKit Mac OS X");
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -643,7 +1028,9 @@ test("keeps player keyboard shortcuts live after leaving fullscreen from the key
 
   try {
     await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-    await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
     const video = await screen.findByLabelText("Playing clip.mp4");
 
     fireEvent.keyDown(window, { key: "f" });
@@ -670,7 +1057,9 @@ function reportFullscreen(active: boolean) {
 }
 
 async function enterFullscreen(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(await screen.findByRole("button", { name: "Enter fullscreen" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Enter fullscreen" }),
+  );
   reportFullscreen(true);
 }
 
@@ -684,7 +1073,12 @@ async function playForFullscreen(names = ["clip.mp4"]) {
   }));
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: results.length, totalPages: 1, results,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: results.length,
+      totalPages: 1,
+      results,
     })
     .mockResolvedValue({ filePath: `/Videos/${names[0]}` });
   Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
@@ -695,7 +1089,11 @@ async function playForFullscreen(names = ["clip.mp4"]) {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: names.length > 1 ? "Play all" : `Play ${names[0]}` }));
+  await user.click(
+    await screen.findByRole("button", {
+      name: names.length > 1 ? "Play all" : `Play ${names[0]}`,
+    }),
+  );
   return user;
 }
 
@@ -711,13 +1109,17 @@ test("clears the whole overlay the moment fullscreen starts, leaving the scrubbe
     const user = await playForFullscreen();
     const controls = await screen.findByLabelText("Video controls");
     expect(controls).not.toHaveClass("idle");
-    expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
+    expect(
+      screen.getByRole("complementary", { name: "Playlist" }),
+    ).toBeVisible();
 
     await enterFullscreen(user);
 
     // Straight away, not after the idle delay: fullscreen is for watching.
     expect(controls).toHaveClass("idle");
-    expect(screen.queryByRole("complementary", { name: "Playlist" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("complementary", { name: "Playlist" }),
+    ).not.toBeInTheDocument();
     // Everything except the scrubber goes; it is the only feedback left about
     // how far into the video the viewer is.
     expect(screen.getByLabelText("Video timeline")).toBeInTheDocument();
@@ -726,7 +1128,9 @@ test("clears the whole overlay the moment fullscreen starts, leaving the scrubbe
     // Coming back out restores the windowed player as it was left.
     reportFullscreen(false);
     expect(controls).not.toHaveClass("idle");
-    expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
+    expect(
+      screen.getByRole("complementary", { name: "Playlist" }),
+    ).toBeVisible();
   } finally {
     reportFullscreen(false);
     vi.useRealTimers();
@@ -791,7 +1195,8 @@ test("keeps the fullscreen controls up while the pointer rests on them", async (
   }
 });
 
-const playlistDrawer = () => screen.queryByRole("complementary", { name: "Playlist" });
+const playlistDrawer = () =>
+  screen.queryByRole("complementary", { name: "Playlist" });
 
 test("summons the fullscreen playlist from the right edge and dismisses it again", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -831,7 +1236,10 @@ test("holds the fullscreen playlist open from the keyboard until the pointer lea
 
     // The heading's toggle is out of reach in fullscreen, so the overlay carries
     // the same control and the same shortcut.
-    expect(screen.getByRole("button", { name: "Playlist" })).toHaveAttribute("aria-keyshortcuts", "P");
+    expect(screen.getByRole("button", { name: "Playlist" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      "P",
+    );
 
     act(() => void fireEvent.keyDown(window, { key: "p" }));
     const drawer = playlistDrawer();
@@ -878,7 +1286,11 @@ function loopControl() {
 test("cycles the loop control through the playlist, one video and off", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -886,7 +1298,9 @@ test("cycles the loop control through the playlist, one video and off", async ()
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   await screen.findByLabelText("Video controls");
 
   // Looping the whole playlist is the default, so a sitting keeps going.
@@ -916,7 +1330,11 @@ test("cycles the loop control through the playlist, one video and off", async ()
 test("replays a one-entry playlist rather than stopping at its end", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -924,12 +1342,16 @@ test("replays a one-entry playlist rather than stopping at its end", async () =>
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
 
   // Looping a playlist of one means playing that one again; wrapping to the
   // index it is already on is a state change React would throw away.
-  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  const play = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
   play.mockClear();
   fireEvent.ended(video);
   expect(play).toHaveBeenCalled();
@@ -943,7 +1365,14 @@ test("repeats the current video in loop-one mode without leaving the playlist", 
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -955,7 +1384,9 @@ test("repeats the current video in loop-one mode without leaving the playlist", 
   fireEvent.loadedMetadata(video);
 
   await user.click(loopControl());
-  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  const play = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
   play.mockClear();
   fireEvent.ended(video);
 
@@ -973,7 +1404,14 @@ test("stops instead of advancing when looping is off", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -988,7 +1426,9 @@ test("stops instead of advancing when looping is off", async () => {
   await user.click(loopControl());
   expect(loopControl()).toHaveAccessibleName("Loop: off");
 
-  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  const play = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
   play.mockClear();
   fireEvent.ended(video);
 
@@ -1005,7 +1445,14 @@ test("fills the scrubber to the whole duration when a video ends", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -1018,7 +1465,11 @@ test("fills the scrubber to the whole duration when a video ends", async () => {
 
   // The engine stops reporting time a little short of the end, which left the
   // bar visibly unfinished and made every video look as though it had been cut.
-  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 112 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 112,
+  });
   fireEvent.timeUpdate(video);
   const timeline = screen.getByLabelText("Video timeline");
   expect(timeline).toHaveValue("112");
@@ -1033,7 +1484,11 @@ test("fills the scrubber to the whole duration when a video ends", async () => {
 test("rotates web playback clockwise and counter-clockwise", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -1041,7 +1496,9 @@ test("rotates web playback clockwise and counter-clockwise", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
 
   await user.click(screen.getByRole("button", { name: "Rotate right" }));
@@ -1052,19 +1509,38 @@ test("rotates web playback clockwise and counter-clockwise", async () => {
 });
 
 test("changes playback speed for web video", async () => {
-  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-  const user = userEvent.setup(); render(<App />);
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
-  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Playback speed" }),
+    "1.5",
+  );
   expect(video).toHaveProperty("playbackRate", 1.5);
 });
 
 test("offers tooltips for every actionable result and player control", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 2,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 2,
       results: [
         { id: "video-1", fileName: "clip.mp4", extension: "mp4" },
         { id: "video-2", fileName: "other.mp4", extension: "mp4" },
@@ -1075,25 +1551,48 @@ test("offers tooltips for every actionable result and player control", async () 
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  expect(screen.getByRole("button", { name: "Clear search" })).toHaveAttribute("title", "Clear search");
-  expect(screen.getByRole("button", { name: "Play all" })).toHaveAttribute("title", "Play all videos");
-  expect(screen.getByRole("button", { name: "Play clip.mp4" })).toHaveAttribute("title", "Play clip.mp4");
+  expect(screen.getByRole("button", { name: "Clear search" })).toHaveAttribute(
+    "title",
+    "Clear search",
+  );
+  expect(screen.getByRole("button", { name: "Play all" })).toHaveAttribute(
+    "title",
+    "Play all videos",
+  );
+  expect(screen.getByRole("button", { name: "Play clip.mp4" })).toHaveAttribute(
+    "title",
+    "Play clip.mp4",
+  );
   expect(screen.getByText("2 of 2 loaded")).toBeVisible();
 
   await user.click(screen.getByRole("button", { name: "Play clip.mp4" }));
   const controls = await screen.findByLabelText("Video controls");
-  for (const control of controls.querySelectorAll<HTMLButtonElement | HTMLSelectElement>("button, select")) {
-    expect(control, `${control.getAttribute("aria-label")} has no tooltip`).toHaveAttribute("title");
+  for (const control of controls.querySelectorAll<
+    HTMLButtonElement | HTMLSelectElement
+  >("button, select")) {
+    expect(
+      control,
+      `${control.getAttribute("aria-label")} has no tooltip`,
+    ).toHaveAttribute("title");
     expect(control.title).not.toBe("");
   }
-  expect(screen.getByRole("button", { name: "Back to results" })).toHaveAttribute("title", "Back to results");
-  expect(screen.getByRole("button", { name: "clip.mp4" })).toHaveAttribute("title", "Play clip.mp4");
+  expect(
+    screen.getByRole("button", { name: "Back to results" }),
+  ).toHaveAttribute("title", "Back to results");
+  expect(screen.getByRole("button", { name: "clip.mp4" })).toHaveAttribute(
+    "title",
+    "Play clip.mp4",
+  );
 });
 
 test("supports playback speeds from 0.1x through 4x", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -1101,7 +1600,9 @@ test("supports playback speeds from 0.1x through 4x", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const speed = screen.getByRole("combobox", { name: "Playback speed" });
 
   expect(speed).toHaveValue("1");
@@ -1118,68 +1619,131 @@ test("supports playback speeds from 0.1x through 4x", async () => {
 });
 
 test("skips web playback by ten seconds", async () => {
-  invokeMock.mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1, results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }] }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-  const user = userEvent.setup(); render(<App />);
-  await user.type(screen.getByRole("searchbox"), "clip{Enter}"); await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
-  const video = await screen.findByLabelText("Playing clip.mp4"); Object.defineProperty(video, "duration", { configurable: true, value: 120 }); Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
-  fireEvent.timeUpdate(video); await user.click(screen.getByRole("button", { name: "Skip forward 10 seconds" })); expect((video as HTMLVideoElement).currentTime).toBe(30);
-});
-
-test("uses left and right arrows for ten-second seeking", async () => {
-  invokeMock.mockResolvedValueOnce({
-    query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
-  }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
   Object.defineProperty(video, "duration", { configurable: true, value: 120 });
-  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.timeUpdate(video);
+  await user.click(
+    screen.getByRole("button", { name: "Skip forward 10 seconds" }),
+  );
+  expect((video as HTMLVideoElement).currentTime).toBe(30);
+});
+
+test("uses left and right arrows for ten-second seeking", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
   fireEvent.timeUpdate(video);
 
   fireEvent.keyDown(window, { key: "ArrowLeft" });
   expect(video).toHaveProperty("currentTime", 10);
   fireEvent.keyDown(window, { key: "ArrowRight" });
   expect(video).toHaveProperty("currentTime", 20);
-  expect(screen.getByRole("button", { name: "Skip back 10 seconds" })).toHaveAttribute("aria-keyshortcuts", "ArrowLeft");
-  expect(screen.getByRole("button", { name: "Skip forward 10 seconds" })).toHaveAttribute("aria-keyshortcuts", "ArrowRight");
+  expect(
+    screen.getByRole("button", { name: "Skip back 10 seconds" }),
+  ).toHaveAttribute("aria-keyshortcuts", "ArrowLeft");
+  expect(
+    screen.getByRole("button", { name: "Skip forward 10 seconds" }),
+  ).toHaveAttribute("aria-keyshortcuts", "ArrowRight");
 });
 
 test("changes volume with the discoverable keyboard shortcuts", async () => {
-  invokeMock.mockResolvedValueOnce({
-    query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
-    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
-  }).mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   await screen.findByLabelText("Playing clip.mp4");
 
   const volume = screen.getByRole("slider", { name: "Volume" });
   expect(volume).toHaveValue("100");
   fireEvent.keyDown(window, { key: "9" });
   expect(volume).toHaveValue("95");
-  expect(screen.getByRole("button", { name: "Decrease volume" })).toHaveAttribute("aria-keyshortcuts", "9");
-  expect(screen.getByRole("button", { name: "Increase volume" })).toHaveAttribute("aria-keyshortcuts", "0");
+  expect(
+    screen.getByRole("button", { name: "Decrease volume" }),
+  ).toHaveAttribute("aria-keyshortcuts", "9");
+  expect(
+    screen.getByRole("button", { name: "Increase volume" }),
+  ).toHaveAttribute("aria-keyshortcuts", "0");
 });
 
 test("sends the selected rotation to native playback", async () => {
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
       return Promise.resolve({
-        query: "native", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
         results: [{ id: "native-1", fileName: "native.mp4", extension: "mp4" }],
       });
     }
     if (command === "prepare_video") {
-      return Promise.resolve({ filePath: "/Videos/native.mp4", playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: "/Videos/native.mp4",
+        playbackBackend: "native",
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
     }
     return Promise.resolve();
   });
@@ -1187,21 +1751,39 @@ test("sends the selected rotation to native playback", async () => {
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "native{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play native.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mp4" }),
+  );
   await user.click(await screen.findByRole("button", { name: "Rotate left" }));
 
-  expect(invokeMock).toHaveBeenCalledWith("set_native_video_rotation", { degrees: 270 });
+  expect(invokeMock).toHaveBeenCalledWith("set_native_video_rotation", {
+    degrees: 270,
+  });
 });
 
 test("keyboard shortcuts control player actions without hijacking search input", async () => {
-  const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `clip-${number}.mp4`, extension: "mp4" }));
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `clip-${number}.mp4`,
+    extension: "mp4",
+  }));
   invokeMock
-    .mockResolvedValueOnce({ query: "clip", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValueOnce({ filePath: "/Videos/clip-1.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/clip-2.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/clip-1.mp4" });
   const requestFullscreen = vi.fn().mockResolvedValue(undefined);
-  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", { configurable: true, value: requestFullscreen });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
   const user = userEvent.setup();
   render(<App />);
 
@@ -1223,13 +1805,19 @@ test("keyboard shortcuts control player actions without hijacking search input",
 
   search.focus();
   fireEvent.keyDown(search, { key: "]" });
-  expect(screen.getByLabelText("Playing clip-1.mp4")).toHaveStyle({ transform: "rotate(0deg)" });
+  expect(screen.getByLabelText("Playing clip-1.mp4")).toHaveStyle({
+    transform: "rotate(0deg)",
+  });
 });
 
 test("keeps keyboard shortcuts active after a transport button receives focus", async () => {
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 1, totalPages: 1,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
       results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
@@ -1237,10 +1825,16 @@ test("keeps keyboard shortcuts active after a transport button receives focus", 
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
   Object.defineProperty(video, "duration", { configurable: true, value: 120 });
-  Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 20 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
   fireEvent.timeUpdate(video);
 
   const skipBack = screen.getByRole("button", { name: "Skip back 10 seconds" });
@@ -1252,9 +1846,20 @@ test("keeps keyboard shortcuts active after a transport button receives focus", 
 });
 
 test("loops a playlist back to its first video", async () => {
-  const results = [1, 2].map((number) => ({ id: `video-${number}`, fileName: `playlist-${number}.mp4`, extension: "mp4" }));
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `playlist-${number}.mp4`,
+    extension: "mp4",
+  }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" });
@@ -1294,31 +1899,47 @@ test("loads more results as the infinite list reaches its end and reports provid
       message: "Recoll search could not start.",
     });
   const user = userEvent.setup();
-  vi.stubGlobal("IntersectionObserver", class {
-    private readonly callback: IntersectionObserverCallback;
-    constructor(callback: IntersectionObserverCallback) { this.callback = callback; }
-    observe(target: Element) {
-      if (target.classList.contains("load-more-marker")) {
-        this.callback([{ isIntersecting: true } as IntersectionObserverEntry], this as unknown as IntersectionObserver);
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      private readonly callback: IntersectionObserverCallback;
+      constructor(callback: IntersectionObserverCallback) {
+        this.callback = callback;
       }
-    }
-    disconnect() {}
-    unobserve() {}
-    takeRecords() { return []; }
-    root = null;
-    rootMargin = "0px";
-    thresholds = [];
-  });
+      observe(target: Element) {
+        if (target.classList.contains("load-more-marker")) {
+          this.callback(
+            [{ isIntersecting: true } as IntersectionObserverEntry],
+            this as unknown as IntersectionObserver,
+          );
+        }
+      }
+      disconnect() {}
+      unobserve() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = "0px";
+      thresholds = [];
+    },
+  );
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  expect(await screen.findByRole("button", { name: "Play clip-24.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play clip-24.mp4" }),
+  ).toBeVisible();
   expect(screen.getByText("2 of 25 loaded")).toBeVisible();
 
   await user.clear(screen.getByRole("searchbox"));
   await user.type(screen.getByRole("searchbox"), "broken{Enter}");
-  expect(await screen.findByRole("alert")).toHaveTextContent("Recoll search could not start.");
-  await waitFor(() => expect(screen.getByRole("searchbox")).toHaveValue("broken"));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Recoll search could not start.",
+  );
+  await waitFor(() =>
+    expect(screen.getByRole("searchbox")).toHaveValue("broken"),
+  );
 });
 
 test("loads every search page into the playlist before playing all", async () => {
@@ -1330,11 +1951,19 @@ test("loads every search page into the playlist before playing all", async () =>
   const last = { id: "video-25", fileName: "clip-25.mp4", extension: "mp4" };
   invokeMock
     .mockResolvedValueOnce({
-      query: "clip", page: 1, pageSize: 24, totalResults: 25, totalPages: 2,
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 25,
+      totalPages: 2,
       results: firstPage,
     })
     .mockResolvedValueOnce({
-      query: "clip", page: 2, pageSize: 24, totalResults: 25, totalPages: 2,
+      query: "clip",
+      page: 2,
+      pageSize: 24,
+      totalResults: 25,
+      totalPages: 2,
       results: [last],
     })
     .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
@@ -1343,7 +1972,9 @@ test("loads every search page into the playlist before playing all", async () =>
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
-  const playlist = await screen.findByRole("complementary", { name: "Playlist" });
+  const playlist = await screen.findByRole("complementary", {
+    name: "Playlist",
+  });
   expect(playlist.querySelectorAll("li")).toHaveLength(25);
   expect(screen.getByText("Playlist video 1 of 25")).toBeVisible();
 });
@@ -1386,7 +2017,9 @@ test("playlist mode advances through every search result", async () => {
   // The end of the last entry wraps round to the first rather than stopping.
   expect(await screen.findByLabelText("Playing playlist-1.mp4")).toBeVisible();
   expect(screen.getByText("Playlist video 1 of 3")).toBeVisible();
-  expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", { resultId: "video-1" });
+  expect(invokeMock).toHaveBeenLastCalledWith("prepare_video", {
+    resultId: "video-1",
+  });
 });
 
 test("opens the playlist drawer and plays a selected playlist item", async () => {
@@ -1415,15 +2048,21 @@ test("opens the playlist drawer and plays a selected playlist item", async () =>
   const toggle = screen.getByRole("button", { name: "Playlist 3" });
   expect(toggle).toHaveAttribute("aria-expanded", "true");
   expect(screen.getByRole("complementary", { name: "Playlist" })).toBeVisible();
-  expect(screen.getByRole("button", { name: "playlist-1.mp4" })).toHaveAttribute("aria-current", "true");
+  expect(
+    screen.getByRole("button", { name: "playlist-1.mp4" }),
+  ).toHaveAttribute("aria-current", "true");
 
   await user.click(toggle);
-  expect(screen.queryByRole("complementary", { name: "Playlist" })).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("complementary", { name: "Playlist" }),
+  ).not.toBeInTheDocument();
   await user.click(toggle);
   await user.click(screen.getByRole("button", { name: "playlist-3.mp4" }));
 
   expect(await screen.findByLabelText("Playing playlist-3.mp4")).toBeVisible();
-  expect(screen.getByRole("button", { name: "playlist-3.mp4" })).toHaveAttribute("aria-current", "true");
+  expect(
+    screen.getByRole("button", { name: "playlist-3.mp4" }),
+  ).toHaveAttribute("aria-current", "true");
 });
 
 test("keeps the chosen playback speed when the playlist advances", async () => {
@@ -1433,7 +2072,14 @@ test("keeps the chosen playback speed when the playlist advances", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" });
   const user = userEvent.setup();
@@ -1443,7 +2089,10 @@ test("keeps the chosen playback speed when the playlist advances", async () => {
   await user.click(await screen.findByRole("button", { name: "Play all" }));
 
   const first = await screen.findByLabelText("Playing playlist-1.mp4");
-  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Playback speed" }),
+    "1.5",
+  );
   expect(first).toHaveProperty("playbackRate", 1.5);
 
   fireEvent.ended(first);
@@ -1451,7 +2100,9 @@ test("keeps the chosen playback speed when the playlist advances", async () => {
   fireEvent.loadedMetadata(second);
 
   // Choosing a speed is a decision about the sitting, not about one file.
-  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue("1.5");
+  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue(
+    "1.5",
+  );
   expect(second).toHaveProperty("playbackRate", 1.5);
 });
 
@@ -1463,15 +2114,30 @@ test("re-applies the chosen playback speed to the next native video", async () =
   }));
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
-      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
     }
     if (command === "prepare_video") {
       const resultId = (args as { resultId: string }).resultId;
-      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
     }
     return Promise.resolve();
   });
@@ -1481,16 +2147,25 @@ test("re-applies the chosen playback speed to the next native video", async () =
   await user.type(screen.getByRole("searchbox"), "native{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
   await screen.findByLabelText("Playing native-1.mp4");
-  await user.selectOptions(screen.getByRole("combobox", { name: "Playback speed" }), "1.5");
-  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }));
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Playback speed" }),
+    "1.5",
+  );
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }),
+  );
 
   invokeMock.mockClear();
   await user.click(screen.getByRole("button", { name: "Next video" }));
   await screen.findByLabelText("Playing native-2.mp4");
 
   // mpv starts every file at 1x, so the retained speed has to be sent again.
-  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }));
-  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue("1.5");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_speed", { speed: 1.5 }),
+  );
+  expect(screen.getByRole("combobox", { name: "Playback speed" })).toHaveValue(
+    "1.5",
+  );
 });
 
 test("stays fullscreen when the playlist advances to the next video", async () => {
@@ -1500,7 +2175,14 @@ test("stays fullscreen when the playlist advances to the next video", async () =
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-1.mp4" })
     .mockResolvedValueOnce({ filePath: "/Videos/playlist-2.mp4" });
   Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
@@ -1516,7 +2198,9 @@ test("stays fullscreen when the playlist advances to the next video", async () =
     const first = await screen.findByLabelText("Playing playlist-1.mp4");
     await enterFullscreen(user);
     const shell = document.querySelector(".player-shell");
-    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Exit fullscreen" }),
+    ).toBeVisible();
 
     fireEvent.ended(first);
     await screen.findByLabelText("Playing playlist-2.mp4");
@@ -1524,7 +2208,9 @@ test("stays fullscreen when the playlist advances to the next video", async () =
     // The browser drops out of fullscreen the moment the element it promoted
     // leaves the document, so the shell has to outlive the video inside it.
     expect(document.querySelector(".player-shell")).toBe(shell);
-    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Exit fullscreen" }),
+    ).toBeVisible();
   } finally {
     reportFullscreen(false);
   }
@@ -1556,15 +2242,30 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
   }));
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
-      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
     }
     if (command === "prepare_video") {
       const resultId = (args as { resultId: string }).resultId;
-      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
     }
     return Promise.resolve();
   });
@@ -1572,15 +2273,55 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
   // would have: an 800x400 picture, the overlay along the bottom 80px and the
   // drawer down the right-hand 240px.
   const layout: Record<string, Partial<DOMRect>> = {
-    "native-video": { x: 0, y: 0, top: 0, left: 0, right: 800, bottom: 400, width: 800, height: 400 },
-    "player-controls": { x: 0, y: 320, top: 320, left: 0, right: 800, bottom: 400, width: 800, height: 80 },
-    "playlist-drawer": { x: 560, y: 0, top: 0, left: 560, right: 800, bottom: 400, width: 240, height: 400 },
+    "native-video": {
+      x: 0,
+      y: 0,
+      top: 0,
+      left: 0,
+      right: 800,
+      bottom: 400,
+      width: 800,
+      height: 400,
+    },
+    "player-controls": {
+      x: 0,
+      y: 320,
+      top: 320,
+      left: 0,
+      right: 800,
+      bottom: 400,
+      width: 800,
+      height: 80,
+    },
+    "playlist-drawer": {
+      x: 560,
+      y: 0,
+      top: 0,
+      left: 560,
+      right: 800,
+      bottom: 400,
+      width: 240,
+      height: 400,
+    },
   };
-  const boxes = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
-    const named = Object.keys(layout).find((name) => this.classList.contains(name));
-    const empty = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
-    return { ...empty, ...(named ? layout[named] : {}) } as DOMRect;
-  });
+  const boxes = vi
+    .spyOn(Element.prototype, "getBoundingClientRect")
+    .mockImplementation(function (this: Element) {
+      const named = Object.keys(layout).find((name) =>
+        this.classList.contains(name),
+      );
+      const empty = {
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        width: 0,
+        height: 0,
+      };
+      return { ...empty, ...(named ? layout[named] : {}) } as DOMRect;
+    });
   const user = userEvent.setup();
   render(<App />);
 
@@ -1622,15 +2363,30 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
   }));
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
-      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
     }
     if (command === "prepare_video") {
       const resultId = (args as { resultId: string }).resultId;
-      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
-      return Promise.resolve({ duration: 120, currentTime: 1, paused: false, ended: false });
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
     }
     return Promise.resolve();
   });
@@ -1638,15 +2394,29 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
   // stylesheet keeps the picture 6px clear of the bottom for the scrubber, the
   // collapsed overlay is exactly that sliver, and the full overlay is 96px tall.
   const box = (left: number, top: number, width: number, height: number) =>
-    ({ x: left, y: top, top, left, right: left + width, bottom: top + height, width, height }) as DOMRect;
-  const boxes = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
-    if (this.classList.contains("native-video")) return box(0, 0, 1200, 794);
-    if (this.classList.contains("player-controls")) {
-      return this.classList.contains("idle") ? box(0, 794, 1200, 6) : box(0, 704, 1200, 96);
-    }
-    if (this.classList.contains("playlist-drawer")) return box(920, 0, 280, 800);
-    return box(0, 0, 0, 0);
-  });
+    ({
+      x: left,
+      y: top,
+      top,
+      left,
+      right: left + width,
+      bottom: top + height,
+      width,
+      height,
+    }) as DOMRect;
+  const boxes = vi
+    .spyOn(Element.prototype, "getBoundingClientRect")
+    .mockImplementation(function (this: Element) {
+      if (this.classList.contains("native-video")) return box(0, 0, 1200, 794);
+      if (this.classList.contains("player-controls")) {
+        return this.classList.contains("idle")
+          ? box(0, 794, 1200, 6)
+          : box(0, 704, 1200, 96);
+      }
+      if (this.classList.contains("playlist-drawer"))
+        return box(920, 0, 280, 800);
+      return box(0, 0, 0, 0);
+    });
   Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
     configurable: true,
     value: vi.fn().mockResolvedValue(undefined),
@@ -1701,7 +2471,14 @@ test("draws the heading controls without font-dependent glyphs", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -1717,7 +2494,9 @@ test("draws the heading controls without font-dependent glyphs", async () => {
   expect(back).toHaveTextContent("Back");
 
   for (const name of ["Previous video", "Next video"]) {
-    expect(screen.getByRole("button", { name }).querySelector("svg.control-icon")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name }).querySelector("svg.control-icon"),
+    ).toBeInTheDocument();
   }
 });
 
@@ -1728,7 +2507,14 @@ test("wraps playlist navigation at both ends", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 3, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -1767,7 +2553,14 @@ test("wraps every button label so the stylesheet can trim it", async () => {
     extension: "mp4",
   }));
   invokeMock
-    .mockResolvedValueOnce({ query: "playlist", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results })
+    .mockResolvedValueOnce({
+      query: "playlist",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
     .mockResolvedValue({ filePath: "/Videos/playlist-1.mp4" });
   const user = userEvent.setup();
   render(<App />);
@@ -1779,18 +2572,36 @@ test("wraps every button label so the stylesheet can trim it", async () => {
   // A loose run of text in a flex row is an anonymous box the stylesheet cannot
   // reach, so its line box — descender space and all — is what gets centred,
   // and the label reads a few pixels above the icon beside it.
-  const loose = [...document.querySelectorAll<HTMLElement>(".player-controls button, .back-button, .playlist-toggle")]
+  const loose = [
+    ...document.querySelectorAll<HTMLElement>(
+      ".player-controls button, .back-button, .playlist-toggle",
+    ),
+  ]
     .filter((control) =>
-      [...control.childNodes].some((node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()),
+      [...control.childNodes].some(
+        (node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim(),
+      ),
     )
-    .map((control) => control.getAttribute("aria-label") ?? control.textContent);
+    .map(
+      (control) => control.getAttribute("aria-label") ?? control.textContent,
+    );
   expect(loose).toEqual([]);
 
-  for (const name of ["Back to results", "Skip back 10 seconds", "Skip forward 10 seconds", "Subtitles"]) {
-    expect(screen.getByRole("button", { name }).querySelector(".control-label")).toBeInTheDocument();
+  for (const name of [
+    "Back to results",
+    "Skip back 10 seconds",
+    "Skip forward 10 seconds",
+    "Subtitles",
+  ]) {
+    expect(
+      screen.getByRole("button", { name }).querySelector(".control-label"),
+    ).toBeInTheDocument();
   }
-  expect(screen.getByRole("button", { name: "Playlist 2" }).querySelector(".playlist-count .control-label"))
-    .toHaveTextContent("2");
+  expect(
+    screen
+      .getByRole("button", { name: "Playlist 2" })
+      .querySelector(".playlist-count .control-label"),
+  ).toHaveTextContent("2");
 });
 
 test("native playlist advances when libmpv reports end of file", async () => {
@@ -1813,7 +2624,10 @@ test("native playlist advances when libmpv reports end of file", async () => {
     }
     if (command === "prepare_video") {
       const resultId = (args as { resultId: string }).resultId;
-      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
     }
     if (command === "load_native_video") {
       loaded = String((args as { filePath: string }).filePath);
@@ -1823,7 +2637,12 @@ test("native playlist advances when libmpv reports end of file", async () => {
       // Only the first file has run out, so the playlist has somewhere to go
       // and the test is not racing a second advance.
       const ended = loaded.includes("native-1");
-      return Promise.resolve({ duration: 30, currentTime: ended ? 28 : 1, paused: ended, ended });
+      return Promise.resolve({
+        duration: 30,
+        currentTime: ended ? 28 : 1,
+        paused: ended,
+        ended,
+      });
     }
     return Promise.resolve();
   });
@@ -1835,9 +2654,17 @@ test("native playlist advances when libmpv reports end of file", async () => {
 
   expect(await screen.findByLabelText("Playing native-1.mp4")).toBeVisible();
   await waitFor(() => {
-    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", { paused: false });
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: false,
+    });
   });
-  expect(await screen.findByLabelText("Playing native-2.mp4", {}, { timeout: 1_000 })).toBeVisible();
+  expect(
+    await screen.findByLabelText(
+      "Playing native-2.mp4",
+      {},
+      { timeout: 1_000 },
+    ),
+  ).toBeVisible();
   expect(screen.getByText("Playlist video 2 of 2")).toBeVisible();
 });
 
@@ -1850,17 +2677,32 @@ test("runs the native scrubber to the end and honours loop off", async () => {
   let ended = false;
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {
-      return Promise.resolve({ query: "native", page: 1, pageSize: 24, totalResults: 2, totalPages: 1, results });
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
     }
     if (command === "prepare_video") {
       const resultId = (args as { resultId: string }).resultId;
-      return Promise.resolve({ filePath: `/Videos/${resultId}.mp4`, playbackBackend: "native" });
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
     }
     if (command === "native_video_rotation") return Promise.resolve(0);
     if (command === "native_playback_state") {
       // mpv's last reported position falls short of the duration, which is what
       // stopped the scrubber before the end of the bar.
-      return Promise.resolve({ duration: 30, currentTime: ended ? 28 : 4, paused: ended, ended });
+      return Promise.resolve({
+        duration: 30,
+        currentTime: ended ? 28 : 4,
+        paused: ended,
+        ended,
+      });
     }
     return Promise.resolve();
   });
@@ -1870,14 +2712,19 @@ test("runs the native scrubber to the end and honours loop off", async () => {
   await user.type(screen.getByRole("searchbox"), "native{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
   await screen.findByLabelText("Playing native-1.mp4");
-  await waitFor(() => expect(screen.getByLabelText("Video timeline")).toHaveValue("4"));
+  await waitFor(() =>
+    expect(screen.getByLabelText("Video timeline")).toHaveValue("4"),
+  );
 
   await user.click(loopControl());
   await user.click(loopControl());
   expect(loopControl()).toHaveAccessibleName("Loop: off");
 
   ended = true;
-  await waitFor(() => expect(screen.getByLabelText("Video timeline")).toHaveValue("30"), { timeout: 2_000 });
+  await waitFor(
+    () => expect(screen.getByLabelText("Video timeline")).toHaveValue("30"),
+    { timeout: 2_000 },
+  );
   expect(screen.getByText("0:30 / 0:30")).toBeVisible();
   // "Off" holds at the end of this video rather than starting the next one.
   expect(screen.getByLabelText("Playing native-1.mp4")).toBeVisible();
