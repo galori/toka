@@ -74,14 +74,20 @@ reports the same value and needed no change.
 
 ## Result
 
-| Scenario                          | Before | After |
-| --------------------------------- | ------ | ----- |
-| Nothing changed (clean tree)       | ~150s  | ~6s   |
-| Rust-only change                   | ~150s  | ~60s  |
-| Frontend change                    | ~150s  | ~60s  |
+| Scenario                     | Before | After |
+| ---------------------------- | ------ | ----- |
+| Nothing changed (clean tree) | ~150s  | 4.2s  |
+| Rust or frontend change      | ~150s  | ~59s  |
 
 A frontend change still pays the crate rebuild — unavoidable while the assets
 are embedded in the binary.
+
+Two caveats on the no-op case. It needs a committed tree: with uncommitted
+changes the timestamp falls back to wall clock by design, and the crate rebuilds
+as before. And it needs consecutive builds to go through the same entry point —
+alternating `npm run build:linux` with a bare `cargo build` invalidates the
+crate each way round, because the Tauri CLI sets `TAURI_CONFIG`, which the
+generated build script declares via `cargo:rerun-if-env-changed`.
 
 ## 3. Not done: one target directory per worktree
 
