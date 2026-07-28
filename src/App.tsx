@@ -513,6 +513,8 @@ function Player({
   const pointerOverPlaylist = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const playlistDrawer = useRef<HTMLElement>(null);
+  const fullscreenPath = useRef<HTMLDivElement>(null);
+  const fullscreenTime = useRef<HTMLDivElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
@@ -677,19 +679,27 @@ function Player({
       const bounds = surface.getBoundingClientRect();
       const controls = playerControls.current?.getBoundingClientRect();
       const drawer = playlistDrawer.current?.getBoundingClientRect();
+      const path = fullscreenPath.current?.getBoundingClientRect();
+      const time = fullscreenTime.current?.getBoundingClientRect();
       // GTK renders the native GL area above the opaque WebView. Trim its
       // bounds around WebView controls and the playlist so the real decoded
       // picture remains visible without covering those interactive elements.
-      const visibleHeight =
-        controls && !controlsIdle
-          ? Math.max(1, Math.min(bounds.height, controls.top - bounds.top))
-          : bounds.height;
+      // The fullscreen overlay is trimmed around for the same reason: it is
+      // read over the picture everywhere else, but on Linux the picture would
+      // simply be painted on top of it.
+      const top = path
+        ? Math.min(bounds.bottom, Math.max(bounds.top, path.bottom))
+        : bounds.top;
+      const floors = [bounds.bottom];
+      if (controls && !controlsIdle) floors.push(controls.top);
+      if (time) floors.push(time.top);
+      const visibleHeight = Math.max(1, Math.min(...floors) - top);
       const visibleWidth = drawer
         ? Math.max(1, Math.min(bounds.width, drawer.left - bounds.left))
         : bounds.width;
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
-        y: Math.round(bounds.y),
+        y: Math.round(top),
         width: Math.round(visibleWidth),
         height: Math.round(visibleHeight),
         visible: visibleWidth > 0 && visibleHeight > 0,
@@ -733,7 +743,7 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, drawerOpen, fullscreen, index, native]);
+  }, [controlsIdle, drawerOpen, fullscreen, index, native, showFullscreenInfo]);
 
   const play = () => {
     if (native) {
@@ -1227,7 +1237,7 @@ function Player({
         run(togglePlaylist);
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
-      } else if (event.key.toLowerCase() === "i") {
+      } else if (event.key.toLowerCase() === "i" && fullscreen) {
         run(() => setShowFullscreenInfo((visible) => !visible));
       } else if (event.key === "Escape") {
         run(fullscreen ? toggleFullscreen : onBack);
@@ -1312,7 +1322,17 @@ function Player({
           <BackArrowIcon />
           <Label>Back</Label>
         </ControlButton>
-        <h1 title={video.fileName}>{video.fileName}</h1>
+        {/* The name is what a viewer looks for; the folder it came from is
+            what tells two identically named files apart. Fullscreen has no
+            room for either, which is what the overlay is for. */}
+        <div className="player-title">
+          <h1 title={prepared?.filePath ?? video.fileName}>{video.fileName}</h1>
+          {prepared ? (
+            <p className="player-file-path" title={prepared.filePath}>
+              {prepared.filePath}
+            </p>
+          ) : null}
+        </div>
         <ControlButton
           shortcut="P"
           className="playlist-toggle"
@@ -1388,10 +1408,10 @@ function Player({
             role="region"
             aria-label="Fullscreen video information"
           >
-            <div className="fullscreen-file-path">
+            <div ref={fullscreenPath} className="fullscreen-file-path">
               {prepared?.filePath ?? video.fileName}
             </div>
-            <div className="fullscreen-time">
+            <div ref={fullscreenTime} className="fullscreen-time">
               {formatTime(currentTime)} / {formatTime(duration)}
             </div>
           </div>
@@ -1608,18 +1628,23 @@ function Player({
               >
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}
               </ControlButton>
-              <ControlButton
-                shortcut="I"
-                onClick={() => setShowFullscreenInfo((visible) => !visible)}
-                aria-label={
-                  showFullscreenInfo
-                    ? "Hide fullscreen information"
-                    : "Show fullscreen information"
-                }
-                aria-pressed={showFullscreenInfo}
-              >
-                <Label>Info</Label>
-              </ControlButton>
+              {/* Windowed, the heading already names the file and its folder
+                  and the transport already shows the clock, so the toggle has
+                  nothing left to reveal. */}
+              {fullscreen ? (
+                <ControlButton
+                  shortcut="I"
+                  onClick={() => setShowFullscreenInfo((visible) => !visible)}
+                  aria-label={
+                    showFullscreenInfo
+                      ? "Hide fullscreen information"
+                      : "Show fullscreen information"
+                  }
+                  aria-pressed={showFullscreenInfo}
+                >
+                  <Label>Info</Label>
+                </ControlButton>
+              ) : null}
               <ControlButton
                 shortcut="Shift+Delete"
                 onClick={() => void removeCurrentVideo()}

@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
@@ -1004,13 +1005,16 @@ test("shows fullscreen path and time overlays and toggles them with I", async ()
     const user = await playForFullscreen();
     await enterFullscreen(user);
 
-    expect(
-      screen.getByRole("region", { name: "Fullscreen video information" }),
-    ).toBeVisible();
-    expect(screen.getByText("/Videos/clip.mp4")).toBeVisible();
-    expect(
-      screen.getByRole("region", { name: "Fullscreen video information" }),
-    ).toHaveTextContent("0:00 / 0:00");
+    const info = screen.getByRole("region", {
+      name: "Fullscreen video information",
+    });
+    expect(info).toBeVisible();
+    expect(within(info).getByText("/Videos/clip.mp4")).toBeVisible();
+    expect(info).toHaveTextContent("0:00 / 0:00");
+    // The overlay is the only thing left telling a viewer what they are
+    // watching and how far in they are, so it outlives the controls it was
+    // revealed alongside.
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
     expect(
       screen.getByRole("button", { name: "Hide fullscreen information" }),
     ).toHaveAttribute("aria-keyshortcuts", "I");
@@ -1023,6 +1027,48 @@ test("shows fullscreen path and time overlays and toggles them with I", async ()
       screen.getByRole("button", { name: "Show fullscreen information" }),
     ).toBeVisible();
   } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("names the file and its folder in the windowed heading", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    await playForFullscreen();
+    const heading = await screen.findByRole("heading", { name: "clip.mp4" });
+
+    // The windowed player already names the file; the folder it came from is
+    // the part that used to be missing, and it is what the fullscreen overlay
+    // exists to supply.
+    expect(heading).toBeVisible();
+    expect(screen.getByText("/Videos/clip.mp4")).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("offers the info control only where it can change anything", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    await screen.findByLabelText("Video controls");
+
+    // Windowed, the heading already shows the name and path and the controls
+    // already show the time, so there is nothing for the toggle to reveal.
+    expect(
+      screen.queryByRole("button", { name: /fullscreen information/ }),
+    ).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "i" });
+    expect(
+      screen.queryByRole("region", { name: "Fullscreen video information" }),
+    ).not.toBeInTheDocument();
+
+    await enterFullscreen(user);
+    expect(
+      screen.getByRole("button", { name: "Hide fullscreen information" }),
+    ).toBeVisible();
+  } finally {
+    reportFullscreen(false);
     vi.useRealTimers();
   }
 });
@@ -2514,6 +2560,10 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
           ? box(0, 794, 1200, 6)
           : box(0, 704, 1200, 96);
       }
+      if (this.classList.contains("fullscreen-file-path"))
+        return box(16, 12, 1168, 18);
+      if (this.classList.contains("fullscreen-time"))
+        return box(1084, 760, 100, 18);
       if (this.classList.contains("playlist-drawer"))
         return box(920, 0, 280, 800);
       return box(0, 0, 0, 0);
@@ -2531,19 +2581,20 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     await screen.findByLabelText("Playing native-1.mp4");
     await enterFullscreen(user);
 
-    // Nothing is showing, so the picture reaches everything except the sliver
-    // the scrubber sits in — the one strip fullscreen takes off the video.
+    // GTK composites the mpv surface above the WebView whatever the z-index
+    // says, so anything the overlay draws is only seen on Linux if the surface
+    // stops short of it. The controls are hidden, but the path and the clock
+    // are not, so the picture starts below one and stops above the other.
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 1200, height: 794, visible: true,
+        x: 0, y: 30, width: 1200, height: 730, visible: true,
       }),
     );
 
-    // GTK composites the mpv surface above the WebView whatever the z-index
-    // says, so a revealed overlay is only seen on Linux if the surface stops
-    // short of it. Every other engine overlays it without moving the picture.
+    // Turning the overlay off hands those two strips back. The keypress also
+    // wakes the controls, which take the bottom of the picture instead.
     invokeMock.mockClear();
-    movePointer();
+    act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
         x: 0, y: 0, width: 1200, height: 704, visible: true,
@@ -2551,10 +2602,18 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     );
 
     invokeMock.mockClear();
+    act(() => void fireEvent.keyDown(window, { key: "i" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0, y: 30, width: 1200, height: 674, visible: true,
+      }),
+    );
+
+    invokeMock.mockClear();
     movePointer(window.innerWidth - 1);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 920, height: 704, visible: true,
+        x: 0, y: 30, width: 920, height: 674, visible: true,
       }),
     );
     expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();

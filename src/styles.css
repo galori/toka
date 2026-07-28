@@ -250,6 +250,10 @@ input[type="search"]:focus {
   margin-bottom: 22px;
 }
 
+.player-title {
+  min-width: 0;
+}
+
 .player-heading h1 {
   min-width: 0;
   margin: 0;
@@ -257,6 +261,18 @@ input[type="search"]:focus {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 1.25rem;
+}
+
+/* A path is long and the name above it is the part being read, so the folder
+   is set quieter and gives way first when the heading runs out of room. */
+.player-file-path {
+  min-width: 0;
+  margin: 2px 0 0;
+  overflow: hidden;
+  color: #93a0b4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
 }
 
 .player-shell {
@@ -494,6 +510,10 @@ button:focus-visible {
 }
 .player-heading h1 {
   font-size: 16px;
+}
+.player-file-path {
+  color: oklch(0.62 0.02 60);
+  font-size: 11px;
 }
 /* Laid out as a flex row rather than a line of inline text: the label, the
    arrow and the shortcut hint are three different sizes, and on a baseline
