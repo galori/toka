@@ -974,10 +974,22 @@ pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
 pub fn set_paused(player: &NativePlayer, paused: bool) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.set_flag("pause", paused))
 }
-pub fn set_speed(player: &NativePlayer, speed: f64) -> Result<(), String> {
-    if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
-        return Err("Playback speed must be between 0.5× and 2×.".into());
+/// The speeds the player controls offer, widened to the range mpv itself
+/// accepts so every entry in `SPEEDS` (`src/App.tsx`) reaches the engine.
+const MIN_SPEED: f64 = 0.01;
+const MAX_SPEED: f64 = 100.0;
+
+fn checked_speed(speed: f64) -> Result<f64, String> {
+    if !speed.is_finite() || !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+        return Err(format!(
+            "Playback speed must be between {MIN_SPEED}× and {MAX_SPEED}×."
+        ));
     }
+    Ok(speed)
+}
+
+pub fn set_speed(player: &NativePlayer, speed: f64) -> Result<(), String> {
+    let speed = checked_speed(speed)?;
     player.with_mpv(|mpv| mpv.set_double("speed", speed))
 }
 
@@ -1139,11 +1151,29 @@ fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{rgb_from_rgba, subtitle_label};
+    use super::{checked_speed, rgb_from_rgba, subtitle_label};
 
     #[test]
     fn extracts_rgb_from_an_aligned_rgba_pixel() {
         assert_eq!(rgb_from_rgba([12, 34, 56, 255]), [12, 34, 56]);
+    }
+
+    #[test]
+    fn accepts_every_speed_the_player_controls_offer() {
+        // Mirrors SPEEDS in src/App.tsx: the slowest and fastest entries there
+        // have to survive the round trip to mpv.
+        for speed in [0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
+            assert_eq!(checked_speed(speed), Ok(speed));
+        }
+    }
+
+    #[test]
+    fn rejects_speeds_mpv_cannot_play() {
+        assert!(checked_speed(0.0).is_err());
+        assert!(checked_speed(-1.0).is_err());
+        assert!(checked_speed(200.0).is_err());
+        assert!(checked_speed(f64::NAN).is_err());
+        assert!(checked_speed(f64::INFINITY).is_err());
     }
 
     #[test]
