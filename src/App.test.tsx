@@ -660,6 +660,114 @@ test("deletes the current video, advances, and restores it with the undo shortcu
   expect(invokeMock).toHaveBeenCalledWith("undo_delete");
 });
 
+// The overlay's own scrubber, volume slider and dropdowns used to swallow every
+// shortcut: once one of them held focus the window handler bailed out on the
+// "someone is typing" check, so Shift+Delete deleted nothing and Space stopped
+// playing and pausing, with no sign of why.
+test("keeps its shortcuts working while a player control holds focus", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `focus-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "focus",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValue({ filePath: "/Videos/focus.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "focus{Enter}");
+  await user.click(screen.getByRole("button", { name: "Play focus-1.mp4" }));
+  expect(await screen.findByLabelText("Playing focus-1.mp4")).toBeVisible();
+
+  const scrubber = screen.getByRole("slider", { name: "Video timeline" });
+  const speed = screen.getByRole("combobox", { name: "Playback speed" });
+  for (const control of [scrubber, speed]) {
+    control.focus();
+    fireEvent.keyDown(control, { key: "]" });
+  }
+
+  // Two rotations, one from each control, and neither was swallowed.
+  expect(screen.getByLabelText("Playing focus-1.mp4")).toHaveStyle({
+    transform: "rotate(180deg)",
+  });
+
+  speed.focus();
+  fireEvent.keyDown(speed, { key: "Delete", shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("delete_video", {
+      resultId: "video-1",
+    }),
+  );
+});
+
+test("hands focus back to the player after a control is used", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "focus",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        { id: "video-1", fileName: "focus.mp4", extension: "mp4", tags: [] },
+      ],
+    })
+    .mockResolvedValue({ filePath: "/Videos/focus.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "focus{Enter}");
+  await user.click(screen.getByRole("button", { name: "Play focus.mp4" }));
+  expect(await screen.findByLabelText("Playing focus.mp4")).toBeVisible();
+
+  // A clicked control kept focus, and with it a ring that stayed lit long after
+  // the click, on a button that was no longer doing anything.
+  await user.click(screen.getByRole("button", { name: "Rotate right" }));
+  expect(document.activeElement).toHaveClass("player-shell");
+
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Playback speed" }),
+    "2",
+  );
+  expect(document.activeElement).toHaveClass("player-shell");
+
+  // The tag field is the one control that has to keep what it is given.
+  await user.click(
+    screen.getByRole("button", { name: "Add tag to focus.mp4" }),
+  );
+  const field = await screen.findByRole("textbox", {
+    name: "Add tag to focus.mp4",
+  });
+  expect(field).toHaveFocus();
+});
+
+test("spells out every key in a shortcut with more than one", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(screen.getByRole("button", { name: "Play clip.mp4" }));
+
+  // "ShiftDelete" read as one unpressable key.
+  const remove = await screen.findByRole("button", { name: "Delete video" });
+  expect(remove.querySelector(".key-hint")).toHaveTextContent("Shift+Delete");
+});
+
 test("shows a sidecar subtitle track and turns it off again", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {
@@ -1986,7 +2094,7 @@ test("keyboard shortcuts control player actions without hijacking search input",
   });
 });
 
-test("keeps keyboard shortcuts active after a transport button receives focus", async () => {
+test("keeps keyboard shortcuts active after a transport button is clicked", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -2015,8 +2123,10 @@ test("keeps keyboard shortcuts active after a transport button receives focus", 
 
   const skipBack = screen.getByRole("button", { name: "Skip back 10 seconds" });
   await user.click(skipBack);
-  expect(skipBack).toHaveFocus();
-  fireEvent.keyDown(skipBack, { key: " " });
+  // The button used to keep the focus it was given, and the ring that came with
+  // it, on a control that had already done its work.
+  expect(skipBack).not.toHaveFocus();
+  fireEvent.keyDown(document.activeElement ?? window, { key: " " });
 
   expect(video).toHaveProperty("paused", true);
 });

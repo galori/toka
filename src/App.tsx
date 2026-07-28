@@ -415,6 +415,29 @@ const KEY_GLYPHS: Record<string, string> = {
   PageDown: "PgDn",
 };
 
+// Whether a keystroke belongs to the control under it rather than to the app.
+// The player's bar is full of form controls — the scrubber, the volume slider,
+// the speed and subtitle pickers — and none of them take typed text, so
+// treating every one of them as an editor left every shortcut dead for as long
+// as one of them held focus.
+function acceptsTypedText(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  const control = target.closest(
+    "input, textarea, [contenteditable], [role=textbox]",
+  );
+  if (!control) return false;
+  if (control instanceof HTMLInputElement)
+    return ![
+      "range",
+      "checkbox",
+      "radio",
+      "button",
+      "submit",
+      "reset",
+    ].includes(control.type);
+  return true;
+}
+
 function KeyHint({ shortcut }: { shortcut: string }) {
   const label = shortcut
     .split(" ")
@@ -422,7 +445,9 @@ function KeyHint({ shortcut }: { shortcut: string }) {
       combination
         .split("+")
         .map((key) => KEY_GLYPHS[key] ?? key)
-        .join(""),
+        // "ShiftDelete" read as one key nobody has. Every key in a combination
+        // is named, and the "+" says they are pressed together.
+        .join("+"),
     )
     .join("/");
   // Assistive technology already gets this from aria-keyshortcuts.
@@ -1129,6 +1154,22 @@ function Player({
     playerShell.current?.focus({ preventScroll: true });
   };
 
+  // No control in the bar keeps the keyboard once it has been used: a button
+  // that held focus after a click kept a focus ring lit long after it had
+  // stopped doing anything, and the player is what the next keystroke is meant
+  // for. A dropdown is left alone here because its list needs the keyboard
+  // while it is open — it hands focus back from its own change handler — and so
+  // is the tag field, which exists to be typed into.
+  const releaseFocus = (event: { target: EventTarget }) => {
+    if (
+      event.target instanceof Element &&
+      event.target.closest("select, textarea, [contenteditable]")
+    )
+      return;
+    if (acceptsTypedText(event.target)) return;
+    focusPlayerShell();
+  };
+
   const toggleFullscreen = () => {
     setFullscreenError(undefined);
     if (document.fullscreenElement) {
@@ -1189,10 +1230,7 @@ function Player({
         (event.ctrlKey && !(event.shiftKey && event.key === "Delete")) ||
         event.metaKey ||
         event.altKey ||
-        (target instanceof Element &&
-          target.closest(
-            "input, textarea, select, [contenteditable], [role=textbox]",
-          ))
+        acceptsTypedText(target)
       )
         return;
 
@@ -1433,6 +1471,7 @@ function Player({
           ref={playerControls}
           className={controlsIdle ? "player-controls idle" : "player-controls"}
           aria-label="Video controls"
+          onClick={releaseFocus}
           onMouseEnter={() => {
             pointerOverControls.current = true;
           }}
@@ -1533,9 +1572,10 @@ function Player({
                   aria-label="Subtitle track"
                   title="Subtitle track"
                   value={subtitleIndex}
-                  onChange={(event) =>
-                    selectSubtitle(Number(event.currentTarget.value))
-                  }
+                  onChange={(event) => {
+                    selectSubtitle(Number(event.currentTarget.value));
+                    focusPlayerShell();
+                  }}
                 >
                   <option value={-1}>Off</option>
                   {subtitles.map((option, position) => (
@@ -1551,9 +1591,10 @@ function Player({
                   aria-keyshortcuts="- ="
                   title="Playback speed"
                   value={speed}
-                  onChange={(event) =>
-                    applySpeed(Number(event.currentTarget.value))
-                  }
+                  onChange={(event) => {
+                    applySpeed(Number(event.currentTarget.value));
+                    focusPlayerShell();
+                  }}
                 >
                   {SPEEDS.map((value) => (
                     <option key={value} value={value}>
