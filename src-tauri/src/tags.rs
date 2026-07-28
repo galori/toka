@@ -55,10 +55,6 @@ impl Tags {
         self.0
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
     pub fn merge(&self, other: &Tags) -> Tags {
         Tags::new(self.0.iter().chain(other.0.iter()))
     }
@@ -279,9 +275,9 @@ mod tests {
 
     #[test]
     fn parses_no_tags_without_a_tag_block() {
-        assert!(Tags::parse_file_name("clip.mp4").is_empty());
-        assert!(Tags::parse_file_name("clip [].mp4").is_empty());
-        assert!(Tags::parse_dir_name("Trips").is_empty());
+        assert!(Tags::parse_file_name("clip.mp4").values().is_empty());
+        assert!(Tags::parse_file_name("clip [].mp4").values().is_empty());
+        assert!(Tags::parse_dir_name("Trips").values().is_empty());
     }
 
     #[test]
@@ -294,7 +290,8 @@ mod tests {
 
     #[test]
     fn parses_tags_only_from_the_end_of_a_name() {
-        assert!(Tags::parse_file_name("clip [home] trailing.mp4").is_empty());
+        let tags = Tags::parse_file_name("clip [home] trailing.mp4");
+        assert!(tags.values().is_empty());
     }
 
     #[test]
