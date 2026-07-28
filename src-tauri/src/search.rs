@@ -58,6 +58,13 @@ pub trait SearchProvider: Send + Sync {
 pub struct SearchEngine {
     provider: Arc<dyn SearchProvider>,
     result_paths: Mutex<HashMap<String, PathBuf>>,
+    /// Files this session has renamed, indexed by the name the search provider
+    /// knew them under. Every provider Toka uses answers from an index that is
+    /// rebuilt on a schedule, so a file tagged a moment ago is still indexed
+    /// under its old name — and an index that filters out names whose file is
+    /// gone, as `plocate --existing` does, stops listing it at all. Keeping the
+    /// renames here lets a search see the file the way it is now.
+    renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
 }
 
 impl SearchEngine {
@@ -65,6 +72,7 @@ impl SearchEngine {
         Self {
             provider,
             result_paths: Mutex::new(HashMap::new()),
+            renamed_paths: Mutex::new(HashMap::new()),
         }
     }
 
@@ -83,7 +91,6 @@ impl SearchEngine {
 
         let mut seen = HashSet::new();
         let mut paths = self
-            .provider
             .candidates(query)?
             .into_iter()
             .filter(|path| is_supported_video(path))
@@ -145,6 +152,29 @@ impl SearchEngine {
         })
     }
 
+    /// The provider's candidates, corrected for the renames this session has
+    /// made: a stale name is replaced by the name its file carries now, and
+    /// every renamed file the index has already dropped is added back. The
+    /// caller still filters these by the search terms, so a rename only shows
+    /// up when the query matches the name the file actually has.
+    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+        let mut paths = self.provider.candidates(query)?;
+        let renamed = self.renamed_paths.lock().unwrap();
+        if renamed.is_empty() {
+            return Ok(paths);
+        }
+        for path in &mut paths {
+            if let Some(current) = renamed.get(path) {
+                *path = current.clone();
+            }
+        }
+        // A renamed file that has since been deleted is not a search result,
+        // and this is the only place a path Toka renamed itself can be checked
+        // cheaply — provider candidates are deliberately left untouched.
+        paths.extend(renamed.values().filter(|path| path.is_file()).cloned());
+        Ok(paths)
+    }
+
     pub fn video_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
         let path = self
             .result_paths
@@ -165,8 +195,29 @@ impl SearchEngine {
         let known_path = known_paths
             .get_mut(result_id)
             .ok_or(SearchError::VideoUnavailable)?;
-        *known_path = path;
+        let previous = std::mem::replace(known_path, path.clone());
+        if previous != path {
+            self.record_rename(previous, path);
+        }
         Ok(())
+    }
+
+    /// Records a rename under the name the index still knows the file by.
+    /// Renaming the same file again replaces that one entry rather than
+    /// chaining, and renaming it back to its indexed name drops the entry, so
+    /// the index's own answer is enough again.
+    fn record_rename(&self, previous: PathBuf, current: PathBuf) {
+        let mut renamed = self.renamed_paths.lock().unwrap();
+        let indexed = renamed
+            .iter()
+            .find(|(_, path)| **path == previous)
+            .map(|(indexed, _)| indexed.clone())
+            .unwrap_or(previous);
+        if indexed == current {
+            renamed.remove(&indexed);
+        } else {
+            renamed.insert(indexed, current);
+        }
     }
 
     pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
@@ -274,6 +325,168 @@ mod tests {
         assert_eq!(page.total_pages, 2);
         assert_eq!(page.results.len(), 1);
         assert_eq!(page.results[0].file_name, "clip-24.mp4");
+    }
+
+    #[test]
+    fn a_renamed_video_is_found_under_its_new_name_while_the_index_is_stale() {
+        let directory = tempdir().unwrap();
+        let indexed = directory.path().join("sample1.mp4");
+        fs::write(&indexed, b"test").unwrap();
+        let provider = Arc::new(FakeProvider {
+            paths: Mutex::new(vec![indexed.clone()]),
+        });
+        let engine = SearchEngine::new(provider.clone());
+        let first = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+
+        let tagged = directory.path().join("sample1 [home].mp4");
+        fs::rename(&indexed, &tagged).unwrap();
+        engine
+            .update_video_path(&first.results[0].id, tagged.clone())
+            .unwrap();
+
+        // The index still lists the name the file had before it was tagged.
+        let stale = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(stale.total_results, 1);
+        assert_eq!(stale.results[0].file_name, "sample1 [home].mp4");
+        assert_eq!(stale.results[0].tags, ["home"]);
+
+        // The index has since dropped the name, because the file behind it is
+        // gone; the renamed file must not disappear with it.
+        provider.paths.lock().unwrap().clear();
+        let dropped = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(dropped.total_results, 1);
+        assert_eq!(dropped.results[0].file_name, "sample1 [home].mp4");
+
+        // Once the index catches up the file is listed once, not twice.
+        *provider.paths.lock().unwrap() = vec![tagged];
+        let refreshed = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+        assert_eq!(refreshed.total_results, 1);
+    }
+
+    #[test]
+    fn a_renamed_video_is_only_found_by_terms_matching_its_new_name() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("sample1.mp4");
+        fs::write(&video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider {
+            paths: Mutex::new(vec![video.clone()]),
+        });
+        let engine = SearchEngine::new(provider.clone());
+        let first = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+        let tagged = directory.path().join("sample1 [home].mp4");
+        fs::rename(&video, &tagged).unwrap();
+        engine
+            .update_video_path(&first.results[0].id, tagged)
+            .unwrap();
+        provider.paths.lock().unwrap().clear();
+
+        let page = engine
+            .search(SearchRequest {
+                query: "holiday".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 0);
+    }
+
+    #[test]
+    fn a_video_renamed_back_to_its_indexed_name_is_listed_once() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("sample1.mp4");
+        fs::write(&video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider {
+            paths: Mutex::new(vec![video.clone()]),
+        });
+        let engine = SearchEngine::new(provider);
+        let request = || SearchRequest {
+            query: "sample".into(),
+            page: 1,
+            page_size: PAGE_SIZE,
+        };
+        let first = engine.search(request()).unwrap();
+
+        let tagged = directory.path().join("sample1 [home].mp4");
+        fs::rename(&video, &tagged).unwrap();
+        engine
+            .update_video_path(&first.results[0].id, tagged.clone())
+            .unwrap();
+        let tagged_page = engine.search(request()).unwrap();
+        fs::rename(&tagged, &video).unwrap();
+        engine
+            .update_video_path(&tagged_page.results[0].id, video)
+            .unwrap();
+
+        let page = engine.search(request()).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "sample1.mp4");
+    }
+
+    #[test]
+    fn a_renamed_video_that_is_gone_is_not_listed() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("sample1.mp4");
+        fs::write(&video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider {
+            paths: Mutex::new(vec![video.clone()]),
+        });
+        let engine = SearchEngine::new(provider.clone());
+        let first = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+        let tagged = directory.path().join("sample1 [home].mp4");
+        fs::rename(&video, &tagged).unwrap();
+        engine
+            .update_video_path(&first.results[0].id, tagged.clone())
+            .unwrap();
+        provider.paths.lock().unwrap().clear();
+        fs::remove_file(&tagged).unwrap();
+
+        let page = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 0);
     }
 
     #[test]
