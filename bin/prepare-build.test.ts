@@ -1,6 +1,19 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { prepareBuild } from "./prepare-build.mjs";
+import { prepareBuild, resolveBuiltAt } from "./prepare-build.mjs";
+
+describe("resolveBuiltAt", () => {
+  const commitTime = "2026-07-20T09:00:00.000Z";
+  const now = "2026-07-27T18:30:00.000Z";
+
+  test("dates a clean tree by its commit so rebuilding it reproduces the same frontend", () => {
+    expect(resolveBuiltAt({ isDirty: false, commitTime, now })).toBe(commitTime);
+  });
+
+  test("dates a dirty tree by wall clock, because uncommitted work has no commit time", () => {
+    expect(resolveBuiltAt({ isDirty: true, commitTime, now })).toBe(now);
+  });
+});
 
 test("packages the generated build provenance file in the Linux deb", () => {
   const config = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));

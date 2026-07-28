@@ -33,8 +33,13 @@ launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 npm run build:linux
 ```
 
-This builds the `.deb` below `src-tauri/target/release/bundle/deb/` and installs it
-with `dpkg` so Toka appears in the Applications menu and can be launched from there.
+This installs Toka into `~/.local/opt/toka` and registers a desktop entry, so it
+appears in the Applications menu and can be launched from there. No `sudo` is
+needed, and nothing outside your home directory is touched.
+
+Add `-- --appimage` to build and install a self-contained AppImage instead. That
+is what you want when copying Toka to another machine; it takes about 90 seconds
+longer, because it bundles GTK and WebKit alongside the app.
 
 Toka uses `libmpv2` for Linux video playback. On Tails, add it to Additional Software so it is restored when Persistent Storage is unlocked.
 

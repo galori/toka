@@ -8,7 +8,7 @@
     "prepare": "husky",
     "build:linux": "node bin/build.mjs linux",
     "build:mac": "node bin/build.mjs mac",
-    "build": "tsc && vite build",
+    "build": "tsc && node bin/build-frontend.mjs",
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check package.json package-lock.json eslint.config.js .prettierrc.json .github/workflows/pr-quality.yml",
     "test": "vitest run",
