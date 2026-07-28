@@ -158,12 +158,15 @@ function VideoTags({
   onChange,
   adding: controlledAdding,
   onAddingChange,
+  shortcut,
 }: {
   video: VideoResult;
   onChange: (update: Pick<VideoResult, "fileName" | "tags">) => void;
   adding?: boolean;
   onAddingChange?: (adding: boolean) => void;
+  shortcut?: string;
 }) {
+  const field = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState("");
   const [uncontrolledAdding, setUncontrolledAdding] = useState(false);
   const [error, setError] = useState<string>();
@@ -173,6 +176,11 @@ function VideoTags({
     onAddingChange?.(next);
   };
   const tags = video.tags ?? [];
+  // Claimed on every open rather than through `autoFocus`, which fires once per
+  // mount and so loses the field to whatever the fullscreen transition focuses.
+  useEffect(() => {
+    if (adding) field.current?.focus();
+  }, [adding]);
   const save = async (update: Promise<VideoTagUpdate>) => {
     try {
       onChange(await update);
@@ -203,24 +211,36 @@ function VideoTags({
       ))}
       {adding ? (
         <input
+          ref={field}
           aria-label={`Add tag to ${video.fileName}`}
           value={draft}
-          autoFocus
           onChange={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter") add();
             if (event.key === "Escape") setAdding(false);
           }}
         />
-      ) : (
+      ) : shortcut ? (
         <ControlButton
-          shortcut="T"
+          shortcut={shortcut}
           className="tag-add"
           aria-label={`Add tag to ${video.fileName}`}
           onClick={() => setAdding(true)}
         >
           <Label>+</Label>
         </ControlButton>
+      ) : (
+        // No shortcut among the results: a keystroke there cannot say which of
+        // the videos on screen it means. The control stays, for the pointer.
+        <button
+          type="button"
+          className="tag-add"
+          title={`Add tag to ${video.fileName}`}
+          aria-label={`Add tag to ${video.fileName}`}
+          onClick={() => setAdding(true)}
+        >
+          <Label>+</Label>
+        </button>
       )}
       {error ? (
         <p className="tag-error" role="alert">
@@ -524,7 +544,13 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
+  // Mirrored into a ref so the fullscreen idle timer can see it without
+  // restarting, the way it already watches the pointer.
+  const tagFieldOpen = useRef(false);
   const video = playlist[index];
+  useEffect(() => {
+    tagFieldOpen.current = addingTag;
+  }, [addingTag]);
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -733,6 +759,12 @@ function Player({
       element.current?.pause();
       setPlayingBack(false);
     }
+  };
+
+  // Typing a tag needs the viewer's attention, so the picture waits for them.
+  const openTagField = () => {
+    if (playingBack) pause();
+    setAddingTag(true);
   };
 
   const restart = () => {
@@ -1022,7 +1054,8 @@ function Player({
     // deliberately not consulted, because clicking a control focuses it and
     // would then pin the overlay open for the rest of the session.
     const tick = window.setInterval(() => {
-      if (pointerOverControls.current) lastActivity = Date.now();
+      if (pointerOverControls.current || tagFieldOpen.current)
+        lastActivity = Date.now();
       else if (Date.now() - lastActivity >= CONTROLS_IDLE_DELAY)
         setControlsIdle(true);
     }, 250);
@@ -1144,6 +1177,18 @@ function Player({
         event.preventDefault();
         action();
       };
+      // Every keystroke belongs to the open tag field: binding them here would
+      // hijack the letters being typed, and Escape has to close the field
+      // rather than leave fullscreen. Reached only when the field does not hold
+      // focus itself, which the check above already returns on.
+      // Every keystroke belongs to the open tag field: binding them here would
+      // hijack the letters being typed, and Escape has to close the field
+      // rather than leave fullscreen. Reached only when the field does not hold
+      // focus itself, which the check above already returns on.
+      if (addingTag) {
+        if (event.key === "Escape") run(() => setAddingTag(false));
+        return;
+      }
       if (event.key === " " || event.key === "Spacebar") {
         run(playingBack ? pause : play);
       } else if (event.key === "[") {
@@ -1173,7 +1218,7 @@ function Player({
       } else if (event.key === "0") {
         run(() => applyVolume(volume + VOLUME_STEP));
       } else if (event.key.toLowerCase() === "t") {
-        run(() => setAddingTag(true));
+        run(openTagField);
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -1198,6 +1243,7 @@ function Player({
     native,
     nativeBaseRotation,
     onBack,
+    addingTag,
     playingBack,
     playlist.length,
     speed,
@@ -1433,9 +1479,12 @@ function Player({
             <div className="player-utilities">
               <VideoTags
                 video={video}
+                shortcut="T"
                 onChange={updateVideoTags}
                 adding={addingTag}
-                onAddingChange={setAddingTag}
+                onAddingChange={(adding) =>
+                  adding ? openTagField() : setAddingTag(false)
+                }
               />
               <ControlButton
                 shortcut="S"
