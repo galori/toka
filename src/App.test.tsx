@@ -253,6 +253,107 @@ test("shows video tags and edits them with the tag helper", async () => {
   });
 });
 
+test("gives the open tag field the keyboard and pauses for it", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValue({ fileName: "tagged [review work].mp4", tags: [] });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const playing = await screen.findByLabelText("Playing tagged.mp4");
+  fireEvent.play(playing);
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+  const paused = vi
+    .spyOn(HTMLMediaElement.prototype, "pause")
+    .mockImplementation(() => {});
+
+  fireEvent.keyDown(window, { key: "t" });
+  const tagField = screen.getByRole("textbox", {
+    name: "Add tag to tagged.mp4",
+  });
+  expect(tagField).toHaveFocus();
+  // The picture waits while the viewer types.
+  expect(paused).toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+
+  // Shortcut letters reach the field instead of running their commands.
+  await user.keyboard("far");
+  expect(tagField).toHaveValue("far");
+  expect(requestFullscreen).not.toHaveBeenCalled();
+
+  // Nor are they commands when the field is open without holding focus, which
+  // is the state fullscreen used to leave it in.
+  tagField.blur();
+  fireEvent.keyDown(window, { key: "f" });
+  expect(requestFullscreen).not.toHaveBeenCalled();
+
+  // Escape closes the field and leaves the player where it was, rather than
+  // falling through to the grid.
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(
+    screen.queryByRole("textbox", { name: "Add tag to tagged.mp4" }),
+  ).toBeNull();
+  expect(await screen.findByLabelText("Video controls")).toBeVisible();
+});
+
+test("leaves the results tag control without a keyboard shortcut", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "tagged",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [
+      {
+        id: "video-1",
+        fileName: "tagged.mp4",
+        extension: "mp4",
+        tags: ["work"],
+      },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+
+  // Nothing on the grid claims T: a keystroke there could not say which video
+  // it meant. The control is still there for the pointer.
+  const addTag = await screen.findByRole("button", {
+    name: "Add tag to tagged.mp4",
+  });
+  expect(addTag).not.toHaveAttribute("aria-keyshortcuts");
+  expect(addTag.querySelector(".key-hint")).toBeNull();
+  expect(addTag).toHaveAttribute("title", "Add tag to tagged.mp4");
+  await user.click(addTag);
+  expect(
+    screen.getByRole("textbox", { name: "Add tag to tagged.mp4" }),
+  ).toHaveFocus();
+});
+
 test("opens a selected result in the player and restores the grid on back", async () => {
   invokeMock
     .mockResolvedValueOnce({
