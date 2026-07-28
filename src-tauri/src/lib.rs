@@ -482,6 +482,15 @@ fn set_native_video_rotation(
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
+fn set_native_video_aspect(
+    ratio: f64,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::set_aspect(player.inner(), ratio).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
 fn native_subtitle_tracks(
     player: State<'_, Arc<player_linux::NativePlayer>>,
 ) -> Result<Vec<player_linux::SubtitleTrack>, CommandError> {
@@ -632,6 +641,7 @@ pub fn run() {
                 set_native_volume,
                 native_video_rotation,
                 set_native_video_rotation,
+                set_native_video_aspect,
                 seek_native_video,
                 native_subtitle_tracks,
                 set_native_subtitle,

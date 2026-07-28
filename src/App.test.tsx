@@ -3224,3 +3224,113 @@ test("focuses the search field on startup and on every return from a video", asy
   await user.keyboard("second");
   expect(field).toHaveValue("clipsecond");
 });
+
+// Aspect deliberately ignores rotation: some players apply an override
+// sideways once a video is turned, which makes the control unpredictable. A
+// CSS aspect-ratio is a layout property and `rotate()` a post-layout
+// transform, so the web path gets that for free; mpv applies
+// `video-aspect-override` to the source before `video-rotate`, so does it.
+test("cycles the picture through common aspect ratios and back to auto", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+
+  const control = screen.getByRole("button", { name: "Aspect ratio: auto" });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "A");
+  expect(video).not.toHaveStyle({ aspectRatio: "16 / 9" });
+
+  await user.click(control);
+  expect(
+    screen.getByRole("button", { name: "Aspect ratio: 16:9" }),
+  ).toBeVisible();
+  expect(video).toHaveStyle({ aspectRatio: "16 / 9", objectFit: "fill" });
+
+  // Rotating must not change which way the override is applied.
+  await user.click(screen.getByRole("button", { name: "Rotate right" }));
+  expect(video).toHaveStyle({
+    aspectRatio: "16 / 9",
+    transform: "rotate(90deg)",
+  });
+
+  fireEvent.keyDown(window, { key: "a" });
+  expect(video).toHaveStyle({ aspectRatio: "4 / 3" });
+  fireEvent.keyDown(window, { key: "a" });
+  fireEvent.keyDown(window, { key: "a" });
+  fireEvent.keyDown(window, { key: "a" });
+
+  // Back where it started, with the browser choosing the shape again.
+  expect(
+    screen.getByRole("button", { name: "Aspect ratio: auto" }),
+  ).toBeVisible();
+  expect(video).not.toHaveStyle({ objectFit: "fill" });
+});
+
+test("sends the chosen aspect ratio to native playback", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "native.mkv", extension: "mkv" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mkv" }),
+  );
+  await screen.findByLabelText("Playing native.mkv");
+
+  await user.click(screen.getByRole("button", { name: "Aspect ratio: auto" }));
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_video_aspect", {
+      ratio: 16 / 9,
+    }),
+  );
+
+  // Auto hands the shape back to mpv rather than pinning it to the last value.
+  for (let step = 0; step < 4; step += 1)
+    fireEvent.keyDown(window, { key: "a" });
+  await waitFor(() => {
+    const ratios = invokeMock.mock.calls
+      .filter(([command]) => command === "set_native_video_aspect")
+      .map(([, args]) => (args as { ratio: number }).ratio);
+    expect(ratios.at(-1)).toBe(-1);
+  });
+});

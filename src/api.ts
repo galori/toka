@@ -140,6 +140,11 @@ export function nativeVideoRotation(): Promise<number> {
   return invoke("native_video_rotation");
 }
 
+// A negative ratio hands the picture's shape back to mpv.
+export function setNativeVideoAspect(ratio: number): Promise<void> {
+  return invoke("set_native_video_aspect", { ratio });
+}
+
 export function setNativeVideoRotation(degrees: number): Promise<void> {
   return invoke("set_native_video_rotation", { degrees });
 }

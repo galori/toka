@@ -1005,6 +1005,13 @@ pub fn set_rotation(player: &NativePlayer, degrees: i32) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.set_i64("video-rotate", i64::from(degrees.rem_euclid(360))))
 }
 
+/// Overrides the picture's shape, or hands it back to mpv with a negative
+/// ratio. mpv applies this to the source before `video-rotate`, so the override
+/// means the same thing however the video is turned.
+pub fn set_aspect(player: &NativePlayer, ratio: f64) -> Result<(), String> {
+    player.with_mpv(|mpv| mpv.set_double("video-aspect-override", ratio.max(-1.0)))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubtitleTrack {

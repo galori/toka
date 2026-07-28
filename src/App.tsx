@@ -22,6 +22,7 @@ import {
   setNativeVolume,
   setNativeSubtitle,
   setNativeVideoRotation,
+  setNativeVideoAspect,
   setNativeVideoBounds,
   stopNativeVideo,
   subtitleCues,
@@ -314,6 +315,17 @@ function SpeakerIcon({ waves }: { waves: 1 | 2 }) {
   );
 }
 
+// A frame with a second, wider frame inside it: the control changes the shape
+// the picture is drawn into, and shows two of them to say so.
+function AspectIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <rect x="2.2" y="4.4" width="19.6" height="15.2" rx="2" />
+      <rect x="6.2" y="8.6" width="11.6" height="6.8" rx="1.4" />
+    </svg>
+  );
+}
+
 function RotateLeftIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
@@ -406,6 +418,17 @@ type FullscreenPlaylist = "hidden" | "peek" | "held";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const VOLUME_STEP = 5;
+
+// The shapes worth cycling between, starting from the one the file itself
+// declares. Each is written the way it is spoken and both the number mpv wants
+// and the value CSS wants are derived from that, so the two engines cannot be
+// given subtly different shapes.
+const ASPECT_RATIOS = ["auto", "16:9", "4:3", "1:1", "21:9"];
+
+function aspectParts(label: string): [number, number] | undefined {
+  const [width, height] = label.split(":").map(Number);
+  return width > 0 && height > 0 ? [width, height] : undefined;
+}
 
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
@@ -585,6 +608,7 @@ function Player({
   const [volume, setVolume] = useState(100);
   const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
+  const [aspectStep, setAspectStep] = useState(0);
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(true);
   const [fullscreenPlaylist, setFullscreenPlaylist] =
@@ -643,6 +667,7 @@ function Player({
     setFullscreenError(undefined);
     setPlayingBack(false);
     setRotation(0);
+    setAspectStep(0);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
     setEmbeddedSubtitles([]);
@@ -657,6 +682,10 @@ function Player({
           await loadNativeVideo(result.filePath);
           const baseRotation = await nativeVideoRotation();
           if (active) setNativeBaseRotation(baseRotation);
+          // mpv keeps `video-aspect-override` across files, unlike the speed
+          // it does reset, so a shape chosen for the last video would carry
+          // silently into this one while the control read "auto".
+          await setNativeVideoAspect(-1);
           // mpv starts every file at 1x.
           if (chosenSpeed.current !== 1)
             await setNativeSpeed(chosenSpeed.current);
@@ -887,6 +916,28 @@ function Player({
           setError(errorMessage(reason)),
         );
       }
+      return next;
+    });
+  };
+
+  const aspect = ASPECT_RATIOS[aspectStep];
+  const aspectSides = aspectParts(aspect);
+
+  // Deliberately independent of rotation. Some players apply an override
+  // sideways once a video is turned, which makes the control unguessable; here
+  // a CSS aspect-ratio is a layout property while `rotate()` is a post-layout
+  // transform, and mpv applies `video-aspect-override` to the source before
+  // `video-rotate`. Both paths therefore act as if the video were upright.
+  const cycleAspect = () => {
+    setAspectStep((current) => {
+      const next = (current + 1) % ASPECT_RATIOS.length;
+      const sides = aspectParts(ASPECT_RATIOS[next]);
+      if (native)
+        // A negative ratio is what hands the shape back to mpv, rather than
+        // pinning it to whatever was chosen last.
+        void setNativeVideoAspect(sides ? sides[0] / sides[1] : -1).catch(
+          (reason: unknown) => setError(errorMessage(reason)),
+        );
       return next;
     });
   };
@@ -1295,6 +1346,8 @@ function Player({
         run(() => applyVolume(volume - VOLUME_STEP));
       } else if (event.key === "ArrowUp") {
         run(() => applyVolume(volume + VOLUME_STEP));
+      } else if (event.key.toLowerCase() === "a") {
+        run(cycleAspect);
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
@@ -1444,7 +1497,18 @@ function Player({
             ref={element}
             src={playbackSource(prepared.filePath)}
             aria-label={`Playing ${video.fileName}`}
-            style={{ transform: `rotate(${rotation}deg)` }}
+            style={{
+              transform: `rotate(${rotation}deg)`,
+              // `fill` matters as much as the ratio: left on `contain` the
+              // picture is letterboxed back into its original shape inside the
+              // new box, and nothing appears to have changed.
+              ...(aspectSides
+                ? {
+                    aspectRatio: `${aspectSides[0]} / ${aspectSides[1]}`,
+                    objectFit: "fill" as const,
+                  }
+                : {}),
+            }}
             onLoadedMetadata={(event) => {
               setDuration(
                 Number.isFinite(event.currentTarget.duration)
@@ -1661,6 +1725,21 @@ function Player({
                 aria-label="Rotate right"
               >
                 <RotateRightIcon />
+              </ControlButton>
+              {/* Named after the shape it is currently in, the way the loop
+                  control is named after its mode, so the control says what it
+                  did as well as what it will do next. */}
+              <ControlButton
+                shortcut="A"
+                className={
+                  aspectSides
+                    ? "transport-button aspect-button on"
+                    : "transport-button aspect-button"
+                }
+                onClick={cycleAspect}
+                aria-label={`Aspect ratio: ${aspect}`}
+              >
+                <AspectIcon />
               </ControlButton>
               <ControlButton
                 shortcut="L"
