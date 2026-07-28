@@ -2720,10 +2720,10 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
           ? box(0, 794, 1200, 6)
           : box(0, 704, 1200, 96);
       }
-      if (this.classList.contains("fullscreen-file-path"))
-        return box(16, 12, 1168, 18);
-      if (this.classList.contains("fullscreen-time"))
-        return box(1084, 760, 100, 18);
+      // Path and clock share one row along the bottom, so the overlay costs the
+      // picture a single strip rather than one at each end.
+      if (this.classList.contains("fullscreen-info"))
+        return box(16, 760, 1168, 18);
       if (this.classList.contains("playlist-drawer"))
         return box(920, 0, 280, 800);
       return box(0, 0, 0, 0);
@@ -2743,20 +2743,34 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
 
     // GTK composites the mpv surface above the WebView whatever the z-index
     // says, so anything the overlay draws is only seen on Linux if the surface
-    // stops short of it. The controls are hidden, but the path and the clock
-    // are not, so the picture starts below one and stops above the other.
+    // stops short of it. The controls are hidden; the path and the clock share
+    // one row, so the picture keeps its whole top and stops above that row.
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
         x: 0,
-        y: 30,
+        y: 0,
         width: 1200,
-        height: 730,
+        height: 760,
         visible: true,
       }),
     );
 
-    // Turning the overlay off hands those two strips back. The keypress also
-    // wakes the controls, which take the bottom of the picture instead.
+    // Turning the overlay off hands that strip back. The keypress also wakes
+    // the controls, which take the bottom of the picture instead.
+    invokeMock.mockClear();
+    act(() => void fireEvent.keyDown(window, { key: "i" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0,
+        y: 0,
+        width: 1200,
+        height: 704,
+        visible: true,
+      }),
+    );
+
+    // Bringing it back while the controls are up costs the picture nothing:
+    // the row sits inside the strip the controls have already reserved.
     invokeMock.mockClear();
     act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
@@ -2770,25 +2784,13 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     );
 
     invokeMock.mockClear();
-    act(() => void fireEvent.keyDown(window, { key: "i" }));
-    await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0,
-        y: 30,
-        width: 1200,
-        height: 674,
-        visible: true,
-      }),
-    );
-
-    invokeMock.mockClear();
     movePointer(window.innerWidth - 1);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
         x: 0,
-        y: 30,
+        y: 0,
         width: 920,
-        height: 674,
+        height: 704,
         visible: true,
       }),
     );
@@ -3171,4 +3173,39 @@ test("says nothing about other players when this computer has none", async () =>
   expect(
     screen.queryByRole("combobox", { name: "Video player" }),
   ).not.toBeInTheDocument();
+});
+
+// `autoFocus` fires once per mount, and the search form stays mounted for the
+// whole session — the player renders beside it rather than replacing it. So the
+// field was focused at startup and never again, and coming back from a video
+// left the keyboard on a shell that had just been unmounted.
+test("focuses the search field on startup and on every return from a video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  const field = screen.getByRole("searchbox");
+  expect(field).toHaveFocus();
+
+  await user.type(field, "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+  expect(field).not.toHaveFocus();
+
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  await waitFor(() => expect(field).toHaveFocus());
+  // Typing goes straight into the field, with nothing else to click first.
+  await user.keyboard("second");
+  expect(field).toHaveValue("clipsecond");
 });

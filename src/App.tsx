@@ -554,8 +554,7 @@ function Player({
   const pointerOverPlaylist = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const playlistDrawer = useRef<HTMLElement>(null);
-  const fullscreenPath = useRef<HTMLDivElement>(null);
-  const fullscreenTime = useRef<HTMLDivElement>(null);
+  const fullscreenInfo = useRef<HTMLDivElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
@@ -720,27 +719,27 @@ function Player({
       const bounds = surface.getBoundingClientRect();
       const controls = playerControls.current?.getBoundingClientRect();
       const drawer = playlistDrawer.current?.getBoundingClientRect();
-      const path = fullscreenPath.current?.getBoundingClientRect();
-      const time = fullscreenTime.current?.getBoundingClientRect();
+      const info = fullscreenInfo.current?.getBoundingClientRect();
       // GTK renders the native GL area above the opaque WebView. Trim its
       // bounds around WebView controls and the playlist so the real decoded
       // picture remains visible without covering those interactive elements.
       // The fullscreen overlay is trimmed around for the same reason: it is
       // read over the picture everywhere else, but on Linux the picture would
       // simply be painted on top of it.
-      const top = path
-        ? Math.min(bounds.bottom, Math.max(bounds.top, path.bottom))
-        : bounds.top;
+      // The path and the clock share one row along the bottom, so the overlay
+      // costs the picture a single strip instead of one at either end — and
+      // while the controls are up that strip is inside the one they already
+      // reserve, so showing the overlay then costs nothing at all.
       const floors = [bounds.bottom];
       if (controls && !controlsIdle) floors.push(controls.top);
-      if (time) floors.push(time.top);
-      const visibleHeight = Math.max(1, Math.min(...floors) - top);
+      if (info) floors.push(info.top);
+      const visibleHeight = Math.max(1, Math.min(...floors) - bounds.top);
       const visibleWidth = drawer
         ? Math.max(1, Math.min(bounds.width, drawer.left - bounds.left))
         : bounds.width;
       void setNativeVideoBounds({
         x: Math.round(bounds.x),
-        y: Math.round(top),
+        y: Math.round(bounds.top),
         width: Math.round(visibleWidth),
         height: Math.round(visibleHeight),
         visible: visibleWidth > 0 && visibleHeight > 0,
@@ -1458,14 +1457,15 @@ function Player({
         )}
         {fullscreen && showFullscreenInfo ? (
           <div
+            ref={fullscreenInfo}
             className="fullscreen-info"
             role="region"
             aria-label="Fullscreen video information"
           >
-            <div ref={fullscreenPath} className="fullscreen-file-path">
+            <div className="fullscreen-file-path">
               {prepared?.filePath ?? video.fileName}
             </div>
-            <div ref={fullscreenTime} className="fullscreen-time">
+            <div className="fullscreen-time">
               {formatTime(currentTime)} / {formatTime(duration)}
             </div>
           </div>
@@ -1777,6 +1777,14 @@ export default function App() {
   }>();
   const [players, setPlayers] = useState<ExternalPlayer[]>([]);
   const [chosenPlayer, setChosenPlayer] = useState<string>();
+  const searchField = useRef<HTMLInputElement>(null);
+  // `autoFocus` fires once per mount, and this form is mounted for the whole
+  // session — the player renders beside it rather than in its place. Claiming
+  // the field whenever no video is playing covers the first paint and every
+  // return from one alike, so the next thing typed is always a search.
+  useEffect(() => {
+    if (!playing) searchField.current?.focus();
+  }, [playing]);
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -1949,7 +1957,7 @@ export default function App() {
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search videos…"
             autoComplete="off"
-            autoFocus
+            ref={searchField}
           />
           {query ? (
             <button
