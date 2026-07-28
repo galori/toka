@@ -81,12 +81,11 @@ describe("Toka native Linux playback", () => {
     if (!layout) throw new Error("The native video surface or player controls are missing");
     const renderSize = (await nativeState()).renderSize;
     if (!renderSize) throw new Error("The native renderer did not report its size");
-    // The native GL surface intentionally keeps the full picture bounds. The
-    // WebView is composited above it, so controls remain visible without
-    // shrinking the video when the overlay is shown.
-    // The fixture player surface is 420 CSS pixels tall. Retaining that
-    // native render height proves the controls were not used to crop mpv.
-    expect(renderSize[1]).toBeGreaterThanOrEqual(400);
+    // GTK composites the GL area above the WebView, so the only way the
+    // controls stay visible is for the surface to stop short of them.
+    expect(renderSize[1]).toBeLessThanOrEqual(
+      Math.ceil(layout.controlsTopWithinSurface * layout.devicePixelRatio),
+    );
 
     // Playing and pausing share one control that renames itself.
     await $("button.play-button").click();

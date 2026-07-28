@@ -581,6 +581,20 @@ unsafe extern "C" fn get_proc_address(_context: *mut c_void, name: *const c_char
     }
 }
 
+// A whole-screen sample of what X11 actually presented, so a failure can tell
+// "the video was drawn somewhere unexpected" apart from "it was never drawn".
+#[cfg(feature = "native-e2e")]
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposedProbe {
+    root_size: [i32; 2],
+    origin: [i32; 2],
+    alloc: [i32; 4],
+    grid: Vec<String>,
+    blue_at: Option<[i32; 2]>,
+    blue_count: u32,
+}
+
 pub struct NativePlayer {
     mpv: Mutex<Result<Mpv, String>>,
     render_error: Mutex<Option<String>>,
@@ -590,6 +604,8 @@ pub struct NativePlayer {
     composed_frame_color: Mutex<Option<[u8; 3]>>,
     #[cfg(feature = "native-e2e")]
     visible_blue_render_count: Mutex<u64>,
+    #[cfg(feature = "native-e2e")]
+    composed_probe: Mutex<Option<ComposedProbe>>,
 }
 
 impl NativePlayer {
@@ -601,6 +617,8 @@ impl NativePlayer {
             composed_frame_color: Mutex::new(None),
             #[cfg(feature = "native-e2e")]
             visible_blue_render_count: Mutex::new(0),
+            #[cfg(feature = "native-e2e")]
+            composed_probe: Mutex::new(None),
         })
     }
 
@@ -643,10 +661,7 @@ impl NativePlayer {
         if let Ok(mut last) = self.composed_frame_color.lock() {
             *last = Some(color);
         }
-        if color[2] > 180
-            && color[2] > color[0].saturating_mul(2)
-            && color[2] > color[1].saturating_mul(2)
-        {
+        if is_blue(&color) {
             if let Ok(mut count) = self.visible_blue_render_count.lock() {
                 *count += 1;
             }
@@ -665,6 +680,81 @@ impl NativePlayer {
             .map(|count| *count)
             .unwrap_or(0)
     }
+
+    #[cfg(feature = "native-e2e")]
+    fn record_composed_probe(&self, probe: ComposedProbe) {
+        if let Ok(mut last) = self.composed_probe.lock() {
+            *last = Some(probe);
+        }
+    }
+
+    #[cfg(feature = "native-e2e")]
+    fn composed_probe(&self) -> Option<ComposedProbe> {
+        self.composed_probe.lock().ok()?.clone()
+    }
+}
+
+#[cfg(feature = "native-e2e")]
+fn is_blue(pixel: &[u8]) -> bool {
+    pixel[2] > 180
+        && u16::from(pixel[2]) > u16::from(pixel[0]) * 2
+        && u16::from(pixel[2]) > u16::from(pixel[1]) * 2
+}
+
+// Reads the entire X root window once and reduces it to a coarse character
+// grid. Sampling the whole screen rather than a single point means a failure
+// reports where the picture landed, not merely that one coordinate was dark.
+#[cfg(feature = "native-e2e")]
+fn scan_root_window(
+    root: &gtk::gdk::Window,
+    origin: (i32, i32),
+    alloc: (i32, i32, i32, i32),
+) -> Option<ComposedProbe> {
+    let (root_width, root_height) = (root.width(), root.height());
+    if root_width <= 0 || root_height <= 0 {
+        return None;
+    }
+    let pixbuf = root.pixbuf(0, 0, root_width, root_height)?;
+    let rowstride = pixbuf.rowstride() as usize;
+    let channels = pixbuf.n_channels() as usize;
+    let bytes = pixbuf.read_pixel_bytes();
+    let pixels = bytes.as_ref();
+
+    let (columns, rows) = (48usize, 24usize);
+    let mut grid = Vec::with_capacity(rows);
+    let mut blue_at = None;
+    let mut blue_count = 0;
+    for row in 0..rows {
+        let y = row * root_height as usize / rows;
+        let mut line = String::with_capacity(columns);
+        for column in 0..columns {
+            let x = column * root_width as usize / columns;
+            let offset = y * rowstride + x * channels;
+            let Some(pixel) = pixels.get(offset..offset + 3) else {
+                line.push('?');
+                continue;
+            };
+            if is_blue(pixel) {
+                blue_count += 1;
+                blue_at.get_or_insert([x as i32, y as i32]);
+                line.push('B');
+            } else if u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]) > 90 {
+                line.push('#');
+            } else {
+                line.push('.');
+            }
+        }
+        grid.push(line);
+    }
+
+    Some(ComposedProbe {
+        root_size: [root_width, root_height],
+        origin: [origin.0, origin.1],
+        alloc: [alloc.0, alloc.1, alloc.2, alloc.3],
+        grid,
+        blue_at,
+        blue_count,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -758,6 +848,9 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     let composed_pixel_player = player.clone();
     #[cfg(feature = "native-e2e")]
     let composed_pixel_overlay = overlay.clone();
+    // Reading the whole root window is far too costly to repeat every frame.
+    #[cfg(feature = "native-e2e")]
+    let probe_tick = std::cell::Cell::new(0u32);
     video_area.add_tick_callback(move |area, _| {
         area.queue_render();
         #[cfg(feature = "native-e2e")]
@@ -774,6 +867,14 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
                     let bytes = pixbuf.read_pixel_bytes();
                     if let Some(rgb) = bytes.as_ref().get(..3) {
                         composed_pixel_player.record_composed_pixel([rgb[0], rgb[1], rgb[2]]);
+                    }
+                }
+                let tick = probe_tick.get().wrapping_add(1);
+                probe_tick.set(tick);
+                if tick % 30 == 0 {
+                    let alloc = (bounds.x(), bounds.y(), bounds.width(), bounds.height());
+                    if let Some(probe) = scan_root_window(&root, (origin_x, origin_y), alloc) {
+                        composed_pixel_player.record_composed_probe(probe);
                     }
                 }
             }
@@ -862,6 +963,8 @@ pub struct PlaybackState {
     composed_frame_color: Option<[u8; 3]>,
     #[cfg(feature = "native-e2e")]
     visible_blue_render_count: u64,
+    #[cfg(feature = "native-e2e")]
+    composed_probe: Option<ComposedProbe>,
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
@@ -1019,6 +1122,8 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             composed_frame_color: player.composed_frame_color(),
             #[cfg(feature = "native-e2e")]
             visible_blue_render_count: player.visible_blue_render_count(),
+            #[cfg(feature = "native-e2e")]
+            composed_probe: player.composed_probe(),
         })
     })
 }
