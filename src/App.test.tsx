@@ -3055,3 +3055,38 @@ test("runs the native scrubber to the end and honours loop off", async () => {
   expect(screen.getByLabelText("Playing native-1.mp4")).toBeVisible();
   expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
 });
+
+// `autoFocus` fires once per mount, and the search form stays mounted for the
+// whole session — the player renders beside it rather than replacing it. So the
+// field was focused at startup and never again, and coming back from a video
+// left the keyboard on a shell that had just been unmounted.
+test("focuses the search field on startup and on every return from a video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  const field = screen.getByRole("searchbox");
+  expect(field).toHaveFocus();
+
+  await user.type(field, "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+  expect(field).not.toHaveFocus();
+
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  await waitFor(() => expect(field).toHaveFocus());
+  // Typing goes straight into the field, with nothing else to click first.
+  await user.keyboard("second");
+  expect(field).toHaveValue("clipsecond");
+});

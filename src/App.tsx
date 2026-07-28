@@ -1772,6 +1772,14 @@ export default function App() {
     videos: VideoResult[];
     startIndex: number;
   }>();
+  const searchField = useRef<HTMLInputElement>(null);
+  // `autoFocus` fires once per mount, and this form is mounted for the whole
+  // session — the player renders beside it rather than in its place. Claiming
+  // the field whenever no video is playing covers the first paint and every
+  // return from one alike, so the next thing typed is always a search.
+  useEffect(() => {
+    if (!playing) searchField.current?.focus();
+  }, [playing]);
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -1904,7 +1912,7 @@ export default function App() {
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search videos…"
             autoComplete="off"
-            autoFocus
+            ref={searchField}
           />
           {query ? (
             <button
