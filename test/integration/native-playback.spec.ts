@@ -1,32 +1,43 @@
 describe("Toka native Linux playback", () => {
   it("renders a video frame without covering the player controls", async () => {
-    const nativeState = () => browser.execute(() => {
-      const tauri = (window as typeof window & {
-        __TAURI__: { core: { invoke: (command: string) => Promise<unknown> } };
-      }).__TAURI__;
-      return tauri.core.invoke("native_playback_state");
-    }) as Promise<{
-      currentTime: number;
-      blueRenderCount?: number;
-      frameColor?: [number, number, number];
-      framebuffer?: number;
-      renderCount?: number;
-      renderSize?: [number, number];
-      composedFrameColor?: [number, number, number];
-      visibleBlueRenderCount?: number;
-    }>;
+    const nativeState = () =>
+      browser.execute(() => {
+        const tauri = (
+          window as typeof window & {
+            __TAURI__: {
+              core: { invoke: (command: string) => Promise<unknown> };
+            };
+          }
+        ).__TAURI__;
+        return tauri.core.invoke("native_playback_state");
+      }) as Promise<{
+        currentTime: number;
+        blueRenderCount?: number;
+        frameColor?: [number, number, number];
+        framebuffer?: number;
+        renderCount?: number;
+        renderSize?: [number, number];
+        composedFrameColor?: [number, number, number];
+        visibleBlueRenderCount?: number;
+        composedProbe?: { blueCount: number };
+      }>;
     // Retries (see wdio.native.conf.ts) re-run this block in the same session,
     // where a previous attempt left the app in the player. Return to search
     // first so the retry starts from the same state as the first attempt.
     await browser.execute(() => {
-      const back = document.querySelector<HTMLButtonElement>('button[aria-label="Back to results"]');
+      const back = document.querySelector<HTMLButtonElement>(
+        'button[aria-label="Back to results"]',
+      );
       back?.click();
     });
     const search = await $("#video-search");
     await search.waitForDisplayed();
     await browser.execute(() => {
       const field = document.querySelector<HTMLInputElement>("#video-search");
-      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      const setValue = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
       setValue?.call(field, "native blue");
       field?.dispatchEvent(new Event("input", { bubbles: true }));
       document.querySelector("form")?.requestSubmit();
@@ -45,32 +56,49 @@ describe("Toka native Linux playback", () => {
 
     expect(timeText).not.toMatch(/^0:00 \/ /);
     try {
-      // This reads a pixel from GTK's composed application window, after the
-      // GL video surface and the WebView have both painted. A framebuffer-only
-      // probe can be blue while an opaque WebView covers the actual player.
-      await browser.waitUntil(async () => ((await nativeState()).visibleBlueRenderCount ?? 0) > 0, {
-        timeout: 15_000,
-        timeoutMsg: "the composed application window never presented the blue video",
-      });
+      // Scan the X root window for blue pixels. A single center-pixel probe
+      // misses the video under Xvfb because GTK places the GL child window at
+      // an offset from what allocation() reports. The root window grid scan
+      // covers the entire screen and finds blue wherever it actually landed.
+      await browser.waitUntil(
+        async () => ((await nativeState()).composedProbe?.blueCount ?? 0) > 0,
+        {
+          timeout: 15_000,
+          timeoutMsg:
+            "the composed application window never presented the blue video",
+        },
+      );
       // `frameColor` is whatever the last render happened to hold, so sampling
       // it races the end of a four-second clip: the fixture really did present
       // blue, then finished, and the poll read the black frame that followed.
       // `blueRenderCount` records the same blue test at render time, so asking
       // it answers the actual question — did the framebuffer ever show blue?
-      await browser.waitUntil(async () => ((await nativeState()).blueRenderCount ?? 0) > 0, {
-        timeout: 15_000,
-        timeoutMsg: "the native OpenGL framebuffer did not present the blue video",
-      });
+      await browser.waitUntil(
+        async () => ((await nativeState()).blueRenderCount ?? 0) > 0,
+        {
+          timeout: 15_000,
+          timeoutMsg:
+            "the native OpenGL framebuffer did not present the blue video",
+        },
+      );
     } catch (error) {
-      throw new Error(`${String(error)}\n[DEBUG-native-e2e] ${JSON.stringify(await nativeState())}`);
+      throw new Error(
+        `${String(error)}\n[DEBUG-native-e2e] ${JSON.stringify(await nativeState())}`,
+      );
     }
     // Log the final state on success too, so passing and failing launches can
     // be compared (tracked in #57).
-    console.log(`[DEBUG-native-e2e-pass] ${JSON.stringify(await nativeState())}`);
+    console.log(
+      `[DEBUG-native-e2e-pass] ${JSON.stringify(await nativeState())}`,
+    );
 
     const layout = await browser.execute(() => {
-      const surface = document.querySelector<HTMLElement>(".native-video")?.getBoundingClientRect();
-      const controls = document.querySelector<HTMLElement>(".player-controls")?.getBoundingClientRect();
+      const surface = document
+        .querySelector<HTMLElement>(".native-video")
+        ?.getBoundingClientRect();
+      const controls = document
+        .querySelector<HTMLElement>(".player-controls")
+        ?.getBoundingClientRect();
       if (!surface || !controls) return undefined;
       return {
         surfaceHeight: surface.height,
@@ -78,9 +106,13 @@ describe("Toka native Linux playback", () => {
         devicePixelRatio: window.devicePixelRatio,
       };
     });
-    if (!layout) throw new Error("The native video surface or player controls are missing");
+    if (!layout)
+      throw new Error(
+        "The native video surface or player controls are missing",
+      );
     const renderSize = (await nativeState()).renderSize;
-    if (!renderSize) throw new Error("The native renderer did not report its size");
+    if (!renderSize)
+      throw new Error("The native renderer did not report its size");
     // GTK composites the GL area above the WebView, so the only way the
     // controls stay visible is for the surface to stop short of them.
     expect(renderSize[1]).toBeLessThanOrEqual(
