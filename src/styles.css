@@ -818,9 +818,18 @@ button:focus-visible {
 .player-controls button:disabled .key-hint {
   color: oklch(0.34 0.012 60);
 }
+/* The transport wraps, but the utilities are one item of it, and an item only
+   wraps at its own edges: below roughly a thousand pixels this cluster stayed a
+   single unbroken row, ran past the right of the bar, and the shell's
+   `overflow: hidden` cut off whatever hung over — subtitles, speed, volume,
+   rotate, loop, fullscreen and delete, in that order. It wraps on its own now,
+   and each of its lines stays against the right-hand edge where the cluster
+   sits when it does fit. */
 .player-utilities {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 12px;
   margin-left: auto;
 }

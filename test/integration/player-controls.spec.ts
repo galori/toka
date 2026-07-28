@@ -250,4 +250,75 @@ describe("Toka player controls", () => {
     });
     await expect($(".player-controls")).toBeDisplayed();
   });
+
+  // The overlay spans the shell, and the shell clips what overflows it, so a
+  // control pushed past the shell's edge is simply not on screen any more.
+  // Narrowing the shell rather than the window keeps this measurable without
+  // asking the driver to resize a native window mid-suite.
+  describe("in a narrow player", () => {
+    const narrowTo = (width: string) =>
+      browser.execute((value) => {
+        const shell = document.querySelector<HTMLElement>(".player-shell");
+        if (!shell) throw new Error("The player shell is missing");
+        shell.style.width = value;
+      }, width);
+
+    before(async () => {
+      await narrowTo("620px");
+      // One frame for the wrap to settle before anything is measured.
+      await browser.pause(100);
+    });
+
+    after(async () => {
+      await narrowTo("");
+    });
+
+    it("keeps every control inside the player", async () => {
+      const outside = await browser.execute(() => {
+        const shell = document.querySelector<HTMLElement>(".player-shell");
+        if (!shell) return ["The player shell is missing"];
+        const shellBox = shell.getBoundingClientRect();
+        return [
+          ...document.querySelectorAll<HTMLElement>(
+            ".player-controls button, .player-controls select, .player-controls input",
+          ),
+        ]
+          .filter((control) => {
+            const box = control.getBoundingClientRect();
+            return (
+              box.left < shellBox.left - 1 ||
+              box.right > shellBox.right + 1 ||
+              box.top < shellBox.top - 1 ||
+              box.bottom > shellBox.bottom + 1
+            );
+          })
+          .map(
+            (control) =>
+              control.getAttribute("aria-label") ??
+              control.textContent?.trim() ??
+              control.tagName,
+          );
+      });
+
+      expect(outside).toEqual([]);
+    });
+
+    // Fitting the row by shrinking its controls away is the other way to keep
+    // them all inside the player, and it is no more usable than losing them.
+    // The loop control is named after the mode it is in, which an earlier test
+    // here has already changed, so it is measured through its class instead.
+    for (const [name, selector] of [
+      ["subtitles", 'button[aria-label="Subtitles"]'],
+      ["rotate left", 'button[aria-label="Rotate left"]'],
+      ["rotate right", 'button[aria-label="Rotate right"]'],
+      ["loop", "button.loop-button"],
+      ["playlist", 'button[aria-label="Playlist"]'],
+      ["fullscreen", 'button[aria-label="Enter fullscreen"]'],
+      ["playback speed", 'select[aria-label="Playback speed"]'],
+    ]) {
+      it(`keeps the ${name} control pressable`, async () => {
+        await expectPressable(`.player-utilities ${selector}`);
+      });
+    }
+  });
 });
