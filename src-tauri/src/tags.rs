@@ -158,7 +158,9 @@ fn validate(tags: &[String], allow_empty: bool) -> Result<Tags, String> {
         tag.is_empty() || tag.contains(['[', ']']) || tag.chars().any(char::is_whitespace)
     });
     match invalid {
-        Some(tag) => Err(format!("Tags must be single words without brackets: {tag:?}")),
+        Some(tag) => Err(format!(
+            "Tags must be single words without brackets: {tag:?}"
+        )),
         None => Ok(Tags::new(tags)),
     }
 }
@@ -242,8 +244,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use tempfile::TempDir;
     use tempfile::tempdir;
+    use tempfile::TempDir;
 
     fn tags(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -284,7 +286,10 @@ mod tests {
 
     #[test]
     fn parses_a_tag_block_with_no_leading_space() {
-        assert_eq!(Tags::parse_file_name("clip[summer].mp4").values(), ["summer"]);
+        assert_eq!(
+            Tags::parse_file_name("clip[summer].mp4").values(),
+            ["summer"]
+        );
     }
 
     #[test]
@@ -294,7 +299,10 @@ mod tests {
 
     #[test]
     fn normalizes_case_whitespace_and_duplicates() {
-        assert_eq!(Tags::new(["Vacation", "home vacation", "HOME"]).values(), ["home", "vacation"]);
+        assert_eq!(
+            Tags::new(["Vacation", "home vacation", "HOME"]).values(),
+            ["home", "vacation"]
+        );
     }
 
     #[test]
@@ -311,23 +319,38 @@ mod tests {
 
     #[test]
     fn applies_tags_to_a_file_name() {
-        assert_eq!(Tags::new(["summer"]).apply_to_file("clip.mp4"), "clip [summer].mp4");
+        assert_eq!(
+            Tags::new(["summer"]).apply_to_file("clip.mp4"),
+            "clip [summer].mp4"
+        );
         assert_eq!(
             Tags::new(["summer", "vacation"]).apply_to_file("clip [summer].mp4"),
             "clip [summer vacation].mp4"
         );
-        assert_eq!(Tags::new(["summer"]).apply_to_file("clip[summer].mp4"), "clip [summer].mp4");
-        assert_eq!(Tags::default().apply_to_file("clip [summer].mp4"), "clip.mp4");
+        assert_eq!(
+            Tags::new(["summer"]).apply_to_file("clip[summer].mp4"),
+            "clip [summer].mp4"
+        );
+        assert_eq!(
+            Tags::default().apply_to_file("clip [summer].mp4"),
+            "clip.mp4"
+        );
     }
 
     #[test]
     fn applies_tags_to_a_directory_name() {
-        assert_eq!(Tags::new(["summer"]).apply_to_dir("Trips"), "Trips [summer]");
+        assert_eq!(
+            Tags::new(["summer"]).apply_to_dir("Trips"),
+            "Trips [summer]"
+        );
         assert_eq!(
             Tags::new(["europe", "summer"]).apply_to_dir("Trips [summer]"),
             "Trips [europe summer]"
         );
-        assert_eq!(Tags::new(["summer"]).apply_to_dir("Trips[summer]"), "Trips [summer]");
+        assert_eq!(
+            Tags::new(["summer"]).apply_to_dir("Trips[summer]"),
+            "Trips [summer]"
+        );
         assert_eq!(Tags::default().apply_to_dir("Trips [summer]"), "Trips");
     }
 
@@ -452,8 +475,12 @@ mod tests {
         let directory = tempdir().unwrap();
         let missing = directory.path().join("missing.mp4");
 
-        assert!(add(&missing, &tags(&["home"])).unwrap_err().contains("does not exist"));
-        assert!(set(&missing, &tags(&["home"])).unwrap_err().contains("does not exist"));
+        assert!(add(&missing, &tags(&["home"]))
+            .unwrap_err()
+            .contains("does not exist"));
+        assert!(set(&missing, &tags(&["home"]))
+            .unwrap_err()
+            .contains("does not exist"));
     }
 
     #[test]
