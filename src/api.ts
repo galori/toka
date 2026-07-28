@@ -83,6 +83,22 @@ export function undoDelete(): Promise<void> {
   return invoke("undo_delete");
 }
 
+// A video player installed on this computer that a search can be handed to.
+export type ExternalPlayer = { command: string; name: string };
+
+export function externalPlayers(): Promise<ExternalPlayer[]> {
+  return invoke("external_players");
+}
+
+// Writes the results to a playlist file, opens it in `player`, and answers with
+// how many videos it handed over.
+export function openInExternalPlayer(
+  player: string,
+  resultIds: string[],
+): Promise<number> {
+  return invoke("open_in_external_player", { player, resultIds });
+}
+
 // Replaces the whole tag set; an empty list clears every tag.
 export function setVideoTags(
   resultId: string,

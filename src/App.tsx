@@ -27,9 +27,12 @@ import {
   subtitleCues,
   deleteVideo,
   undoDelete,
+  externalPlayers,
+  openInExternalPlayer,
   addVideoTags,
   removeVideoTags,
   videoThumbnail,
+  type ExternalPlayer,
   type PreparedVideo,
   type SearchPage,
   type VideoResult,
@@ -1772,6 +1775,8 @@ export default function App() {
     videos: VideoResult[];
     startIndex: number;
   }>();
+  const [players, setPlayers] = useState<ExternalPlayer[]>([]);
+  const [chosenPlayer, setChosenPlayer] = useState<string>();
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -1835,6 +1840,46 @@ export default function App() {
     observer.observe(loadMoreMarker.current);
     return () => observer.disconnect();
   }, [page, loadingMore]);
+
+  // Asked once: which players are installed does not change while Toka runs,
+  // and a computer with none should never be offered the control at all.
+  useEffect(() => {
+    void externalPlayers()
+      .then(setPlayers)
+      .catch(() => setPlayers([]));
+  }, []);
+
+  // Whichever player is picked, or the first Toka found if the viewer has not
+  // picked one.
+  const activePlayer = chosenPlayer ?? players[0]?.command;
+
+  const openInPlayer = async () => {
+    if (!page || !activePlayer) return;
+    setError(undefined);
+    try {
+      await openInExternalPlayer(
+        activePlayer,
+        page.results.map((video) => video.id),
+      );
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+
+  // The search field holds the keyboard on this screen, so a bare letter would
+  // be typed into it rather than reaching the app; Ctrl is what gets a shortcut
+  // through, and Ctrl+O is where "open" lives everywhere else.
+  useEffect(() => {
+    if (playing || !activePlayer) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.key.toLowerCase() !== "o") return;
+      event.preventDefault();
+      void openInPlayer();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   const playSearchResults = async (position: number) => {
     if (!page) return;
@@ -1983,6 +2028,34 @@ export default function App() {
               >
                 <Label>Shuffle</Label>
               </ControlButton>
+            ) : null}
+            {/* Only offered where there is something to offer: a computer with
+                no other video player installed gets no control at all. */}
+            {players.length ? (
+              <span className="labelled-control">
+                <select
+                  aria-label="Video player"
+                  title="Video player"
+                  value={activePlayer}
+                  onChange={(event) =>
+                    setChosenPlayer(event.currentTarget.value)
+                  }
+                >
+                  {players.map((player) => (
+                    <option key={player.command} value={player.command}>
+                      {player.name}
+                    </option>
+                  ))}
+                </select>
+                <ControlButton
+                  shortcut="Ctrl+O"
+                  className="playlist-button"
+                  aria-label="Open in player"
+                  onClick={() => void openInPlayer()}
+                >
+                  <Label>Open in</Label>
+                </ControlButton>
+              </span>
             ) : null}
             <p>
               {page.results.length} of {page.totalResults} loaded

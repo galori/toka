@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { externalPlayers } from "./api";
 import App, { playbackSource, shuffleVideos } from "./App";
 
 const windowApiMock = vi.hoisted(() => ({
@@ -24,7 +25,18 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowApiMock,
 }));
 
+// Asked for once at startup, on a screen most of these tests never reach. Left
+// on the real `invoke` it would take the first queued response out of every
+// test's mock, so this one call is stubbed at the module seam instead;
+// `openInExternalPlayer` stays real, so what Toka sends the backend is still
+// asserted through `invoke`.
+vi.mock("./api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api")>()),
+  externalPlayers: vi.fn(() => Promise.resolve([])),
+}));
+
 const invokeMock = vi.mocked(invoke);
+const externalPlayersMock = vi.mocked(externalPlayers);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
 const randomMock = vi.spyOn(Math, "random");
 
@@ -59,6 +71,7 @@ test("shows build provenance on the initial home screen", () => {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  externalPlayersMock.mockReset().mockResolvedValue([]);
   convertFileSrcMock.mockClear();
   randomMock.mockReset().mockReturnValue(0.999999);
   windowApiMock.isFullscreen.mockReset();
@@ -3054,4 +3067,108 @@ test("runs the native scrubber to the end and honours loop off", async () => {
   // "Off" holds at the end of this video rather than starting the next one.
   expect(screen.getByLabelText("Playing native-1.mp4")).toBeVisible();
   expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
+});
+
+test("hands the search results to another player installed on this computer", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `clip-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results,
+      });
+    }
+    if (command === "open_in_external_player") return Promise.resolve(2);
+    return Promise.resolve();
+  });
+  externalPlayersMock.mockResolvedValue([
+    { command: "vlc", name: "VLC" },
+    { command: "mpv", name: "mpv" },
+  ]);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
+  const chooser = await screen.findByRole("combobox", { name: "Video player" });
+  expect(chooser).toHaveValue("vlc");
+  await user.selectOptions(chooser, "mpv");
+  await user.click(screen.getByRole("button", { name: "Open in player" }));
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_in_external_player", {
+      player: "mpv",
+      resultIds: ["video-1", "video-2"],
+    }),
+  );
+});
+
+test("opens the chosen player from its keyboard shortcut", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "open_in_external_player") return Promise.resolve(1);
+    return Promise.resolve();
+  });
+  externalPlayersMock.mockResolvedValue([{ command: "vlc", name: "VLC" }]);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  const open = await screen.findByRole("button", { name: "Open in player" });
+  expect(open).toHaveAttribute("aria-keyshortcuts", "Ctrl+O");
+
+  // The search field holds the keyboard on this screen, so a bare letter would
+  // be typed into it rather than reaching the app.
+  const field = screen.getByRole("searchbox");
+  fireEvent.keyDown(field, { key: "o", ctrlKey: true });
+  expect(field).toHaveValue("clip");
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_in_external_player", {
+      player: "vlc",
+      resultIds: ["video-1"],
+    }),
+  );
+});
+
+test("says nothing about other players when this computer has none", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  expect(await screen.findByText("1 video")).toBeVisible();
+
+  expect(
+    screen.queryByRole("button", { name: "Open in player" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("combobox", { name: "Video player" }),
+  ).not.toBeInTheDocument();
 });
