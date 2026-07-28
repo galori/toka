@@ -219,8 +219,8 @@ test("shows video tags and edits them with the tag helper", async () => {
       ],
     })
     .mockResolvedValueOnce({
-      fileName: "tagged [work] [review].mp4",
-      tags: ["work", "review"],
+      fileName: "tagged [review work].mp4",
+      tags: ["review", "work"],
     })
     .mockResolvedValueOnce({
       fileName: "tagged [review].mp4",
@@ -243,13 +243,13 @@ test("shows video tags and edits them with the tag helper", async () => {
     await screen.findByRole("button", { name: "Remove tag review" }),
   ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove tag work" }));
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
-    resultId: "video-1",
-    tags: ["work", "review"],
-  });
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
     resultId: "video-1",
     tags: ["review"],
+  });
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["work"],
   });
 });
 
@@ -363,8 +363,8 @@ test("edits the playing video's tags from the playback controls with T", async (
     })
     .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
     .mockResolvedValueOnce({
-      fileName: "tagged [work] [review].mp4",
-      tags: ["work", "review"],
+      fileName: "tagged [review work].mp4",
+      tags: ["review", "work"],
     })
     .mockResolvedValueOnce({
       fileName: "tagged [review].mp4",
@@ -393,13 +393,13 @@ test("edits the playing video's tags from the playback controls with T", async (
   ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove tag work" }));
 
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
-    resultId: "video-1",
-    tags: ["work", "review"],
-  });
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
     resultId: "video-1",
     tags: ["review"],
+  });
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["work"],
   });
 });
 

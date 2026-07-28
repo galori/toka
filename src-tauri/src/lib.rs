@@ -12,6 +12,7 @@ use providers::MdfindSearchProvider;
 use providers::{PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -208,16 +209,45 @@ fn set_video_tags(
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    let path = engine.video_path(&result_id).map_err(|error| TagsError {
+    update_video_tags(&result_id, &tags, &engine, tags::set)
+}
+
+#[tauri::command]
+fn add_video_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<VideoTagUpdate, TagsError> {
+    update_video_tags(&result_id, &tags, &engine, tags::add)
+}
+
+#[tauri::command]
+fn remove_video_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<VideoTagUpdate, TagsError> {
+    update_video_tags(&result_id, &tags, &engine, tags::remove)
+}
+
+/// Retags the video behind `result_id` and keeps the search engine pointing at
+/// the renamed file.
+fn update_video_tags(
+    result_id: &str,
+    tags: &[String],
+    engine: &SearchEngine,
+    operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
+) -> Result<VideoTagUpdate, TagsError> {
+    let path = engine.video_path(result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
         message: error.to_string(),
     })?;
-    let update = tags::set(&path, &tags).map_err(|message| TagsError {
+    let update = operation(&path, tags).map_err(|message| TagsError {
         kind: "Tags",
         message,
     })?;
     engine
-        .update_video_path(&result_id, update.path.clone())
+        .update_video_path(result_id, update.path.clone())
         .map_err(|error| TagsError {
             kind: "VideoUnavailable",
             message: error.to_string(),
@@ -482,6 +512,8 @@ pub fn run() {
             delete_video,
             undo_delete,
             set_video_tags,
+            add_video_tags,
+            remove_video_tags,
             prepare_video,
             subtitle_cues
         ])
@@ -497,6 +529,8 @@ pub fn run() {
                 delete_video,
                 undo_delete,
                 set_video_tags,
+                add_video_tags,
+                remove_video_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -520,6 +554,8 @@ pub fn run() {
         delete_video,
         undo_delete,
         set_video_tags,
+        add_video_tags,
+        remove_video_tags,
         prepare_video,
         subtitle_cues
     ]);

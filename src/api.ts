@@ -83,11 +83,26 @@ export function undoDelete(): Promise<void> {
   return invoke("undo_delete");
 }
 
+// Replaces the whole tag set; an empty list clears every tag.
 export function setVideoTags(
   resultId: string,
   tags: string[],
 ): Promise<VideoTagUpdate> {
   return invoke("set_video_tags", { resultId, tags });
+}
+
+export function addVideoTags(
+  resultId: string,
+  tags: string[],
+): Promise<VideoTagUpdate> {
+  return invoke("add_video_tags", { resultId, tags });
+}
+
+export function removeVideoTags(
+  resultId: string,
+  tags: string[],
+): Promise<VideoTagUpdate> {
+  return invoke("remove_video_tags", { resultId, tags });
 }
 
 export function loadNativeVideo(filePath: string): Promise<void> {
