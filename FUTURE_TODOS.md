@@ -1,8 +1,8 @@
-# TODO
+# Future TODOs
 
 Future work that is deliberately not tracked as a GitHub issue, because it is
-not wanted yet. Anything here is potential tech debt to revisit only if it
-starts to matter.
+not wanted yet. GitHub issues remain the source of truth for outstanding work;
+anything here is potential tech debt to revisit only if it starts to matter.
 
 ## Make a tagged file findable again after Toka restarts
 
