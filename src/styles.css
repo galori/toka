@@ -815,6 +815,11 @@ button:focus-visible {
 .player-controls .loop-button.on {
   color: oklch(0.68 0.19 38);
 }
+/* Same reasoning as the loop control: "auto" and a pinned shape are two states
+   of one button, and the accent is what separates them. */
+.player-controls .aspect-button.on {
+  color: oklch(0.68 0.19 38);
+}
 /* An icon faded by opacity reads as badly drawn rather than as unavailable,
    because the shape blurs into the picture behind it. Dimming the colour at
    full opacity keeps the edges crisp and puts real contrast between the two
