@@ -40,7 +40,10 @@ async function metricsFor(selector: string): Promise<Metrics | undefined> {
     if (!element || !shell || !overlay) return undefined;
     const box = element.getBoundingClientRect();
     const shellBox = shell.getBoundingClientRect();
-    const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+    const centre = document.elementFromPoint(
+      box.left + box.width / 2,
+      box.top + box.height / 2,
+    );
     return {
       width: box.width,
       height: box.height,
@@ -49,7 +52,9 @@ async function metricsFor(selector: string): Promise<Metrics | undefined> {
         box.bottom <= shellBox.bottom + 1 &&
         box.left >= shellBox.left - 1 &&
         box.right <= shellBox.right + 1,
-      clipsContent: element.scrollWidth > element.clientWidth + 1 || element.scrollHeight > element.clientHeight + 1,
+      clipsContent:
+        element.scrollWidth > element.clientWidth + 1 ||
+        element.scrollHeight > element.clientHeight + 1,
       onTop: element === centre || element.contains(centre),
       shareOfOverlayWidth: box.width / overlay.clientWidth,
     };
@@ -61,7 +66,8 @@ async function expectLaidOut(selector: string): Promise<Metrics> {
   await expect(control).toBeDisplayed();
 
   const metrics = await metricsFor(selector);
-  if (!metrics) throw new Error(`No player shell or control found for ${selector}`);
+  if (!metrics)
+    throw new Error(`No player shell or control found for ${selector}`);
   // Reported together so a failure names what went wrong about the layout.
   expect({
     laidOutInsideThePlayer: metrics.insideShell,
@@ -90,7 +96,10 @@ describe("Toka player controls", () => {
     await browser.execute(() => {
       const search = document.querySelector<HTMLInputElement>("#video-search");
       if (!search) throw new Error("The search field is missing");
-      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      const setValue = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
       setValue?.call(search, "sample");
       search.dispatchEvent(new Event("input", { bubbles: true }));
       document.querySelector("form")?.requestSubmit();
@@ -115,7 +124,9 @@ describe("Toka player controls", () => {
 
   for (const label of transportControls) {
     it(`shows the ${label.toLowerCase()} control`, async () => {
-      await expectPressable(`.player-transport > button[aria-label="${label}"]`);
+      await expectPressable(
+        `.player-transport > button[aria-label="${label}"]`,
+      );
     });
   }
 
@@ -124,9 +135,11 @@ describe("Toka player controls", () => {
     // One action, one button: the pair used to sit side by side, with whichever
     // one did not apply still taking up room and still clickable.
     const names = await browser.execute(() =>
-      [...document.querySelectorAll('.player-transport > button[aria-label="Play"], .player-transport > button[aria-label="Pause"]')].map(
-        (button) => button.getAttribute("aria-label"),
-      ),
+      [
+        ...document.querySelectorAll(
+          '.player-transport > button[aria-label="Play"], .player-transport > button[aria-label="Pause"]',
+        ),
+      ].map((button) => button.getAttribute("aria-label")),
     );
     expect(names).toHaveLength(1);
     expect(["Play", "Pause"]).toContain(names[0]);
@@ -139,7 +152,9 @@ describe("Toka player controls", () => {
   }
 
   it("shows the playback speed control", async () => {
-    await expectPressable('.player-utilities select[aria-label="Playback speed"]');
+    await expectPressable(
+      '.player-utilities select[aria-label="Playback speed"]',
+    );
   });
 
   it("shows the keyboard shortcut on the controls that have one", async () => {
@@ -147,24 +162,35 @@ describe("Toka player controls", () => {
       [...document.querySelectorAll(".player-controls [aria-keyshortcuts]")]
         .filter((control) => {
           const hint =
-            control.querySelector(".key-hint") ?? control.parentElement?.querySelector(".key-hint");
+            control.querySelector(".key-hint") ??
+            control.parentElement?.querySelector(".key-hint");
           if (!hint) return true;
           const box = hint.getBoundingClientRect();
-          return box.width === 0 || box.height === 0 || getComputedStyle(hint).visibility === "hidden";
+          return (
+            box.width === 0 ||
+            box.height === 0 ||
+            getComputedStyle(hint).visibility === "hidden"
+          );
         })
-        .map((control) => control.getAttribute("aria-label") ?? control.tagName),
+        .map(
+          (control) => control.getAttribute("aria-label") ?? control.tagName,
+        ),
     );
     expect(missing).toEqual([]);
   });
 
   it("shows the elapsed and total time", async () => {
-    await expect($(".player-transport .time-display")).toHaveText(/^\d+:\d\d \/ \d+:\d\d$/);
+    await expect($(".player-transport .time-display")).toHaveText(
+      /^\d+:\d\d \/ \d+:\d\d$/,
+    );
   });
 
   it("pauses and resumes from the one overlay button", async () => {
     const pill = () =>
       browser.execute(() => {
-        const button = document.querySelector<HTMLElement>(".player-transport button.play-button");
+        const button = document.querySelector<HTMLElement>(
+          ".player-transport button.play-button",
+        );
         const box = button?.getBoundingClientRect();
         return {
           label: button?.getAttribute("aria-label") ?? "",
@@ -178,24 +204,48 @@ describe("Toka player controls", () => {
         };
       });
 
+    // Every fixture runs for about two seconds, so a looping playlist keeps
+    // starting the next video underneath this test — and each start renames the
+    // button on its own. Looping the one video instead leaves playing and
+    // paused as the only two states, and the button as the only way between
+    // them, so a rename here can only be the click that caused it.
+    await $('.player-utilities button[aria-label="Loop: playlist"]').click();
+    await $(
+      '.player-utilities button[aria-label="Loop: this video"]',
+    ).waitForExist();
+
     const toggle = await $(".player-transport button.play-button");
+    // An advance that began before the mode changed can still start its video
+    // afterwards, so paused counts only once it has held for a moment.
+    await browser.waitUntil(
+      async () => {
+        if ((await pill()).label === "Pause") {
+          await toggle.click();
+          return false;
+        }
+        await browser.pause(500);
+        return (await pill()).label === "Play";
+      },
+      { timeoutMsg: "The player never came to rest on Play" },
+    );
+
     const before = await pill();
-    expect(before.glyph).toBe(before.label === "Pause" ? "pause" : "play");
+    expect(before.glyph).toBe("play");
 
     await toggle.click();
     // The same element swaps its name and its glyph rather than handing over to
     // a second button.
-    await browser.waitUntil(async () => (await pill()).label !== before.label, {
-      timeoutMsg: `The play/pause control stayed on "${before.label}" after being clicked`,
+    await browser.waitUntil(async () => (await pill()).label === "Pause", {
+      timeoutMsg: 'The play/pause control stayed on "Play" after being clicked',
     });
     const after = await pill();
-    expect(after.glyph).toBe(after.label === "Pause" ? "pause" : "play");
+    expect(after.glyph).toBe("pause");
     // Swapping the glyph must not resize the pill or shove the row sideways.
     expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(1);
     expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
 
     await toggle.click();
-    await browser.waitUntil(async () => (await pill()).label === before.label, {
+    await browser.waitUntil(async () => (await pill()).label === "Play", {
       timeoutMsg: "The play/pause control did not come back to its first state",
     });
     await expect($(".player-controls")).toBeDisplayed();
