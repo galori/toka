@@ -1,10 +1,20 @@
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { installAppImage } from "./install-linux.mjs";
+import { installAppImage, installBinary, releaseDir } from "./install-linux.mjs";
+
+describe("releaseDir", () => {
+  it("defaults to the crate's own target directory", () => {
+    expect(releaseDir({})).toBe(path.resolve("src-tauri/target/release"));
+  });
+
+  it("follows CARGO_TARGET_DIR, so a shared build cache still installs the right binary", () => {
+    expect(releaseDir({ CARGO_TARGET_DIR: "/shared/target" })).toBe("/shared/target/release");
+  });
+});
 
 describe("linux build script", () => {
-  it("uses the provenance-aware user-local AppImage install path by default", async () => {
+  it("skips AppImage bundling by default, because a local install needs no bundled libraries", async () => {
     const packageJson = JSON.parse(
       await readFile(path.resolve("package.json"), "utf8"),
     );
@@ -12,10 +22,17 @@ describe("linux build script", () => {
     const installScript = await readFile(path.resolve("scripts/install-linux.mjs"), "utf8");
 
     expect(packageJson.scripts["build:linux"]).toBe("node bin/build.mjs linux");
-    expect(buildScript).toContain('target === "linux" ? "appimage" : "app,dmg"');
+    expect(buildScript).toContain("--no-bundle");
     expect(buildScript).toContain('"scripts/install-linux.mjs"');
     expect(buildScript).not.toContain('"sudo"');
-    expect(installScript).toContain("await rename(temporaryAppImage, installedAppImage)");
+    expect(installScript).toContain("await rename(temporaryPath, installedPath)");
+  });
+
+  it("still packages an AppImage when one is asked for", async () => {
+    const buildScript = await readFile(path.resolve("bin/build.mjs"), "utf8");
+
+    expect(buildScript).toContain("--appimage");
+    expect(buildScript).toContain("appimage");
   });
 });
 
@@ -55,5 +72,44 @@ describe("installAppImage", () => {
     await expect(readFile(desktopEntry, "utf8")).resolves.toContain(
       `Exec=${installedAppImage} %U`,
     );
+  });
+});
+
+describe("installBinary", () => {
+  it("installs the unbundled executable and registers it for the current user", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-linux-binary-"));
+    const releaseDir = path.join(root, "release");
+    const homeDir = path.join(root, "home");
+    const binaryPath = path.join(releaseDir, "toka");
+
+    await mkdir(releaseDir, { recursive: true });
+    await writeFile(binaryPath, "test binary");
+    await chmod(binaryPath, 0o755);
+
+    await installBinary({ binaryPath, homeDir, iconPath: path.join(root, "128x128.png") });
+
+    const installedBinary = path.join(homeDir, ".local", "opt", "toka", "Toka");
+    const desktopEntry = path.join(homeDir, ".local", "share", "applications", "toka.desktop");
+
+    await expect(readFile(installedBinary, "utf8")).resolves.toBe("test binary");
+    expect((await stat(installedBinary)).mode & 0o111).toBeTruthy();
+    await expect(readFile(desktopEntry, "utf8")).resolves.toContain(`Exec=${installedBinary} %U`);
+  });
+
+  it("replaces a running install atomically rather than writing over a busy executable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-linux-binary-replace-"));
+    const releaseDir = path.join(root, "release");
+    const homeDir = path.join(root, "home");
+    const installDir = path.join(homeDir, ".local", "opt", "toka");
+    const binaryPath = path.join(releaseDir, "toka");
+
+    await mkdir(releaseDir, { recursive: true });
+    await mkdir(installDir, { recursive: true });
+    await writeFile(path.join(installDir, "Toka"), "previous binary");
+    await writeFile(binaryPath, "next binary");
+
+    await installBinary({ binaryPath, homeDir, iconPath: path.join(root, "128x128.png") });
+
+    await expect(readFile(path.join(installDir, "Toka"), "utf8")).resolves.toBe("next binary");
   });
 });

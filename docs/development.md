@@ -8,8 +8,14 @@ npm test                # React unit tests
 npm run test:integration # build, launch, and interact with the native app
 npm run build           # type-check and build only the web frontend
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run build:linux     # package, install, and record provenance without modifying tracked files
+npm run build:linux     # build, install, and record provenance without modifying tracked files
+npm run build:linux -- --appimage # the same, packaged as an AppImage
 ```
+
+`build:linux` installs the release executable straight into `~/.local/opt/toka`
+and skips AppImage bundling, which roughly halves the build. Use `--appimage`
+when you need to check the packaged artifact; CI builds the real bundles either
+way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.
 
