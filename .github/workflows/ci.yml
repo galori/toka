@@ -37,7 +37,12 @@ jobs:
       - name: Unit tests
         run: |
           npm test
-          cargo test --manifest-path src-tauri/Cargo.toml
+          if [ "$RUNNER_OS" = Linux ]; then
+            # The GTK widget tests need a display to open a window on.
+            xvfb-run --auto-servernum cargo test --manifest-path src-tauri/Cargo.toml
+          else
+            cargo test --manifest-path src-tauri/Cargo.toml
+          fi
       - name: Integration tests
         run: |
           if [ "$RUNNER_OS" = Linux ]; then

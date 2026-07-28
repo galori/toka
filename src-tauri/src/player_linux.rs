@@ -797,6 +797,20 @@ fn disconnect_incompatible_resize_handlers(webview: &gtk::Widget) {
     }
 }
 
+/// Moves the WebView out of the window's box and into an overlay it shares with
+/// the video area, so mpv can paint over it.
+fn mount_web_view_over_video(vbox: &gtk::Box, web_view: &gtk::Widget, overlay: &gtk::Overlay) {
+    vbox.remove(web_view);
+    overlay.add(web_view);
+    vbox.pack_start(overlay, true, true, 0);
+    // Unparenting the WebView takes the window's focus widget with it, and this
+    // is the one wry focused when the window opened. Nothing hands it back, so
+    // without this the window starts with its keyboard pointed at nothing: the
+    // search field can hold the document's focus and still never see a
+    // keystroke until a click returns the WebView to the keyboard.
+    web_view.grab_focus();
+}
+
 pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
         .get_webview_window("main")
@@ -808,7 +822,6 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
         .next()
         .ok_or("The web view was not created.")?;
     disconnect_incompatible_resize_handlers(&webview);
-    vbox.remove(&webview);
 
     let overlay = gtk::Overlay::new();
     let video_area = gtk::GLArea::new();
@@ -817,12 +830,11 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     video_area.set_halign(gtk::Align::Start);
     video_area.set_valign(gtk::Align::Start);
     video_area.set_size_request(1, 1);
+    mount_web_view_over_video(&vbox, &webview, &overlay);
     // WebKitGTK paints an opaque backing surface, including CSS-transparent
     // regions. Keep the GL area above it or a healthy mpv framebuffer is still
     // hidden behind the WebView's black player background.
-    overlay.add(&webview);
     overlay.add_overlay(&video_area);
-    vbox.pack_start(&overlay, true, true, 0);
 
     let realize_player = player.clone();
     video_area.connect_realize(move |area| {
@@ -1158,7 +1170,31 @@ fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_speed, rgb_from_rgba, subtitle_label};
+    use super::{checked_speed, mount_web_view_over_video, rgb_from_rgba, subtitle_label};
+    use gtk::prelude::*;
+
+    // A `GtkEntry` stands in for the WebView: the reparenting under test is
+    // plain GTK container work, and an entry takes the keyboard the same way
+    // without needing a web process or a GL context.
+    #[test]
+    fn keeps_the_keyboard_on_the_web_view_it_moves_into_the_overlay() {
+        gtk::init().expect("GTK needs a display to run this test.");
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let web_view = gtk::Entry::new();
+        vbox.pack_start(&web_view, true, true, 0);
+        window.add(&vbox);
+        window.show_all();
+        web_view.grab_focus();
+        assert!(web_view.is_focus(), "the web view starts with the keyboard");
+
+        mount_web_view_over_video(&vbox, web_view.upcast_ref(), &gtk::Overlay::new());
+
+        assert!(
+            web_view.is_focus(),
+            "the web view still holds the keyboard once it is inside the overlay"
+        );
+    }
 
     #[test]
     fn extracts_rgb_from_an_aligned_rgba_pixel() {
