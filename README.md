@@ -1,6 +1,6 @@
 # Toka
 
-Toka is a small, read-only desktop app for finding and playing videos on macOS and Linux. It searches the operating system's existing index—Spotlight on macOS or plocate on Linux—and never moves or modifies your files.
+Toka is a small desktop app for finding and playing videos on macOS and Linux. It searches the operating system's existing index—Spotlight on macOS or plocate on Linux. It never changes the contents of your files; the only thing it writes is a video's tags, which live in its filename.
 
 ## Quick start
 
@@ -17,6 +17,19 @@ npm run build:mac   # macOS: builds the .app and .dmg
 Build Linux bundles on Linux and macOS bundles on macOS. The Linux command installs
 the generated `.deb` so Toka appears in the Applications menu and can be launched
 from there. See the platform quick-start guide for details.
+
+## Tagging
+
+Tags are stored in the filename, inside square brackets before the extension:
+
+```
+my_home_video [cute home].mp4
+```
+
+Multiple tags are space-separated, lowercased, sorted alphabetically, and never
+duplicated. Press `T` on a video to add a tag, or click a tag to remove it —
+Toka renames the file to match, and refuses the change if that name is already
+taken.
 
 ## Notes
 

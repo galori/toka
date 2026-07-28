@@ -27,11 +27,13 @@ import {
   subtitleCues,
   deleteVideo,
   undoDelete,
-  setVideoTags,
+  addVideoTags,
+  removeVideoTags,
   videoThumbnail,
   type PreparedVideo,
   type SearchPage,
   type VideoResult,
+  type VideoTagUpdate,
 } from "./api";
 import { buildInfo } from "./buildInfo";
 
@@ -171,9 +173,9 @@ function VideoTags({
     onAddingChange?.(next);
   };
   const tags = video.tags ?? [];
-  const save = async (next: string[]) => {
+  const save = async (update: Promise<VideoTagUpdate>) => {
     try {
-      onChange(await setVideoTags(video.id, next));
+      onChange(await update);
       setError(undefined);
     } catch (reason) {
       setError(`Could not update tags: ${errorMessage(reason)}`);
@@ -182,7 +184,7 @@ function VideoTags({
   const add = () => {
     const tag = draft.trim();
     if (!tag || tags.includes(tag)) return;
-    void save([...tags, tag]);
+    void save(addVideoTags(video.id, [tag]));
     setDraft("");
     setAdding(false);
   };
@@ -194,7 +196,7 @@ function VideoTags({
           type="button"
           className="tag-pill"
           aria-label={`Remove tag ${tag}`}
-          onClick={() => void save(tags.filter((current) => current !== tag))}
+          onClick={() => void save(removeVideoTags(video.id, [tag]))}
         >
           {tag} <span aria-hidden="true">×</span>
         </button>
