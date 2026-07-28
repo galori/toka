@@ -1,3 +1,4 @@
+mod external_players;
 #[cfg(target_os = "linux")]
 mod player_linux;
 mod providers;
@@ -184,6 +185,61 @@ fn trash_outcome(
         });
     }
     Ok(name)
+}
+
+/// The players installed on this computer that Toka can hand a playlist to.
+#[tauri::command]
+fn external_players() -> Vec<external_players::ExternalPlayer> {
+    external_players::available(|command| {
+        external_players::on_path(command, std::env::var_os("PATH"))
+    })
+}
+
+/// Writes the search results to a playlist file and opens it in `player`.
+#[tauri::command]
+fn open_in_external_player(
+    player: String,
+    result_ids: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<usize, CommandError> {
+    // The frontend sends back a command it was given, and this is what keeps
+    // that from becoming a way to run anything at all.
+    if !external_players::is_known(&player) {
+        return Err(CommandError {
+            kind: "ExternalPlayer",
+            message: format!("{player} is not a video player Toka can open."),
+        });
+    }
+    let paths: Vec<std::path::PathBuf> = result_ids
+        .iter()
+        .take(external_players::MAX_ENTRIES)
+        .filter_map(|result_id| engine.video_path(result_id).ok())
+        .collect();
+    let body = external_players::playlist_body(&paths);
+    let entries = body.lines().count();
+    if entries == 0 {
+        return Err(CommandError {
+            kind: "ExternalPlayer",
+            message: "None of these videos are still available to open.".into(),
+        });
+    }
+    let playlist = external_players::write_playlist(
+        &std::env::temp_dir(),
+        &body,
+        &uuid::Uuid::new_v4().to_string(),
+    )
+    .map_err(|error| CommandError {
+        kind: "ExternalPlayer",
+        message: format!("The playlist could not be written: {error}"),
+    })?;
+    std::process::Command::new(&player)
+        .arg(&playlist)
+        .spawn()
+        .map_err(|error| CommandError {
+            kind: "ExternalPlayer",
+            message: format!("{player} could not be started: {error}"),
+        })?;
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -544,6 +600,8 @@ pub fn run() {
             video_thumbnail,
             delete_video,
             undo_delete,
+            external_players,
+            open_in_external_player,
             set_video_tags,
             add_video_tags,
             remove_video_tags,
@@ -561,6 +619,8 @@ pub fn run() {
                 video_thumbnail,
                 delete_video,
                 undo_delete,
+                external_players,
+                open_in_external_player,
                 set_video_tags,
                 add_video_tags,
                 remove_video_tags,
@@ -586,6 +646,8 @@ pub fn run() {
         video_thumbnail,
         delete_video,
         undo_delete,
+        external_players,
+        open_in_external_player,
         set_video_tags,
         add_video_tags,
         remove_video_tags,
