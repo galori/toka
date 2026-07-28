@@ -1992,14 +1992,29 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
 
   const volume = screen.getByRole("slider", { name: "Volume" });
   expect(volume).toHaveValue("100");
-  fireEvent.keyDown(window, { key: "9" });
+  fireEvent.keyDown(window, { key: "ArrowDown" });
   expect(volume).toHaveValue("95");
-  expect(
-    screen.getByRole("button", { name: "Decrease volume" }),
-  ).toHaveAttribute("aria-keyshortcuts", "9");
-  expect(
-    screen.getByRole("button", { name: "Increase volume" }),
-  ).toHaveAttribute("aria-keyshortcuts", "0");
+  fireEvent.keyDown(window, { key: "ArrowUp" });
+  expect(volume).toHaveValue("100");
+
+  const quieter = screen.getByRole("button", { name: "Decrease volume" });
+  const louder = screen.getByRole("button", { name: "Increase volume" });
+  expect(quieter).toHaveAttribute("aria-keyshortcuts", "ArrowDown");
+  expect(louder).toHaveAttribute("aria-keyshortcuts", "ArrowUp");
+  expect(quieter.querySelector(".key-hint")).toHaveTextContent("↓");
+  expect(louder.querySelector(".key-hint")).toHaveTextContent("↑");
+
+  // The digits were awkward to reach and are no longer volume's to take.
+  fireEvent.keyDown(window, { key: "9" });
+  fireEvent.keyDown(window, { key: "0" });
+  expect(volume).toHaveValue("100");
+
+  // "Vol −" and "Vol +" as words sat oddly among a row of icons; a speaker
+  // carrying more or fewer waves says the same thing at a glance.
+  expect(quieter).not.toHaveTextContent("Vol");
+  expect(louder).not.toHaveTextContent("Vol");
+  expect(quieter.querySelector(".control-icon")).toBeInTheDocument();
+  expect(louder.querySelector(".control-icon")).toBeInTheDocument();
 });
 
 test("sends the selected rotation to native playback", async () => {

@@ -298,6 +298,19 @@ function NextIcon() {
   );
 }
 
+// The pair reads as one scale rather than two unrelated pictures: the same
+// speaker throughout, carrying one wave for quieter and both for louder, so
+// which way each button goes is legible without reading a word.
+function SpeakerIcon({ waves }: { waves: 1 | 2 }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M3.5 9.5h3.6L11.5 5.6v12.8L7.1 14.5H3.5z" />
+      <path d="M15.4 10.1a4.2 4.2 0 0 1 0 3.8" />
+      {waves === 2 ? <path d="M18.4 7.4a8.6 8.6 0 0 1 0 9.2" /> : null}
+    </svg>
+  );
+}
+
 function RotateLeftIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
@@ -411,6 +424,8 @@ const KEY_GLYPHS: Record<string, string> = {
   Space: "Space",
   ArrowLeft: "←",
   ArrowRight: "→",
+  ArrowUp: "↑",
+  ArrowDown: "↓",
   PageUp: "PgUp",
   PageDown: "PgDn",
 };
@@ -1273,9 +1288,9 @@ function Player({
         run(() => stepSpeed(-1));
       } else if (event.key === "=" || event.key === "+") {
         run(() => stepSpeed(1));
-      } else if (event.key === "9") {
+      } else if (event.key === "ArrowDown") {
         run(() => applyVolume(volume - VOLUME_STEP));
-      } else if (event.key === "0") {
+      } else if (event.key === "ArrowUp") {
         run(() => applyVolume(volume + VOLUME_STEP));
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
@@ -1605,11 +1620,11 @@ function Player({
                 <KeyHint shortcut="- =" />
               </span>
               <ControlButton
-                shortcut="9"
+                shortcut="ArrowDown"
                 onClick={() => applyVolume(volume - VOLUME_STEP)}
                 aria-label="Decrease volume"
               >
-                <Label>Vol −</Label>
+                <SpeakerIcon waves={1} />
               </ControlButton>
               <input
                 className="volume-slider"
@@ -1624,11 +1639,11 @@ function Player({
                 }
               />
               <ControlButton
-                shortcut="0"
+                shortcut="ArrowUp"
                 onClick={() => applyVolume(volume + VOLUME_STEP)}
                 aria-label="Increase volume"
               >
-                <Label>Vol +</Label>
+                <SpeakerIcon waves={2} />
               </ControlButton>
               <ControlButton
                 shortcut="["
