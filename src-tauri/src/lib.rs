@@ -35,7 +35,7 @@ struct SubtitleTrack {
     web_playable: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct CommandError {
     kind: &'static str,
     message: String,
@@ -139,18 +139,51 @@ fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
         kind: "Delete",
         message: format!("The video could not be moved to the trash: {error}"),
     })?;
-    if output.status.success() {
-        Ok(path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned())
-    } else {
-        Err(CommandError {
+    trash_outcome(
+        path,
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stderr),
+        // Checked after the helper has run, and deliberately not through
+        // `exists`: a symlink that still dangles was not trashed either.
+        path.symlink_metadata().is_ok(),
+    )
+}
+
+/// What a trash helper's result means for the file it was handed. A helper that
+/// reports success and leaves the file where it was has deleted nothing, and
+/// saying otherwise is what let a video disappear from the playlist while it
+/// stayed on disk.
+fn trash_outcome(
+    path: &std::path::Path,
+    succeeded: bool,
+    stderr: &str,
+    still_on_disk: bool,
+) -> Result<String, CommandError> {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if !succeeded {
+        let detail = stderr.trim();
+        return Err(CommandError {
             kind: "Delete",
-            message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
+            message: if detail.is_empty() {
+                format!("{name} could not be moved to the trash.")
+            } else {
+                detail.to_owned()
+            },
+        });
     }
+    if still_on_disk {
+        return Err(CommandError {
+            kind: "Delete",
+            message: format!(
+                "{name} is still on disk: the trash helper reported success without moving it."
+            ),
+        });
+    }
+    Ok(name)
 }
 
 #[tauri::command]
@@ -563,4 +596,46 @@ pub fn run() {
     builder
         .run(tauri::generate_context!())
         .expect("error while running Toka");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn outcome(succeeded: bool, stderr: &str, still_on_disk: bool) -> Result<String, CommandError> {
+        trash_outcome(
+            Path::new("/Videos/clip.mp4"),
+            succeeded,
+            stderr,
+            still_on_disk,
+        )
+    }
+
+    #[test]
+    fn a_trashed_video_reports_the_name_it_went_to_the_trash_under() {
+        assert_eq!(outcome(true, "", false).unwrap(), "clip.mp4");
+    }
+
+    #[test]
+    fn a_helper_that_reported_success_without_moving_the_file_is_a_failure() {
+        let error = outcome(true, "", true).unwrap_err();
+
+        assert_eq!(error.kind, "Delete");
+        assert!(error.message.contains("still on disk"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_failed_helper_passes_on_what_it_said_went_wrong() {
+        let error = outcome(false, "  Trashing is not supported here\n", true).unwrap_err();
+
+        assert_eq!(error.message, "Trashing is not supported here");
+    }
+
+    #[test]
+    fn a_failed_helper_that_said_nothing_still_names_the_video() {
+        let error = outcome(false, "   ", true).unwrap_err();
+
+        assert!(error.message.contains("clip.mp4"), "{}", error.message);
+    }
 }
