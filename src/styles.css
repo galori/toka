@@ -140,6 +140,33 @@ input[type="search"]:focus {
   font-size: 0.78rem;
   cursor: pointer;
 }
+/* The cross is centred against the name's cap band rather than sharing its
+   baseline, and the gap keeps the two from reading as one word. Slightly less
+   padding on the trailing edge balances the pill, because the drawn glyph
+   carries none of its own. */
+.tag-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 6px;
+}
+.tag-name {
+  text-box: trim-both cap alphabetic;
+}
+.tag-remove-glyph {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  opacity: 0.72;
+}
+.tag-pill:hover .tag-remove-glyph,
+.tag-pill:focus-visible .tag-remove-glyph {
+  opacity: 1;
+}
 .tag-pill:hover,
 .tag-pill:focus-visible,
 .tag-add:hover,
@@ -810,6 +837,13 @@ button:focus-visible {
   background: #172235;
   color: #dbe7f7;
   font-size: 0.78rem;
+}
+/* `.player-controls .tag-pill` above restates the pill's padding at a weight
+   the results-list rule cannot reach, so the trailing edge has to be trimmed
+   for the drawn cross here too. */
+.player-controls .tag-pill {
+  gap: 6px;
+  padding-right: 6px;
 }
 .player-controls .video-tags input {
   min-width: 80px;

@@ -153,6 +153,18 @@ function VideoThumbnail({ video }: { video: VideoResult }) {
   );
 }
 
+// A drawn cross rather than a "×" character: the glyph sits on the text
+// baseline, which left it riding above the middle of the tag beside it, and its
+// side bearings are too small to separate it from the name on their own.
+function TagRemoveIcon() {
+  return (
+    <svg viewBox="0 0 12 12" aria-hidden="true" className="tag-remove-glyph">
+      <path d="M3 3 9 9" />
+      <path d="M9 3 3 9" />
+    </svg>
+  );
+}
+
 function VideoTags({
   video,
   onChange,
@@ -206,7 +218,8 @@ function VideoTags({
           aria-label={`Remove tag ${tag}`}
           onClick={() => void save(removeVideoTags(video.id, [tag]))}
         >
-          {tag} <span aria-hidden="true">×</span>
+          <span className="tag-name">{tag}</span>
+          <TagRemoveIcon />
         </button>
       ))}
       {adding ? (

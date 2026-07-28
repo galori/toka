@@ -254,6 +254,35 @@ test("shows video tags and edits them with the tag helper", async () => {
   });
 });
 
+test("draws the tag's remove control as its own icon beside the name", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "tagged",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [
+      {
+        id: "video-1",
+        fileName: "tagged.mp4",
+        extension: "mp4",
+        tags: ["work"],
+      },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+
+  const pill = await screen.findByRole("button", { name: "Remove tag work" });
+
+  // A text "×" sat on the name's baseline rather than its centre, and the two
+  // ran together. The name is the pill's only text now; the cross is a drawn
+  // glyph the stylesheet can centre and space on its own.
+  expect(pill).toHaveTextContent(/^work$/);
+  expect(pill.querySelector(".tag-remove-glyph")).toBeInTheDocument();
+});
+
 test("gives the open tag field the keyboard and pauses for it", async () => {
   invokeMock
     .mockResolvedValueOnce({
@@ -2483,7 +2512,11 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
     // surface stops short of them.
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 560, height: 320, visible: true,
+        x: 0,
+        y: 0,
+        width: 560,
+        height: 320,
+        visible: true,
       }),
     );
 
@@ -2493,7 +2526,11 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
     await user.click(screen.getByRole("button", { name: "Playlist 2" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 800, height: 320, visible: true,
+        x: 0,
+        y: 0,
+        width: 800,
+        height: 320,
+        visible: true,
       }),
     );
   } finally {
@@ -2587,7 +2624,11 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     // are not, so the picture starts below one and stops above the other.
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 30, width: 1200, height: 730, visible: true,
+        x: 0,
+        y: 30,
+        width: 1200,
+        height: 730,
+        visible: true,
       }),
     );
 
@@ -2597,7 +2638,11 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 0, width: 1200, height: 704, visible: true,
+        x: 0,
+        y: 0,
+        width: 1200,
+        height: 704,
+        visible: true,
       }),
     );
 
@@ -2605,7 +2650,11 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 30, width: 1200, height: 674, visible: true,
+        x: 0,
+        y: 30,
+        width: 1200,
+        height: 674,
+        visible: true,
       }),
     );
 
@@ -2613,10 +2662,16 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
     movePointer(window.innerWidth - 1);
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
-        x: 0, y: 30, width: 920, height: 674, visible: true,
+        x: 0,
+        y: 30,
+        width: 920,
+        height: 674,
+        visible: true,
       }),
     );
-    expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Exit fullscreen" }),
+    ).toBeVisible();
   } finally {
     reportFullscreen(false);
     boxes.mockRestore();
