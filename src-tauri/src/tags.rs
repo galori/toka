@@ -144,21 +144,19 @@ fn parse(path: &Path) -> Tags {
     }
 }
 
-/// Tags must be non-empty single words without brackets, so that they survive a
-/// round trip through a name's tag block.
+/// Brackets are the one thing a tag cannot carry, because they delimit the tag
+/// block it has to round trip through. Whitespace separates tags rather than
+/// spoiling them, so a single entry of several words asks for several tags — and
+/// an entry of nothing but whitespace asks for none at all.
 fn validate(tags: &[String], allow_empty: bool) -> Result<Tags, String> {
-    if tags.is_empty() && !allow_empty {
+    if let Some(tag) = tags.iter().find(|tag| tag.contains(['[', ']'])) {
+        return Err(format!("Tags must not contain brackets: {tag:?}"));
+    }
+    let tags = Tags::new(tags);
+    if tags.values().is_empty() && !allow_empty {
         return Err("At least one tag is required.".to_owned());
     }
-    let invalid = tags.iter().find(|tag| {
-        tag.is_empty() || tag.contains(['[', ']']) || tag.chars().any(char::is_whitespace)
-    });
-    match invalid {
-        Some(tag) => Err(format!(
-            "Tags must be single words without brackets: {tag:?}"
-        )),
-        None => Ok(Tags::new(tags)),
-    }
+    Ok(tags)
 }
 
 fn resolve(path: &Path, untagged: bool) -> Result<PathBuf, String> {
@@ -373,6 +371,40 @@ mod tests {
     }
 
     #[test]
+    fn add_reads_a_multi_word_entry_as_several_tags() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "sample1 [old].mp4");
+
+        let update = add(&video, &tags(&["vacation house"])).unwrap();
+
+        assert_eq!(name_of(&update.path), "sample1 [house old vacation].mp4");
+        assert_eq!(update.tags, ["house", "old", "vacation"]);
+    }
+
+    #[test]
+    fn add_ignores_padding_and_words_a_name_already_carries() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "Clip [old].mp4");
+
+        let update = add(&video, &tags(&["  vacation   OLD  "])).unwrap();
+
+        assert_eq!(name_of(&update.path), "Clip [old vacation].mp4");
+        assert_eq!(update.tags, ["old", "vacation"]);
+    }
+
+    #[test]
+    fn add_rejects_an_entry_that_is_nothing_but_whitespace() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "Clip.mp4");
+
+        for blank in ["", "   "] {
+            let error = add(&video, &tags(&[blank])).unwrap_err();
+            assert!(error.contains("At least one tag"), "{blank:?}: {error}");
+        }
+        assert_eq!(name_of(&video), "Clip.mp4");
+    }
+
+    #[test]
     fn add_is_a_no_op_when_the_tag_is_already_present() {
         let directory = tempdir().unwrap();
         let video = file(&directory, "Clip [home].mp4");
@@ -485,9 +517,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let video = file(&directory, "Clip.mp4");
 
-        for invalid in [" ", "", "home vacation", "ho[me]"] {
+        for invalid in ["ho[me]", "home vacation]"] {
             let error = add(&video, &tags(&[invalid])).unwrap_err();
-            assert!(error.contains("single words"), "{invalid:?}: {error}");
+            assert!(error.contains("brackets"), "{invalid:?}: {error}");
         }
         assert!(add(&video, &[]).unwrap_err().contains("At least one tag"));
         assert_eq!(name_of(&video), "Clip.mp4");
