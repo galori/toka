@@ -2256,6 +2256,110 @@ test("loads more results as the infinite list reaches its end and reports provid
   );
 });
 
+test("keeps loading more results after coming back from a video", async () => {
+  const pageOf = (start: number) =>
+    [start, start + 1, start + 2].map((number) => ({
+      id: `video-${number}`,
+      fileName: `clip-${number}.mp4`,
+      extension: "mp4",
+    }));
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      const requested = (args as { request: { page: number } }).request.page;
+      return Promise.resolve({
+        query: "clip",
+        page: requested,
+        pageSize: 24,
+        totalResults: 6,
+        totalPages: 2,
+        results: pageOf(requested === 1 ? 1 : 4),
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({ filePath: "/Videos/clip-1.mp4" });
+    }
+    return Promise.resolve();
+  });
+  // Faithful enough to catch the bug this covers: an observer only reports a
+  // target that is still in the document, and reports nothing once it has been
+  // disconnected. An observer left watching the marker from a previous mount
+  // therefore never fires, exactly as in a browser.
+  const observers: {
+    disconnected: boolean;
+    targets: Set<Element>;
+    report: () => void;
+  }[] = [];
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      readonly targets = new Set<Element>();
+      disconnected = false;
+      constructor(private readonly callback: IntersectionObserverCallback) {
+        observers.push(this);
+      }
+      report() {
+        if (this.disconnected) return;
+        const visible = [...this.targets].filter(
+          (target) => target.isConnected,
+        );
+        if (!visible.length) return;
+        this.callback(
+          visible.map(
+            (target) =>
+              ({
+                target,
+                isIntersecting: true,
+              }) as unknown as IntersectionObserverEntry,
+          ),
+          this as unknown as IntersectionObserver,
+        );
+      }
+      observe(target: Element) {
+        if (target.classList.contains("load-more-marker"))
+          this.targets.add(target);
+      }
+      disconnect() {
+        this.disconnected = true;
+        this.targets.clear();
+      }
+      unobserve(target: Element) {
+        this.targets.delete(target);
+      }
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = "0px";
+      thresholds = [];
+    },
+  );
+  const scrollToTheEnd = async () => {
+    await act(async () => {
+      for (const observer of observers) observer.report();
+    });
+  };
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  expect(await screen.findByText("3 of 6 loaded")).toBeVisible();
+
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-1.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Back to results" }),
+  );
+  expect(await screen.findByText("3 of 6 loaded")).toBeVisible();
+
+  await scrollToTheEnd();
+
+  expect(await screen.findByText("6 of 6 loaded")).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play clip-6.mp4" }),
+  ).toBeVisible();
+});
+
 test("loads every search page into the playlist before playing all", async () => {
   const firstPage = Array.from({ length: 24 }, (_, index) => ({
     id: `video-${index + 1}`,
