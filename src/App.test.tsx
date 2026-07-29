@@ -359,6 +359,55 @@ test("shows video tags and edits them with the tag helper", async () => {
   });
 });
 
+test("hands a multi-word tag entry over as the several tags it is", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "sample1",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "sample1 [old].mp4",
+          extension: "mp4",
+          tags: ["old"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({
+      fileName: "sample1 [house old vacation].mp4",
+      tags: ["house", "old", "vacation"],
+    });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "sample1{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Remove tag old" }),
+  ).toBeVisible();
+  await user.click(
+    screen.getByRole("button", { name: "Add tag to sample1 [old].mp4" }),
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "Add tag to sample1 [old].mp4" }),
+    "  vacation house  {Enter}",
+  );
+
+  // The entry travels whole. Splitting it on whitespace, lowercasing, sorting
+  // and dropping the words the name already carries is the tag layer's job, so
+  // every caller of the tag commands reads an entry the same way.
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["vacation house"],
+  });
+  for (const tag of ["house", "old", "vacation"]) {
+    expect(
+      await screen.findByRole("button", { name: `Remove tag ${tag}` }),
+    ).toBeVisible();
+  }
+});
+
 test("draws the tag's remove control as its own icon beside the name", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "tagged",
