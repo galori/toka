@@ -444,6 +444,32 @@ const VOLUME_PRESETS: {
   { key: "1", volume: 100, name: "Full volume", label: "100%" },
 ];
 
+// How far each skip moves. Ten seconds suits scrubbing past an ad break and
+// nothing else: finding the frame someone walks into shot wants a frame, and
+// walking through an hour of footage wants minutes. So the step is a choice,
+// and both skips take whichever one is chosen.
+// A step without `seconds` is one frame, which is only known in seconds once
+// the backend says how fast the frames run.
+const SKIP_STEPS: { label: string; name: string; seconds?: number }[] = [
+  { label: "1f", name: "1 frame" },
+  { label: "1s", name: "1 second", seconds: 1 },
+  { label: "5s", name: "5 seconds", seconds: 5 },
+  { label: "10s", name: "10 seconds", seconds: 10 },
+  { label: "30s", name: "30 seconds", seconds: 30 },
+  { label: "1m", name: "1 minute", seconds: 60 },
+  { label: "5m", name: "5 minutes", seconds: 300 },
+  { label: "10m", name: "10 minutes", seconds: 600 },
+];
+
+// Where the cycle starts: what both skips did before they could be changed.
+const DEFAULT_SKIP_STEP = SKIP_STEPS.findIndex((step) => step.seconds === 10);
+
+// mpv reads a real frame rate out of the file, but a `<video>` element exposes
+// none at all, and neither knows one before the file is open. So a frame is a
+// thirtieth of a second until a backend says otherwise — an assumption the
+// control names, so a guess is never presented as a measurement.
+const ASSUMED_FRAME_RATE = 30;
+
 // The shapes worth cycling between, starting from the one the file itself
 // declares. Each is written the way it is spoken and both the number mpv wants
 // and the value CSS wants are derived from that, so the two engines cannot be
@@ -634,6 +660,10 @@ function Player({
   const [playingBack, setPlayingBack] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [aspectStep, setAspectStep] = useState(0);
+  const [skipStepIndex, setSkipStepIndex] = useState(DEFAULT_SKIP_STEP);
+  // Whatever the backend has been able to say about the open file, so an
+  // undefined rate means "nobody knows yet" rather than "no frames".
+  const [frameRate, setFrameRate] = useState<number>();
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(true);
   const [fullscreenPlaylist, setFullscreenPlaylist] =
@@ -693,6 +723,9 @@ function Player({
     setPlayingBack(false);
     setRotation(0);
     setAspectStep(0);
+    // The step itself outlives the file, the way the speed and the volume do;
+    // the rate it is measured against belongs to this file alone.
+    setFrameRate(undefined);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
     setEmbeddedSubtitles([]);
@@ -823,6 +856,9 @@ function Player({
         .then((state) => {
           setDuration(state.duration);
           setCurrentTime(state.currentTime);
+          // mpv only knows the rate once it has read the file, so this arrives
+          // with the polling rather than with the load.
+          if (state.frameRate) setFrameRate(state.frameRate);
           if (!state.ended) advancing = false;
           if (state.ended && !advancing) {
             advancing = true;
@@ -966,6 +1002,20 @@ function Player({
       return next;
     });
   };
+
+  const skipStep = SKIP_STEPS[skipStepIndex];
+  // A frame is only as exact as the rate behind it, so the control says which
+  // rate that is and whether anybody measured it.
+  const skipSeconds = skipStep.seconds ?? 1 / (frameRate ?? ASSUMED_FRAME_RATE);
+  const measuredRate = frameRate
+    ? `${Number(frameRate.toFixed(3))} fps`
+    : `assumed ${ASSUMED_FRAME_RATE} fps`;
+  const skipStepName = skipStep.seconds
+    ? skipStep.name
+    : `${skipStep.name} (${measuredRate})`;
+
+  const cycleSkipStep = () =>
+    setSkipStepIndex((current) => (current + 1) % SKIP_STEPS.length);
 
   const skip = (amount: number) => {
     const next = Math.max(
@@ -1353,9 +1403,11 @@ function Player({
       } else if (event.key === "]") {
         run(() => rotate(90));
       } else if (event.key === "ArrowLeft") {
-        run(() => skip(-10));
+        run(() => skip(-skipSeconds));
       } else if (event.key === "ArrowRight") {
-        run(() => skip(10));
+        run(() => skip(skipSeconds));
+      } else if (event.key.toLowerCase() === "j") {
+        run(cycleSkipStep);
       } else if (event.key === "PageUp") {
         run(() => moveVideo(-1));
       } else if (event.key === "PageDown") {
@@ -1407,6 +1459,7 @@ function Player({
     addingTag,
     playingBack,
     playlist.length,
+    skipSeconds,
     speed,
     subtitleIndex,
     subtitles,
@@ -1624,10 +1677,10 @@ function Player({
             </ControlButton>
             <ControlButton
               shortcut="ArrowLeft"
-              onClick={() => skip(-10)}
-              aria-label="Skip back 10 seconds"
+              onClick={() => skip(-skipSeconds)}
+              aria-label={`Skip back ${skipStep.name}`}
             >
-              <Label>−10</Label>
+              <Label>{`−${skipStep.label}`}</Label>
             </ControlButton>
             {/* Playing and pausing are one action whose meaning follows the
                 state, so they are one control rather than two, the way every
@@ -1645,10 +1698,10 @@ function Player({
             </ControlButton>
             <ControlButton
               shortcut="ArrowRight"
-              onClick={() => skip(10)}
-              aria-label="Skip forward 10 seconds"
+              onClick={() => skip(skipSeconds)}
+              aria-label={`Skip forward ${skipStep.name}`}
             >
-              <Label>+10</Label>
+              <Label>{`+${skipStep.label}`}</Label>
             </ControlButton>
             <ControlButton
               shortcut="PageDown"
@@ -1697,6 +1750,16 @@ function Player({
                   ))}
                 </select>
               ) : null}
+              {/* Named after the step it is on rather than the one it moves
+                  to, like the aspect and loop controls, so the button reads as
+                  the setting it is. */}
+              <ControlButton
+                shortcut="J"
+                onClick={cycleSkipStep}
+                aria-label={`Skip step: ${skipStepName}`}
+              >
+                <Label>{skipStep.label}</Label>
+              </ControlButton>
               <span className="labelled-control">
                 <select
                   aria-label="Playback speed"

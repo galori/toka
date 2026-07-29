@@ -70,6 +70,9 @@ export type PlaybackState = {
   currentTime: number;
   paused: boolean;
   ended: boolean;
+  // How fast the open file's frames run, so a one-frame skip can be a frame
+  // rather than a guess. Zero until mpv has read a rate out of the file.
+  frameRate?: number;
 };
 
 export function prepareVideo(resultId: string): Promise<PreparedVideo> {

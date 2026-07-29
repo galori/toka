@@ -3551,3 +3551,206 @@ test("sends the chosen aspect ratio to native playback", async () => {
     expect(ratios.at(-1)).toBe(-1);
   });
 });
+
+// Ten seconds is a compromise: too far for finding the frame a face appears
+// on, too short for walking through an hour of footage. The step is therefore
+// a choice of its own, and whatever is chosen has to move both skips.
+test("cycles the skip step and applies it to both directions", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 3600 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 1000,
+  });
+  fireEvent.timeUpdate(video);
+
+  const control = screen.getByRole("button", { name: "Skip step: 10 seconds" });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "J");
+  expect(control.querySelector(".key-hint")).toHaveTextContent("J");
+
+  // The step it starts on is the one both skips used before they could be
+  // changed.
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 1010);
+
+  await user.click(control);
+  expect(
+    screen.getByRole("button", { name: "Skip step: 30 seconds" }),
+  ).toBeVisible();
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 1040);
+  // Backwards moves by exactly what forwards did.
+  await user.click(
+    screen.getByRole("button", { name: "Skip back 30 seconds" }),
+  );
+  expect(video).toHaveProperty("currentTime", 1010);
+
+  fireEvent.keyDown(window, { key: "j" });
+  await user.click(
+    screen.getByRole("button", { name: "Skip forward 1 minute" }),
+  );
+  expect(video).toHaveProperty("currentTime", 1070);
+
+  for (const name of ["5 minutes", "10 minutes"]) {
+    fireEvent.keyDown(window, { key: "j" });
+    expect(
+      screen.getByRole("button", { name: `Skip step: ${name}` }),
+    ).toBeVisible();
+  }
+
+  // Round the cycle: the frame and the short steps come next, and it wraps
+  // back to where it started rather than sticking at the far end.
+  for (const name of [
+    "1 frame (assumed 30 fps)",
+    "1 second",
+    "5 seconds",
+    "10 seconds",
+  ]) {
+    fireEvent.keyDown(window, { key: "j" });
+    expect(
+      screen.getByRole("button", { name: `Skip step: ${name}` }),
+    ).toBeVisible();
+  }
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(video).toHaveProperty("currentTime", 1060);
+});
+
+// A `<video>` element never says how fast its frames run, so the web path can
+// only assume — and the control says so rather than presenting a guess as a
+// measurement.
+test("steps an assumed frame on the web backend and names the assumption", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.timeUpdate(video);
+
+  await user.click(
+    screen.getByRole("button", { name: "Skip step: 10 seconds" }),
+  );
+  for (let press = 0; press < 4; press += 1)
+    fireEvent.keyDown(window, { key: "j" });
+  expect(
+    screen.getByRole("button", { name: "Skip step: 1 frame (assumed 30 fps)" }),
+  ).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect((video as HTMLVideoElement).currentTime).toBeCloseTo(20 + 1 / 30, 5);
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect((video as HTMLVideoElement).currentTime).toBeCloseTo(20, 5);
+});
+
+// mpv knows the real rate once the file is open, so on that backend a frame is
+// a frame rather than a thirtieth of a second.
+test("steps a real frame using the rate native playback reports", async () => {
+  // mpv answers with wherever the last seek left the file, so the polling that
+  // follows a skip reports the position that skip asked for.
+  let nativeTime = 10;
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "seek_native_video") {
+      nativeTime = (args as { seconds: number }).seconds;
+      return Promise.resolve();
+    }
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "native.mkv", extension: "mkv" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 120,
+        currentTime: nativeTime,
+        paused: false,
+        ended: false,
+        frameRate: 25,
+      });
+    }
+    return Promise.resolve();
+  });
+  const seeks = () =>
+    invokeMock.mock.calls
+      .filter(([command]) => command === "seek_native_video")
+      .map(([, args]) => (args as { seconds: number }).seconds);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mkv" }),
+  );
+  await screen.findByLabelText("Playing native.mkv");
+
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Skip step: 10 seconds" }),
+    ).toBeVisible(),
+  );
+  for (let press = 0; press < 5; press += 1)
+    fireEvent.keyDown(window, { key: "j" });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Skip step: 1 frame (25 fps)" }),
+    ).toBeVisible(),
+  );
+
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  await waitFor(() => expect(seeks().at(-1)).toBeCloseTo(10 + 1 / 25, 5));
+
+  // Backwards takes whichever step is chosen, from where the last one landed.
+  fireEvent.keyDown(window, { key: "j" });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("button", { name: "Skip step: 1 second" }),
+    ).toBeVisible(),
+  );
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  await waitFor(() => expect(seeks().at(-1)).toBeCloseTo(10 + 1 / 25 - 1, 5));
+});
