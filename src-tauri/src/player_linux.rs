@@ -595,9 +595,19 @@ pub struct ComposedProbe {
     blue_count: u32,
 }
 
+/// Why the video surface is showing nothing, and whether anything can still
+/// recover from it. A failure that belongs to one file has to go when the next
+/// file is loaded, or a single unplayable video leaves every later one looking
+/// broken too; a renderer that never started is fatal and stays.
+#[derive(Default)]
+struct RenderError {
+    message: Option<String>,
+    fatal: bool,
+}
+
 pub struct NativePlayer {
     mpv: Mutex<Result<Mpv, String>>,
-    render_error: Mutex<Option<String>>,
+    render_error: Mutex<RenderError>,
     // Unlike the GL framebuffer probes, this is sampled from the GTK window
     // after GTK has composited the GL area and WebView together.
     #[cfg(feature = "native-e2e")]
@@ -610,9 +620,13 @@ pub struct NativePlayer {
 
 impl NativePlayer {
     pub fn new() -> Arc<Self> {
+        Self::from_mpv(Mpv::new())
+    }
+
+    fn from_mpv(mpv: Result<Mpv, String>) -> Arc<Self> {
         Arc::new(Self {
-            mpv: Mutex::new(Mpv::new()),
-            render_error: Mutex::new(None),
+            mpv: Mutex::new(mpv),
+            render_error: Mutex::new(RenderError::default()),
             #[cfg(feature = "native-e2e")]
             composed_frame_color: Mutex::new(None),
             #[cfg(feature = "native-e2e")]
@@ -639,20 +653,41 @@ impl NativePlayer {
     fn render(&self, width: c_int, height: c_int) -> Result<(), String> {
         let result = self.with_mpv(|mpv| mpv.render(width, height));
         if let Err(error) = &result {
-            if let Ok(mut render_error) = self.render_error.lock() {
-                *render_error = Some(error.clone());
-            }
+            self.record_render_failure(error.clone());
         }
         result
     }
 
     fn render_error(&self) -> Option<String> {
-        self.render_error.lock().ok()?.clone()
+        self.render_error.lock().ok()?.message.clone()
     }
 
-    fn set_render_error(&self, error: String) {
+    /// A file that failed to draw. Reported until another file is loaded, but
+    /// never in place of the setup failure that would have caused it.
+    fn record_render_failure(&self, error: String) {
         if let Ok(mut render_error) = self.render_error.lock() {
-            *render_error = Some(error);
+            if !render_error.fatal {
+                render_error.message = Some(error);
+            }
+        }
+    }
+
+    /// A renderer that never came up. Nothing the viewer does afterwards will
+    /// produce a frame, so this is reported for the rest of the session.
+    fn set_fatal_render_error(&self, error: String) {
+        if let Ok(mut render_error) = self.render_error.lock() {
+            render_error.message = Some(error);
+            render_error.fatal = true;
+        }
+    }
+
+    /// Drops a failure that belonged to the file being replaced, keeping one
+    /// the renderer itself will never get past.
+    fn clear_recoverable_render_error(&self) {
+        if let Ok(mut render_error) = self.render_error.lock() {
+            if !render_error.fatal {
+                render_error.message = None;
+            }
         }
     }
 
@@ -840,9 +875,10 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     video_area.connect_realize(move |area| {
         area.make_current();
         if let Some(error) = area.error() {
-            realize_player.set_render_error(format!("OpenGL context creation failed: {error}"));
+            let error = format!("OpenGL context creation failed: {error}");
+            realize_player.set_fatal_render_error(error);
         } else if let Err(error) = realize_player.with_mpv(Mpv::initialize_renderer) {
-            realize_player.set_render_error(error);
+            realize_player.set_fatal_render_error(error);
         }
         area.hide();
     });
@@ -983,6 +1019,10 @@ pub struct PlaybackState {
 }
 
 pub fn load(player: &NativePlayer, path: &str) -> Result<(), String> {
+    // Whatever went wrong drawing the last file described that file, not this
+    // one. Left in place it would fail every `state` poll from here on and put
+    // the viewer in front of an error page for a video that plays perfectly.
+    player.clear_recoverable_render_error();
     player.with_mpv(|mpv| mpv.command(&["loadfile", path, "replace"]))
 }
 
@@ -1187,8 +1227,67 @@ fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_speed, mount_web_view_over_video, rgb_from_rgba, subtitle_label};
+    use super::{
+        checked_speed, load, mount_web_view_over_video, rgb_from_rgba, state, subtitle_label,
+        NativePlayer,
+    };
     use gtk::prelude::*;
+    use std::sync::Arc;
+
+    // Rendering for real needs a libmpv handle and a live OpenGL context, and
+    // starting libmpv from a test only to throw it away is a good way to crash
+    // the test binary. So these run a player that has no handle at all: `load`
+    // and `state` both clear and report the render error before they reach mpv,
+    // which is all that is under test. What they then make of the path is not.
+    fn player_without_mpv() -> Arc<NativePlayer> {
+        NativePlayer::from_mpv(Err("This player has no video engine.".to_owned()))
+    }
+
+    #[test]
+    fn forgets_a_failed_render_once_the_next_file_loads() {
+        let player = player_without_mpv();
+        player.record_render_failure("The last file could not be drawn.".to_owned());
+        assert_eq!(
+            state(&player).err().as_deref(),
+            Some("The last file could not be drawn."),
+            "the failure reaches the frontend while that file is open"
+        );
+
+        let _ = load(&player, "/videos/next.mp4");
+
+        assert_eq!(
+            player.render_error(),
+            None,
+            "the next file starts without the previous file's failure"
+        );
+    }
+
+    #[test]
+    fn keeps_reporting_an_opengl_setup_failure_whatever_loads_next() {
+        let player = player_without_mpv();
+        player.set_fatal_render_error("OpenGL context creation failed".to_owned());
+
+        let _ = load(&player, "/videos/next.mp4");
+
+        assert_eq!(
+            state(&player).err().as_deref(),
+            Some("OpenGL context creation failed"),
+            "nothing will ever draw again, so loading a file cannot clear this"
+        );
+    }
+
+    #[test]
+    fn reports_the_setup_failure_behind_the_renders_it_breaks() {
+        let player = player_without_mpv();
+        player.set_fatal_render_error("OpenGL context creation failed".to_owned());
+        player.record_render_failure("The file could not be drawn.".to_owned());
+
+        assert_eq!(
+            state(&player).err().as_deref(),
+            Some("OpenGL context creation failed"),
+            "the cause outranks the failures it produces"
+        );
+    }
 
     // A `GtkEntry` stands in for the WebView: the reparenting under test is
     // plain GTK container work, and an entry takes the keyboard the same way
