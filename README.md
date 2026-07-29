@@ -18,6 +18,19 @@ Build Linux bundles on Linux and macOS bundles on macOS. The Linux command insta
 the generated `.deb` so Toka appears in the Applications menu and can be launched
 from there. See the platform quick-start guide for details.
 
+## Search
+
+A search looks at three separate things, and any combination of them can be
+switched on: a video's tags (`Ctrl+T`), its filename without the tag block
+(`Ctrl+F`), and the folders above it (`Ctrl+P`). Tags and the filename are on to
+begin with. Each search term has to be found in one of the parts being searched,
+so a second word still narrows a search even when it lands somewhere else.
+
+Changing what is searched runs the search again straight away. The last part
+left on cannot be switched off, because a search with nothing to look at could
+only ever answer "no videos". The choice lasts as long as Toka is open, like
+every other setting here.
+
 ## Tagging
 
 Tags are stored in the filename, inside square brackets before the extension:

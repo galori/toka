@@ -52,12 +52,19 @@ impl MdfindSearchProvider {
 
 #[cfg(any(target_os = "macos", test))]
 impl SearchProvider for MdfindSearchProvider {
-    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
         prepare_macos_downloads_folder_access();
         let term = longest_term(query)?;
         let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
+        // Spotlight's display name is the file's own name; its path attribute
+        // covers the folders above it, which is what a folder search needs.
+        let attribute = if whole_path {
+            "kMDItemPath"
+        } else {
+            "kMDItemDisplayName"
+        };
         let predicate = format!(
-            "kMDItemDisplayName == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
+            "{attribute} == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
         );
         let mut paths = run_mdfind(&*self.runner, vec![predicate])?;
         paths.extend(macos_download_candidates(query)?);
@@ -157,7 +164,11 @@ impl RecollSearchProvider {
 
 #[cfg(any(target_os = "linux", test))]
 impl SearchProvider for RecollSearchProvider {
-    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+    // Recoll indexes names and contents, and its query language has no
+    // substring match over a file's folders, so a folder search here can only
+    // be answered from the names Recoll already returns. Every other provider
+    // widens; this one is the reason a path search is worth having plocate for.
+    fn candidates(&self, query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
@@ -195,12 +206,16 @@ impl PlocateSearchProvider {
 
 #[cfg(any(target_os = "linux", test))]
 impl SearchProvider for PlocateSearchProvider {
-    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
-        let args = ["--ignore-case", "--basename", "--existing", "--", term]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>();
+        // plocate matches the whole path unless it is confined to the base
+        // name, so a folder search is the flag left off rather than added.
+        let mut args = vec!["--ignore-case"];
+        if !whole_path {
+            args.push("--basename");
+        }
+        args.extend(["--existing", "--", term]);
+        let args = args.into_iter().map(String::from).collect::<Vec<_>>();
         let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
         // plocate uses exit status 1 to report a successful search with no
         // matches. Other non-zero statuses still indicate a provider error.
@@ -301,7 +316,7 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation").unwrap();
+        let paths = provider.candidates("summer vacation", false).unwrap();
 
         let invocations = runner.invocations.lock().unwrap();
         assert_eq!(
@@ -324,7 +339,7 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation").unwrap();
+        let paths = provider.candidates("summer vacation", false).unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -362,7 +377,7 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation").unwrap();
+        let paths = provider.candidates("summer vacation", false).unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -384,13 +399,55 @@ mod tests {
     }
 
     #[test]
+    fn plocate_matches_whole_paths_when_the_folder_is_searched() {
+        let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
+        let provider = PlocateSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider.candidates("holiday", true).unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "plocate".into(),
+                ["--ignore-case", "--existing", "--", "holiday"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn mdfind_matches_whole_paths_when_the_folder_is_searched() {
+        let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
+        let provider = MdfindSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider.candidates("holiday", true).unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "/usr/bin/mdfind".into(),
+                vec![
+                    "kMDItemPath == \"*holiday*\"cd && kMDItemContentTypeTree == \"public.movie\""
+                        .into()
+                ]
+            ))
+        );
+    }
+
+    #[test]
     fn plocate_reports_no_matches_as_an_empty_result_set() {
         let provider = PlocateSearchProvider {
             runner: Arc::new(FakeRunner::no_matches()),
         };
 
         assert_eq!(
-            provider.candidates("does-not-exist").unwrap(),
+            provider.candidates("does-not-exist", false).unwrap(),
             Vec::<PathBuf>::new()
         );
     }

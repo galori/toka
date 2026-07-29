@@ -448,6 +448,58 @@ button:focus-visible {
   outline-offset: 2px;
 }
 
+/* Where a search looks, read as a row of switches under the field it belongs
+   to: a pressed one is filled the way the accent buttons are, an unpressed one
+   is only outlined, so which parts are being searched is legible at a glance
+   rather than by reading each label. */
+.search-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.scope-toggle {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid oklch(0.4 0.02 40 / 0.7);
+  border-radius: 999px;
+  padding: 4px 14px;
+  background: transparent;
+  color: oklch(0.72 0.02 60);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: capitalize;
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+.scope-toggle[aria-pressed="true"] {
+  border-color: transparent;
+  background: oklch(0.68 0.19 38);
+  color: oklch(0.14 0.01 40);
+}
+.scope-toggle:not(:disabled):hover {
+  border-color: oklch(0.68 0.19 38);
+  background: oklch(0.28 0.02 40);
+  color: oklch(0.95 0.01 90);
+}
+.scope-toggle[aria-pressed="true"]:not(:disabled):hover {
+  background: oklch(0.73 0.19 38);
+  color: oklch(0.14 0.01 40);
+}
+/* The one part left on cannot be turned off, and says so by going quiet
+   rather than by disappearing. */
+.scope-toggle:disabled {
+  background: oklch(0.34 0.06 38);
+  color: oklch(0.72 0.02 60);
+}
+.scope-toggle .key-hint {
+  color: inherit;
+  opacity: 0.7;
+}
+
 .results-summary {
   min-height: 42px;
   color: oklch(0.65 0.02 60);

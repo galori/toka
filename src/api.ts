@@ -21,9 +21,30 @@ export type SearchPage = {
   results: VideoResult[];
 };
 
-export function searchVideos(query: string, page: number): Promise<SearchPage> {
+// Which part of a video a query is matched against. The three are separate
+// haystacks rather than nested ones: the tag block belongs to the tags, the
+// file name is read without it, and the path is the folders above the file.
+export type SearchFields = {
+  tags: boolean;
+  fileName: boolean;
+  path: boolean;
+};
+
+// What a search covered before the parts could be chosen: the whole file name,
+// tag block included, and nothing of the folders above it.
+export const DEFAULT_SEARCH_FIELDS: SearchFields = {
+  tags: true,
+  fileName: true,
+  path: false,
+};
+
+export function searchVideos(
+  query: string,
+  page: number,
+  fields: SearchFields = DEFAULT_SEARCH_FIELDS,
+): Promise<SearchPage> {
   return invoke<SearchPage>("search_videos", {
-    request: { query, page, pageSize: PAGE_SIZE },
+    request: { query, page, pageSize: PAGE_SIZE, fields },
   });
 }
 

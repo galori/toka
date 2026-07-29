@@ -33,8 +33,10 @@ import {
   addVideoTags,
   removeVideoTags,
   videoThumbnail,
+  DEFAULT_SEARCH_FIELDS,
   type ExternalPlayer,
   type PreparedVideo,
+  type SearchFields,
   type SearchPage,
   type VideoResult,
   type VideoTagUpdate,
@@ -480,6 +482,22 @@ function aspectParts(label: string): [number, number] | undefined {
   const [width, height] = label.split(":").map(Number);
   return width > 0 && height > 0 ? [width, height] : undefined;
 }
+
+// What a query is matched against, in the order the controls are read. Each
+// part is its own haystack, so turning one off really does stop it being
+// searched: a video tagged "home" stops answering to "home" once the tags are
+// off, even though the tag is written into its name.
+// Bare letters belong to the search field on this screen, so these take Ctrl,
+// beside the Ctrl+O that hands a search to another player.
+const SEARCH_SCOPES: {
+  field: keyof SearchFields;
+  key: string;
+  name: string;
+}[] = [
+  { field: "tags", key: "T", name: "tags" },
+  { field: "fileName", key: "F", name: "filename" },
+  { field: "path", key: "P", name: "path" },
+];
 
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
@@ -1973,6 +1991,7 @@ function Player({
 
 export default function App() {
   const [query, setQuery] = useState("");
+  const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [page, setPage] = useState<SearchPage>();
   // Playback is always a playlist: choosing one result starts the whole page of
   // them, positioned at the one that was chosen.
@@ -2004,15 +2023,21 @@ export default function App() {
     null,
   );
 
+  // The query the results on screen answer to, which is not always what the
+  // field holds: changing what is searched has to search for that again rather
+  // than for whatever has been typed since.
+  const searchedQuery = useRef<string | undefined>(undefined);
+
   const runSearch = async (submittedQuery: string, requestedPage: number) => {
     const trimmed = submittedQuery.trim();
     if (!trimmed) return;
+    searchedQuery.current = trimmed;
     const currentRequest = ++requestNumber.current;
     setLoading(true);
     setError(undefined);
     setPlaying(undefined);
     try {
-      const response = await searchVideos(trimmed, requestedPage);
+      const response = await searchVideos(trimmed, requestedPage, fields);
       if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
       if (currentRequest === requestNumber.current) {
@@ -2031,7 +2056,7 @@ export default function App() {
     if (loadedPages >= page.totalPages) return;
     setLoadingMore(true);
     try {
-      const next = await searchVideos(page.query, loadedPages + 1);
+      const next = await searchVideos(page.query, loadedPages + 1, fields);
       setPage((current) =>
         current && current.query === next.query
           ? { ...next, results: [...current.results, ...next.results] }
@@ -2082,9 +2107,49 @@ export default function App() {
     }
   };
 
+  // The last field left on stays on: a search with nothing to match against
+  // could only ever answer "no videos", which reads as a broken search rather
+  // than as a setting.
+  const onlySearchedField = (field: keyof SearchFields) =>
+    fields[field] &&
+    SEARCH_SCOPES.every(
+      (scope) => scope.field === field || !fields[scope.field],
+    );
+
+  const toggleField = (field: keyof SearchFields) => {
+    if (onlySearchedField(field)) return;
+    setFields((current) => ({ ...current, [field]: !current[field] }));
+  };
+
+  // Results on screen were found by looking at particular parts of a video, so
+  // changing which parts those are asks the question again rather than leaving
+  // an answer that no longer matches the controls.
+  const searchedFields = useRef(fields);
+  useEffect(() => {
+    if (searchedFields.current === fields) return;
+    searchedFields.current = fields;
+    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+  });
+
   // The search field holds the keyboard on this screen, so a bare letter would
   // be typed into it rather than reaching the app; Ctrl is what gets a shortcut
-  // through, and Ctrl+O is where "open" lives everywhere else.
+  // through, beside the Ctrl+O that hands a search to another player.
+  useEffect(() => {
+    if (playing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
+        return;
+      const scope = SEARCH_SCOPES.find(
+        (candidate) => candidate.key.toLowerCase() === event.key.toLowerCase(),
+      );
+      if (!scope) return;
+      event.preventDefault();
+      toggleField(scope.field);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   useEffect(() => {
     if (playing || !activePlayer) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2109,7 +2174,7 @@ export default function App() {
       const pages = needsAdditionalPages
         ? await Promise.all(
             Array.from({ length: totalPages - loadedPages }, (_, offset) =>
-              searchVideos(page.query, loadedPages + offset + 1).then(
+              searchVideos(page.query, loadedPages + offset + 1, fields).then(
                 (response) => response?.results ?? [],
               ),
             ),
@@ -2180,6 +2245,29 @@ export default function App() {
           ) : (
             <SearchIcon />
           )}
+        </div>
+        {/* Where a search looks. Any combination will do, so these are three
+            independent switches rather than a cycle through the seven states
+            they can be in between them. */}
+        <div className="search-scope" role="group" aria-label="Search in">
+          {SEARCH_SCOPES.map((scope) => (
+            <ControlButton
+              key={scope.field}
+              shortcut={`Ctrl+${scope.key}`}
+              className="scope-toggle"
+              aria-label={`Search ${scope.name}`}
+              aria-pressed={fields[scope.field]}
+              disabled={onlySearchedField(scope.field)}
+              title={
+                onlySearchedField(scope.field)
+                  ? `A search has to look somewhere, so ${scope.name} stays on`
+                  : `Search ${scope.name}`
+              }
+              onClick={() => toggleField(scope.field)}
+            >
+              <Label>{scope.name}</Label>
+            </ControlButton>
+          ))}
         </div>
       </form>
 
