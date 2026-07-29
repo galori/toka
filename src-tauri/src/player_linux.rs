@@ -933,6 +933,9 @@ pub struct PlaybackState {
     current_time: f64,
     paused: bool,
     ended: bool,
+    /// How fast the open file's frames run, so the player can skip by a real
+    /// frame rather than by an assumed one. Zero until mpv has read a rate.
+    frame_rate: f64,
     #[cfg(feature = "native-e2e")]
     frame_color: Option<[u8; 3]>,
     #[cfg(feature = "native-e2e")]
@@ -1088,6 +1091,19 @@ pub fn seek(player: &NativePlayer, seconds: f64) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.command(&["seek", &seconds.max(0.0).to_string(), "absolute+exact"]))
 }
 
+/// The open file's frame rate, or zero while nothing plausible is known. The
+/// container's declared rate is what a frame-accurate seek should use; mpv's
+/// running estimate stands in for containers that declare nothing, and both
+/// can report nonsense, so anything outside what a video could actually be is
+/// treated as unknown rather than passed on.
+fn frame_rate(mpv: &Mpv) -> f64 {
+    let plausible = |fps: f64| (1.0..=1000.0).contains(&fps).then_some(fps);
+    mpv.get_double("container-fps")
+        .and_then(plausible)
+        .or_else(|| mpv.get_double("estimated-vf-fps").and_then(plausible))
+        .unwrap_or(0.0)
+}
+
 pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
     if let Some(error) = player.render_error() {
         return Err(error);
@@ -1098,6 +1114,7 @@ pub fn state(player: &NativePlayer) -> Result<PlaybackState, String> {
             current_time: mpv.get_double("time-pos").unwrap_or(0.0),
             paused: mpv.get_flag("pause").unwrap_or(true),
             ended: mpv.get_flag("eof-reached").unwrap_or(false),
+            frame_rate: frame_rate(mpv),
             #[cfg(feature = "native-e2e")]
             frame_color: mpv.last_frame_color,
             #[cfg(feature = "native-e2e")]
