@@ -16,6 +16,38 @@ pub struct SearchRequest {
     pub query: String,
     pub page: usize,
     pub page_size: usize,
+    #[serde(default)]
+    pub fields: SearchFields,
+}
+
+/// Which part of a video a query is matched against. The three are separate
+/// haystacks rather than nested ones, so switching one off cannot be undone by
+/// another: the tag block belongs to the tags, the file name is read without
+/// it, and the path is the folders the file sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchFields {
+    pub tags: bool,
+    pub file_name: bool,
+    pub path: bool,
+}
+
+impl SearchFields {
+    fn any(&self) -> bool {
+        self.tags || self.file_name || self.path
+    }
+}
+
+/// What a search covered before the fields could be chosen: the whole file
+/// name, tag block included, and nothing of the folders above it.
+impl Default for SearchFields {
+    fn default() -> Self {
+        Self {
+            tags: true,
+            file_name: true,
+            path: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -43,6 +75,8 @@ pub struct SearchPage {
 pub enum SearchError {
     #[error("Enter at least one search term.")]
     InvalidQuery,
+    #[error("Choose at least one of tags, file name or path to search.")]
+    NoSearchFields,
     #[error("The requested search page is invalid.")]
     InvalidPage,
     #[error("{0}")]
@@ -52,7 +86,12 @@ pub enum SearchError {
 }
 
 pub trait SearchProvider: Send + Sync {
-    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError>;
+    /// Candidate videos for `query`, which the engine then filters by the
+    /// fields the viewer chose. `whole_path` asks for the wider set a folder
+    /// search needs: every index Toka reads answers on file names alone unless
+    /// it is told otherwise, and a video in a matching folder has no reason to
+    /// carry the term in its own name.
+    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError>;
 }
 
 pub struct SearchEngine {
@@ -85,23 +124,20 @@ impl SearchEngine {
         if terms.is_empty() {
             return Err(SearchError::InvalidQuery);
         }
+        if !request.fields.any() {
+            return Err(SearchError::NoSearchFields);
+        }
         if request.page == 0 || request.page_size != PAGE_SIZE {
             return Err(SearchError::InvalidPage);
         }
 
+        let fields = request.fields;
         let mut seen = HashSet::new();
         let mut paths = self
-            .candidates(query)?
+            .candidates(query, fields.path)?
             .into_iter()
             .filter(|path| is_supported_video(path))
-            .filter(|path| {
-                let name = path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase();
-                terms.iter().all(|term| name.contains(term))
-            })
+            .filter(|path| matches_terms(path, &terms, fields))
             .filter(|path| seen.insert(path.clone()))
             .collect::<Vec<_>>();
 
@@ -157,8 +193,8 @@ impl SearchEngine {
     /// every renamed file the index has already dropped is added back. The
     /// caller still filters these by the search terms, so a rename only shows
     /// up when the query matches the name the file actually has.
-    fn candidates(&self, query: &str) -> Result<Vec<PathBuf>, SearchError> {
-        let mut paths = self.provider.candidates(query)?;
+    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+        let mut paths = self.provider.candidates(query, whole_path)?;
         let renamed = self.renamed_paths.lock().unwrap();
         if renamed.is_empty() {
             return Ok(paths);
@@ -226,6 +262,40 @@ impl SearchEngine {
     }
 }
 
+/// Whether every term is somewhere in the parts of `path` the viewer chose to
+/// search. A term may land in any one of them, so a query can name a folder and
+/// a tag at once; all of them still have to land somewhere, which is what makes
+/// a second word narrow a search rather than widen it.
+fn matches_terms(path: &Path, terms: &[String], fields: SearchFields) -> bool {
+    let haystacks = haystacks(path, fields);
+    terms
+        .iter()
+        .all(|term| haystacks.iter().any(|hay| hay.contains(term)))
+}
+
+/// The lowercased text of each part of `path` that is being searched. The tags
+/// are read from the name rather than the filesystem, so this stays free of the
+/// per-candidate `stat` a lookup would cost.
+fn haystacks(path: &Path, fields: SearchFields) -> Vec<String> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut haystacks = Vec::with_capacity(3);
+    if fields.tags {
+        haystacks.push(tags::Tags::parse_file_name(&name).into_values().join(" "));
+    }
+    if fields.file_name {
+        haystacks.push(tags::Tags::default().apply_to_file(&name).to_lowercase());
+    }
+    if fields.path {
+        haystacks.push(
+            path.parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .to_lowercase(),
+        );
+    }
+    haystacks
+}
+
 fn is_supported_video(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -244,11 +314,31 @@ mod tests {
 
     struct FakeProvider {
         paths: Mutex<Vec<PathBuf>>,
+        whole_path_asks: Mutex<Vec<bool>>,
+    }
+
+    impl FakeProvider {
+        fn new(paths: Vec<PathBuf>) -> Self {
+            Self {
+                paths: Mutex::new(paths),
+                whole_path_asks: Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl SearchProvider for FakeProvider {
-        fn candidates(&self, _query: &str) -> Result<Vec<PathBuf>, SearchError> {
+        fn candidates(&self, _query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+            self.whole_path_asks.lock().unwrap().push(whole_path);
             Ok(self.paths.lock().unwrap().clone())
+        }
+    }
+
+    fn request(query: &str) -> SearchRequest {
+        SearchRequest {
+            query: query.into(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            fields: SearchFields::default(),
         }
     }
 
@@ -262,15 +352,13 @@ mod tests {
             fs::write(path, b"test").unwrap();
         }
 
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![wrong_type, missing_term, matching.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![
+            wrong_type,
+            missing_term,
+            matching.clone(),
+        ]));
         let page = SearchEngine::new(provider)
-            .search(SearchRequest {
-                query: "family SUMMER".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
+            .search(request("family SUMMER"))
             .unwrap();
 
         assert_eq!(page.total_results, 1);
@@ -282,16 +370,10 @@ mod tests {
     #[test]
     fn search_lists_provider_video_paths_without_filesystem_access() {
         let protected = PathBuf::from("/protected/Downloads/Untitled.mov");
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![protected.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![protected.clone()]));
 
         let page = SearchEngine::new(provider)
-            .search(SearchRequest {
-                query: "untitled".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
+            .search(request("untitled"))
             .unwrap();
 
         assert_eq!(page.total_results, 1);
@@ -310,14 +392,11 @@ mod tests {
         }
         paths.push(paths[0].clone());
 
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(paths),
-        });
+        let provider = Arc::new(FakeProvider::new(paths));
         let page = SearchEngine::new(provider)
             .search(SearchRequest {
-                query: "clip".into(),
                 page: 2,
-                page_size: PAGE_SIZE,
+                ..request("clip")
             })
             .unwrap();
 
@@ -328,21 +407,142 @@ mod tests {
     }
 
     #[test]
+    fn search_covers_the_whole_file_name_including_its_tags_by_default() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("Beach day [home summer].mp4");
+        fs::write(&video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video]));
+        let engine = SearchEngine::new(provider.clone());
+
+        assert_eq!(
+            engine.search(request("beach home")).unwrap().total_results,
+            1
+        );
+        // The folder is not part of that default, so the provider is never
+        // asked for the wider candidate set either.
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [false]);
+    }
+
+    #[test]
+    fn searching_tags_alone_ignores_the_rest_of_the_name() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("Beach day [home].mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+        let tags_only = |query: &str| SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: false,
+                path: false,
+            },
+            ..request(query)
+        };
+
+        assert_eq!(engine.search(tags_only("home")).unwrap().total_results, 1);
+        assert_eq!(engine.search(tags_only("beach")).unwrap().total_results, 0);
+    }
+
+    #[test]
+    fn searching_the_file_name_alone_ignores_its_tag_block() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("Beach day [home].mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+        let name_only = |query: &str| SearchRequest {
+            fields: SearchFields {
+                tags: false,
+                file_name: true,
+                path: false,
+            },
+            ..request(query)
+        };
+
+        assert_eq!(engine.search(name_only("beach")).unwrap().total_results, 1);
+        assert_eq!(engine.search(name_only("home")).unwrap().total_results, 0);
+    }
+
+    #[test]
+    fn searching_the_path_matches_the_folder_and_widens_the_candidate_set() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Holiday");
+        fs::create_dir(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video]));
+        let engine = SearchEngine::new(provider.clone());
+        let with_path = |path: bool| SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: true,
+                path,
+            },
+            ..request("holiday")
+        };
+
+        assert_eq!(engine.search(with_path(false)).unwrap().total_results, 0);
+        assert_eq!(engine.search(with_path(true)).unwrap().total_results, 1);
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [false, true]);
+    }
+
+    #[test]
+    fn every_term_may_match_a_different_selected_field() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Holiday");
+        fs::create_dir(&folder).unwrap();
+        let video = folder.join("clip [home].mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+        let all_fields = |query: &str| SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: true,
+                path: true,
+            },
+            ..request(query)
+        };
+
+        assert_eq!(
+            engine
+                .search(all_fields("holiday clip home"))
+                .unwrap()
+                .total_results,
+            1
+        );
+        assert_eq!(
+            engine
+                .search(all_fields("holiday absent"))
+                .unwrap()
+                .total_results,
+            0
+        );
+    }
+
+    #[test]
+    fn a_search_with_nothing_selected_is_refused() {
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+
+        let error = engine
+            .search(SearchRequest {
+                fields: SearchFields {
+                    tags: false,
+                    file_name: false,
+                    path: false,
+                },
+                ..request("clip")
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::NoSearchFields), "{error}");
+    }
+
+    #[test]
     fn a_renamed_video_is_found_under_its_new_name_while_the_index_is_stale() {
         let directory = tempdir().unwrap();
         let indexed = directory.path().join("sample1.mp4");
         fs::write(&indexed, b"test").unwrap();
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![indexed.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![indexed.clone()]));
         let engine = SearchEngine::new(provider.clone());
-        let first = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let first = engine.search(request("sample")).unwrap();
 
         let tagged = directory.path().join("sample1 [home].mp4");
         fs::rename(&indexed, &tagged).unwrap();
@@ -351,13 +551,7 @@ mod tests {
             .unwrap();
 
         // The index still lists the name the file had before it was tagged.
-        let stale = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let stale = engine.search(request("sample")).unwrap();
         assert_eq!(stale.total_results, 1);
         assert_eq!(stale.results[0].file_name, "sample1 [home].mp4");
         assert_eq!(stale.results[0].tags, ["home"]);
@@ -365,25 +559,13 @@ mod tests {
         // The index has since dropped the name, because the file behind it is
         // gone; the renamed file must not disappear with it.
         provider.paths.lock().unwrap().clear();
-        let dropped = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let dropped = engine.search(request("sample")).unwrap();
         assert_eq!(dropped.total_results, 1);
         assert_eq!(dropped.results[0].file_name, "sample1 [home].mp4");
 
         // Once the index catches up the file is listed once, not twice.
         *provider.paths.lock().unwrap() = vec![tagged];
-        let refreshed = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let refreshed = engine.search(request("sample")).unwrap();
         assert_eq!(refreshed.total_results, 1);
     }
 
@@ -392,17 +574,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let video = directory.path().join("sample1.mp4");
         fs::write(&video, b"test").unwrap();
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![video.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![video.clone()]));
         let engine = SearchEngine::new(provider.clone());
-        let first = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let first = engine.search(request("sample")).unwrap();
         let tagged = directory.path().join("sample1 [home].mp4");
         fs::rename(&video, &tagged).unwrap();
         engine
@@ -410,13 +584,7 @@ mod tests {
             .unwrap();
         provider.paths.lock().unwrap().clear();
 
-        let page = engine
-            .search(SearchRequest {
-                query: "holiday".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let page = engine.search(request("holiday")).unwrap();
 
         assert_eq!(page.total_results, 0);
     }
@@ -426,15 +594,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let video = directory.path().join("sample1.mp4");
         fs::write(&video, b"test").unwrap();
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![video.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![video.clone()]));
         let engine = SearchEngine::new(provider);
-        let request = || SearchRequest {
-            query: "sample".into(),
-            page: 1,
-            page_size: PAGE_SIZE,
-        };
+        let request = || request("sample");
         let first = engine.search(request()).unwrap();
 
         let tagged = directory.path().join("sample1 [home].mp4");
@@ -459,17 +621,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let video = directory.path().join("sample1.mp4");
         fs::write(&video, b"test").unwrap();
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![video.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![video.clone()]));
         let engine = SearchEngine::new(provider.clone());
-        let first = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let first = engine.search(request("sample")).unwrap();
         let tagged = directory.path().join("sample1 [home].mp4");
         fs::rename(&video, &tagged).unwrap();
         engine
@@ -478,13 +632,7 @@ mod tests {
         provider.paths.lock().unwrap().clear();
         fs::remove_file(&tagged).unwrap();
 
-        let page = engine
-            .search(SearchRequest {
-                query: "sample".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let page = engine.search(request("sample")).unwrap();
 
         assert_eq!(page.total_results, 0);
     }
@@ -496,26 +644,12 @@ mod tests {
         let second_path = directory.path().join("second-clip.mp4");
         fs::write(&first_path, b"test").unwrap();
         fs::write(&second_path, b"test").unwrap();
-        let provider = Arc::new(FakeProvider {
-            paths: Mutex::new(vec![first_path.clone()]),
-        });
+        let provider = Arc::new(FakeProvider::new(vec![first_path.clone()]));
         let engine = SearchEngine::new(provider.clone());
 
-        let first_page = engine
-            .search(SearchRequest {
-                query: "first".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        let first_page = engine.search(request("first")).unwrap();
         *provider.paths.lock().unwrap() = vec![second_path];
-        engine
-            .search(SearchRequest {
-                query: "second".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-            })
-            .unwrap();
+        engine.search(request("second")).unwrap();
 
         assert_eq!(
             engine.video_path(&first_page.results[0].id).unwrap(),

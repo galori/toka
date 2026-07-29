@@ -63,6 +63,7 @@ impl From<SearchError> for CommandError {
     fn from(error: SearchError) -> Self {
         let kind = match &error {
             SearchError::InvalidQuery => "InvalidQuery",
+            SearchError::NoSearchFields => "NoSearchFields",
             SearchError::InvalidPage => "InvalidPage",
             SearchError::Provider(_) => "Provider",
             SearchError::VideoUnavailable => "VideoUnavailable",
@@ -542,7 +543,11 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
     {
         struct FixtureSearchProvider;
         impl SearchProvider for FixtureSearchProvider {
-            fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
+            fn candidates(
+                &self,
+                _query: &str,
+                _whole_path: bool,
+            ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 let paths = std::env::var_os("TOKA_E2E_VIDEOS").ok_or_else(|| {
                     SearchError::Provider("The integration-test videos were not configured.".into())
                 })?;
@@ -571,7 +576,11 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
-            fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
+            fn candidates(
+                &self,
+                _query: &str,
+                _whole_path: bool,
+            ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 Err(SearchError::Provider(
                     "Toka currently supports video search on macOS and Linux.".into(),
                 ))
@@ -586,7 +595,11 @@ struct InvalidProvider(String);
 
 #[cfg(target_os = "linux")]
 impl SearchProvider for InvalidProvider {
-    fn candidates(&self, _query: &str) -> Result<Vec<std::path::PathBuf>, SearchError> {
+    fn candidates(
+        &self,
+        _query: &str,
+        _whole_path: bool,
+    ) -> Result<Vec<std::path::PathBuf>, SearchError> {
         Err(SearchError::Provider(self.0.clone()))
     }
 }

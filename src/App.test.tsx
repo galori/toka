@@ -146,8 +146,100 @@ test("starts with a focused search field and displays submitted results", async 
     await screen.findByRole("button", { name: "Play Summer Vacation.mp4" }),
   ).toBeVisible();
   expect(invokeMock).toHaveBeenCalledWith("search_videos", {
-    request: { query: "summer vacation", page: 1, pageSize: 24 },
+    request: {
+      query: "summer vacation",
+      page: 1,
+      pageSize: 24,
+      fields: { tags: true, fileName: true, path: false },
+    },
   });
+});
+
+const searchPage = (query: string) => ({
+  query,
+  page: 1,
+  pageSize: 24,
+  totalResults: 1,
+  totalPages: 1,
+  results: [{ id: "video-1", fileName: `${query}.mp4`, extension: "mp4" }],
+});
+
+const lastSearchFields = () => {
+  const call = invokeMock.mock.calls
+    .filter(([command]) => command === "search_videos")
+    .at(-1);
+  return (call?.[1] as { request: { fields: unknown } } | undefined)?.request
+    .fields;
+};
+
+test("chooses which parts of a video a search looks at", async () => {
+  invokeMock.mockResolvedValue(searchPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+
+  const tags = screen.getByRole("button", { name: "Search tags" });
+  const filename = screen.getByRole("button", { name: "Search filename" });
+  const path = screen.getByRole("button", { name: "Search path" });
+  expect(tags).toHaveAttribute("aria-keyshortcuts", "Ctrl+T");
+  expect(filename).toHaveAttribute("aria-keyshortcuts", "Ctrl+F");
+  expect(path).toHaveAttribute("aria-keyshortcuts", "Ctrl+P");
+  expect(tags).toHaveAttribute("aria-pressed", "true");
+  expect(filename).toHaveAttribute("aria-pressed", "true");
+  expect(path).toHaveAttribute("aria-pressed", "false");
+  // Nothing has been searched for yet, so a choice about the next search is
+  // not a search of its own.
+  await user.click(path);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
+
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+
+  expect(
+    await screen.findByRole("button", { name: "Play holiday.mp4" }),
+  ).toBeVisible();
+  expect(lastSearchFields()).toEqual({
+    tags: true,
+    fileName: true,
+    path: true,
+  });
+});
+
+test("searches again as soon as the parts being searched change", async () => {
+  invokeMock.mockResolvedValue(searchPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play holiday.mp4" }),
+  ).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+
+  await waitFor(() =>
+    expect(lastSearchFields()).toEqual({
+      tags: true,
+      fileName: false,
+      path: false,
+    }),
+  );
+  expect(
+    screen.getByRole("button", { name: "Search filename" }),
+  ).toHaveAttribute("aria-pressed", "false");
+});
+
+test("keeps the last part of a search selected", async () => {
+  render(<App />);
+  const tags = await screen.findByRole("button", { name: "Search tags" });
+
+  fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+
+  // Tags are all that is left, and a search with nothing to match against can
+  // only ever answer "no videos".
+  expect(tags).toBeDisabled();
+  fireEvent.keyDown(window, { key: "t", ctrlKey: true });
+  expect(tags).toHaveAttribute("aria-pressed", "true");
 });
 
 test("offers a results shuffle control and restarts a shuffled playlist with R", async () => {
