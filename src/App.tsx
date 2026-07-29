@@ -3,6 +3,7 @@ import {
   CSSProperties,
   FormEvent,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -2037,8 +2038,12 @@ export default function App() {
   // session — the player renders beside it rather than in its place. Claiming
   // the field whenever no video is playing covers the first paint and every
   // return from one alike, so the next thing typed is always a search.
+  //
+  // Without `preventScroll` this focus scrolls the field into view, and the
+  // field sits above everything a viewer coming back to a long list of results
+  // had scrolled past — it would drag them to the top of the page again.
   useEffect(() => {
-    if (!playing) searchField.current?.focus();
+    if (!playing) searchField.current?.focus({ preventScroll: true });
   }, [playing]);
   const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -2053,6 +2058,29 @@ export default function App() {
   const [loadMoreMarker, setLoadMoreMarker] = useState<HTMLDivElement | null>(
     null,
   );
+
+  // Playing a video takes the results off screen, so the page is left only as
+  // tall as the player and a deep scroll offset has nowhere to survive: coming
+  // back rendered the list from the top, however far into it the viewer had got.
+  // The offset is read while the list is still on screen and put back once it
+  // returns. Every page the viewer had loaded is still in `page`, so the list
+  // comes back the same height it went away — and where it cannot, `scrollTo`
+  // clamps to whatever is really rendered rather than scrolling past the end.
+  const resultsScrollOffset = useRef(0);
+  // Only a viewer coming back from a video is put back where they were. A fresh
+  // search answers a new question, and belongs at the top of its own results.
+  const restoreResultsScroll = useRef(false);
+  // Held in state for the same reason as the marker above: the list unmounts
+  // while a video plays, so the offset has to be restored on whichever list
+  // node is really rendered, in a layout effect that runs before it is painted.
+  const [resultsList, setResultsList] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!resultsList || !restoreResultsScroll.current) return;
+    restoreResultsScroll.current = false;
+    // A list left at the top is already where it belongs.
+    if (resultsScrollOffset.current)
+      window.scrollTo({ top: resultsScrollOffset.current });
+  }, [resultsList]);
 
   // The query the results on screen answer to, which is not always what the
   // field holds: changing what is searched has to search for that again rather
@@ -2195,6 +2223,7 @@ export default function App() {
 
   const playSearchResults = async (position: number) => {
     if (!page) return;
+    resultsScrollOffset.current = window.scrollY;
     setPlaylistLoading(true);
     setError(undefined);
     try {
@@ -2324,13 +2353,16 @@ export default function App() {
         <Player
           videos={playing.videos}
           startIndex={playing.startIndex}
-          onBack={() => setPlaying(undefined)}
+          onBack={() => {
+            restoreResultsScroll.current = true;
+            setPlaying(undefined);
+          }}
           onTagsChange={updateTags}
         />
       ) : null}
 
       {!loading && !playing && page ? (
-        <section className="results">
+        <section className="results" ref={setResultsList}>
           <div className="results-summary">
             <p>
               {page.totalResults} {page.totalResults === 1 ? "video" : "videos"}

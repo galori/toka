@@ -2565,6 +2565,56 @@ test("keeps loading more results after coming back from a video", async () => {
   ).toBeVisible();
 });
 
+test("returns to where the results were scrolled to after a video", async () => {
+  const results = [1, 2, 3].map((number) => ({
+    id: `video-${number}`,
+    fileName: `clip-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 3,
+        totalPages: 1,
+        results,
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip-2.mp4" });
+    return Promise.resolve();
+  });
+  const scrollTo = vi.fn();
+  vi.stubGlobal("scrollTo", scrollTo);
+  const focusSearchField = vi.spyOn(HTMLInputElement.prototype, "focus");
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  // How far down the list the viewer was when they picked a video out of it.
+  vi.stubGlobal("scrollY", 1200);
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-2.mp4" }),
+  );
+  // What a browser does once the list unmounts: the document is only as tall as
+  // the player, so the offset is clamped away. Whatever the app puts the viewer
+  // back at has to have been remembered before this point.
+  vi.stubGlobal("scrollY", 0);
+  await user.click(
+    await screen.findByRole("button", { name: "Back to results" }),
+  );
+  expect(
+    await screen.findByRole("button", { name: "Play clip-2.mp4" }),
+  ).toBeVisible();
+
+  expect(scrollTo).toHaveBeenCalledWith(expect.objectContaining({ top: 1200 }));
+  // Claiming the search field for the next search must not undo that: the field
+  // is above everything the viewer scrolled past.
+  expect(focusSearchField).toHaveBeenCalledWith({ preventScroll: true });
+  focusSearchField.mockRestore();
+});
+
 test("loads every search page into the playlist before playing all", async () => {
   const firstPage = Array.from({ length: 24 }, (_, index) => ({
     id: `video-${index + 1}`,
