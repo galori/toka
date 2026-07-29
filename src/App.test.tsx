@@ -2857,6 +2857,160 @@ test("keeps fullscreen controls hidden when autoplay advances the playlist", asy
   }
 });
 
+test("hides the native surface when opening a video fails", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "broken",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "broken-video", fileName: "broken.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/broken.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "load_native_video") {
+      return Promise.reject(new Error("The video file is empty."));
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "broken{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play broken.mp4" }),
+  );
+
+  // GTK places native video above the WebView. Once native playback reports an
+  // error, leaving that surface visible makes it cover the error view (and the
+  // results shown after Back) at its last, cropped position.
+  expect(
+    await screen.findByRole("heading", {
+      name: "This video could not be played",
+    }),
+  ).toBeVisible();
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      visible: false,
+    }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("stop_native_video");
+});
+
+test("keeps the native surface hidden after playback fails mid-file", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "broken",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "broken-video", fileName: "broken.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/broken.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    // An empty file loads, so the surface is already up and cropped by the time
+    // the engine admits it has nothing to show.
+    if (command === "native_playback_state") {
+      return Promise.reject(new Error("Rendering the video failed."));
+    }
+    return Promise.resolve();
+  });
+  const boxes = vi
+    .spyOn(Element.prototype, "getBoundingClientRect")
+    .mockImplementation(function (this: Element) {
+      const box = (left: number, top: number, width: number, height: number) =>
+        ({
+          x: left,
+          y: top,
+          top,
+          left,
+          right: left + width,
+          bottom: top + height,
+          width,
+          height,
+        }) as DOMRect;
+      if (this.classList.contains("native-video")) return box(0, 60, 800, 340);
+      if (this.classList.contains("player-controls"))
+        return box(0, 320, 800, 80);
+      if (this.classList.contains("playlist-drawer"))
+        return box(560, 0, 240, 400);
+      return box(0, 0, 0, 0);
+    });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "broken{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play broken.mp4" }),
+    );
+    await screen.findByLabelText("Playing broken.mp4");
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0,
+        y: 60,
+        width: 560,
+        height: 260,
+        visible: true,
+      }),
+    );
+    await screen.findByRole("heading", {
+      name: "This video could not be played",
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        visible: false,
+      }),
+    );
+
+    // The error view has no surface to measure, so anything still watching for
+    // a new size would hand the hidden layer bounds of its own invention and
+    // put it back over the view — the position the report describes.
+    invokeMock.mockClear();
+    act(() => void fireEvent(window, new Event("resize")));
+    await Promise.resolve();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: true }),
+    );
+    // Nothing is playing any more either, so the failed engine stops being
+    // asked how far along it is.
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "native_playback_state",
+      undefined,
+    );
+  } finally {
+    boxes.mockRestore();
+  }
+});
+
 test("keeps native video clear of the player controls and playlist drawer", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,

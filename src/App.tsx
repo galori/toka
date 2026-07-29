@@ -668,6 +668,7 @@ function Player({
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
+  const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
@@ -737,6 +738,7 @@ function Player({
     setDuration(0);
     setCurrentTime(0);
     setError(undefined);
+    setNativeStarted(false);
     setFullscreenError(undefined);
     setPlayingBack(false);
     setRotation(0);
@@ -755,6 +757,7 @@ function Player({
         if (!active) return;
         if (result.playbackBackend === "native") {
           nativeActive = true;
+          setNativeStarted(true);
           await loadNativeVideo(result.filePath);
           const baseRotation = await nativeVideoRotation();
           if (active) setNativeBaseRotation(baseRotation);
@@ -791,6 +794,21 @@ function Player({
   }, [video.id]);
 
   const native = prepared?.playbackBackend === "native";
+  // GTK composites the native surface above the WebView. An invalid file can
+  // fail after that surface has been started, so an error view alone is not
+  // enough: the native layer must be hidden before it can cover the view (or
+  // the search results shown after Back) at its previous cropped bounds.
+  useEffect(() => {
+    if (!error || !nativeStarted) return;
+    void setNativeVideoBounds({
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      visible: false,
+    }).catch(() => {});
+    void stopNativeVideo().catch(() => {});
+  }, [error, nativeStarted]);
   // Windowed playback keeps the drawer permanently; fullscreen is for watching,
   // so there it starts hidden and is summoned instead.
   const drawerOpen = fullscreen
@@ -828,7 +846,12 @@ function Player({
   const selectedSubtitle = subtitles[subtitleIndex];
 
   useEffect(() => {
-    if (!native || !nativeSurface.current) return;
+    // The error view replaces the surface these measurements come from, so the
+    // watchers have to go with it: left running, the next resize would measure
+    // a view that no longer has a picture in it and put the hidden layer back
+    // over whatever is on screen, and the poll would keep asking an engine that
+    // has already been stopped how far along it is.
+    if (!native || error || !nativeSurface.current) return;
     const surface = nativeSurface.current;
     let advancing = false;
     // mpv only knows the file's subtitle tracks once it has finished loading,
@@ -906,7 +929,15 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, drawerOpen, fullscreen, index, native, showFullscreenInfo]);
+  }, [
+    controlsIdle,
+    drawerOpen,
+    error,
+    fullscreen,
+    index,
+    native,
+    showFullscreenInfo,
+  ]);
 
   const play = () => {
     if (native) {
