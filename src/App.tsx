@@ -302,14 +302,21 @@ function NextIcon() {
   );
 }
 
-// The pair reads as one scale rather than two unrelated pictures: the same
-// speaker throughout, carrying one wave for quieter and both for louder, so
-// which way each button goes is legible without reading a word.
-function SpeakerIcon({ waves }: { waves: 1 | 2 }) {
+// The set reads as one scale rather than unrelated pictures: the same speaker
+// throughout, crossed out for silence, carrying one wave for quieter and both
+// for louder, so what each button does is legible without reading a word.
+function SpeakerIcon({ waves }: { waves: 0 | 1 | 2 }) {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
       <path d="M3.5 9.5h3.6L11.5 5.6v12.8L7.1 14.5H3.5z" />
-      <path d="M15.4 10.1a4.2 4.2 0 0 1 0 3.8" />
+      {waves === 0 ? (
+        <>
+          <path d="m15.6 9.6 5 4.8" />
+          <path d="m20.6 9.6-5 4.8" />
+        </>
+      ) : (
+        <path d="M15.4 10.1a4.2 4.2 0 0 1 0 3.8" />
+      )}
       {waves === 2 ? <path d="M18.4 7.4a8.6 8.6 0 0 1 0 9.2" /> : null}
     </svg>
   );
@@ -418,6 +425,24 @@ type FullscreenPlaylist = "hidden" | "peek" | "held";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const VOLUME_STEP = 5;
+
+// The whole digit row once stepped the volume, which was a lot of reaching for
+// a scale the arrow keys walk in one place. Three of those digits are worth
+// keeping, because a preset is pressed once rather than held: each is named by
+// the digit its percentage starts with, so 0 is silence, 5 is half and 1 is
+// full.
+// A preset without a label is drawn as the crossed-out speaker instead, which
+// says "silent" without spending the width a written "0%" would.
+const VOLUME_PRESETS: {
+  key: string;
+  volume: number;
+  name: string;
+  label?: string;
+}[] = [
+  { key: "0", volume: 0, name: "Mute" },
+  { key: "5", volume: 50, name: "Half volume", label: "50%" },
+  { key: "1", volume: 100, name: "Full volume", label: "100%" },
+];
 
 // The shapes worth cycling between, starting from the one the file itself
 // declares. Each is written the way it is spoken and both the number mpv wants
@@ -1306,6 +1331,9 @@ function Player({
         event.preventDefault();
         action();
       };
+      const volumePreset = VOLUME_PRESETS.find(
+        (preset) => preset.key === event.key,
+      );
       // Every keystroke belongs to the open tag field: binding them here would
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
@@ -1346,6 +1374,8 @@ function Player({
         run(() => applyVolume(volume - VOLUME_STEP));
       } else if (event.key === "ArrowUp") {
         run(() => applyVolume(volume + VOLUME_STEP));
+      } else if (volumePreset) {
+        run(() => applyVolume(volumePreset.volume));
       } else if (event.key.toLowerCase() === "a") {
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "t") {
@@ -1712,6 +1742,24 @@ function Player({
               >
                 <SpeakerIcon waves={2} />
               </ControlButton>
+              {/* The volumes worth going straight to, each pressed rather than
+                  stepped towards, and each lit while the volume is sitting on
+                  it. */}
+              {VOLUME_PRESETS.map((preset) => (
+                <ControlButton
+                  key={preset.key}
+                  shortcut={preset.key}
+                  onClick={() => applyVolume(preset.volume)}
+                  aria-label={preset.name}
+                  aria-pressed={volume === preset.volume}
+                >
+                  {preset.label ? (
+                    <Label>{preset.label}</Label>
+                  ) : (
+                    <SpeakerIcon waves={0} />
+                  )}
+                </ControlButton>
+              ))}
               <ControlButton
                 shortcut="["
                 onClick={() => rotate(-90)}

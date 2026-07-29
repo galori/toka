@@ -2017,9 +2017,10 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   expect(quieter.querySelector(".key-hint")).toHaveTextContent("↓");
   expect(louder.querySelector(".key-hint")).toHaveTextContent("↑");
 
-  // The digits were awkward to reach and are no longer volume's to take.
+  // Stepping the volume digit by digit was awkward to reach: only the three
+  // presets keep a digit, and the rest of the row does nothing.
   fireEvent.keyDown(window, { key: "9" });
-  fireEvent.keyDown(window, { key: "0" });
+  fireEvent.keyDown(window, { key: "3" });
   expect(volume).toHaveValue("100");
 
   // "Vol −" and "Vol +" as words sat oddly among a row of icons; a speaker
@@ -2028,6 +2029,118 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   expect(louder).not.toHaveTextContent("Vol");
   expect(quieter.querySelector(".control-icon")).toBeInTheDocument();
   expect(louder.querySelector(".control-icon")).toBeInTheDocument();
+});
+
+test("jumps to preset volumes with the discoverable digit shortcuts", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+
+  const volume = screen.getByRole("slider", { name: "Volume" });
+  expect(volume).toHaveValue("100");
+
+  fireEvent.keyDown(window, { key: "0" });
+  expect(volume).toHaveValue("0");
+  expect(video).toHaveProperty("volume", 0);
+
+  fireEvent.keyDown(window, { key: "5" });
+  expect(volume).toHaveValue("50");
+  expect(video).toHaveProperty("volume", 0.5);
+
+  fireEvent.keyDown(window, { key: "1" });
+  expect(volume).toHaveValue("100");
+  expect(video).toHaveProperty("volume", 1);
+
+  // The arrow keys still step from wherever a preset left the volume.
+  fireEvent.keyDown(window, { key: "0" });
+  fireEvent.keyDown(window, { key: "ArrowUp" });
+  expect(volume).toHaveValue("5");
+
+  const mute = screen.getByRole("button", { name: "Mute" });
+  const half = screen.getByRole("button", { name: "Half volume" });
+  const full = screen.getByRole("button", { name: "Full volume" });
+  expect(mute).toHaveAttribute("aria-keyshortcuts", "0");
+  expect(half).toHaveAttribute("aria-keyshortcuts", "5");
+  expect(full).toHaveAttribute("aria-keyshortcuts", "1");
+  expect(mute.querySelector(".key-hint")).toHaveTextContent("0");
+  expect(half.querySelector(".key-hint")).toHaveTextContent("5");
+  expect(full.querySelector(".key-hint")).toHaveTextContent("1");
+
+  // The mute control reads as pressed while the sound is off, and clicking
+  // any preset moves the volume the same way its key does.
+  await user.click(mute);
+  expect(volume).toHaveValue("0");
+  expect(mute).toHaveAttribute("aria-pressed", "true");
+  await user.click(half);
+  expect(volume).toHaveValue("50");
+  expect(mute).toHaveAttribute("aria-pressed", "false");
+  await user.click(full);
+  expect(volume).toHaveValue("100");
+});
+
+test("sends preset volumes to native playback", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "native-1", fileName: "native.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({ currentTime: 0, duration: 30, ended: false });
+    }
+    return Promise.resolve(null);
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mp4" }),
+  );
+  await screen.findByLabelText("Playing native.mp4");
+
+  fireEvent.keyDown(window, { key: "0" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_volume", {
+      volume: 0,
+    }),
+  );
+  fireEvent.keyDown(window, { key: "5" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_volume", {
+      volume: 50,
+    }),
+  );
+  fireEvent.keyDown(window, { key: "1" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_volume", {
+      volume: 100,
+    }),
+  );
 });
 
 test("sends the selected rotation to native playback", async () => {
