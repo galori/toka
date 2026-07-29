@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { externalPlayers } from "./api";
+import { externalPlayers, launchPlaylist } from "./api";
 import App, { playbackSource, shuffleVideos } from "./App";
 
 const windowApiMock = vi.hoisted(() => ({
@@ -25,18 +25,20 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowApiMock,
 }));
 
-// Asked for once at startup, on a screen most of these tests never reach. Left
-// on the real `invoke` it would take the first queued response out of every
-// test's mock, so this one call is stubbed at the module seam instead;
+// Asked for once at startup each, on a screen most of these tests never reach.
+// Left on the real `invoke` they would take the first queued responses out of
+// every test's mock, so these calls are stubbed at the module seam instead;
 // `openInExternalPlayer` stays real, so what Toka sends the backend is still
 // asserted through `invoke`.
 vi.mock("./api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./api")>()),
   externalPlayers: vi.fn(() => Promise.resolve([])),
+  launchPlaylist: vi.fn(() => Promise.resolve(null)),
 }));
 
 const invokeMock = vi.mocked(invoke);
 const externalPlayersMock = vi.mocked(externalPlayers);
+const launchPlaylistMock = vi.mocked(launchPlaylist);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
 const randomMock = vi.spyOn(Math, "random");
 
@@ -72,6 +74,7 @@ test("shows build provenance on the initial home screen", () => {
 beforeEach(() => {
   invokeMock.mockReset();
   externalPlayersMock.mockReset().mockResolvedValue([]);
+  launchPlaylistMock.mockReset().mockResolvedValue(null);
   convertFileSrcMock.mockClear();
   randomMock.mockReset().mockReturnValue(0.999999);
   windowApiMock.isFullscreen.mockReset();
@@ -4049,4 +4052,52 @@ test("steps a real frame using the rate native playback reports", async () => {
   );
   fireEvent.keyDown(window, { key: "ArrowLeft" });
   await waitFor(() => expect(seeks().at(-1)).toBeCloseTo(10 + 1 / 25 - 1, 5));
+});
+
+test("plays the playlist Toka was launched with and leaves it to come back to", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `launched-${number}.mp4`,
+    extension: "mp4",
+  }));
+  launchPlaylistMock.mockResolvedValue({
+    query: "summer.m3u8",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results,
+  });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/launched-1.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  // The playlist plays on its own, from its first entry, without anything being
+  // searched for or clicked.
+  expect(await screen.findByLabelText("Playing launched-1.mp4")).toBeVisible();
+  expect(screen.getByText("Playlist video 1 of 2")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Playlist 2" })).toBeVisible();
+  expect(invokeMock.mock.calls.map(([command]) => command)).not.toContain(
+    "search_videos",
+  );
+
+  // And its entries are the list a viewer coming out of the player lands on,
+  // the same as a search's results would be.
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(
+    screen.getByRole("button", { name: "Play launched-2.mp4" }),
+  ).toBeVisible();
+});
+
+test("reports a launch playlist it cannot play and leaves the search ready", async () => {
+  launchPlaylistMock.mockRejectedValue({
+    kind: "Playlist",
+    message: "summer.m3u8 lists no videos Toka can play.",
+  });
+  render(<App />);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "summer.m3u8 lists no videos Toka can play.",
+  );
+  expect(screen.getByRole("searchbox")).toHaveFocus();
 });
