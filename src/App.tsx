@@ -1884,7 +1884,14 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
   const requestNumber = useRef(0);
-  const loadMoreMarker = useRef<HTMLDivElement>(null);
+  // State, not a ref: the results list unmounts for as long as a video plays,
+  // so coming back puts a brand new marker on screen. A ref would leave the
+  // observer watching the detached original — which can never intersect again —
+  // and infinite scroll would quietly stop after the first video. Holding the
+  // node in state re-runs the effect for whichever marker is really rendered.
+  const [loadMoreMarker, setLoadMoreMarker] = useState<HTMLDivElement | null>(
+    null,
+  );
 
   const runSearch = async (submittedQuery: string, requestedPage: number) => {
     const trimmed = submittedQuery.trim();
@@ -1927,11 +1934,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (
-      !page ||
-      !loadMoreMarker.current ||
-      typeof IntersectionObserver === "undefined"
-    )
+    if (!page || !loadMoreMarker || typeof IntersectionObserver === "undefined")
       return;
     const observer = new IntersectionObserver(
       (entries) => {
@@ -1939,9 +1942,9 @@ export default function App() {
       },
       { rootMargin: "400px" },
     );
-    observer.observe(loadMoreMarker.current);
+    observer.observe(loadMoreMarker);
     return () => observer.disconnect();
-  }, [page, loadingMore]);
+  }, [page, loadingMore, loadMoreMarker]);
 
   // Asked once: which players are installed does not change while Toka runs,
   // and a computer with none should never be offered the control at all.
@@ -2189,7 +2192,7 @@ export default function App() {
           )}
           {page.results.length < page.totalResults ? (
             <div
-              ref={loadMoreMarker}
+              ref={setLoadMoreMarker}
               className="load-more-marker"
               aria-live="polite"
             >
