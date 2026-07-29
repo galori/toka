@@ -2857,6 +2857,59 @@ test("keeps fullscreen controls hidden when autoplay advances the playlist", asy
   }
 });
 
+test("hides the native surface when opening a video fails", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "broken",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "broken-video", fileName: "broken.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/broken.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "load_native_video") {
+      return Promise.reject(new Error("The video file is empty."));
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "broken{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play broken.mp4" }),
+  );
+
+  // GTK places native video above the WebView. Once native playback reports an
+  // error, leaving that surface visible makes it cover the error view (and the
+  // results shown after Back) at its last, cropped position.
+  expect(
+    await screen.findByRole("heading", {
+      name: "This video could not be played",
+    }),
+  ).toBeVisible();
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_video_bounds", {
+      x: 0,
+      y: 0,
+      width: 1,
+      height: 1,
+      visible: false,
+    }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("stop_native_video");
+});
+
 test("keeps native video clear of the player controls and playlist drawer", async () => {
   const results = [1, 2].map((number) => ({
     id: `native-${number}`,
