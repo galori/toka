@@ -846,7 +846,12 @@ function Player({
   const selectedSubtitle = subtitles[subtitleIndex];
 
   useEffect(() => {
-    if (!native || !nativeSurface.current) return;
+    // The error view replaces the surface these measurements come from, so the
+    // watchers have to go with it: left running, the next resize would measure
+    // a view that no longer has a picture in it and put the hidden layer back
+    // over whatever is on screen, and the poll would keep asking an engine that
+    // has already been stopped how far along it is.
+    if (!native || error || !nativeSurface.current) return;
     const surface = nativeSurface.current;
     let advancing = false;
     // mpv only knows the file's subtitle tracks once it has finished loading,
@@ -924,7 +929,15 @@ function Player({
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);
     };
-  }, [controlsIdle, drawerOpen, fullscreen, index, native, showFullscreenInfo]);
+  }, [
+    controlsIdle,
+    drawerOpen,
+    error,
+    fullscreen,
+    index,
+    native,
+    showFullscreenInfo,
+  ]);
 
   const play = () => {
     if (native) {
