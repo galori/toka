@@ -3776,6 +3776,49 @@ test("opens the chosen player from its keyboard shortcut", async () => {
   );
 });
 
+// The Ubuntu launcher raises the Toka that is already running rather than
+// starting another, so asking for a second one has to be possible from inside
+// the first.
+test("starts a second Toka from the control and from Ctrl+N", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+
+  const control = screen.getByRole("button", { name: "New window" });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Ctrl+N");
+  expect(control.querySelector(".key-hint")).toHaveTextContent("Ctrl+N");
+
+  await user.click(control);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
+  );
+
+  // The search field holds the keyboard on this screen, so a bare letter would
+  // be typed into it rather than reaching the app.
+  invokeMock.mockClear();
+  const field = screen.getByRole("searchbox");
+  fireEvent.keyDown(field, { key: "n", ctrlKey: true });
+  expect(field).toHaveValue("");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
+  );
+});
+
+test("says why a second Toka could not be started", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "open_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(screen.getByRole("button", { name: "New window" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
+});
+
 test("says nothing about other players when this computer has none", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {

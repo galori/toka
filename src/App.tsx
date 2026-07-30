@@ -32,6 +32,7 @@ import {
   undoDelete,
   externalPlayers,
   openInExternalPlayer,
+  openNewWindow,
   addVideoTags,
   removeVideoTags,
   videoThumbnail,
@@ -2165,6 +2166,18 @@ export default function App() {
   // picked one.
   const activePlayer = chosenPlayer ?? players[0]?.command;
 
+  // The desktop launcher raises the Toka that is already running rather than
+  // starting a second one, so watching two things at once has to be asked for
+  // from inside the first.
+  const startNewWindow = async () => {
+    setError(undefined);
+    try {
+      await openNewWindow();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    }
+  };
+
   const openInPlayer = async () => {
     if (!page || !activePlayer) return;
     setError(undefined);
@@ -2228,6 +2241,18 @@ export default function App() {
       if (event.key.toLowerCase() !== "o") return;
       event.preventDefault();
       void openInPlayer();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  useEffect(() => {
+    if (playing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.key.toLowerCase() !== "n") return;
+      event.preventDefault();
+      void startNewWindow();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2356,6 +2381,18 @@ export default function App() {
               <Label>{scope.name}</Label>
             </ControlButton>
           ))}
+        </div>
+        {/* Always here rather than beside the results: a second Toka is worth
+            asking for before there is anything to show. */}
+        <div className="search-actions">
+          <ControlButton
+            shortcut="Ctrl+N"
+            className="scope-toggle"
+            aria-label="New window"
+            onClick={() => void startNewWindow()}
+          >
+            <Label>New window</Label>
+          </ControlButton>
         </div>
       </form>
 

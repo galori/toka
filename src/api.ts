@@ -202,3 +202,7 @@ export function setNativeVideoBounds(bounds: {
 }): Promise<void> {
   return invoke("set_native_video_bounds", bounds);
 }
+
+export function openNewWindow(): Promise<void> {
+  return invoke("open_new_window");
+}
