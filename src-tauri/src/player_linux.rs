@@ -19,6 +19,9 @@ const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
 const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
+// The one bit of mpv_render_context_update's answer that means "there is a new
+// frame to draw".
+const MPV_RENDER_UPDATE_FRAME: u64 = 1;
 const GL_FRAMEBUFFER_BINDING: u32 = 0x8CA6;
 #[cfg(feature = "native-e2e")]
 const GL_READ_FRAMEBUFFER: u32 = 0x8CA8;
@@ -81,6 +84,7 @@ type MpvRenderContextCreate =
     unsafe extern "C" fn(*mut *mut MpvRenderContext, *mut MpvHandle, *mut MpvRenderParam) -> c_int;
 type MpvRenderContextRender =
     unsafe extern "C" fn(*mut MpvRenderContext, *mut MpvRenderParam) -> c_int;
+type MpvRenderContextUpdate = unsafe extern "C" fn(*mut MpvRenderContext) -> u64;
 type MpvRenderContextFree = unsafe extern "C" fn(*mut MpvRenderContext);
 
 struct MpvApi {
@@ -96,6 +100,7 @@ struct MpvApi {
     free: MpvFree,
     render_context_create: MpvRenderContextCreate,
     render_context_render: MpvRenderContextRender,
+    render_context_update: MpvRenderContextUpdate,
     render_context_free: MpvRenderContextFree,
 }
 
@@ -122,6 +127,7 @@ impl MpvApi {
             free: symbol!("mpv_free", MpvFree),
             render_context_create: symbol!("mpv_render_context_create", MpvRenderContextCreate),
             render_context_render: symbol!("mpv_render_context_render", MpvRenderContextRender),
+            render_context_update: symbol!("mpv_render_context_update", MpvRenderContextUpdate),
             render_context_free: symbol!("mpv_render_context_free", MpvRenderContextFree),
             _library: library,
         })
@@ -322,6 +328,20 @@ impl Mpv {
             )
         };
         (code >= 0).then_some(value != 0)
+    }
+
+    // Whether mpv has a frame waiting to be drawn. Asking is the whole point:
+    // a render with nothing new to show still walks mpv's renderer and the GL
+    // driver behind it, and neither is free to do several million times a
+    // night.
+    // A renderer that has not been built yet answers yes, because building it
+    // is what the first render does.
+    fn wants_frame(&self) -> bool {
+        if self.render_context.is_null() {
+            return true;
+        }
+        let update = unsafe { (self.api.render_context_update)(self.render_context) };
+        update & MPV_RENDER_UPDATE_FRAME != 0
     }
 
     fn get_string(&self, name: &str) -> Option<String> {
@@ -658,6 +678,10 @@ impl NativePlayer {
         result
     }
 
+    fn wants_frame(&self) -> bool {
+        self.with_mpv(|mpv| Ok(mpv.wants_frame())).unwrap_or(false)
+    }
+
     fn render_error(&self) -> Option<String> {
         self.render_error.lock().ok()?.message.clone()
     }
@@ -899,8 +923,18 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     // Reading the whole root window is far too costly to repeat every frame.
     #[cfg(feature = "native-e2e")]
     let probe_tick = std::cell::Cell::new(0u32);
+    let tick_player = player.clone();
+    // The frame clock ticks for as long as the window is on screen, whether or
+    // not there is anything playing. Drawing on every one of those ticks asked
+    // mpv's renderer and the GL driver behind it for a frame sixty times a
+    // second from the moment Toka opened — with no file loaded, with the video
+    // paused, all night — and the memory that costs is never handed back: an
+    // idle Toka grew by about a gigabyte an hour until the desktop killed it.
+    // mpv is asked instead, and only draws when it says there is a frame.
     video_area.add_tick_callback(move |area, _| {
-        area.queue_render();
+        if tick_player.wants_frame() {
+            area.queue_render();
+        }
         #[cfg(feature = "native-e2e")]
         if let Some(window) = composed_pixel_overlay.window() {
             let bounds = area.allocation();
@@ -1241,6 +1275,20 @@ mod tests {
     // which is all that is under test. What they then make of the path is not.
     fn player_without_mpv() -> Arc<NativePlayer> {
         NativePlayer::from_mpv(Err("This player has no video engine.".to_owned()))
+    }
+
+    // The frame clock ticks whether or not anything is playing, so what the
+    // tick callback asks before drawing is the whole of the fix: a player with
+    // nothing behind it must answer no, or an engine that failed to start would
+    // still be drawn sixty times a second for as long as Toka was open.
+    #[test]
+    fn never_asks_to_draw_without_a_video_engine() {
+        let player = player_without_mpv();
+
+        assert!(
+            !player.wants_frame(),
+            "there is no engine to produce a frame, so there is nothing to draw"
+        );
     }
 
     #[test]
