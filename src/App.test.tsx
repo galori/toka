@@ -3817,11 +3817,14 @@ test("cycles the picture through common aspect ratios and back to auto", async (
   const control = screen.getByRole("button", { name: "Aspect ratio: auto" });
   expect(control).toHaveAttribute("aria-keyshortcuts", "A");
   expect(video).not.toHaveStyle({ aspectRatio: "16 / 9" });
+  // The shape the picture is in is written on the control, the way the skip
+  // step is, so cycling says what it landed on rather than only what it did.
+  expect(control).toHaveTextContent("auto");
 
   await user.click(control);
   expect(
     screen.getByRole("button", { name: "Aspect ratio: 16:9" }),
-  ).toBeVisible();
+  ).toHaveTextContent("16:9");
   expect(video).toHaveStyle({ aspectRatio: "16 / 9", objectFit: "fill" });
 
   // Rotating must not change which way the override is applied.
@@ -3831,16 +3834,29 @@ test("cycles the picture through common aspect ratios and back to auto", async (
     transform: "rotate(90deg)",
   });
 
-  fireEvent.keyDown(window, { key: "a" });
-  expect(video).toHaveStyle({ aspectRatio: "4 / 3" });
-  fireEvent.keyDown(window, { key: "a" });
-  fireEvent.keyDown(window, { key: "a" });
-  fireEvent.keyDown(window, { key: "a" });
+  // The rest of the cycle, each stop naming itself: the tall shapes a phone
+  // records in, then the wide ones a film is cut for.
+  const rest = [
+    ["4:3", "4 / 3"],
+    ["1:1", "1 / 1"],
+    ["3:4", "3 / 4"],
+    ["9:16", "9 / 16"],
+    ["21:9", "21 / 9"],
+    ["2.39:1", "2.39 / 1"],
+  ];
+  for (const [label, ratio] of rest) {
+    fireEvent.keyDown(window, { key: "a" });
+    expect(
+      screen.getByRole("button", { name: `Aspect ratio: ${label}` }),
+    ).toHaveTextContent(label);
+    expect(video).toHaveStyle({ aspectRatio: ratio });
+  }
 
   // Back where it started, with the browser choosing the shape again.
+  fireEvent.keyDown(window, { key: "a" });
   expect(
     screen.getByRole("button", { name: "Aspect ratio: auto" }),
-  ).toBeVisible();
+  ).toHaveTextContent("auto");
   expect(video).not.toHaveStyle({ objectFit: "fill" });
 });
 
@@ -3889,9 +3905,18 @@ test("sends the chosen aspect ratio to native playback", async () => {
     }),
   );
 
-  // Auto hands the shape back to mpv rather than pinning it to the last value.
-  for (let step = 0; step < 4; step += 1)
+  // The decimal shape reaches mpv as the number it stands for rather than as
+  // the text it is written with.
+  for (let step = 0; step < 6; step += 1)
     fireEvent.keyDown(window, { key: "a" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_video_aspect", {
+      ratio: 2.39,
+    }),
+  );
+
+  // Auto hands the shape back to mpv rather than pinning it to the last value.
+  fireEvent.keyDown(window, { key: "a" });
   await waitFor(() => {
     const ratios = invokeMock.mock.calls
       .filter(([command]) => command === "set_native_video_aspect")
