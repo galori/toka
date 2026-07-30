@@ -11,6 +11,7 @@ import {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  launchPlaylist,
   loadNativeVideo,
   nativePlaybackState,
   nativeSubtitleTracks,
@@ -2251,6 +2252,22 @@ export default function App() {
       setPlaylistLoading(false);
     }
   };
+
+  // A playlist Toka was launched with plays as soon as the window is up. Its
+  // entries arrive as a page of results, so everything a search's results reach
+  // — the player, its drawer, prev and next, coming back to the list — works for
+  // a playlist file without a second way through any of it.
+  useEffect(() => {
+    void launchPlaylist()
+      .then((launched) => {
+        // A viewer who got a search in first has asked for something newer than
+        // the command line did, and keeps it.
+        if (!launched?.results.length || requestNumber.current) return;
+        setPage(launched);
+        setPlaying({ videos: launched.results, startIndex: 0 });
+      })
+      .catch((reason) => setError(errorMessage(reason)));
+  }, []);
 
   const submit = (event: FormEvent) => {
     event.preventDefault();

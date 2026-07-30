@@ -1,6 +1,7 @@
 mod external_players;
 #[cfg(target_os = "linux")]
 mod player_linux;
+mod playlist;
 mod providers;
 mod search;
 mod subtitles;
@@ -13,7 +14,7 @@ use providers::MdfindSearchProvider;
 use providers::{PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 
@@ -45,6 +46,10 @@ struct CommandError {
 struct DeletedVideo {
     trash_name: String,
 }
+
+/// The playlist file Toka was launched with, kept from the command line until
+/// the frontend is up to ask for it.
+struct LaunchPlaylist(Option<PathBuf>);
 
 #[derive(Serialize)]
 struct TagsError {
@@ -186,6 +191,29 @@ fn trash_outcome(
         });
     }
     Ok(name)
+}
+
+/// The playlist Toka was launched with — `toka summer.m3u8`, or the playlist
+/// opened in a file manager — as a page of results to play, so it goes through
+/// the same player, drawer and controls a search's results do.
+///
+/// `None` is the ordinary case: Toka was started on its own and belongs on an
+/// empty search. A playlist that cannot be read, and one with nothing left in it
+/// to play, come back as errors for the viewer to see instead.
+#[tauri::command]
+fn launch_playlist(
+    launched: State<'_, LaunchPlaylist>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<Option<SearchPage>, CommandError> {
+    let Some(path) = launched.0.as_deref() else {
+        return Ok(None);
+    };
+    let videos = playlist::videos(path).map_err(|message| CommandError {
+        kind: "Playlist",
+        message,
+    })?;
+    let name = playlist::name(path).into_owned();
+    Ok(Some(engine.page_of_videos(name, videos)))
 }
 
 /// The players installed on this computer that Toka can hand a playlist to.
@@ -612,13 +640,18 @@ pub fn run() {
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
 
+    // Read before the window exists, because the command line Toka was started
+    // with is the whole of what it was asked to open.
+    let launched = LaunchPlaylist(playlist::from_arguments(std::env::args_os()));
     let builder = builder
         .manage(Arc::new(SearchEngine::new(platform_provider())))
-        .manage(Mutex::new(None::<DeletedVideo>));
+        .manage(Mutex::new(None::<DeletedVideo>))
+        .manage(launched);
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
         builder.invoke_handler(tauri::generate_handler![
             search_videos,
+            launch_playlist,
             video_thumbnail,
             delete_video,
             undo_delete,
@@ -638,6 +671,7 @@ pub fn run() {
             .setup(move |app| player_linux::install(app, setup_player.clone()))
             .invoke_handler(tauri::generate_handler![
                 search_videos,
+                launch_playlist,
                 video_thumbnail,
                 delete_video,
                 undo_delete,
@@ -666,6 +700,7 @@ pub fn run() {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
+        launch_playlist,
         video_thumbnail,
         delete_video,
         undo_delete,

@@ -157,23 +157,8 @@ impl SearchEngine {
         let mut known_paths = self.result_paths.lock().unwrap();
         let results = page_paths
             .map(|path| {
-                let id = Uuid::new_v4().to_string();
-                let result = VideoResult {
-                    id: id.clone(),
-                    file_name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    extension: path
-                        .extension()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase(),
-                    thumbnail_path: None,
-                    tags: tags::get(&path),
-                };
-                known_paths.insert(id, path);
+                let result = video_result(&path);
+                known_paths.insert(result.id.clone(), path);
                 result
             })
             .collect();
@@ -209,6 +194,34 @@ impl SearchEngine {
         // cheaply — provider candidates are deliberately left untouched.
         paths.extend(renamed.values().filter(|path| path.is_file()).cloned());
         Ok(paths)
+    }
+
+    /// A page of results for videos Toka was handed rather than found, so a
+    /// playlist file plays through everything a search's results do — the
+    /// player, its drawer, tagging, thumbnails — without a second path through
+    /// any of it. `paths` keeps the order it was given, because that is the
+    /// order a playlist asked for.
+    ///
+    /// The page is whole: it holds every video there is, so nothing about it
+    /// invites the frontend to ask for a second page that no search backs.
+    pub fn page_of_videos(&self, query: String, paths: Vec<PathBuf>) -> SearchPage {
+        let mut known_paths = self.result_paths.lock().unwrap();
+        let results: Vec<VideoResult> = paths
+            .into_iter()
+            .map(|path| {
+                let result = video_result(&path);
+                known_paths.insert(result.id.clone(), path);
+                result
+            })
+            .collect();
+        SearchPage {
+            query,
+            page: 1,
+            page_size: PAGE_SIZE,
+            total_results: results.len(),
+            total_pages: 1,
+            results,
+        }
     }
 
     pub fn video_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
@@ -262,6 +275,26 @@ impl SearchEngine {
     }
 }
 
+/// A result for `path` under a fresh id, which is what the frontend names the
+/// video by from then on: an id the engine minted, never a filesystem path.
+fn video_result(path: &Path) -> VideoResult {
+    VideoResult {
+        id: Uuid::new_v4().to_string(),
+        file_name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        extension: path
+            .extension()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase(),
+        thumbnail_path: None,
+        tags: tags::get(path),
+    }
+}
+
 /// Whether every term is somewhere in the parts of `path` the viewer chose to
 /// search. A term may land in any one of them, so a query can name a folder and
 /// a tag at once; all of them still have to land somewhere, which is what makes
@@ -296,7 +329,7 @@ fn haystacks(path: &Path, fields: SearchFields) -> Vec<String> {
     haystacks
 }
 
-fn is_supported_video(path: &Path) -> bool {
+pub fn is_supported_video(path: &Path) -> bool {
     matches!(
         path.extension()
             .and_then(|extension| extension.to_str())
@@ -635,6 +668,32 @@ mod tests {
         let page = engine.search(request("sample")).unwrap();
 
         assert_eq!(page.total_results, 0);
+    }
+
+    #[test]
+    fn videos_handed_to_the_engine_become_a_playable_page_in_the_order_given() {
+        let directory = tempdir().unwrap();
+        let beach = directory.path().join("Beach day [home].mp4");
+        let party = directory.path().join("party.MKV");
+        for path in [&beach, &party] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+
+        let page = engine.page_of_videos("summer.m3u8".into(), vec![party.clone(), beach.clone()]);
+
+        assert_eq!(page.query, "summer.m3u8");
+        assert_eq!(page.total_results, 2);
+        assert_eq!(page.total_pages, 1);
+        // A playlist's order is the order it asked to be played in, so these
+        // are not sorted by name the way a search's results are.
+        assert_eq!(page.results[0].file_name, "party.MKV");
+        assert_eq!(page.results[0].extension, "mkv");
+        assert_eq!(page.results[1].file_name, "Beach day [home].mp4");
+        assert_eq!(page.results[1].tags, ["home"]);
+        // And each result plays the video it stands for.
+        assert_eq!(engine.video_path(&page.results[0].id).unwrap(), party);
+        assert_eq!(engine.video_path(&page.results[1].id).unwrap(), beach);
     }
 
     #[test]

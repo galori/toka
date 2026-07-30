@@ -48,6 +48,14 @@ export function searchVideos(
   });
 }
 
+// The playlist file Toka was launched with — `toka summer.m3u8`, or a playlist
+// opened from a file manager — as a page of results to play. `null` is the
+// ordinary case: Toka was started on its own. A playlist that cannot be read,
+// or that has nothing left in it to play, rejects with the reason.
+export function launchPlaylist(): Promise<SearchPage | null> {
+  return invoke<SearchPage | null>("launch_playlist");
+}
+
 export function videoThumbnail(resultId: string): Promise<string> {
   return invoke<string>("video_thumbnail", { resultId });
 }

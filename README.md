@@ -31,6 +31,25 @@ left on cannot be switched off, because a search with nothing to look at could
 only ever answer "no videos". The choice lasts as long as Toka is open, like
 every other setting here.
 
+## Playlists
+
+Every page of results is a playlist: playing one video plays the rest after it,
+with `PageUp` and `PageDown` for the previous and next entry.
+
+Toka can also be launched with a playlist file, and starts playing it straight
+away:
+
+```sh
+toka ~/Videos/summer.m3u8
+```
+
+Opening a `.m3u8` or `.m3u` file with Toka from a file manager does the same
+thing. The format is the extended M3U that the `Open in` control writes for other
+players: one path per line, `#` lines ignored, and a path written relative to the
+playlist resolved against the folder the playlist is in. Entries that have since
+been deleted are skipped rather than stopping the playlist, and the playlist's
+entries stay on screen as the list to come back to.
+
 ## Tagging
 
 Tags are stored in the filename, inside square brackets before the extension:
