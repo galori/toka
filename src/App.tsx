@@ -326,17 +326,6 @@ function SpeakerIcon({ waves }: { waves: 0 | 1 | 2 }) {
   );
 }
 
-// A frame with a second, wider frame inside it: the control changes the shape
-// the picture is drawn into, and shows two of them to say so.
-function AspectIcon() {
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
-      <rect x="2.2" y="4.4" width="19.6" height="15.2" rx="2" />
-      <rect x="6.2" y="8.6" width="11.6" height="6.8" rx="1.4" />
-    </svg>
-  );
-}
-
 function RotateLeftIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
@@ -478,7 +467,19 @@ const ASSUMED_FRAME_RATE = 30;
 // declares. Each is written the way it is spoken and both the number mpv wants
 // and the value CSS wants are derived from that, so the two engines cannot be
 // given subtly different shapes.
-const ASPECT_RATIOS = ["auto", "16:9", "4:3", "1:1", "21:9"];
+// Ordered from the widest common shape to the squarest and on into the tall
+// ones a phone records in, then out to the wide ones a film is cut for, so a
+// press moves the picture one step in a direction rather than jumping about.
+const ASPECT_RATIOS = [
+  "auto",
+  "16:9",
+  "4:3",
+  "1:1",
+  "3:4",
+  "9:16",
+  "21:9",
+  "2.39:1",
+];
 
 function aspectParts(label: string): [number, number] | undefined {
   const [width, height] = label.split(":").map(Number);
@@ -1890,7 +1891,10 @@ function Player({
               </ControlButton>
               {/* Named after the shape it is currently in, the way the loop
                   control is named after its mode, so the control says what it
-                  did as well as what it will do next. */}
+                  did as well as what it will do next. The shape is written out
+                  rather than drawn: an icon can say that the picture has been
+                  reshaped, but only the numbers say which of eight shapes it
+                  landed on, which is the whole question while cycling. */}
               <ControlButton
                 shortcut="A"
                 className={
@@ -1901,7 +1905,7 @@ function Player({
                 onClick={cycleAspect}
                 aria-label={`Aspect ratio: ${aspect}`}
               >
-                <AspectIcon />
+                <Label>{aspect}</Label>
               </ControlButton>
               <ControlButton
                 shortcut="L"
