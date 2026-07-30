@@ -1406,6 +1406,54 @@ test("uses Tauri window fullscreen when the web fullscreen request fails", async
   expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
 });
 
+// WebKitGTK's own fullscreen mode takes keys before the page is offered them:
+// `f` leaves fullscreen there, so a tag with an f in it could not be typed
+// while the player was fullscreen, and the letter never reached the field.
+// Tauri's window fullscreen looks the same to the viewer and leaves every
+// keystroke to the app.
+test("uses Tauri window fullscreen first on Linux", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15");
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
+    await user.click(
+      await screen.findByRole("button", { name: "Enter fullscreen" }),
+    );
+
+    await waitFor(() =>
+      expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
+    );
+    expect(requestFullscreen).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Exit fullscreen" }),
+    ).toBeVisible();
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
 test("uses Tauri window fullscreen first on macOS", async () => {
   const userAgent = vi
     .spyOn(window.navigator, "userAgent", "get")

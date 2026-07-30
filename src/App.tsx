@@ -639,8 +639,15 @@ export function playbackSource(filePath: string): string {
   return convertFileSrc(filePath);
 }
 
+// Which engines are better asked for a fullscreen window than for a fullscreen
+// element. WebKitGTK takes keys for itself once an element is fullscreen — `f`
+// leaves fullscreen there, before the page is offered the keystroke — so a tag
+// with an f in it could not be typed while the player was fullscreen. The
+// window is fullscreen either way as far as the viewer can tell, and this way
+// every key still belongs to the app.
 function prefersWindowFullscreen(): boolean {
-  return navigator.userAgent.includes("Mac OS X");
+  const agent = navigator.userAgent;
+  return agent.includes("Mac OS X") || agent.includes("Linux");
 }
 
 function Player({
