@@ -1141,3 +1141,12 @@ button:focus-visible {
     margin-left: 0;
   }
 }
+
+/* The row the new-window control sits on, laid out like the scope switches
+   above it so the two read as one block of controls. */
+.search-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}

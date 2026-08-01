@@ -271,6 +271,23 @@ fn open_in_external_player(
     Ok(entries)
 }
 
+/// Starts another Toka. The desktop launcher raises the one already running
+/// rather than opening a second, so the running one has to be able to ask.
+#[tauri::command]
+fn open_new_window() -> Result<(), CommandError> {
+    let executable = std::env::current_exe().map_err(|error| CommandError {
+        kind: "NewWindow",
+        message: format!("Toka could not find its own program to start again: {error}"),
+    })?;
+    std::process::Command::new(&executable)
+        .spawn()
+        .map_err(|error| CommandError {
+            kind: "NewWindow",
+            message: format!("Another Toka could not be started: {error}"),
+        })?;
+    Ok(())
+}
+
 #[tauri::command]
 fn delete_video(
     result_id: String,
@@ -657,6 +674,7 @@ pub fn run() {
             undo_delete,
             external_players,
             open_in_external_player,
+            open_new_window,
             set_video_tags,
             add_video_tags,
             remove_video_tags,
@@ -677,6 +695,7 @@ pub fn run() {
                 undo_delete,
                 external_players,
                 open_in_external_player,
+                open_new_window,
                 set_video_tags,
                 add_video_tags,
                 remove_video_tags,
@@ -706,6 +725,7 @@ pub fn run() {
         undo_delete,
         external_players,
         open_in_external_player,
+        open_new_window,
         set_video_tags,
         add_video_tags,
         remove_video_tags,
