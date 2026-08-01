@@ -1293,6 +1293,72 @@ test("enters fullscreen mode for the player", async () => {
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
 
+test("cycles F through video, information, controls, and windowed modes", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  try {
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
+    const fullscreenControl = screen.getByRole("button", {
+      name: "Enter fullscreen",
+    });
+    expect(fullscreenControl).toHaveAttribute("aria-keyshortcuts", "F");
+
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
+    );
+    await waitFor(() =>
+      expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
+    );
+    expect(document.querySelector(".player-shell")).toHaveClass("video-only");
+    expect(
+      screen.queryByRole("region", { name: "Fullscreen video information" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Video controls")).not.toBeVisible();
+
+    fireEvent.keyDown(window, { key: "f" });
+    expect(document.querySelector(".player-shell")).not.toHaveClass(
+      "video-only",
+    );
+    expect(
+      screen.getByRole("region", { name: "Fullscreen video information" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle"),
+    );
+
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(windowApiMock.setFullscreen).toHaveBeenLastCalledWith(false),
+    );
+    expect(
+      screen.getByRole("button", { name: "Enter fullscreen" }),
+    ).toHaveAttribute("aria-keyshortcuts", "F");
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
 test("shows fullscreen path and time overlays and toggles them with I", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
@@ -1403,7 +1469,7 @@ test("uses Tauri window fullscreen when the web fullscreen request fails", async
     screen.queryByRole("heading", { name: "This video could not be played" }),
   ).not.toBeInTheDocument();
   expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
-  expect(screen.getByRole("button", { name: "Exit fullscreen" })).toBeVisible();
+  expect(screen.getByLabelText("Video controls")).not.toBeVisible();
 });
 
 // WebKitGTK's own fullscreen mode takes keys before the page is offered them:
@@ -1446,9 +1512,7 @@ test("uses Tauri window fullscreen first on Linux", async () => {
       expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
     );
     expect(requestFullscreen).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole("button", { name: "Exit fullscreen" }),
-    ).toBeVisible();
+    expect(screen.getByLabelText("Video controls")).not.toBeVisible();
   } finally {
     userAgent.mockRestore();
   }
@@ -1523,7 +1587,17 @@ test("keeps player keyboard shortcuts live after leaving fullscreen from the key
     const video = await screen.findByLabelText("Playing clip.mp4");
 
     fireEvent.keyDown(window, { key: "f" });
-    await screen.findByRole("button", { name: "Exit fullscreen" });
+    await waitFor(() =>
+      expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
+    );
+    fireEvent.keyDown(window, { key: "f" });
+    await screen.findByRole("region", {
+      name: "Fullscreen video information",
+    });
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle"),
+    );
     fireEvent.keyDown(window, { key: "f" });
     await screen.findByRole("button", { name: "Enter fullscreen" });
 
@@ -1550,6 +1624,13 @@ async function enterFullscreen(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByRole("button", { name: "Enter fullscreen" }),
   );
   reportFullscreen(true);
+  // Most legacy fullscreen tests exercise the information/scrubber mode that
+  // used to be the only entry state. The first F now advances there from the
+  // new video-only state.
+  fireEvent.keyDown(window, { key: "f" });
+  await screen.findByRole("region", {
+    name: "Fullscreen video information",
+  });
 }
 
 // The three fullscreen behaviours all need a player, fake timers and an engine
@@ -3383,8 +3464,8 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
       }),
     );
 
-    // Turning the overlay off hands that strip back. The keypress also wakes
-    // the controls, which take the bottom of the picture instead.
+    // Turning the overlay off hands that strip back without changing the
+    // selected information/scrubber mode.
     invokeMock.mockClear();
     act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
@@ -3392,13 +3473,12 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
         x: 0,
         y: 0,
         width: 1200,
-        height: 704,
+        height: 794,
         visible: true,
       }),
     );
 
-    // Bringing it back while the controls are up costs the picture nothing:
-    // the row sits inside the strip the controls have already reserved.
+    // Bringing it back reserves its single bottom row again.
     invokeMock.mockClear();
     act(() => void fireEvent.keyDown(window, { key: "i" }));
     await waitFor(() =>
@@ -3406,7 +3486,7 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
         x: 0,
         y: 0,
         width: 1200,
-        height: 704,
+        height: 760,
         visible: true,
       }),
     );

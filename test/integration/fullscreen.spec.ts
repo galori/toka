@@ -46,10 +46,19 @@ async function enterFullscreen(): Promise<boolean> {
   if (await inFullscreen()) return true;
   // A real user gesture, so the fullscreen request is allowed.
   await $('button[aria-label="Enter fullscreen"]').click();
-  return browser
+  const entered = await browser
     .waitUntil(async () => (await inFullscreen()) === true, { timeout: 5_000 })
     .then(() => true)
     .catch(() => false);
+  if (!entered) return false;
+  // Fullscreen now opens video-only. Advance once to the information/scrubber
+  // mode these layout checks exercise; dispatch inside the page because some
+  // WebKit builds reserve the physical F key for their own fullscreen UI.
+  await browser.execute(() =>
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", bubbles: true })),
+  );
+  await $(".fullscreen-info").waitForExist();
+  return true;
 }
 
 // The overlay is driven by the pointer, and both halves of it take themselves
