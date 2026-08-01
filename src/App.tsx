@@ -416,6 +416,7 @@ const PLAYLIST_HIDE_DELAY = 800;
 // stays with it, and the P key holds it open until the pointer visits and
 // leaves, or until P is pressed again.
 type FullscreenPlaylist = "hidden" | "peek" | "held";
+type FullscreenMode = "video" | "information" | "controls";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const VOLUME_STEP = 5;
@@ -705,6 +706,9 @@ function Player({
   const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
+  const [fullscreenMode, setFullscreenMode] =
+    useState<FullscreenMode>("video");
+  const fullscreenModeRef = useRef<FullscreenMode>("video");
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   const [controlsIdle, setControlsIdle] = useState(false);
   const [loop, setLoop] = useState<LoopMode>("playlist");
@@ -1334,33 +1338,43 @@ function Player({
     pointerOverControls.current = false;
     setControlsIdle(true);
     let lastActivity = 0;
-    const wake = () => {
+    const showControls = () => {
+      lastActivity = Date.now();
+      fullscreenModeRef.current = "controls";
+      setFullscreenMode("controls");
+      setShowFullscreenInfo(true);
+      setControlsIdle(false);
+    };
+    const wakeFromKeyboard = () => {
+      if (fullscreenModeRef.current !== "controls") return;
       lastActivity = Date.now();
       setControlsIdle(false);
     };
+    if (fullscreenMode === "controls") setControlsIdle(false);
     // Polling rather than a one-shot timer so that moving the pointer off the
     // controls re-arms the countdown without needing its own listener.
     // Keyboard use keeps them up through the keydown listener below; focus is
     // deliberately not consulted, because clicking a control focuses it and
     // would then pin the overlay open for the rest of the session.
     const tick = window.setInterval(() => {
+      if (fullscreenModeRef.current !== "controls") return;
       if (pointerOverControls.current || tagFieldOpen.current)
         lastActivity = Date.now();
       else if (Date.now() - lastActivity >= CONTROLS_IDLE_DELAY)
         setControlsIdle(true);
     }, 250);
-    window.addEventListener("mousemove", wake);
-    document.addEventListener("mousemove", wake);
-    document.addEventListener("pointermove", wake);
-    window.addEventListener("keydown", wake);
+    window.addEventListener("mousemove", showControls);
+    document.addEventListener("mousemove", showControls);
+    document.addEventListener("pointermove", showControls);
+    window.addEventListener("keydown", wakeFromKeyboard);
     return () => {
       window.clearInterval(tick);
-      window.removeEventListener("mousemove", wake);
-      document.removeEventListener("mousemove", wake);
-      document.removeEventListener("pointermove", wake);
-      window.removeEventListener("keydown", wake);
+      window.removeEventListener("mousemove", showControls);
+      document.removeEventListener("mousemove", showControls);
+      document.removeEventListener("pointermove", showControls);
+      window.removeEventListener("keydown", wakeFromKeyboard);
     };
-  }, [fullscreen]);
+  }, [fullscreen, fullscreenMode]);
 
   // Bringing the pointer all the way to the right-hand edge of the screen slides
   // the playlist out over the picture; it stays for as long as the pointer is on
@@ -1412,7 +1426,7 @@ function Player({
     focusPlayerShell();
   };
 
-  const toggleFullscreen = () => {
+  const leaveFullscreen = () => {
     setFullscreenError(undefined);
     if (document.fullscreenElement) {
       const exiting = document.exitFullscreen?.();
@@ -1441,6 +1455,28 @@ function Player({
         .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
       return;
     }
+  };
+
+  const cycleFullscreen = () => {
+    if (fullscreen) {
+      if (fullscreenModeRef.current === "video") {
+        setShowFullscreenInfo(true);
+        fullscreenModeRef.current = "information";
+        setFullscreenMode("information");
+        return;
+      }
+      if (fullscreenModeRef.current === "information") {
+        fullscreenModeRef.current = "controls";
+        setFullscreenMode("controls");
+        return;
+      }
+      leaveFullscreen();
+      return;
+    }
+    fullscreenModeRef.current = "video";
+    setFullscreenMode("video");
+    setShowFullscreenInfo(false);
+    setFullscreenError(undefined);
     const shell = playerShell.current;
     const enterWindowFullscreen = () =>
       getCurrentWindow()
@@ -1538,11 +1574,11 @@ function Player({
       } else if (event.key.toLowerCase() === "p") {
         run(togglePlaylist);
       } else if (event.key.toLowerCase() === "f") {
-        run(toggleFullscreen);
+        run(cycleFullscreen);
       } else if (event.key.toLowerCase() === "i" && fullscreen) {
         run(() => setShowFullscreenInfo((visible) => !visible));
       } else if (event.key === "Escape") {
-        run(fullscreen ? toggleFullscreen : onBack);
+        run(fullscreen ? leaveFullscreen : onBack);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -1663,7 +1699,7 @@ function Player({
           refuse the request to grant it. */}
       <div
         ref={playerShell}
-        className={`player-shell${fullscreen ? " fullscreen" : ""}${controlsIdle ? " idle" : ""}`}
+        className={`player-shell${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}`}
         tabIndex={-1}
       >
         {!prepared ? (
@@ -1716,7 +1752,7 @@ function Player({
             }
           ></video>
         )}
-        {fullscreen && showFullscreenInfo ? (
+        {fullscreen && fullscreenMode !== "video" && showFullscreenInfo ? (
           <div
             ref={fullscreenInfo}
             className="fullscreen-info"
@@ -1734,6 +1770,7 @@ function Player({
         <div
           ref={playerControls}
           className={controlsIdle ? "player-controls idle" : "player-controls"}
+          hidden={fullscreen && fullscreenMode === "video"}
           aria-label="Video controls"
           onClick={releaseFocus}
           onMouseEnter={() => {
@@ -1987,7 +2024,7 @@ function Player({
               </ControlButton>
               <ControlButton
                 shortcut="F"
-                onClick={toggleFullscreen}
+                onClick={cycleFullscreen}
                 aria-label={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
               >
                 {fullscreen ? <FullscreenExitIcon /> : <FullscreenEnterIcon />}

@@ -682,6 +682,9 @@ button:focus-visible {
   border-radius: 0;
   background: #000;
 }
+.player-shell.fullscreen.video-only {
+  --scrubber-sliver: 0px;
+}
 /* `height: auto` let the element fall back to the file's intrinsic size, so a
    320x180 clip stayed 320x180 in the middle of the screen. The sliver is the
    only thing taken off it: this height does not change as the overlay comes and
