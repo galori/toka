@@ -455,8 +455,31 @@ const SKIP_STEPS: { label: string; name: string; seconds?: number }[] = [
   { label: "10m", name: "10 minutes", seconds: 600 },
 ];
 
-// Where the cycle starts: what both skips did before they could be changed.
+// Where the cycle starts before anything is known about the file: what both
+// skips did before they could be changed.
 const DEFAULT_SKIP_STEP = SKIP_STEPS.findIndex((step) => step.seconds === 10);
+
+// How far a skip should reach depends on what it is moving through: ten seconds
+// is a nudge in a feature and a third of a short clip. A fifth of the file is
+// the yardstick — five of them cross it — so each video opens on whichever step
+// lands nearest that, and a tie takes the shorter one, since overshooting the
+// moment being looked for is the more tedious mistake to undo.
+// The frame step is not a candidate: it measures a rate, not a length.
+const skipStepForDuration = (duration: number) => {
+  if (!Number.isFinite(duration) || duration <= 0) return undefined;
+  const target = duration / 5;
+  let best: number | undefined;
+  let closest = Number.POSITIVE_INFINITY;
+  SKIP_STEPS.forEach((step, index) => {
+    if (step.seconds === undefined) return;
+    const distance = Math.abs(step.seconds - target);
+    if (distance < closest) {
+      closest = distance;
+      best = index;
+    }
+  });
+  return best;
+};
 
 // mpv reads a real frame rate out of the file, but a `<video>` element exposes
 // none at all, and neither knows one before the file is open. So a frame is a
@@ -735,6 +758,9 @@ function Player({
   // have to depend on it and restart playback whenever it changes.
   const chosenSpeed = useRef(speed);
   const chosenVolume = useRef(volume);
+  // Whether the step showing is one the viewer picked for this file or one read
+  // from its length, which decides whether the length may still change it.
+  const chosenSkipStep = useRef(false);
   useEffect(() => {
     chosenSpeed.current = speed;
   }, [speed]);
@@ -754,8 +780,10 @@ function Player({
     setPlayingBack(false);
     setRotation(0);
     setAspectStep(0);
-    // The step itself outlives the file, the way the speed and the volume do;
-    // the rate it is measured against belongs to this file alone.
+    // Both the step and the rate it may be measured against belong to this
+    // file: the next one is read from its own length once that is known.
+    setSkipStepIndex(DEFAULT_SKIP_STEP);
+    chosenSkipStep.current = false;
     setFrameRate(undefined);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
@@ -1063,6 +1091,15 @@ function Player({
     });
   };
 
+  // The length lands after the file opens — and on the native path a poll
+  // repeats it — so the default waits for it, and stands aside for good once
+  // the viewer has said what they want for this file.
+  useEffect(() => {
+    if (chosenSkipStep.current) return;
+    const step = skipStepForDuration(duration);
+    if (step !== undefined) setSkipStepIndex(step);
+  }, [duration]);
+
   const skipStep = SKIP_STEPS[skipStepIndex];
   // A frame is only as exact as the rate behind it, so the control says which
   // rate that is and whether anybody measured it.
@@ -1074,8 +1111,10 @@ function Player({
     ? skipStep.name
     : `${skipStep.name} (${measuredRate})`;
 
-  const cycleSkipStep = () =>
+  const cycleSkipStep = () => {
+    chosenSkipStep.current = true;
     setSkipStepIndex((current) => (current + 1) % SKIP_STEPS.length);
+  };
 
   const skip = (amount: number) => {
     const next = Math.max(

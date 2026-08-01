@@ -4,12 +4,15 @@
 // DOM is therefore not enough — each control is also measured.
 
 // Play and pause are one control that renames itself, so the transport is
-// measured through whichever of the two names it is wearing.
-const transportControls = [
-  "Previous video",
-  "Skip back 10 seconds",
-  "Skip forward 10 seconds",
-  "Next video",
+// measured through whichever of the two names it is wearing. The skips are
+// named after the step the video's length chose for them, the way the loop
+// control is named after its mode, so those two are matched by what they do
+// rather than by how far they happen to go for this fixture.
+const transportControls: [string, string][] = [
+  ["previous video", 'button[aria-label="Previous video"]'],
+  ["skip back", 'button[aria-label^="Skip back"]'],
+  ["skip forward", 'button[aria-label^="Skip forward"]'],
+  ["next video", 'button[aria-label="Next video"]'],
 ];
 
 const utilityControls = [
@@ -122,11 +125,9 @@ describe("Toka player controls", () => {
     expect(metrics.height).toBeGreaterThan(0);
   });
 
-  for (const label of transportControls) {
-    it(`shows the ${label.toLowerCase()} control`, async () => {
-      await expectPressable(
-        `.player-transport > button[aria-label="${label}"]`,
-      );
+  for (const [name, selector] of transportControls) {
+    it(`shows the ${name} control`, async () => {
+      await expectPressable(`.player-transport > ${selector}`);
     });
   }
 
