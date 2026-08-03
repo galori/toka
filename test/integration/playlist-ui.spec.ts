@@ -80,9 +80,19 @@ function trimsLabels(): Promise<boolean> {
 }
 
 describe("Toka playlist interface", () => {
+  // Results come back shuffled, so the playlist runs in whatever order the
+  // grid was showing rather than in one this file can name. Read off the grid
+  // before playback starts, so first and last can still be asserted about.
+  let playlistOrder: string[] = [];
+
   before(async () => {
     await search("sample");
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
+    playlistOrder = await browser.execute(() =>
+      [...document.querySelectorAll<HTMLElement>(".video-tile .video-name")].map(
+        (name) => name.textContent?.trim() ?? "",
+      ),
+    );
     await $("button=Play all").click();
     await $(".player-controls").waitForDisplayed();
   });
@@ -120,7 +130,9 @@ describe("Toka playlist interface", () => {
 
   it("lists every video in the drawer with the current one marked", async () => {
     expect((await $$(".playlist-drawer li button")).length).toBe(5);
-    await expect($('.playlist-drawer button[aria-current="true"]')).toHaveText(/sample1\.mp4/);
+    await expect($('.playlist-drawer button[aria-current="true"]')).toHaveText(
+      new RegExp(playlistOrder[0].replace(".", "\\.")),
+    );
   });
 
   it("keeps every player control clear of the open drawer", async () => {
@@ -193,7 +205,8 @@ describe("Toka playlist interface", () => {
       const now = await playingNow();
       return Boolean(now) && now !== before;
     });
-    expect(await playingNow()).toMatch(/sample5\.mp4/);
+    // Back from the first video is the last one, whichever the shuffle made it.
+    expect(await playingNow()).toBe(`Playing ${playlistOrder[4]}`);
 
     await next.click();
     await browser.waitUntil(async () => (await playingNow()) === before);
@@ -442,11 +455,21 @@ describe("Toka permanent playlist mode", () => {
 
   it("opens the whole page of results when one of them is chosen", async () => {
     // There is no such thing as playing one video on its own any more: a tile
-    // drops the viewer into the page's playlist at that tile's place.
+    // drops the viewer into the page's playlist at that tile's place — which,
+    // with the results shuffled, is wherever this fixture happens to have
+    // landed rather than a place this file can name.
+    const place = await browser.execute(
+      () =>
+        [...document.querySelectorAll<HTMLElement>(".video-tile .video-name")].findIndex(
+          (name) => name.textContent?.trim() === "sample3.mp4",
+        ) + 1,
+    );
+    expect(place).toBeGreaterThan(0);
+
     await $('button[aria-label="Play sample3.mp4"]').click();
     await $(".player-controls").waitForDisplayed();
 
-    await expect($(".playlist-status")).toHaveText("Playlist video 3 of 5");
+    await expect($(".playlist-status")).toHaveText(`Playlist video ${place} of 5`);
     expect((await $$(".playlist-drawer li button")).length).toBe(5);
     await expect($('.playlist-drawer button[aria-current="true"]')).toHaveText(/sample3\.mp4/);
     await expect($(".playlist-toggle")).toHaveText(/5/);

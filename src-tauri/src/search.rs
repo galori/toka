@@ -4,7 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -104,6 +108,19 @@ pub struct SearchEngine {
     /// gone, as `plocate --existing` does, stops listing it at all. Keeping the
     /// renames here lets a search see the file the way it is now.
     renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// The order the search on screen is being read in. Only the current one is
+    /// kept: a new question replaces it, and there is never a second search to
+    /// go back to — the frontend asks for page one and then walks forward.
+    shuffle: Mutex<Option<Shuffle>>,
+}
+
+/// The seed a search's order was drawn from, under the question that asked for
+/// it. Pages after the first reuse the seed so they continue that order instead
+/// of drawing a new one, which would repeat some videos and skip others.
+struct Shuffle {
+    query: String,
+    fields: SearchFields,
+    seed: u64,
 }
 
 impl SearchEngine {
@@ -112,6 +129,7 @@ impl SearchEngine {
             provider,
             result_paths: Mutex::new(HashMap::new()),
             renamed_paths: Mutex::new(HashMap::new()),
+            shuffle: Mutex::new(None),
         }
     }
 
@@ -141,6 +159,10 @@ impl SearchEngine {
             .filter(|path| seen.insert(path.clone()))
             .collect::<Vec<_>>();
 
+        // Sorted not to be read in this order — the shuffle below undoes it —
+        // but so that the shuffle has something fixed to work from. A provider
+        // is free to answer the same query in a different order each time, and
+        // page two has to continue the order page one started.
         paths.sort_by(|left, right| {
             let left_name = left.file_name().unwrap_or_default().to_string_lossy();
             let right_name = right.file_name().unwrap_or_default().to_string_lossy();
@@ -149,6 +171,7 @@ impl SearchEngine {
                 .cmp(&right_name.to_lowercase())
                 .then_with(|| left.cmp(right))
         });
+        shuffle(&mut paths, self.shuffle_seed(query, fields, request.page));
 
         let total_results = paths.len();
         let total_pages = total_results.div_ceil(PAGE_SIZE);
@@ -171,6 +194,28 @@ impl SearchEngine {
             total_pages,
             results,
         })
+    }
+
+    /// The seed the order of this page is drawn from. Page one is a new
+    /// question and always gets a new one, so asking the same thing twice shows
+    /// a different part of what matched rather than the same screenful again.
+    /// The pages after it continue whatever order page one started.
+    fn shuffle_seed(&self, query: &str, fields: SearchFields, page: usize) -> u64 {
+        let mut current = self.shuffle.lock().unwrap();
+        if page > 1 {
+            if let Some(shuffle) = current.as_ref() {
+                if shuffle.query == query && shuffle.fields == fields {
+                    return shuffle.seed;
+                }
+            }
+        }
+        let seed = fresh_seed();
+        *current = Some(Shuffle {
+            query: query.to_owned(),
+            fields,
+            seed,
+        });
+        seed
     }
 
     /// The provider's candidates, corrected for the renames this session has
@@ -272,6 +317,42 @@ impl SearchEngine {
     pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
         let path = self.video_path(result_id)?;
         thumbnails::generate(&path).ok_or(SearchError::VideoUnavailable)
+    }
+}
+
+/// A seed nothing can predict, and never the same one twice: the clock alone
+/// repeats itself when two searches land inside the same tick, which the
+/// counter separates.
+fn fresh_seed() -> u64 {
+    static SEARCHES: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or_default();
+    let searches = SEARCHES.fetch_add(1, Ordering::Relaxed);
+    let mut state = now ^ searches.wrapping_mul(GOLDEN_GAMMA);
+    next_random(&mut state)
+}
+
+/// Toka carries no random number generator, and does not need one it could not
+/// reproduce: SplitMix64 is a handful of arithmetic, and a seed is enough to
+/// draw the same order again for the pages that follow.
+const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(GOLDEN_GAMMA);
+    let mut drawn = *state;
+    drawn = (drawn ^ (drawn >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    drawn = (drawn ^ (drawn >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    drawn ^ (drawn >> 31)
+}
+
+/// Fisher-Yates, so every order is as likely as every other one.
+fn shuffle(paths: &mut [PathBuf], seed: u64) {
+    let mut state = seed;
+    for index in (1..paths.len()).rev() {
+        let swap = (next_random(&mut state) % (index as u64 + 1)) as usize;
+        paths.swap(index, swap);
     }
 }
 
@@ -414,29 +495,106 @@ mod tests {
         assert_eq!(page.results[0].extension, "mov");
     }
 
-    #[test]
-    fn search_sorts_deduplicates_and_paginates_results() {
-        let directory = tempdir().unwrap();
-        let mut paths = Vec::new();
-        for number in (0..25).rev() {
-            let path = directory.path().join(format!("clip-{number:02}.mp4"));
-            fs::write(&path, b"test").unwrap();
-            paths.push(path);
+    /// `count` clips named `clip-00.mp4` upwards, handed to the provider in
+    /// reverse so nothing downstream can pass by keeping the order it was given.
+    fn clips(directory: &Path, count: usize) -> Vec<PathBuf> {
+        (0..count)
+            .rev()
+            .map(|number| {
+                let path = directory.join(format!("clip-{number:02}.mp4"));
+                fs::write(&path, b"test").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn names(page: &SearchPage) -> Vec<String> {
+        page.results
+            .iter()
+            .map(|result| result.file_name.clone())
+            .collect()
+    }
+
+    /// Every name `clips` wrote, in the order `sort` puts them in, so a set of
+    /// results can be compared for what it holds rather than for its order.
+    fn every_clip_name(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|number| format!("clip-{number:02}.mp4"))
+            .collect()
+    }
+
+    fn page_two(query: &str) -> SearchRequest {
+        SearchRequest {
+            page: 2,
+            ..request(query)
         }
+    }
+
+    #[test]
+    fn search_deduplicates_and_paginates_results() {
+        let directory = tempdir().unwrap();
+        let mut paths = clips(directory.path(), 25);
         paths.push(paths[0].clone());
 
-        let provider = Arc::new(FakeProvider::new(paths));
-        let page = SearchEngine::new(provider)
-            .search(SearchRequest {
-                page: 2,
-                ..request("clip")
-            })
-            .unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = engine.search(request("clip")).unwrap();
+        let second = engine.search(page_two("clip")).unwrap();
 
-        assert_eq!(page.total_results, 25);
-        assert_eq!(page.total_pages, 2);
-        assert_eq!(page.results.len(), 1);
-        assert_eq!(page.results[0].file_name, "clip-24.mp4");
+        assert_eq!(first.total_results, 25);
+        assert_eq!(first.total_pages, 2);
+        assert_eq!(first.results.len(), 24);
+        assert_eq!(second.results.len(), 1);
+
+        let mut every_name = [names(&first), names(&second)].concat();
+        every_name.sort();
+        assert_eq!(every_name, every_clip_name(25));
+    }
+
+    /// An alphabetical list buries everything past the first screenful, which
+    /// is the wrong answer to "find me something to watch".
+    #[test]
+    fn search_shuffles_results_rather_than_listing_them_by_name() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = names(&engine.search(request("clip")).unwrap());
+
+        let mut by_name = found.clone();
+        by_name.sort();
+        assert_eq!(found.len(), 24);
+        assert_ne!(found, by_name);
+    }
+
+    /// The pages after the first continue the order the first one started. A
+    /// fresh shuffle per page would repeat some videos and skip others.
+    #[test]
+    fn search_keeps_one_order_across_the_pages_of_a_search() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = names(&engine.search(request("clip")).unwrap());
+        let second = names(&engine.search(page_two("clip")).unwrap());
+
+        let mut every_name = [first, second].concat();
+        every_name.sort();
+        assert_eq!(every_name, every_clip_name(30));
+    }
+
+    /// Asking the same question again is a new search, and gets a new order —
+    /// otherwise a viewer who did not like what came back has no way to see the
+    /// rest of what matched.
+    #[test]
+    fn search_gives_the_same_query_a_new_order_each_time() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = names(&engine.search(request("clip")).unwrap());
+        let second = names(&engine.search(request("clip")).unwrap());
+
+        assert_ne!(first, second);
     }
 
     #[test]
