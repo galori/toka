@@ -527,6 +527,11 @@ const SEARCH_SCOPES: {
   { field: "path", key: "P", name: "path" },
 ];
 
+// Not Ctrl+F, which a browser reads as "find in page" and which Toka has
+// already given to the filename scope above; Ctrl+K is what the rest of the
+// world binds "jump to search" to.
+const SEARCH_SHORTCUT = "Ctrl+K";
+
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
 // so the control names the one it is in and the pointer or the L key cycles.
@@ -706,8 +711,7 @@ function Player({
   const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
-  const [fullscreenMode, setFullscreenMode] =
-    useState<FullscreenMode>("video");
+  const [fullscreenMode, setFullscreenMode] = useState<FullscreenMode>("video");
   const fullscreenModeRef = useRef<FullscreenMode>("video");
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   const [controlsIdle, setControlsIdle] = useState(false);
@@ -2291,6 +2295,31 @@ export default function App() {
     if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
   });
 
+  // Focus starts in the search field and is put back there on the way out of a
+  // video, but anything clicked in between — a tile, a tag, a scope switch —
+  // takes it away, and a long page of results leaves the field scrolled off the
+  // top. This is the way back to it from wherever the keyboard has ended up.
+  useEffect(() => {
+    if (playing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
+        return;
+      if (event.key.toLowerCase() !== "k") return;
+      // WebKit reads Ctrl+K in a text field as "delete to end of line".
+      event.preventDefault();
+      const field = searchField.current;
+      if (!field) return;
+      // Scrolling to the field is the point here, unlike the focus that
+      // follows a video: someone reaching for the search box wants to see it.
+      field.focus();
+      // Selected rather than merely focused, so the next thing typed asks a
+      // new question instead of being appended to the old one.
+      field.select();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   // The search field holds the keyboard on this screen, so a bare letter would
   // be typed into it rather than reaching the app; Ctrl is what gets a shortcut
   // through, beside the Ctrl+O that hands a search to another player.
@@ -2419,8 +2448,14 @@ export default function App() {
             onChange={(event) => setQuery(event.currentTarget.value)}
             placeholder="Search videos…"
             autoComplete="off"
+            aria-keyshortcuts={SEARCH_SHORTCUT}
             ref={searchField}
           />
+          {/* The field is its own control, so the hint sits in it rather than
+              on a button that would do no more than a click on the field
+              already does. It still reads its text from the value the
+              shortcut is declared with, so the two cannot drift apart. */}
+          <KeyHint shortcut={SEARCH_SHORTCUT} />
           {query ? (
             <button
               type="button"

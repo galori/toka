@@ -209,6 +209,36 @@ test("chooses which parts of a video a search looks at", async () => {
   });
 });
 
+// A long page of results puts the field far off the top of the screen, and
+// clicking a tile or a tag hands the keyboard to whatever was clicked. Getting
+// back to the field should not mean scrolling to it.
+test("jumps to the search field from its keyboard shortcut", async () => {
+  invokeMock.mockResolvedValue(searchPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+
+  const field = screen.getByRole("searchbox");
+  expect(field).toHaveAttribute("aria-keyshortcuts", "Ctrl+K");
+  expect(field.parentElement?.querySelector(".key-hint")).toHaveTextContent(
+    "Ctrl+K",
+  );
+
+  await user.type(field, "holiday{Enter}");
+  const tile = await screen.findByRole("button", {
+    name: "Play holiday.mp4",
+  });
+  tile.focus();
+  expect(field).not.toHaveFocus();
+
+  fireEvent.keyDown(tile, { key: "k", ctrlKey: true });
+  expect(field).toHaveFocus();
+  // Selected rather than merely focused, so the next thing typed asks a new
+  // question instead of being appended to the old one.
+  expect(field).toHaveValue("holiday");
+  await user.keyboard("beach");
+  expect(field).toHaveValue("beach");
+});
+
 test("searches again as soon as the parts being searched change", async () => {
   invokeMock.mockResolvedValue(searchPage("holiday"));
   const user = userEvent.setup();
