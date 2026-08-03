@@ -39,6 +39,17 @@ describe("Toka playlist", () => {
     await browser.execute(() => document.querySelector("form")?.requestSubmit());
 
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5);
+    // Results come back shuffled, so which video is played first is not
+    // "sample1.mp4" but whatever the grid is showing at the top. The playlist
+    // plays in the order on screen, which is what this reads off it.
+    const expectedOrder = await browser.execute(() =>
+      [...document.querySelectorAll<HTMLElement>(".video-tile .video-name")].map(
+        (name) => name.textContent?.trim() ?? "",
+      ),
+    );
+    expect(expectedOrder).toHaveLength(5);
+    expect([...expectedOrder].sort()).toEqual([1, 2, 3, 4, 5].map((number) => `sample${number}.mp4`));
+
     await browser.execute(() => {
       const windowWithMediaError = window as Window & {
         tokaMediaError?: Record<string, unknown>;
@@ -74,7 +85,7 @@ describe("Toka playlist", () => {
     await $("button=Play all").click();
 
     for (let number = 1; number <= 5; number += 1) {
-      const fileName = "sample" + number + ".mp4";
+      const fileName = expectedOrder[number - 1];
       const player = await $(`video[aria-label="Playing ${fileName}"]`);
       try {
         await player.waitForDisplayed();
