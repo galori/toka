@@ -388,14 +388,11 @@ describe("Toka playlist interface", () => {
     // Reported as "the playlist skips the end of every clip": the engine's last
     // reported time falls short of the duration, so the bar stopped five to ten
     // percent early just before the next video started.
-    const ready = await browser.execute(() => {
-      const video = document.querySelector<HTMLVideoElement>("video");
-      return Boolean(video) && Number.isFinite(video?.duration) && (video?.duration ?? 0) > 0;
-    });
-    if (!ready) this.skip();
-
-    // Looping off, so the player holds at the end instead of racing the next
-    // video's metadata into the same measurement.
+    // Looping off first, before anything is read. Until it is off the playlist
+    // is still advancing every couple of seconds, and each advance points the
+    // player at a new file whose duration is unknown until its metadata loads
+    // — so a duration read before this point can belong to a video that is
+    // already gone, and the bar can be measured while it reports nothing.
     for (let click = 0; click < 2; click += 1) await $(".player-controls .loop-button").click();
     await expect($(".player-controls .loop-button")).toHaveAttribute("aria-label", "Loop: off");
 
@@ -407,6 +404,25 @@ describe("Toka playlist interface", () => {
         if (!range) return undefined;
         return { value: Number(range.value), max: Number(range.max), step: Number(range.step) };
       });
+
+    // Now that no further advance can replace it, wait for the video that will
+    // actually be measured to report how long it is. An engine with no media
+    // element, or one that never reports a duration, has nothing for this test
+    // to measure and is skipped rather than failed.
+    const ready = await browser
+      .waitUntil(
+        async () => {
+          const playable = await browser.execute(() => {
+            const video = document.querySelector<HTMLVideoElement>("video");
+            return Boolean(video) && Number.isFinite(video?.duration) && (video?.duration ?? 0) > 0;
+          });
+          return playable && ((await readBar())?.max ?? 0) > 0;
+        },
+        { timeout: 5_000 },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (!ready) this.skip();
 
     // A tenth of the clip left to run: roughly what the engine last reports
     // before it gives up on a video, and where the bar used to stop.
