@@ -148,6 +148,39 @@ fn video_thumbnail(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// The frames a result's preview runs through while the pointer rests on it.
+/// Asked for on hover rather than with the search, because generating them is
+/// several seeks through the file and most results are never pointed at.
+#[tauri::command]
+async fn video_preview(
+    result_id: String,
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<Vec<String>, CommandError> {
+    // On a worker, not the main thread: this runs ffmpeg once per frame, and
+    // on the main thread a first hover would freeze the window for as long as
+    // that took.
+    let engine = Arc::clone(engine.inner());
+    let paths = tauri::async_runtime::spawn_blocking(move || engine.preview_paths(&result_id))
+        .await
+        .map_err(|error| CommandError {
+            kind: "Thumbnail",
+            message: format!("The preview worker stopped unexpectedly: {error}"),
+        })?
+        .map_err(CommandError::from)?;
+    let mut sources = Vec::with_capacity(paths.len());
+    for path in paths {
+        app.asset_protocol_scope()
+            .allow_file(&path)
+            .map_err(|_| CommandError {
+                kind: "Thumbnail",
+                message: "The video preview could not be exposed.".into(),
+            })?;
+        sources.push(path.to_string_lossy().into_owned());
+    }
+    Ok(sources)
+}
+
 fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
     #[cfg(target_os = "linux")]
     let output = std::process::Command::new("gio")
@@ -732,6 +765,7 @@ pub fn run() {
             search_videos,
             launch_playlist,
             video_thumbnail,
+            video_preview,
             delete_video,
             undo_delete,
             external_players,
@@ -754,6 +788,7 @@ pub fn run() {
                 search_videos,
                 launch_playlist,
                 video_thumbnail,
+                video_preview,
                 delete_video,
                 undo_delete,
                 external_players,
@@ -785,6 +820,7 @@ pub fn run() {
         search_videos,
         launch_playlist,
         video_thumbnail,
+        video_preview,
         delete_video,
         undo_delete,
         external_players,
