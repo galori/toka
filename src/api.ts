@@ -60,6 +60,13 @@ export function videoThumbnail(resultId: string): Promise<string> {
   return invoke<string>("video_thumbnail", { resultId });
 }
 
+// Frames sampled across the video, to run through while the pointer rests on a
+// result. Asked for on hover rather than with the search: making them is
+// several seeks through the file, and most results are never pointed at.
+export function videoPreview(resultId: string): Promise<string[]> {
+  return invoke<string[]>("video_preview", { resultId });
+}
+
 export type SidecarSubtitle = {
   track: number;
   label: string;

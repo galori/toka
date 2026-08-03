@@ -318,6 +318,12 @@ impl SearchEngine {
         let path = self.video_path(result_id)?;
         thumbnails::generate(&path).ok_or(SearchError::VideoUnavailable)
     }
+
+    /// The frames a preview runs through for the video behind `result_id`.
+    pub fn preview_paths(&self, result_id: &str) -> Result<Vec<PathBuf>, SearchError> {
+        let path = self.video_path(result_id)?;
+        thumbnails::preview(&path).ok_or(SearchError::VideoUnavailable)
+    }
 }
 
 /// A seed nothing can predict, and never the same one twice: the clock alone

@@ -36,6 +36,7 @@ import {
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
+  videoPreview,
   videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
   type BulkTagUpdate,
@@ -120,9 +121,56 @@ function VideoIcon() {
   );
 }
 
-function VideoThumbnail({ video }: { video: VideoResult }) {
+// How long the pointer has to rest on a result before its preview is made.
+// Sweeping the pointer across a grid of results should not set eight seeks
+// through a file going for every tile it happens to cross.
+const PREVIEW_DELAY = 350;
+
+// How long each frame of a preview is held. Slow enough to read what is in the
+// picture, quick enough that a whole video goes by in a few seconds.
+const PREVIEW_FRAME = 450;
+
+function VideoThumbnail({
+  video,
+  previewing,
+}: {
+  video: VideoResult;
+  previewing: boolean;
+}) {
   const container = useRef<HTMLSpanElement>(null);
   const [thumbnailPath, setThumbnailPath] = useState(video.thumbnailPath);
+  const [frames, setFrames] = useState<string[]>();
+  const [frame, setFrame] = useState(0);
+
+  // Asked for once per video and then kept: the frames are files on disk that
+  // do not change, so pointing at the same result again costs nothing.
+  useEffect(() => {
+    if (!previewing || frames) return;
+    const timer = setTimeout(() => {
+      void videoPreview(video.id)
+        .then(setFrames)
+        // A video ffmpeg cannot read frames out of keeps its still. There is
+        // nothing to tell the viewer here: they pointed at a picture and the
+        // picture stayed.
+        .catch(() => {});
+    }, PREVIEW_DELAY);
+    return () => clearTimeout(timer);
+  }, [previewing, frames, video.id]);
+
+  useEffect(() => {
+    if (!previewing || !frames?.length) return;
+    const timer = setInterval(
+      () => setFrame((current) => (current + 1) % frames.length),
+      PREVIEW_FRAME,
+    );
+    return () => clearInterval(timer);
+  }, [previewing, frames]);
+
+  // Every visit to a result starts its preview from the beginning rather than
+  // resuming wherever the last one was interrupted.
+  useEffect(() => {
+    if (!previewing) setFrame(0);
+  }, [previewing]);
 
   useEffect(() => {
     if (
@@ -145,22 +193,55 @@ function VideoThumbnail({ video }: { video: VideoResult }) {
     return () => observer.disconnect();
   }, [thumbnailPath, video.id]);
 
+  const showing = (previewing ? frames?.[frame] : undefined) ?? thumbnailPath;
+
   return (
     <span
       ref={container}
       className="video-art"
       style={
-        thumbnailPath
-          ? { backgroundImage: `url(${convertFileSrc(thumbnailPath)})` }
+        showing
+          ? { backgroundImage: `url(${convertFileSrc(showing)})` }
           : undefined
       }
     >
-      {thumbnailPath ? (
+      {showing ? (
         <span className="thumbnail-overlay" aria-hidden="true" />
       ) : (
         <VideoIcon />
       )}
     </span>
+  );
+}
+
+// The pointer resting on a result, or the keyboard reaching it, runs a preview
+// of the video in place of its still. Both belong to the tile rather than to
+// the page: a keystroke among a grid of results cannot say which of them it
+// means, which is why there is no shortcut for this — the same reason the tag
+// control on a result carries none.
+function VideoTile({
+  video,
+  onPlay,
+}: {
+  video: VideoResult;
+  onPlay: () => void;
+}) {
+  const [previewing, setPreviewing] = useState(false);
+  return (
+    <button
+      type="button"
+      className="video-tile"
+      aria-label={`Play ${video.fileName}`}
+      title={`Play ${video.fileName}`}
+      onClick={onPlay}
+      onPointerEnter={() => setPreviewing(true)}
+      onPointerLeave={() => setPreviewing(false)}
+      onFocus={() => setPreviewing(true)}
+      onBlur={() => setPreviewing(false)}
+    >
+      <VideoThumbnail video={video} previewing={previewing} />
+      <span className="video-name">{video.fileName}</span>
+    </button>
   );
 }
 
@@ -2741,16 +2822,10 @@ export default function App() {
             <ul className="video-grid" aria-label="Video results">
               {page.results.map((video, position) => (
                 <li key={video.id}>
-                  <button
-                    type="button"
-                    className="video-tile"
-                    aria-label={`Play ${video.fileName}`}
-                    title={`Play ${video.fileName}`}
-                    onClick={() => void playSearchResults(position)}
-                  >
-                    <VideoThumbnail video={video} />
-                    <span className="video-name">{video.fileName}</span>
-                  </button>
+                  <VideoTile
+                    video={video}
+                    onPlay={() => void playSearchResults(position)}
+                  />
                   <VideoTags
                     video={video}
                     onChange={(update) => updateTags(video.id, update)}

@@ -340,6 +340,138 @@ test("displays an app-generated thumbnail when search returns one", async () => 
   });
 });
 
+const previewPage = {
+  query: "clip",
+  page: 1,
+  pageSize: 24,
+  totalResults: 1,
+  totalPages: 1,
+  results: [
+    {
+      id: "video-1",
+      fileName: "clip.mp4",
+      extension: "mp4",
+      thumbnailPath: "/tmp/toka-thumbnails/clip.jpg",
+    },
+  ],
+};
+
+const previewFrames = [
+  "/tmp/toka-thumbnails/clip-preview-0.jpg",
+  "/tmp/toka-thumbnails/clip-preview-1.jpg",
+];
+
+function mockPreviewSearch() {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(previewPage);
+    if (command === "video_preview") return Promise.resolve(previewFrames);
+    return Promise.resolve();
+  });
+}
+
+const tileArt = () =>
+  screen
+    .getByRole("button", { name: "Play clip.mp4" })
+    .querySelector(".video-art");
+
+test("runs a preview through a result while the pointer rests on it", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  mockPreviewSearch();
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  try {
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    const tile = await screen.findByRole("button", { name: "Play clip.mp4" });
+
+    await user.hover(tile);
+    // Nothing yet: the pointer has to rest on a result before Toka goes to the
+    // trouble of making its preview.
+    expect(invokeMock).not.toHaveBeenCalledWith("video_preview", {
+      resultId: "video-1",
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("video_preview", {
+        resultId: "video-1",
+      }),
+    );
+    await waitFor(() =>
+      expect(tileArt()).toHaveStyle({
+        backgroundImage: `url("asset://${previewFrames[0]}")`,
+      }),
+    );
+
+    // One frame on, and the picture has moved: the preview is running rather
+    // than showing a single frame that happens not to be the still.
+    await act(async () => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(tileArt()).toHaveStyle({
+      backgroundImage: `url("asset://${previewFrames[1]}")`,
+    });
+
+    // Off the result, back to the still it was showing before.
+    await user.unhover(tile);
+    expect(tileArt()).toHaveStyle({
+      backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")',
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+// A result reached with Tab is being pointed at just as much as one under the
+// pointer, and there is no shortcut that could say which result it meant.
+test("previews the result the keyboard has reached", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  mockPreviewSearch();
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  try {
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    const tile = await screen.findByRole("button", { name: "Play clip.mp4" });
+
+    act(() => tile.focus());
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("video_preview", {
+        resultId: "video-1",
+      }),
+    );
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("makes no preview for a result the pointer only crosses", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  mockPreviewSearch();
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  try {
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    const tile = await screen.findByRole("button", { name: "Play clip.mp4" });
+
+    await user.hover(tile);
+    await user.unhover(tile);
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    expect(invokeMock).not.toHaveBeenCalledWith("video_preview", {
+      resultId: "video-1",
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("shows video tags and edits them with the tag helper", async () => {
   invokeMock
     .mockResolvedValueOnce({
