@@ -398,7 +398,8 @@ input[type="search"] {
   background: oklch(0.17 0.02 40);
   appearance: none;
   height: 64px;
-  padding: 19px 54px 19px 24px;
+  /* Room on the right for the glyph and, inside it, the shortcut hint. */
+  padding: 19px 110px 19px 24px;
   font-size: 18px;
   line-height: 24px;
   box-shadow: none;
@@ -426,6 +427,17 @@ input[type="search"]:focus {
   background: transparent;
   font-size: 28px;
   line-height: 1;
+}
+/* Sits just inside the glyph, quiet enough to read as a hint rather than as
+   part of what has been typed, and out of the pointer's way so a click landing
+   near the right edge of the field still lands in the field. */
+.search-field .key-hint {
+  position: absolute;
+  top: 50%;
+  right: 49px;
+  transform: translateY(-50%);
+  margin-left: 0;
+  pointer-events: none;
 }
 .search-glyph {
   width: 24px;
