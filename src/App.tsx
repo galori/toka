@@ -34,9 +34,11 @@ import {
   openInExternalPlayer,
   openNewWindow,
   addVideoTags,
+  addTagsToVideos,
   removeVideoTags,
   videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
+  type BulkTagUpdate,
   type ExternalPlayer,
   type PreparedVideo,
   type SearchFields,
@@ -618,6 +620,18 @@ export function shuffleVideos(videos: VideoResult[]): VideoResult[] {
     ];
   }
   return shuffled;
+}
+
+// What tagging a whole page of results did, in a sentence. A page half tagged
+// is the interesting case: it says how many were left, and why the first of
+// them was, rather than reporting a flat success over a partial rename.
+export function taggingOutcome(update: BulkTagUpdate, entry: string): string {
+  const count = update.tagged.length;
+  const videos = `${count} ${count === 1 ? "video" : "videos"}`;
+  const done = `Tagged ${videos} with ${entry}.`;
+  if (!update.failed) return done;
+  const problem = update.problem ? ` ${update.problem}` : "";
+  return `${done} ${update.failed} could not be tagged.${problem}`;
 }
 
 // Pairs the declared shortcut with the one shown on the control, so the two
@@ -2142,6 +2156,16 @@ export default function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  // Tagging the whole page of results: whether its field is open, what has been
+  // typed into it, whether the renames are still running, and what they did.
+  const [taggingAll, setTaggingAll] = useState(false);
+  const [tagAllDraft, setTagAllDraft] = useState("");
+  const [tagAllBusy, setTagAllBusy] = useState(false);
+  const [tagAllOutcome, setTagAllOutcome] = useState<string>();
+  const tagAllField = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (taggingAll) tagAllField.current?.focus();
+  }, [taggingAll]);
   const requestNumber = useRef(0);
   // State, not a ref: the results list unmounts for as long as a video plays,
   // so coming back puts a brand new marker on screen. A ref would leave the
@@ -2363,34 +2387,98 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  // Shift is what separates this from the Ctrl+T that chooses whether tags are
+  // searched: one asks a question about tags, the other writes them.
+  useEffect(() => {
+    if (playing || !page?.results.length) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "t") return;
+      event.preventDefault();
+      setTaggingAll(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  // Every video the search matched, not only the pages scrolled to so far:
+  // "play all" and "tag all" both mean all of them, however far down the list
+  // the viewer has got.
+  const everyResult = async (): Promise<VideoResult[]> => {
+    if (!page) return [];
+    const totalPages = Math.max(1, page.totalPages || 1);
+    const loadedPages = Math.max(1, page.page);
+    const needsAdditionalPages =
+      page.results.length < page.totalResults && totalPages > loadedPages;
+    const pages = needsAdditionalPages
+      ? await Promise.all(
+          Array.from({ length: totalPages - loadedPages }, (_, offset) =>
+            searchVideos(page.query, loadedPages + offset + 1, fields).then(
+              (response) => response?.results ?? [],
+            ),
+          ),
+        )
+      : [];
+    return [page.results, ...pages].flat();
+  };
+
   const playSearchResults = async (position: number) => {
     if (!page) return;
     resultsScrollOffset.current = window.scrollY;
     setPlaylistLoading(true);
     setError(undefined);
     try {
-      const totalPages = Math.max(1, page.totalPages || 1);
-      const loadedPages = Math.max(1, page.page);
-      const needsAdditionalPages =
-        page.results.length < page.totalResults && totalPages > loadedPages;
-      const pages = needsAdditionalPages
-        ? await Promise.all(
-            Array.from({ length: totalPages - loadedPages }, (_, offset) =>
-              searchVideos(page.query, loadedPages + offset + 1, fields).then(
-                (response) => response?.results ?? [],
-              ),
-            ),
-          )
-        : [];
-      const videos = [page.results, ...pages].flat();
       setPlaying({
-        videos,
+        videos: await everyResult(),
         startIndex: position,
       });
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
       setPlaylistLoading(false);
+    }
+  };
+
+  // One entry, every result. The videos off the bottom of the list are tagged
+  // too, so what comes back matches what the summary above the grid claims was
+  // found — and the results on screen carry the new names, because a tag is a
+  // rename.
+  const tagEveryResult = async () => {
+    const entry = tagAllDraft.trim();
+    if (!page || !entry) return;
+    setTaggingAll(false);
+    setTagAllDraft("");
+    setTagAllOutcome(undefined);
+    setTagAllBusy(true);
+    setError(undefined);
+    try {
+      const videos = await everyResult();
+      const update = await addTagsToVideos(
+        videos.map((video) => video.id),
+        [entry],
+      );
+      const tagged = new Map(
+        update.tagged.map((video) => [video.resultId, video]),
+      );
+      setPage((current) =>
+        current
+          ? {
+              ...current,
+              results: current.results.map((video) => {
+                const change = tagged.get(video.id);
+                return change
+                  ? { ...video, fileName: change.fileName, tags: change.tags }
+                  : video;
+              }),
+            }
+          : current,
+      );
+      setTagAllOutcome(taggingOutcome(update, entry));
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setTagAllBusy(false);
     }
   };
 
@@ -2433,6 +2521,9 @@ export default function App() {
 
   const hasSubmitted =
     loading || Boolean(page) || Boolean(error) || Boolean(playing);
+  // The same name on the control and on the field it opens, so a viewer who
+  // reached one by keyboard is still in the same place after it opens.
+  const tagAllLabel = `Tag all ${page?.totalResults ?? 0} videos`;
 
   return (
     <main className={hasSubmitted ? "app" : "app initial"}>
@@ -2572,6 +2663,38 @@ export default function App() {
                 <Label>Shuffle</Label>
               </ControlButton>
             ) : null}
+            {/* One tag for the whole search, so a folder's worth of videos does
+                not have to be tagged a tile at a time. The count is in the name
+                rather than only in the summary beside it: this renames every
+                video the search matched, including the ones off the bottom of
+                the list, and that is worth being unambiguous about. */}
+            {page.results.length > 1 ? (
+              taggingAll ? (
+                <input
+                  ref={tagAllField}
+                  className="tag-all-field"
+                  aria-label={tagAllLabel}
+                  value={tagAllDraft}
+                  onChange={(event) =>
+                    setTagAllDraft(event.currentTarget.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void tagEveryResult();
+                    if (event.key === "Escape") setTaggingAll(false);
+                  }}
+                />
+              ) : (
+                <ControlButton
+                  shortcut="Ctrl+Shift+T"
+                  className="playlist-button"
+                  aria-label={tagAllLabel}
+                  disabled={tagAllBusy}
+                  onClick={() => setTaggingAll(true)}
+                >
+                  <Label>{tagAllBusy ? "Tagging…" : "Tag all"}</Label>
+                </ControlButton>
+              )
+            ) : null}
             {/* Only offered where there is something to offer: a computer with
                 no other video player installed gets no control at all. */}
             {players.length ? (
@@ -2604,6 +2727,16 @@ export default function App() {
               {page.results.length} of {page.totalResults} loaded
             </p>
           </div>
+          {tagAllOutcome ? (
+            <p
+              className="message"
+              role="status"
+              aria-label="Tagging results"
+              aria-live="polite"
+            >
+              {tagAllOutcome}
+            </p>
+          ) : null}
           {page.results.length ? (
             <ul className="video-grid" aria-label="Video results">
               {page.results.map((video, position) => (

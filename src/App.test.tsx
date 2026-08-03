@@ -392,6 +392,155 @@ test("shows video tags and edits them with the tag helper", async () => {
   });
 });
 
+const tagAllPage = {
+  query: "beach",
+  page: 1,
+  pageSize: 24,
+  totalResults: 2,
+  totalPages: 1,
+  results: [
+    { id: "video-1", fileName: "one.mp4", extension: "mp4", tags: [] },
+    { id: "video-2", fileName: "two.mp4", extension: "mp4", tags: [] },
+  ],
+};
+
+test("puts one tag on every video in the results", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(tagAllPage);
+    if (command === "add_tags_to_videos")
+      return Promise.resolve({
+        tagged: [
+          {
+            resultId: "video-1",
+            fileName: "one [summer].mp4",
+            tags: ["summer"],
+          },
+          {
+            resultId: "video-2",
+            fileName: "two [summer].mp4",
+            tags: ["summer"],
+          },
+        ],
+        failed: 0,
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "beach{Enter}");
+
+  const control = await screen.findByRole("button", {
+    name: "Tag all 2 videos",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+T");
+  await user.click(control);
+  await user.type(
+    screen.getByRole("textbox", { name: "Tag all 2 videos" }),
+    "summer{Enter}",
+  );
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_tags_to_videos", {
+      resultIds: ["video-1", "video-2"],
+      tags: ["summer"],
+    }),
+  );
+  // The results carry what the tagging did to them: a tag renames the file,
+  // so both the name on the tile and the pill under it have moved on.
+  expect(
+    await screen.findByRole("button", { name: "Play one [summer].mp4" }),
+  ).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Play two [summer].mp4" }),
+  ).toBeVisible();
+  expect(
+    await screen.findByRole("status", { name: "Tagging results" }),
+  ).toHaveTextContent("Tagged 2 videos with summer");
+});
+
+test("tags the results that are not on screen yet as well", async () => {
+  const secondPage = {
+    ...tagAllPage,
+    page: 2,
+    totalResults: 3,
+    totalPages: 2,
+    results: [
+      { id: "video-3", fileName: "three.mp4", extension: "mp4", tags: [] },
+    ],
+  };
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      const { request } = args as { request: { page: number } };
+      return Promise.resolve(
+        request.page === 1
+          ? { ...tagAllPage, totalResults: 3, totalPages: 2 }
+          : secondPage,
+      );
+    }
+    if (command === "add_tags_to_videos")
+      return Promise.resolve({ tagged: [], failed: 0 });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "beach{Enter}");
+
+  await user.click(
+    await screen.findByRole("button", { name: "Tag all 3 videos" }),
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "Tag all 3 videos" }),
+    "summer{Enter}",
+  );
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_tags_to_videos", {
+      resultIds: ["video-1", "video-2", "video-3"],
+      tags: ["summer"],
+    }),
+  );
+});
+
+test("says how many results could not be tagged", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(tagAllPage);
+    if (command === "add_tags_to_videos")
+      return Promise.resolve({
+        tagged: [
+          {
+            resultId: "video-1",
+            fileName: "one [summer].mp4",
+            tags: ["summer"],
+          },
+        ],
+        failed: 1,
+        problem: "That video is no longer available.",
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "beach{Enter}");
+
+  // The shortcut opens the field, so the whole page can be tagged without
+  // reaching for the pointer.
+  fireEvent.keyDown(screen.getByRole("searchbox"), {
+    key: "T",
+    ctrlKey: true,
+    shiftKey: true,
+  });
+  await user.type(
+    await screen.findByRole("textbox", { name: "Tag all 2 videos" }),
+    "summer{Enter}",
+  );
+
+  const status = await screen.findByRole("status", { name: "Tagging results" });
+  await waitFor(() =>
+    expect(status).toHaveTextContent("1 could not be tagged"),
+  );
+  expect(status).toHaveTextContent("That video is no longer available.");
+});
+
 test("hands a multi-word tag entry over as the several tags it is", async () => {
   invokeMock
     .mockResolvedValueOnce({

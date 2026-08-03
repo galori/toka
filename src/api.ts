@@ -146,6 +146,27 @@ export function addVideoTags(
   return invoke("add_video_tags", { resultId, tags });
 }
 
+// One video out of a page tagged in a single go. Tagging renames the file, so
+// the id is what the update is matched back to — never the name.
+export type TaggedVideo = VideoTagUpdate & { resultId: string };
+
+export type BulkTagUpdate = {
+  tagged: TaggedVideo[];
+  failed: number;
+  // Why the first video that could not be tagged was left alone.
+  problem?: string;
+};
+
+// Puts the same tags on every video at once. A page of results is hundreds of
+// videos and each tag is a rename, so this is one request rather than one per
+// video — and it tags what it can rather than stopping at the first failure.
+export function addTagsToVideos(
+  resultIds: string[],
+  tags: string[],
+): Promise<BulkTagUpdate> {
+  return invoke("add_tags_to_videos", { resultIds, tags });
+}
+
 export function removeVideoTags(
   resultId: string,
   tags: string[],

@@ -534,6 +534,20 @@ button:focus-visible {
   align-items: center;
   justify-content: center;
 }
+/* Sits in the row where the control it replaced was, and to the same height,
+   so opening it does not shift the summary beside it. */
+.tag-all-field {
+  min-height: 40px;
+  min-width: 160px;
+  border: 1px solid oklch(0.68 0.19 38);
+  border-radius: 10px;
+  background: oklch(0.17 0.02 40);
+  color: inherit;
+  padding: 10px 14px;
+  font-size: 14px;
+  line-height: 20px;
+}
+
 .playlist-button,
 .pagination button,
 .back-button,

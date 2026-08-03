@@ -64,6 +64,27 @@ struct VideoTagUpdate {
     tags: Vec<String>,
 }
 
+/// One video out of a page that was tagged in a single go, under the id the
+/// frontend knows it by — tagging renames the file, so the caller cannot match
+/// these up by name afterwards.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaggedVideo {
+    result_id: String,
+    file_name: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkTagUpdate {
+    tagged: Vec<TaggedVideo>,
+    failed: usize,
+    /// Why the first video that could not be tagged was left alone. A page of
+    /// identical failures says no more than the first one of them does.
+    problem: Option<String>,
+}
+
 impl From<SearchError> for CommandError {
     fn from(error: SearchError) -> Self {
         let kind = match &error {
@@ -363,6 +384,47 @@ fn remove_video_tags(
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<VideoTagUpdate, TagsError> {
     update_video_tags(&result_id, &tags, &engine, tags::remove)
+}
+
+/// Puts the same tags on every video in `result_ids`, in one call rather than
+/// one call each: a page of results is hundreds of videos, and tagging is a
+/// rename, so this has to walk them one at a time behind a single request.
+#[tauri::command]
+fn add_tags_to_videos(
+    result_ids: Vec<String>,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> BulkTagUpdate {
+    tag_videos(&result_ids, &tags, &engine)
+}
+
+fn tag_videos(result_ids: &[String], tags: &[String], engine: &SearchEngine) -> BulkTagUpdate {
+    let mut tagged = Vec::new();
+    let mut failed = 0;
+    let mut problem = None;
+    for result_id in result_ids {
+        // One video that has moved or been deleted since the search is a
+        // reason to say so afterwards, not a reason to abandon the rest of
+        // the page half tagged.
+        match update_video_tags(result_id, tags, engine, tags::add) {
+            Ok(update) => tagged.push(TaggedVideo {
+                result_id: result_id.clone(),
+                file_name: update.file_name,
+                tags: update.tags,
+            }),
+            Err(error) => {
+                failed += 1;
+                if problem.is_none() {
+                    problem = Some(error.message);
+                }
+            }
+        }
+    }
+    BulkTagUpdate {
+        tagged,
+        failed,
+        problem,
+    }
 }
 
 /// Retags the video behind `result_id` and keeps the search engine pointing at
@@ -678,6 +740,7 @@ pub fn run() {
             set_video_tags,
             add_video_tags,
             remove_video_tags,
+            add_tags_to_videos,
             prepare_video,
             subtitle_cues
         ])
@@ -699,6 +762,7 @@ pub fn run() {
                 set_video_tags,
                 add_video_tags,
                 remove_video_tags,
+                add_tags_to_videos,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -729,6 +793,7 @@ pub fn run() {
         set_video_tags,
         add_video_tags,
         remove_video_tags,
+        add_tags_to_videos,
         prepare_video,
         subtitle_cues
     ]);
@@ -777,5 +842,75 @@ mod tests {
         let error = outcome(false, "   ", true).unwrap_err();
 
         assert!(error.message.contains("clip.mp4"), "{}", error.message);
+    }
+
+    struct FakeProvider(Vec<PathBuf>);
+
+    impl SearchProvider for FakeProvider {
+        fn candidates(&self, _query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// An engine holding a page of results for `clip`, so the ids a bulk tag
+    /// works from are the ones a real search would have handed out.
+    fn engine_over(paths: Vec<PathBuf>) -> (Arc<SearchEngine>, Vec<String>) {
+        let engine = Arc::new(SearchEngine::new(Arc::new(FakeProvider(paths))));
+        let page = engine
+            .search(SearchRequest {
+                query: "clip".into(),
+                page: 1,
+                page_size: search::PAGE_SIZE,
+                fields: Default::default(),
+            })
+            .unwrap();
+        let ids = page.results.iter().map(|r| r.id.clone()).collect();
+        (engine, ids)
+    }
+
+    #[test]
+    fn tagging_a_page_puts_the_same_tags_on_every_video_in_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = ["clip-one.mp4", "clip-two.mp4"]
+            .iter()
+            .map(|name| {
+                let path = directory.path().join(name);
+                std::fs::write(&path, b"test").unwrap();
+                path
+            })
+            .collect();
+        let (engine, ids) = engine_over(paths);
+
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine);
+
+        assert_eq!(update.failed, 0);
+        assert_eq!(update.problem, None);
+        assert_eq!(update.tagged.len(), 2);
+        for tagged in &update.tagged {
+            assert_eq!(tagged.tags, ["beach"]);
+            assert!(tagged.file_name.contains("[beach]"), "{}", tagged.file_name);
+            // Renaming is what tagging is, so the engine has to be pointing at
+            // the new name — otherwise the next tag on the same video fails.
+            assert!(engine.video_path(&tagged.result_id).is_ok());
+        }
+    }
+
+    /// A video that has gone since the search should not take the rest of the
+    /// page down with it.
+    #[test]
+    fn tagging_a_page_carries_on_past_a_video_that_is_no_longer_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let present = directory.path().join("clip-here.mp4");
+        let missing = directory.path().join("clip-gone.mp4");
+        std::fs::write(&present, b"test").unwrap();
+        std::fs::write(&missing, b"test").unwrap();
+        let (engine, ids) = engine_over(vec![present, missing.clone()]);
+        std::fs::remove_file(&missing).unwrap();
+
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine);
+
+        assert_eq!(update.tagged.len(), 1);
+        assert_eq!(update.failed, 1);
+        assert!(update.problem.is_some());
     }
 }
