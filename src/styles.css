@@ -698,12 +698,25 @@ button:focus-visible {
 }
 .player-shell:fullscreen .preparing-video,
 .player-shell.fullscreen .preparing-video {
-  height: 100vh;
+  height: 100%;
 }
+/* An engine that grants element fullscreen lifts the shell out of the page for
+   us. A fullscreen *window* does not: the shell is still an ordinary block
+   inside the centred, padded page, below the player's heading, so sizing it to
+   the screen only made it overflow its container — the window filled the screen
+   while the picture sat wherever the page had put it. Taking it out of flow is
+   what makes those two paths look the same, and the z-index puts it over the
+   page it is now painting on top of rather than replacing. */
 .player-shell:fullscreen,
 .player-shell.fullscreen {
-  width: 100vw;
-  height: 100vh;
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  /* Percentages of the viewport rather than viewport units: a page that still
+     has a scrollbar behind the shell makes 100vw wider than what can be seen,
+     and the picture would be cropped by exactly that much. */
+  width: 100%;
+  height: 100%;
   border: 0;
   border-radius: 0;
   background: #000;
@@ -720,8 +733,8 @@ button:focus-visible {
 .player-shell:fullscreen .native-video,
 .player-shell.fullscreen video,
 .player-shell.fullscreen .native-video {
-  width: 100vw;
-  height: calc(100vh - var(--scrubber-sliver));
+  width: 100%;
+  height: calc(100% - var(--scrubber-sliver));
   max-height: none;
   object-fit: contain;
 }
