@@ -6,7 +6,10 @@ async function search(query: string) {
   await browser.execute((value) => {
     const field = document.querySelector<HTMLInputElement>("#video-search");
     if (!field) throw new Error("The search field is missing");
-    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    const setValue = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
     setValue?.call(field, value);
     field.dispatchEvent(new Event("input", { bubbles: true }));
     document.querySelector("form")?.requestSubmit();
@@ -25,8 +28,18 @@ type Layout = {
   viewport: { width: number; height: number };
 };
 
+// Fullscreen is a fullscreen *window* on Linux and macOS and a fullscreen
+// element elsewhere, and the player marks the shell itself either way. Asking
+// only for `document.fullscreenElement` reported the window path as a refusal,
+// so every test here skipped on the platform the app is actually built for.
 function inFullscreen(): Promise<boolean> {
-  return browser.execute(() => document.fullscreenElement !== null);
+  return browser.execute(
+    () =>
+      document.fullscreenElement !== null ||
+      document
+        .querySelector(".player-shell")
+        ?.classList.contains("fullscreen") === true,
+  );
 }
 
 // Some headless WebKit builds refuse fullscreen outright, and an engine that
@@ -36,7 +49,9 @@ function inFullscreen(): Promise<boolean> {
 async function enterFullscreen(): Promise<boolean> {
   try {
     await browser.waitUntil(
-      async () => (await $(".player-error-state").isExisting()) || (await $('button[aria-label="Enter fullscreen"]').isExisting()),
+      async () =>
+        (await $(".player-error-state").isExisting()) ||
+        (await $('button[aria-label="Enter fullscreen"]').isExisting()),
       { timeout: 5_000 },
     );
   } catch {
@@ -55,7 +70,9 @@ async function enterFullscreen(): Promise<boolean> {
   // mode these layout checks exercise; dispatch inside the page because some
   // WebKit builds reserve the physical F key for their own fullscreen UI.
   await browser.execute(() =>
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "f", bubbles: true })),
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
+    ),
   );
   await $(".fullscreen-info").waitForExist();
   return true;
@@ -72,7 +89,9 @@ function holdPointer(atRightEdge: boolean) {
     const send = () =>
       window.dispatchEvent(
         new MouseEvent("mousemove", {
-          clientX: edge ? window.innerWidth - 1 : Math.round(window.innerWidth / 2),
+          clientX: edge
+            ? window.innerWidth - 1
+            : Math.round(window.innerWidth / 2),
           clientY: Math.round(window.innerHeight / 2),
         }),
       );
@@ -142,6 +161,12 @@ describe("Toka fullscreen", () => {
     await releasePointer();
     await browser.execute(() => {
       if (document.fullscreenElement) document.exitFullscreen?.();
+      // Escape leaves a fullscreen window, which nothing in the document can
+      // exit on its own.
+      else
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
     });
   });
 
@@ -149,12 +174,16 @@ describe("Toka fullscreen", () => {
     if (!(await enterFullscreen())) this.skip();
 
     const measurements = await browser.execute(() => {
-      const picture = document.querySelector<HTMLElement>("video, .native-video");
+      const picture = document.querySelector<HTMLElement>(
+        "video, .native-video",
+      );
       if (!picture) return undefined;
       const box = picture.getBoundingClientRect();
       return {
         heightShare: box.height / window.innerHeight,
         widthShare: box.width / window.innerWidth,
+        left: Math.round(box.left),
+        top: Math.round(box.top),
         intrinsicHeight: (picture as HTMLVideoElement).videoHeight ?? 0,
       };
     });
@@ -164,50 +193,87 @@ describe("Toka fullscreen", () => {
     // the middle of the screen.
     expect(measurements.heightShare).toBeGreaterThan(0.9);
     expect(measurements.widthShare).toBeGreaterThan(0.9);
+    // Screen-sized is not the same as on the screen. A fullscreen window leaves
+    // the shell in the page unless it is taken out of flow, and there it was
+    // pushed down by the player's heading and in by the page's own margin: the
+    // right size, wholly in the wrong place, with the far edge off the screen.
+    expect({ left: measurements.left, top: measurements.top }).toEqual({
+      left: 0,
+      top: 0,
+    });
   });
 
   it("leaves nothing but a scrubber sliver below the picture once the pointer settles", async function () {
     if (!(await enterFullscreen())) this.skip();
     await releasePointer();
 
-    const hidden = await layoutWhile(true, "The fullscreen overlay never collapsed onto the scrubber");
+    const hidden = await layoutWhile(
+      true,
+      "The fullscreen overlay never collapsed onto the scrubber",
+    );
     const { picture, timeline, viewport } = hidden;
-    if (!picture || !timeline) throw new Error("No picture or scrubber found in fullscreen");
+    if (!picture || !timeline)
+      throw new Error("No picture or scrubber found in fullscreen");
 
     // The playlist is gone and the transport row with it, and what is left is a
     // strip a few pixels tall that the picture stops short of rather than sits
     // under — the one thing fullscreen takes off the video.
     expect(hidden.drawer).toBe(null);
     expect(await $(".player-transport").isDisplayed()).toBe(false);
-    expect({ sliverHeight: timeline.height > 0 && timeline.height <= 10 }).toEqual({ sliverHeight: true });
-    expect(Math.abs(timeline.top - (picture.top + picture.height))).toBeLessThanOrEqual(1);
-    expect(Math.abs(timeline.top + timeline.height - viewport.height)).toBeLessThanOrEqual(1);
+    expect({
+      sliverHeight: timeline.height > 0 && timeline.height <= 10,
+    }).toEqual({ sliverHeight: true });
+    expect(
+      Math.abs(timeline.top - (picture.top + picture.height)),
+    ).toBeLessThanOrEqual(1);
+    expect(
+      Math.abs(timeline.top + timeline.height - viewport.height),
+    ).toBeLessThanOrEqual(1);
   });
 
   it("overlays the controls and the playlist without moving the picture", async function () {
     if (!(await enterFullscreen())) this.skip();
     await releasePointer();
-    const hidden = await layoutWhile(true, "The fullscreen overlay never collapsed onto the scrubber");
+    const hidden = await layoutWhile(
+      true,
+      "The fullscreen overlay never collapsed onto the scrubber",
+    );
 
     // Any movement brings the whole overlay back, and the scrubber goes up with
     // it — over the picture this time, not below it.
     await holdPointer(false);
-    const shown = await layoutWhile(false, "Moving the pointer never brought the fullscreen controls back");
+    const shown = await layoutWhile(
+      false,
+      "Moving the pointer never brought the fullscreen controls back",
+    );
     expect(shown.picture).toEqual(hidden.picture);
-    if (!shown.timeline || !shown.picture) throw new Error("No picture or scrubber found in fullscreen");
-    expect(shown.timeline.top).toBeLessThan(shown.picture.top + shown.picture.height);
+    if (!shown.timeline || !shown.picture)
+      throw new Error("No picture or scrubber found in fullscreen");
+    expect(shown.timeline.top).toBeLessThan(
+      shown.picture.top + shown.picture.height,
+    );
 
     // The right-hand edge of the screen slides the playlist out over the top of
     // the picture. Nothing about the video may move: this is the whole of the
     // "same resolution, location and aspect ratio" rule.
     await holdPointer(true);
-    await $(".playlist-drawer").waitForExist({ timeoutMsg: "The right-hand edge never revealed the playlist" });
-    const withPlaylist = await layoutWhile(false, "The fullscreen controls went away while the playlist was up");
+    await $(".playlist-drawer").waitForExist({
+      timeoutMsg: "The right-hand edge never revealed the playlist",
+    });
+    const withPlaylist = await layoutWhile(
+      false,
+      "The fullscreen controls went away while the playlist was up",
+    );
     expect(withPlaylist.picture).toEqual(hidden.picture);
-    if (!withPlaylist.drawer) throw new Error("The playlist drawer was not measured");
+    if (!withPlaylist.drawer)
+      throw new Error("The playlist drawer was not measured");
     expect(withPlaylist.drawer.width).toBeGreaterThan(100);
     expect(
-      Math.abs(withPlaylist.drawer.left + withPlaylist.drawer.width - withPlaylist.viewport.width),
+      Math.abs(
+        withPlaylist.drawer.left +
+          withPlaylist.drawer.width -
+          withPlaylist.viewport.width,
+      ),
     ).toBeLessThanOrEqual(1);
 
     // And taking the pointer away puts everything back without moving it either.
@@ -216,7 +282,10 @@ describe("Toka fullscreen", () => {
       reverse: true,
       timeoutMsg: "The playlist stayed up after the pointer left it",
     });
-    const back = await layoutWhile(true, "The fullscreen overlay never collapsed onto the scrubber again");
+    const back = await layoutWhile(
+      true,
+      "The fullscreen overlay never collapsed onto the scrubber again",
+    );
     expect(back.picture).toEqual(hidden.picture);
   });
 });
