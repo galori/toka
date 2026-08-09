@@ -485,7 +485,14 @@ mod tests {
 
         provider.candidates("HoLiDaY", false).unwrap();
 
-        let args = runner.invocations.lock().unwrap().first().unwrap().1.clone();
+        let args = runner
+            .invocations
+            .lock()
+            .unwrap()
+            .first()
+            .unwrap()
+            .1
+            .clone();
         assert!(
             args.contains(&"*holiday*".to_string()),
             "recoll should lowercase mixed-case term, got {args:?}"
