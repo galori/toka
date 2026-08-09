@@ -1024,20 +1024,23 @@ button:focus-visible {
   font: 700 13px inherit;
 }
 .volume-control {
+  position: relative;
   display: flex;
-  flex-direction: column;
-  align-items: stretch;
+  align-items: center;
   width: 92px;
-  gap: 2px;
 }
 .volume-slider {
   width: 92px;
   accent-color: oklch(0.68 0.19 38);
 }
 .volume-markers {
-  position: relative;
-  height: 12px;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  height: 10px;
   margin: 0 2px;
+  pointer-events: none;
 }
 .volume-marker {
   position: absolute;
