@@ -51,16 +51,26 @@ struct DeletedVideo {
 /// the frontend is up to ask for it.
 struct LaunchPlaylist(Option<PathBuf>);
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct TagsError {
     kind: &'static str,
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct VideoTagUpdate {
     file_name: String,
+    tags: Vec<String>,
+}
+
+/// The folder that now carries the tags, mirroring `VideoTagUpdate` for
+/// directories. Minimal UI — requires discussion (issue #198).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderTagUpdate {
+    folder_name: String,
+    folder_path: String,
     tags: Vec<String>,
 }
 
@@ -427,6 +437,33 @@ fn set_video_tags(
 }
 
 #[tauri::command]
+fn add_folder_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<FolderTagUpdate, TagsError> {
+    update_folder_tags(&result_id, &tags, &engine, tags::add)
+}
+
+#[tauri::command]
+fn remove_folder_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<FolderTagUpdate, TagsError> {
+    update_folder_tags(&result_id, &tags, &engine, tags::remove)
+}
+
+#[tauri::command]
+fn set_folder_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<FolderTagUpdate, TagsError> {
+    update_folder_tags(&result_id, &tags, &engine, tags::set)
+}
+
+#[tauri::command]
 fn add_video_tags(
     result_id: String,
     tags: Vec<String>,
@@ -514,6 +551,47 @@ fn update_video_tags(
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned(),
+        tags: update.tags,
+    })
+}
+
+/// Retags the folder containing the video behind `result_id`, reusing
+/// `tags::add`/`remove`/`set` for directories (same bracket syntax, no
+/// extension). Minimal UI — requires discussion per issue #198.
+fn update_folder_tags(
+    result_id: &str,
+    tags: &[String],
+    engine: &SearchEngine,
+    operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
+) -> Result<FolderTagUpdate, TagsError> {
+    let folder = engine
+        .folder_path_for_video(result_id)
+        .map_err(|error| TagsError {
+            kind: "VideoUnavailable",
+            message: error.to_string(),
+        })?;
+    let update = operation(&folder, tags).map_err(|message| TagsError {
+        kind: "Tags",
+        message,
+    })?;
+    if update.path != folder {
+        // Move every video that lived inside the folder to the new name, so
+        // `video_path` still resolves after the rename.
+        engine
+            .update_folder_path(&folder, &update.path)
+            .map_err(|error| TagsError {
+                kind: "VideoUnavailable",
+                message: error.to_string(),
+            })?;
+    }
+    Ok(FolderTagUpdate {
+        folder_name: update
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        folder_path: update.path.to_string_lossy().into_owned(),
         tags: update.tags,
     })
 }
@@ -800,6 +878,9 @@ pub fn run() {
             add_video_tags,
             remove_video_tags,
             add_tags_to_videos,
+            add_folder_tags,
+            remove_folder_tags,
+            set_folder_tags,
             prepare_video,
             subtitle_cues
         ])
@@ -823,6 +904,9 @@ pub fn run() {
                 add_video_tags,
                 remove_video_tags,
                 add_tags_to_videos,
+                add_folder_tags,
+                remove_folder_tags,
+                set_folder_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -855,6 +939,9 @@ pub fn run() {
         add_video_tags,
         remove_video_tags,
         add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
+        set_folder_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -973,5 +1060,69 @@ mod tests {
         assert_eq!(update.tagged.len(), 1);
         assert_eq!(update.failed, 1);
         assert!(update.problem.is_some());
+    }
+
+    // TDD for #198: folder tagging mirrors file tagging via same `tags::add`
+    // but for the directory containing the video. Minimal UI, requires
+    // discussion — the backend must be correct first.
+    #[test]
+    fn folder_tagging_via_add_folder_tags() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("Trips");
+        std::fs::create_dir(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        std::fs::write(&video, b"test").unwrap();
+        let (engine, ids) = engine_over(vec![video]);
+
+        // Initially folder has no tags.
+        let folder_before = engine.folder_path_for_video(&ids[0]).unwrap();
+        assert_eq!(
+            crate::tags::Tags::parse_dir_name(
+                &folder_before.file_name().unwrap().to_string_lossy()
+            )
+            .values()
+            .len(),
+            0
+        );
+
+        let update =
+            update_folder_tags(&ids[0], &["beach".to_owned()], &engine, crate::tags::add)
+                .unwrap();
+        assert_eq!(update.tags, ["beach"]);
+        assert!(update.folder_name.contains("[beach]"), "{}", update.folder_name);
+        assert!(std::path::Path::new(&update.folder_path).is_dir());
+        // Tag is lowercased/sorted like file tags.
+        assert!(update.folder_path.contains("Trips [beach]"));
+
+        // Engine follows the rename: video is now inside renamed folder.
+        let folder_after = engine.folder_path_for_video(&ids[0]).unwrap();
+        assert_eq!(folder_after, std::path::PathBuf::from(&update.folder_path));
+        assert!(engine.video_path(&ids[0]).is_ok());
+        assert_eq!(
+            engine
+                .video_path(&ids[0])
+                .unwrap()
+                .parent()
+                .unwrap(),
+            std::path::Path::new(&update.folder_path)
+        );
+    }
+
+    #[test]
+    fn folder_tagging_rejects_brackets_and_requires_tag() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("Trips");
+        std::fs::create_dir(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        std::fs::write(&video, b"test").unwrap();
+        let (engine, ids) = engine_over(vec![video]);
+
+        let err = update_folder_tags(&ids[0], &["bad[tag]".to_owned()], &engine, crate::tags::add)
+            .unwrap_err();
+        assert!(err.message.contains("brackets"));
+
+        let err2 =
+            update_folder_tags(&ids[0], &["   ".to_owned()], &engine, crate::tags::add).unwrap_err();
+        assert!(err2.message.contains("At least one tag"));
     }
 }

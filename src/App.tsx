@@ -36,11 +36,14 @@ import {
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
+  addFolderTags,
+  removeFolderTags,
   videoPreview,
   videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
   type BulkTagUpdate,
   type ExternalPlayer,
+  type FolderTagUpdate,
   type PreparedVideo,
   type SearchFields,
   type SearchPage,
@@ -346,6 +349,118 @@ function VideoTags({
         >
           <Label>+</Label>
         </button>
+      )}
+      {error ? (
+        <p className="tag-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// Minimal folder tagging UI — mirrors `VideoTags` but for the directory
+// containing the video. Requires discussion per issue #198: placement,
+// shortcut choice, and whether folders should appear as searchable results are
+// still open. Uses `ControlButton` so shortcut hint and
+// `aria-keyshortcuts` cannot drift apart, and reuses `tags::add` for
+// directories (bracket syntax, no extension).
+function parseFolderTags(folderName: string): string[] {
+  // Mirrors `tags::Tags::parse_dir_name` — tag block is `[...]` at end.
+  if (!folderName.endsWith("]")) return [];
+  const open = folderName.lastIndexOf("[");
+  if (open === -1) return [];
+  const block = folderName.slice(open + 1, -1);
+  if (!block || block.includes("]")) return [];
+  return block
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((t) => t.toLowerCase());
+}
+
+function FolderTags({
+  video,
+  folderName,
+  folderTags,
+  onChange,
+  adding: controlledAdding,
+  onAddingChange,
+  shortcut = "G",
+}: {
+  video: VideoResult;
+  folderName: string;
+  folderTags?: string[];
+  onChange: (update: FolderTagUpdate) => void;
+  adding?: boolean;
+  onAddingChange?: (adding: boolean) => void;
+  shortcut?: string;
+}) {
+  const field = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState("");
+  const [uncontrolledAdding, setUncontrolledAdding] = useState(false);
+  const [error, setError] = useState<string>();
+  const adding = controlledAdding ?? uncontrolledAdding;
+  const setAdding = (next: boolean) => {
+    setUncontrolledAdding(next);
+    onAddingChange?.(next);
+  };
+  const tags = folderTags ?? parseFolderTags(folderName);
+  useEffect(() => {
+    if (adding) field.current?.focus();
+  }, [adding]);
+  const save = async (update: Promise<FolderTagUpdate>) => {
+    try {
+      onChange(await update);
+      setError(undefined);
+    } catch (reason) {
+      setError(`Could not update folder tags: ${errorMessage(reason)}`);
+    }
+  };
+  const add = () => {
+    const tag = draft.trim();
+    if (!tag || tags.includes(tag.toLowerCase())) return;
+    void save(addFolderTags(video.id, [tag]));
+    setDraft("");
+    setAdding(false);
+  };
+  const folderLabel = folderName || "folder";
+  return (
+    <div className="video-tags folder-tags" aria-label={`Tags for folder ${folderLabel}`}>
+      <span className="folder-tag-prefix" aria-hidden="true">
+        {folderLabel}:
+      </span>
+      {tags.map((tag) => (
+        <button
+          key={tag}
+          type="button"
+          className="tag-pill"
+          aria-label={`Remove tag ${tag} from folder ${folderLabel}`}
+          onClick={() => void save(removeFolderTags(video.id, [tag]))}
+        >
+          <span className="tag-name">{tag}</span>
+          <TagRemoveIcon />
+        </button>
+      ))}
+      {adding ? (
+        <input
+          ref={field}
+          aria-label={`Add tag to folder ${folderLabel}`}
+          value={draft}
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") add();
+            if (event.key === "Escape") setAdding(false);
+          }}
+        />
+      ) : (
+        <ControlButton
+          shortcut={shortcut}
+          className="tag-add"
+          aria-label={`Add tag to folder ${folderLabel}`}
+          onClick={() => setAdding(true)}
+        >
+          <Label>+</Label>
+        </ControlButton>
       )}
       {error ? (
         <p className="tag-error" role="alert">
@@ -845,6 +960,7 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
+  const [addingFolderTag, setAddingFolderTag] = useState(false);
   // Mirrored into a ref so the fullscreen idle timer can see it without
   // restarting, the way it already watches the pointer.
   const tagFieldOpen = useRef(false);
@@ -853,8 +969,8 @@ function Player({
   const cursorTimer = useRef<number | undefined>(undefined);
   const video = playlist[index];
   useEffect(() => {
-    tagFieldOpen.current = addingTag;
-  }, [addingTag]);
+    tagFieldOpen.current = addingTag || addingFolderTag;
+  }, [addingTag, addingFolderTag]);
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -862,6 +978,31 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
+  };
+  // Folder name for the current video — derived from the prepared path when
+  // available, otherwise from the playlist entry. Requires discussion: this is
+  // the minimal placement that mirrors file tagging without a dedicated
+  // folder browser.
+  const derivedFolderName = useMemo(() => {
+    const fullPath = prepared?.filePath ?? "";
+    if (fullPath) {
+      const parts = fullPath.split(/[\\/]/);
+      if (parts.length >= 2) return parts[parts.length - 2] ?? "";
+    }
+    return "";
+  }, [prepared?.filePath]);
+  const [folderNameOverride, setFolderNameOverride] = useState<string | null>(null);
+  const folderName = folderNameOverride ?? derivedFolderName;
+  useEffect(() => {
+    setFolderNameOverride(null);
+  }, [video.id]);
+  const handleFolderUpdate = (update: FolderTagUpdate) => {
+    setFolderNameOverride(update.folderName);
+    // Folder rename moves video; reflect new path in prepared state so
+    // subsequent actions target the renamed location.
+    setPrepared((current) =>
+      current ? { ...current, filePath: update.folderPath + "/" + video.fileName } : current,
+    );
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1123,6 +1264,11 @@ function Player({
   const openTagField = () => {
     if (playingBack) pause();
     setAddingTag(true);
+  };
+  // Folder tagging mirrors file tagging — minimal, requires discussion.
+  const openFolderTagField = () => {
+    if (playingBack) pause();
+    setAddingFolderTag(true);
   };
 
   const restart = () => {
@@ -1720,8 +1866,13 @@ function Player({
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
       // focus itself, which the check above already returns on.
-      if (addingTag) {
-        if (event.key === "Escape") run(() => setAddingTag(false));
+      if (addingTag || addingFolderTag) {
+        if (event.key === "Escape") {
+          run(() => {
+            setAddingTag(false);
+            setAddingFolderTag(false);
+          });
+        }
         return;
       }
       if (event.key === " " || event.key === "Spacebar") {
@@ -1760,6 +1911,8 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
+      } else if (event.key.toLowerCase() === "g") {
+        run(openFolderTagField);
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -1785,6 +1938,7 @@ function Player({
     nativeBaseRotation,
     onBack,
     addingTag,
+    addingFolderTag,
     playingBack,
     playlist.length,
     skipSeconds,
@@ -2055,6 +2209,18 @@ function Player({
                   adding ? openTagField() : setAddingTag(false)
                 }
               />
+              {folderName ? (
+                <FolderTags
+                  video={video}
+                  folderName={folderName}
+                  onChange={handleFolderUpdate}
+                  shortcut="G"
+                  adding={addingFolderTag}
+                  onAddingChange={(adding) =>
+                    adding ? openFolderTagField() : setAddingFolderTag(false)
+                  }
+                />
+              ) : null}
               <ControlButton
                 shortcut="S"
                 onClick={toggleSubtitles}
