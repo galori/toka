@@ -4489,7 +4489,7 @@ test("cycles the skip step and applies it to both directions", async () => {
 
 // Ten seconds is a nudge through a feature and a third of a short clip, so the
 // step each video starts on is read from that video's own length.
-test("starts each video on the skip step closest to a fifth of its length", async () => {
+test("starts each video on the skip step closest to a tenth of its length", async () => {
   const results = [1, 2].map((number) => ({
     id: `video-${number}`,
     fileName: `clip-${number}.mp4`,
@@ -4510,7 +4510,7 @@ test("starts each video on the skip step closest to a fifth of its length", asyn
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
 
-  // Fifty minutes: a fifth of it is exactly one of the steps on offer.
+  // Fifty minutes: a tenth of it is exactly one of the steps on offer.
   const first = await screen.findByLabelText("Playing clip-1.mp4");
   Object.defineProperty(first, "duration", {
     configurable: true,
@@ -4518,18 +4518,17 @@ test("starts each video on the skip step closest to a fifth of its length", asyn
   });
   fireEvent.loadedMetadata(first);
   expect(
-    await screen.findByRole("button", { name: "Skip step: 10 minutes" }),
+    await screen.findByRole("button", { name: "Skip step: 5 minutes" }),
   ).toBeVisible();
 
   // The next video is read on its own terms rather than inheriting the last
-  // one's step: two minutes wants thirty seconds, the closest step to twenty-
-  // four.
+  // one's step: two minutes wants ten seconds, the closest step to twelve.
   fireEvent.keyDown(window, { key: "PageDown" });
   const second = await screen.findByLabelText("Playing clip-2.mp4");
   Object.defineProperty(second, "duration", { configurable: true, value: 120 });
   fireEvent.loadedMetadata(second);
   expect(
-    await screen.findByRole("button", { name: "Skip step: 30 seconds" }),
+    await screen.findByRole("button", { name: "Skip step: 10 seconds" }),
   ).toBeVisible();
 });
 
@@ -4664,14 +4663,14 @@ test("steps a real frame using the rate native playback reports", async () => {
   await screen.findByLabelText("Playing native.mkv");
 
   // Two minutes, so the poll that reports the length settles the step on the
-  // thirty seconds nearest a fifth of it. Waiting for that rather than for the
+  // ten seconds nearest a tenth of it. Waiting for that rather than for the
   // opening step keeps the cycle below counting from a known place.
   await waitFor(() =>
     expect(
-      screen.getByRole("button", { name: "Skip step: 30 seconds" }),
+      screen.getByRole("button", { name: "Skip step: 10 seconds" }),
     ).toBeVisible(),
   );
-  for (let press = 0; press < 4; press += 1)
+  for (let press = 0; press < 5; press += 1)
     fireEvent.keyDown(window, { key: "j" });
   await waitFor(() =>
     expect(
