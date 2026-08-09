@@ -4194,6 +4194,44 @@ test("starts a second Toka from the control and from Ctrl+N", async () => {
   );
 });
 
+test("opens a new window from Ctrl+N while a video is playing", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Video controls");
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
+  );
+
+  invokeMock.mockClear();
+  await user.click(screen.getByRole("button", { name: "New window" }));
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
+  );
+
+  // Ctrl+Shift+N is not the shortcut: it must not open a new window.
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "n", ctrlKey: true, shiftKey: true });
+  expect(invokeMock).not.toHaveBeenCalled();
+});
+
 test("says why a second Toka could not be started", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "open_new_window")

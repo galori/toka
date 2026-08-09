@@ -2549,9 +2549,9 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (playing) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.ctrlKey || event.metaKey || event.altKey) return;
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
+        return;
       if (event.key.toLowerCase() !== "n") return;
       event.preventDefault();
       void startNewWindow();
