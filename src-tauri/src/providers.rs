@@ -169,7 +169,7 @@ impl SearchProvider for RecollSearchProvider {
     // be answered from the names Recoll already returns. Every other provider
     // widens; this one is the reason a path search is worth having plocate for.
     fn candidates(&self, query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
-        let term = longest_term(query)?;
+        let term = longest_term(query)?.to_lowercase();
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
         let filename_query = format!("*{term}*");
@@ -449,6 +449,46 @@ mod tests {
         assert_eq!(
             provider.candidates("does-not-exist", false).unwrap(),
             Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn recoll_lowercases_term_for_case_insensitive_search() {
+        let runner = Arc::new(FakeRunner::new("/media/Summer Vacation.mkv\n"));
+        let provider = RecollSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider.candidates("SUMMER VACATION", false).unwrap();
+
+        // longest term is "VACATION" (or "SUMMER" same length, max_by_key picks last),
+        // but it must be lowercased for case-insensitive query.
+        let invoked = runner.invocations.lock().unwrap();
+        let args = &invoked.first().unwrap().1;
+        // args are ["-f", "-b", "--paths-only", "-C", "-n", "0", "*vacation*"] lowercased
+        assert!(
+            args.iter().any(|a| a == "*vacation*"),
+            "recoll query should be lowercased, got {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "*VACATION*"),
+            "recoll query must not preserve uppercase, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn recoll_is_case_insensitive_for_mixed_case_query() {
+        let runner = Arc::new(FakeRunner::new("/media/Holiday Clip.mkv\n"));
+        let provider = RecollSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider.candidates("HoLiDaY", false).unwrap();
+
+        let args = runner.invocations.lock().unwrap().first().unwrap().1.clone();
+        assert!(
+            args.contains(&"*holiday*".to_string()),
+            "recoll should lowercase mixed-case term, got {args:?}"
         );
     }
 }
