@@ -247,13 +247,18 @@ fn trash_outcome(
     Ok(name)
 }
 
-/// The playlist Toka was launched with — `toka summer.m3u8`, or the playlist
-/// opened in a file manager — as a page of results to play, so it goes through
-/// the same player, drawer and controls a search's results do.
+/// The playlist — or single video, or folder — Toka was launched with, as a
+/// page of results to play, so it goes through the same player, drawer and
+/// controls a search's results do.
+///
+/// `toka summer.m3u8` opens that playlist, `toka clip.mp4` plays that one
+/// video, and `toka /Videos` plays every supported video under that folder and
+/// its subfolders, shuffled like any other playlist.
 ///
 /// `None` is the ordinary case: Toka was started on its own and belongs on an
-/// empty search. A playlist that cannot be read, and one with nothing left in it
-/// to play, come back as errors for the viewer to see instead.
+/// empty search. A playlist, video or folder that cannot be read, and one with
+/// nothing left in it to play, come back as errors for the viewer to see
+/// instead.
 #[tauri::command]
 fn launch_playlist(
     launched: State<'_, LaunchPlaylist>,
@@ -262,6 +267,26 @@ fn launch_playlist(
     let Some(path) = launched.0.as_deref() else {
         return Ok(None);
     };
+    if path.is_dir() {
+        let mut videos =
+            playlist::collect_directory_videos(path).map_err(|message| CommandError {
+                kind: "Playlist",
+                message,
+            })?;
+        playlist::shuffle_paths(&mut videos);
+        let name = playlist::name(path).into_owned();
+        return Ok(Some(engine.page_of_videos(name, videos)));
+    }
+    if search::is_supported_video(path) {
+        if !path.is_file() {
+            return Err(CommandError {
+                kind: "Playlist",
+                message: format!("{} could not be found.", playlist::name(path)),
+            });
+        }
+        let name = playlist::name(path).into_owned();
+        return Ok(Some(engine.page_of_videos(name, vec![path.to_path_buf()])));
+    }
     let videos = playlist::videos(path).map_err(|message| CommandError {
         kind: "Playlist",
         message,

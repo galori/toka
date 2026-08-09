@@ -10,22 +10,25 @@ use std::{
     borrow::Cow,
     ffi::OsString,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// The extensions a playlist file goes by. `m3u8` is the UTF-8 one Toka writes;
 /// `m3u` is the same format under its older name.
 const PLAYLIST_EXTENSIONS: [&str; 2] = ["m3u8", "m3u"];
 
-/// The playlist file Toka was launched with, which is the first argument naming
-/// one. `arguments` is the whole command line, program name included, the way
-/// the operating system hands it over — including when the viewer opened the
-/// playlist in a file manager rather than typing the command themselves.
+/// The argument Toka was launched with that names what to play: a playlist
+/// file, a single video, or a folder whose videos become the playlist.
+/// `arguments` is the whole command line, program name included, the way the
+/// operating system hands it over — including when the viewer opened the item
+/// in a file manager rather than typing the command themselves.
 pub fn from_arguments(arguments: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
     arguments
         .into_iter()
         .skip(1)
         .map(PathBuf::from)
-        .find(|path| is_playlist(path))
+        .find(|path| is_playlist(path) || is_supported_video(path) || path.is_dir())
 }
 
 fn is_playlist(path: &Path) -> bool {
@@ -79,6 +82,71 @@ pub fn videos(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(videos)
 }
 
+/// Every supported video under `directory` and its subfolders, recursively.
+/// The walk skips files Toka cannot play and any entry that cannot be read.
+pub fn collect_directory_videos(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    if !directory.is_dir() {
+        return Err(format!("{} could not be read: not a directory", name(directory)));
+    }
+    let mut videos = Vec::new();
+    collect_recursive(directory, &mut videos)
+        .map_err(|error| format!("{} could not be read: {error}", name(directory)))?;
+    if videos.is_empty() {
+        return Err(format!("{} contains no videos Toka can play.", name(directory)));
+    }
+    Ok(videos)
+}
+
+fn collect_recursive(directory: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_recursive(&path, out)?;
+        } else if path.is_file() && is_supported_video(&path) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Shuffles `paths` with a fresh unpredictable seed, like every search's
+/// results are shuffled. A folder's videos should start in a different order
+/// each time Toka is asked to play it.
+pub fn shuffle_paths(paths: &mut [PathBuf]) {
+    let seed = fresh_seed();
+    shuffle(paths, seed);
+}
+
+fn fresh_seed() -> u64 {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or_default();
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed);
+    let mut state = now ^ calls.wrapping_mul(GOLDEN_GAMMA);
+    next_random(&mut state)
+}
+
+const GOLDEN_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+fn next_random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(GOLDEN_GAMMA);
+    let mut drawn = *state;
+    drawn = (drawn ^ (drawn >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    drawn = (drawn ^ (drawn >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    drawn ^ (drawn >> 31)
+}
+
+fn shuffle(paths: &mut [PathBuf], seed: u64) {
+    let mut state = seed;
+    for index in (1..paths.len()).rev() {
+        let swap = (next_random(&mut state) % (index as u64 + 1)) as usize;
+        paths.swap(index, swap);
+    }
+}
+
 /// What to call the playlist when telling the viewer about it: the file's own
 /// name, which is what they opened, rather than the whole path to it.
 pub fn name(path: &Path) -> Cow<'_, str> {
@@ -111,12 +179,68 @@ mod tests {
     #[test]
     fn launching_toka_without_a_playlist_names_none() {
         assert_eq!(from_arguments(arguments(&["toka"])), None);
+        // A bare flag or unsupported file carries no launch — a playlist is not
+        // assumed. Video files are handled separately via is_supported_video.
         assert_eq!(
-            from_arguments(arguments(&["toka", "/Videos/clip.mp4", "--flag"])),
+            from_arguments(arguments(&["toka", "--flag", "notes.txt"])),
             None
         );
         // The program itself is not the playlist, whatever it is called.
         assert_eq!(from_arguments(arguments(&["/usr/bin/toka.m3u8"])), None);
+    }
+
+    #[test]
+    fn launching_toka_with_a_single_video_is_recognised() {
+        assert_eq!(
+            from_arguments(arguments(&["toka", "/Videos/clip.mp4"])),
+            Some(PathBuf::from("/Videos/clip.mp4"))
+        );
+        assert_eq!(
+            from_arguments(arguments(&["toka", "--flag", "movie.MKV"])),
+            Some(PathBuf::from("movie.MKV"))
+        );
+        // Unsupported extensions are not launch targets.
+        assert_eq!(from_arguments(arguments(&["toka", "/Videos/notes.txt"])), None);
+    }
+
+    #[test]
+    fn launching_toka_with_a_folder_is_recognised() {
+        let directory = tempdir().unwrap();
+        let arg = directory.path().to_string_lossy().into_owned();
+        assert_eq!(
+            from_arguments(arguments(&["toka", &arg])),
+            Some(directory.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn launching_prefers_the_first_launchable_argument() {
+        assert_eq!(
+            from_arguments(arguments(&["toka", "--flag", "/Videos/a.mp4", "/Videos/b.m3u8"])),
+            Some(PathBuf::from("/Videos/a.mp4"))
+        );
+        let directory = tempdir().unwrap();
+        let dir_arg = directory.path().to_string_lossy().into_owned();
+        assert_eq!(
+            from_arguments(arguments(&["toka", &dir_arg, "/Videos/a.mp4"])),
+            Some(directory.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn video_extension_matching_is_case_insensitive() {
+        assert_eq!(
+            from_arguments(arguments(&["toka", "clip.Mp4"])),
+            Some(PathBuf::from("clip.Mp4"))
+        );
+        assert_eq!(
+            from_arguments(arguments(&["toka", "clip.MOV"])),
+            Some(PathBuf::from("clip.MOV"))
+        );
+        assert_eq!(
+            from_arguments(arguments(&["toka", "clip.AVI"])),
+            Some(PathBuf::from("clip.AVI"))
+        );
     }
 
     #[test]
@@ -208,5 +332,70 @@ mod tests {
             assert!(error.contains(name.as_ref()), "{error}");
             assert!(error.contains("no videos"), "{error}");
         }
+    }
+
+    #[test]
+    fn collecting_a_folders_videos_finds_supported_videos_recursively() {
+        let root = tempdir().unwrap();
+        let beach = root.path().join("beach.mp4");
+        let notes = root.path().join("notes.txt");
+        fs::write(&beach, b"test").unwrap();
+        fs::write(&notes, b"test").unwrap();
+        let sub = root.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        let party = sub.join("party.mkv");
+        let hidden = sub.join("hidden.avi");
+        fs::write(&party, b"test").unwrap();
+        fs::write(&hidden, b"test").unwrap();
+        let deep = sub.join("deep");
+        fs::create_dir(&deep).unwrap();
+        let extra = deep.join("extra.webm");
+        fs::write(&extra, b"test").unwrap();
+
+        let mut collected = collect_directory_videos(root.path()).unwrap();
+        collected.sort();
+        let mut expected = vec![beach, party, hidden, extra];
+        expected.sort();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn collecting_a_folders_videos_is_case_insensitive() {
+        let directory = tempdir().unwrap();
+        let upper = directory.path().join("CLIP.MP4");
+        fs::write(&upper, b"test").unwrap();
+        let collected = collect_directory_videos(directory.path()).unwrap();
+        assert_eq!(collected, vec![upper]);
+    }
+
+    #[test]
+    fn an_empty_folder_reports_no_videos() {
+        let directory = tempdir().unwrap();
+        let error = collect_directory_videos(directory.path()).unwrap_err();
+        assert!(error.contains("no videos"), "{error}");
+    }
+
+    #[test]
+    fn a_folder_with_only_unsupported_files_reports_no_videos() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("notes.txt"), b"test").unwrap();
+        let error = collect_directory_videos(directory.path()).unwrap_err();
+        assert!(error.contains("no videos"), "{error}");
+    }
+
+    #[test]
+    fn shuffle_paths_keeps_all_entries() {
+        let mut paths = vec![
+            PathBuf::from("/a.mp4"),
+            PathBuf::from("/b.mp4"),
+            PathBuf::from("/c.mp4"),
+        ];
+        let original = paths.clone();
+        shuffle_paths(&mut paths);
+        let mut sorted_original = original.clone();
+        let mut sorted_shuffled = paths.clone();
+        sorted_original.sort();
+        sorted_shuffled.sort();
+        assert_eq!(sorted_original, sorted_shuffled);
     }
 }
