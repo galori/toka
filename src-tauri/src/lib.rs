@@ -1086,10 +1086,13 @@ mod tests {
         );
 
         let update =
-            update_folder_tags(&ids[0], &["beach".to_owned()], &engine, crate::tags::add)
-                .unwrap();
+            update_folder_tags(&ids[0], &["beach".to_owned()], &engine, crate::tags::add).unwrap();
         assert_eq!(update.tags, ["beach"]);
-        assert!(update.folder_name.contains("[beach]"), "{}", update.folder_name);
+        assert!(
+            update.folder_name.contains("[beach]"),
+            "{}",
+            update.folder_name
+        );
         assert!(std::path::Path::new(&update.folder_path).is_dir());
         // Tag is lowercased/sorted like file tags.
         assert!(update.folder_path.contains("Trips [beach]"));
@@ -1099,11 +1102,7 @@ mod tests {
         assert_eq!(folder_after, std::path::PathBuf::from(&update.folder_path));
         assert!(engine.video_path(&ids[0]).is_ok());
         assert_eq!(
-            engine
-                .video_path(&ids[0])
-                .unwrap()
-                .parent()
-                .unwrap(),
+            engine.video_path(&ids[0]).unwrap().parent().unwrap(),
             std::path::Path::new(&update.folder_path)
         );
     }
@@ -1121,8 +1120,8 @@ mod tests {
             .unwrap_err();
         assert!(err.message.contains("brackets"));
 
-        let err2 =
-            update_folder_tags(&ids[0], &["   ".to_owned()], &engine, crate::tags::add).unwrap_err();
+        let err2 = update_folder_tags(&ids[0], &["   ".to_owned()], &engine, crate::tags::add)
+            .unwrap_err();
         assert!(err2.message.contains("At least one tag"));
     }
 }
