@@ -4739,3 +4739,45 @@ test("reports a launch playlist it cannot play and leaves the search ready", asy
   );
   expect(screen.getByRole("searchbox")).toHaveFocus();
 });
+
+test("hides the cursor when it rests on the video during playback", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  const shell = document.querySelector(".player-shell")!;
+  fireEvent.play(video);
+  await act(async () => { vi.advanceTimersByTime(10); });
+  expect(shell).not.toHaveClass("cursor-hidden");
+  // Resting the pointer on the picture hides the cursor after a short idle.
+  await user.hover(video);
+  await act(async () => { vi.advanceTimersByTime(2100); });
+  expect(shell).toHaveClass("cursor-hidden");
+  // Moving brings it back.
+  fireEvent.mouseMove(video);
+  await act(async () => { vi.advanceTimersByTime(10); });
+  expect(shell).not.toHaveClass("cursor-hidden");
+  // When the pointer is not over the picture it stays visible even after idle.
+  fireEvent.mouseLeave(video);
+  window.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }));
+  await act(async () => { vi.advanceTimersByTime(3000); });
+  expect(shell).not.toHaveClass("cursor-hidden");
+  // Paused playback never hides.
+  await user.hover(video);
+  fireEvent.pause(video);
+  await act(async () => { vi.advanceTimersByTime(3000); });
+  expect(shell).not.toHaveClass("cursor-hidden");
+  vi.useRealTimers();
+});

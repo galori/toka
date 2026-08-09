@@ -742,6 +742,9 @@ button:focus-visible {
 .player-shell.fullscreen.idle {
   cursor: none;
 }
+.player-shell.cursor-hidden {
+  cursor: none;
+}
 /* One row along the bottom rather than a band at either end. Two rows cost the
    picture a strip top and bottom — on Linux literally, because GTK paints the
    mpv surface over the WebView and the surface has to stop short of anything
