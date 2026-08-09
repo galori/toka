@@ -86,13 +86,19 @@ pub fn videos(path: &Path) -> Result<Vec<PathBuf>, String> {
 /// The walk skips files Toka cannot play and any entry that cannot be read.
 pub fn collect_directory_videos(directory: &Path) -> Result<Vec<PathBuf>, String> {
     if !directory.is_dir() {
-        return Err(format!("{} could not be read: not a directory", name(directory)));
+        return Err(format!(
+            "{} could not be read: not a directory",
+            name(directory)
+        ));
     }
     let mut videos = Vec::new();
     collect_recursive(directory, &mut videos)
         .map_err(|error| format!("{} could not be read: {error}", name(directory)))?;
     if videos.is_empty() {
-        return Err(format!("{} contains no videos Toka can play.", name(directory)));
+        return Err(format!(
+            "{} contains no videos Toka can play.",
+            name(directory)
+        ));
     }
     Ok(videos)
 }
@@ -200,7 +206,10 @@ mod tests {
             Some(PathBuf::from("movie.MKV"))
         );
         // Unsupported extensions are not launch targets.
-        assert_eq!(from_arguments(arguments(&["toka", "/Videos/notes.txt"])), None);
+        assert_eq!(
+            from_arguments(arguments(&["toka", "/Videos/notes.txt"])),
+            None
+        );
     }
 
     #[test]
@@ -216,7 +225,12 @@ mod tests {
     #[test]
     fn launching_prefers_the_first_launchable_argument() {
         assert_eq!(
-            from_arguments(arguments(&["toka", "--flag", "/Videos/a.mp4", "/Videos/b.m3u8"])),
+            from_arguments(arguments(&[
+                "toka",
+                "--flag",
+                "/Videos/a.mp4",
+                "/Videos/b.m3u8"
+            ])),
             Some(PathBuf::from("/Videos/a.mp4"))
         );
         let directory = tempdir().unwrap();
