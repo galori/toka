@@ -544,14 +544,14 @@ const SKIP_STEPS: { label: string; name: string; seconds?: number }[] = [
 const DEFAULT_SKIP_STEP = SKIP_STEPS.findIndex((step) => step.seconds === 10);
 
 // How far a skip should reach depends on what it is moving through: ten seconds
-// is a nudge in a feature and a third of a short clip. A fifth of the file is
-// the yardstick — five of them cross it — so each video opens on whichever step
+// is a nudge in a feature and a third of a short clip. A tenth of the file is
+// the yardstick — ten of them cross it — so each video opens on whichever step
 // lands nearest that, and a tie takes the shorter one, since overshooting the
 // moment being looked for is the more tedious mistake to undo.
 // The frame step is not a candidate: it measures a rate, not a length.
 const skipStepForDuration = (duration: number) => {
   if (!Number.isFinite(duration) || duration <= 0) return undefined;
-  const target = duration / 5;
+  const target = duration / 10;
   let best: number | undefined;
   let closest = Number.POSITIVE_INFINITY;
   SKIP_STEPS.forEach((step, index) => {
