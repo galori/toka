@@ -1318,6 +1318,7 @@ function Player({
   ): { context: AudioContext; gain: GainNode } | null => {
     if (audioGraphRef.current) return audioGraphRef.current;
     try {
+      if (typeof window === "undefined") return null;
       const AudioContextClass =
         (window.AudioContext as typeof AudioContext | undefined) ??
         (
@@ -1327,6 +1328,11 @@ function Player({
         ).webkitAudioContext;
       if (!AudioContextClass) return null;
       const context = new AudioContextClass();
+      if (
+        typeof context.createMediaElementSource !== "function" ||
+        typeof context.createGain !== "function"
+      )
+        return null;
       const source = context.createMediaElementSource(media);
       const gain = context.createGain();
       gain.gain.value = 1;
@@ -1338,6 +1344,24 @@ function Player({
       return null;
     }
   };
+
+  // Release the Web Audio graph when the player unmounts or the media
+  // element changes, so a test that mounts many players does not leak a
+  // suspended AudioContext and so a re-used video element can be re-wired.
+  useEffect(() => {
+    return () => {
+      const graph = audioGraphRef.current;
+      if (!graph) return;
+      try {
+        graph.source.disconnect();
+        graph.gain.disconnect();
+        void graph.context.close?.().catch(() => {});
+      } catch {
+        // ignore cleanup errors in tests
+      }
+      audioGraphRef.current = null;
+    };
+  }, []);
 
   const applyVolume = (next: number) => {
     const clamped = Math.max(0, Math.min(VOLUME_MAX, next));
