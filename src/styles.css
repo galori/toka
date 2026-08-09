@@ -347,7 +347,6 @@ input[type="search"]:focus {
     padding-top: 18px;
   }
   .video-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 12px;
   }
 }
@@ -576,7 +575,10 @@ button:focus-visible {
 }
 
 .video-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(
+    auto-fill,
+    minmax(var(--thumbnail-size, 180px), 1fr)
+  );
   gap: 24px;
   margin-top: 22px;
 }
@@ -1161,9 +1163,6 @@ button:focus-visible {
   .app {
     width: min(100% - 24px, 1120px);
     padding-top: 20px;
-  }
-  .video-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .results-summary {
     gap: 12px;

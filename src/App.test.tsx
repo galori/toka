@@ -9,7 +9,14 @@ import {
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { externalPlayers, launchPlaylist } from "./api";
-import App, { playbackSource, shuffleVideos } from "./App";
+import App, {
+  playbackSource,
+  shuffleVideos,
+  THUMBNAIL_SIZE_DEFAULT,
+  THUMBNAIL_SIZE_MAX,
+  THUMBNAIL_SIZE_MIN,
+  THUMBNAIL_SIZE_STEP,
+} from "./App";
 
 const windowApiMock = vi.hoisted(() => ({
   isFullscreen: vi.fn(),
@@ -4818,4 +4825,69 @@ test("hides the cursor when it rests on the video during playback", async () => 
   await act(async () => { vi.advanceTimersByTime(3000); });
   expect(shell).not.toHaveClass("cursor-hidden");
   vi.useRealTimers();
+});
+
+test("makes the results grid responsive and fills the width with as many thumbnails as fit", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      { id: "video-1", fileName: "clip-1.mp4", extension: "mp4" },
+      { id: "video-2", fileName: "clip-2.mp4", extension: "mp4" },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  const grid = await screen.findByRole("list", { name: "Video results" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT}px`,
+  );
+  // The grid should use auto-fill/minmax via the CSS variable.
+  expect(grid).toBeVisible();
+});
+
+test("resizes thumbnails with the larger and smaller controls", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  const grid = await screen.findByRole("list", { name: "Video results" });
+  const larger = await screen.findByRole("button", {
+    name: "Larger thumbnails",
+  });
+  const smaller = await screen.findByRole("button", {
+    name: "Smaller thumbnails",
+  });
+  expect(larger).toHaveAttribute("aria-keyshortcuts", "+");
+  expect(smaller).toHaveAttribute("aria-keyshortcuts", "-");
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT}px`,
+  );
+
+  await user.click(larger);
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT + THUMBNAIL_SIZE_STEP}px`,
+  );
+
+  await user.click(smaller);
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT}px`,
+  );
+
+  await user.click(smaller);
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT - THUMBNAIL_SIZE_STEP}px`,
+  );
+});
 });

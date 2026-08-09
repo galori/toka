@@ -619,6 +619,11 @@ const SEARCH_SCOPES: {
 // world binds "jump to search" to.
 const SEARCH_SHORTCUT = "Ctrl+K";
 
+export const THUMBNAIL_SIZE_DEFAULT = 180;
+export const THUMBNAIL_SIZE_MIN = 120;
+export const THUMBNAIL_SIZE_MAX = 360;
+export const THUMBNAIL_SIZE_STEP = 20;
+
 // Every result page is a playlist now, so looping has VLC's three states rather
 // than a single on/off. Three states cannot be expressed with `aria-pressed`,
 // so the control names the one it is in and the pointer or the L key cycles.
@@ -2348,6 +2353,15 @@ export default function App() {
   const [loadMoreMarker, setLoadMoreMarker] = useState<HTMLDivElement | null>(
     null,
   );
+  const [thumbnailSize, setThumbnailSize] = useState(THUMBNAIL_SIZE_DEFAULT);
+  const increaseThumbnailSize = () =>
+    setThumbnailSize((size) =>
+      Math.min(THUMBNAIL_SIZE_MAX, size + THUMBNAIL_SIZE_STEP),
+    );
+  const decreaseThumbnailSize = () =>
+    setThumbnailSize((size) =>
+      Math.max(THUMBNAIL_SIZE_MIN, size - THUMBNAIL_SIZE_STEP),
+    );
 
   // Playing a video takes the results off screen, so the page is left only as
   // tall as the player and a deep scroll offset has nowhere to survive: coming
@@ -2570,6 +2584,40 @@ export default function App() {
       if (event.key.toLowerCase() !== "t") return;
       event.preventDefault();
       setTaggingAll(true);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  // Thumbnail size: the grid fills the width with as many minmax columns as fit.
+  // Larger thumbs mean fewer per row, smaller mean more. Ctrl with the window's
+  // zoom keys also works, so a viewer reaching for the browser's zoom gets this
+  // instead while results are showing.
+  useEffect(() => {
+    if (playing || !page?.results.length) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (acceptsTypedText(event.target)) return;
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        increaseThumbnailSize();
+        return;
+      }
+      if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        decreaseThumbnailSize();
+        return;
+      }
+      // Ctrl and Cmd variants: the key is still + / - / = while the modifier is
+      // held, so the handlers above already cover them; no separate branch is
+      // needed except to stop the browser's own zoom.
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        (event.key === "Add" || event.key === "Subtract")
+      ) {
+        event.preventDefault();
+        if (event.key === "Add") increaseThumbnailSize();
+        else decreaseThumbnailSize();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2910,8 +2958,44 @@ export default function App() {
               {tagAllOutcome}
             </p>
           ) : null}
+          <div
+            className="thumbnail-controls"
+            style={{
+              display: "flex",
+              gap: "8px",
+              justifyContent: "flex-end",
+              marginBottom: "12px",
+            }}
+          >
+            <ControlButton
+              shortcut="-"
+              className="scope-toggle"
+              aria-label="Smaller thumbnails"
+              onClick={decreaseThumbnailSize}
+              disabled={thumbnailSize <= THUMBNAIL_SIZE_MIN}
+            >
+              <Label>Smaller</Label>
+            </ControlButton>
+            <ControlButton
+              shortcut="+"
+              className="scope-toggle"
+              aria-label="Larger thumbnails"
+              onClick={increaseThumbnailSize}
+              disabled={thumbnailSize >= THUMBNAIL_SIZE_MAX}
+            >
+              <Label>Larger</Label>
+            </ControlButton>
+          </div>
           {page.results.length ? (
-            <ul className="video-grid" aria-label="Video results">
+            <ul
+              className="video-grid"
+              aria-label="Video results"
+              style={
+                {
+                  "--thumbnail-size": `${thumbnailSize}px`,
+                } as CSSProperties
+              }
+            >
               {page.results.map((video, position) => (
                 <li key={video.id}>
                   <VideoTile
