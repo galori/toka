@@ -4890,4 +4890,81 @@ test("resizes thumbnails with the larger and smaller controls", async () => {
     `${THUMBNAIL_SIZE_DEFAULT - THUMBNAIL_SIZE_STEP}px`,
   );
 });
+
+test("resizes thumbnails with the plus and minus hotkeys", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  const grid = await screen.findByRole("list", { name: "Video results" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT}px`,
+  );
+
+  fireEvent.keyDown(window, { key: "+" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT + THUMBNAIL_SIZE_STEP}px`,
+  );
+
+  fireEvent.keyDown(window, { key: "=" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT + THUMBNAIL_SIZE_STEP * 2}px`,
+  );
+
+  fireEvent.keyDown(window, { key: "-" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT + THUMBNAIL_SIZE_STEP}px`,
+  );
+
+  // While the search field holds focus, typing should not resize.
+  const search = screen.getByRole("searchbox");
+  search.focus();
+  fireEvent.keyDown(search, { key: "+" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_DEFAULT + THUMBNAIL_SIZE_STEP}px`,
+  );
+});
+
+test("clamps thumbnail size and disables controls at the limits", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  const grid = await screen.findByRole("list", { name: "Video results" });
+  const larger = await screen.findByRole("button", {
+    name: "Larger thumbnails",
+  });
+  const smaller = await screen.findByRole("button", {
+    name: "Smaller thumbnails",
+  });
+
+  // Decrease to the minimum.
+  for (let index = 0; index < 20; index += 1) fireEvent.keyDown(window, { key: "-" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_MIN}px`,
+  );
+  expect(smaller).toBeDisabled();
+  expect(larger).not.toBeDisabled();
+
+  // Increase to the maximum.
+  for (let index = 0; index < 20; index += 1) fireEvent.keyDown(window, { key: "+" });
+  expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
+    `${THUMBNAIL_SIZE_MAX}px`,
+  );
+  expect(larger).toBeDisabled();
+  expect(smaller).not.toBeDisabled();
 });
