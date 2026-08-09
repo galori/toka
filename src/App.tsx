@@ -488,6 +488,10 @@ function BackArrowIcon() {
 // How long the fullscreen overlay waits after the last movement before fading.
 const CONTROLS_IDLE_DELAY = 2_500;
 
+// How long the pointer can rest on the video while it is playing before the
+// cursor hides. Moving the pointer brings it back.
+const CURSOR_IDLE_DELAY = 2_000;
+
 // How near the right-hand edge of the screen the pointer has to come before the
 // playlist slides in over the picture, and how long the drawer waits after the
 // pointer has left it before sliding back out.
@@ -839,6 +843,9 @@ function Player({
   // Mirrored into a ref so the fullscreen idle timer can see it without
   // restarting, the way it already watches the pointer.
   const tagFieldOpen = useRef(false);
+  const [cursorHidden, setCursorHidden] = useState(false);
+  const pointerOverVideo = useRef(false);
+  const cursorTimer = useRef<number | undefined>(undefined);
   const video = playlist[index];
   useEffect(() => {
     tagFieldOpen.current = addingTag;
@@ -1505,6 +1512,88 @@ function Player({
     };
   }, [fullscreen]);
 
+  // Hide the cursor while it rests on the picture during playback. It shows
+  // again at once on movement and whenever it is not over the picture, so it
+  // never gets lost on the controls or the rest of the page.
+  useEffect(() => {
+    const clearTimer = () => {
+      if (cursorTimer.current !== undefined) {
+        window.clearTimeout(cursorTimer.current);
+        cursorTimer.current = undefined;
+      }
+    };
+    const scheduleHide = () => {
+      clearTimer();
+      if (
+        !playingBack ||
+        !pointerOverVideo.current ||
+        pointerOverControls.current
+      )
+        return;
+      cursorTimer.current = window.setTimeout(
+        () => setCursorHidden(true),
+        CURSOR_IDLE_DELAY,
+      );
+    };
+    const isOverVideo = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      const videoEl = element.current;
+      const surfaceEl = nativeSurface.current;
+      return (
+        target === videoEl ||
+        target === surfaceEl ||
+        (videoEl?.contains(target) ?? false) ||
+        (surfaceEl?.contains(target) ?? false)
+      );
+    };
+    if (!playingBack) {
+      clearTimer();
+      setCursorHidden(false);
+      return;
+    }
+    scheduleHide();
+    const onPointerMove = (event: MouseEvent | PointerEvent) => {
+      const over = isOverVideo(event.target);
+      pointerOverVideo.current = over;
+      // Moving anywhere brings the cursor back; if it is still over the
+      // picture a new idle countdown begins.
+      setCursorHidden(false);
+      if (over) scheduleHide();
+      else clearTimer();
+    };
+    const onLeaveVideo = () => {
+      pointerOverVideo.current = false;
+      setCursorHidden(false);
+      clearTimer();
+    };
+    const onKeyDown = () => {
+      setCursorHidden(false);
+      scheduleHide();
+    };
+    window.addEventListener("mousemove", onPointerMove);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("mouseout", (event) => {
+      // Leaving the video element fires mouseout with relatedTarget outside.
+      if (isOverVideo(event.target) && !isOverVideo(event.relatedTarget as EventTarget)) {
+        onLeaveVideo();
+      }
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      clearTimer();
+      window.removeEventListener("mousemove", onPointerMove);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [playingBack]);
+
+  useEffect(() => {
+    return () => {
+      if (cursorTimer.current !== undefined)
+        window.clearTimeout(cursorTimer.current);
+    };
+  }, []);
+
   const focusPlayerShell = () => {
     playerShell.current?.focus({ preventScroll: true });
   };
@@ -1798,8 +1887,11 @@ function Player({
           refuse the request to grant it. */}
       <div
         ref={playerShell}
-        className={`player-shell${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}`}
+        className={`player-shell${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}${cursorHidden ? " cursor-hidden" : ""}`}
         tabIndex={-1}
+        onMouseMove={() => {
+          if (cursorHidden) setCursorHidden(false);
+        }}
       >
         {!prepared ? (
           <p className="message preparing-video">Preparing video…</p>
