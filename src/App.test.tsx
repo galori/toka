@@ -161,6 +161,7 @@ test("starts with a focused search field and displays submitted results", async 
       page: 1,
       pageSize: 24,
       fields: { tags: true, fileName: true, path: false },
+      mediaType: "videos",
     },
   });
 });
@@ -4967,4 +4968,119 @@ test("clamps thumbnail size and disables controls at the limits", async () => {
   );
   expect(larger).toBeDisabled();
   expect(smaller).not.toBeDisabled();
+});
+test("defaults media type to videos and toggles with shortcuts", async () => {
+  invokeMock.mockResolvedValue(searchPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+
+  const videos = screen.getByRole("button", { name: "Videos" });
+  const images = screen.getByRole("button", { name: "Images" });
+  const both = screen.getByRole("button", { name: "Both" });
+  expect(videos).toHaveAttribute("aria-keyshortcuts", "Ctrl+1");
+  expect(images).toHaveAttribute("aria-keyshortcuts", "Ctrl+2");
+  expect(both).toHaveAttribute("aria-keyshortcuts", "Ctrl+3");
+  expect(videos).toHaveAttribute("aria-pressed", "true");
+  expect(images).toHaveAttribute("aria-pressed", "false");
+  expect(both).toHaveAttribute("aria-pressed", "false");
+
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(await screen.findByRole("button", { name: "Play holiday.mp4" })).toBeVisible();
+  const lastMediaType = () => {
+    const call = invokeMock.mock.calls.filter(([c]) => c === "search_videos").at(-1);
+    return (call?.[1] as { request: { mediaType: string } })?.request.mediaType;
+  };
+  expect(lastMediaType()).toBe("videos");
+
+  await user.click(images);
+  expect(images).toHaveAttribute("aria-pressed", "true");
+  await waitFor(() => expect(lastMediaType()).toBe("images"));
+
+  fireEvent.keyDown(window, { key: "3", ctrlKey: true });
+  await waitFor(() => expect(lastMediaType()).toBe("both"));
+  expect(both).toHaveAttribute("aria-pressed", "true");
+
+  fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+  await waitFor(() => expect(lastMediaType()).toBe("videos"));
+});
+
+test("shows image results and handles slideshow controls", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const imagePage = {
+    query: "sunset",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      { id: "img-1", fileName: "sunset.jpg", extension: "jpg" },
+      { id: "img-2", fileName: "beach.png", extension: "png" },
+    ],
+  };
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(imagePage);
+    if (command === "prepare_video") return Promise.resolve({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  try {
+    render(<App />);
+    // switch to images before searching
+    await user.click(screen.getByRole("button", { name: "Images" }));
+    await user.type(screen.getByRole("searchbox"), "sunset{Enter}");
+    expect(await screen.findByRole("button", { name: "Play sunset.jpg" })).toBeVisible();
+    // play first image
+    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    await user.click(screen.getByRole("button", { name: "Play sunset.jpg" }));
+    const image = await screen.findByLabelText("Playing sunset.jpg");
+    expect(image.tagName).toBe("IMG");
+    expect(image).toHaveAttribute("src", "asset:///Photos/sunset.jpg");
+
+    // timeline and speed disabled for images
+    expect(screen.getByLabelText("Video timeline")).toBeDisabled();
+    expect(screen.getByLabelText("Playback speed")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Skip step: 10 seconds" })).toBeDisabled();
+
+    // slideshow control with shortcut S
+    const slideshowButton = screen.getByRole("button", { name: "Pause slideshow" });
+    expect(slideshowButton).toHaveAttribute("aria-keyshortcuts", "S");
+    expect(slideshowButton).toHaveAttribute("aria-pressed", "true");
+
+    // pause slideshow
+    await user.click(slideshowButton);
+    expect(screen.getByRole("button", { name: "Play slideshow" })).toBeVisible();
+
+    // resume
+    fireEvent.keyDown(window, { key: "s" });
+    expect(await screen.findByRole("button", { name: "Pause slideshow" })).toBeVisible();
+
+    // arrow navigation
+    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/beach.png", playbackBackend: "web" });
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(await screen.findByLabelText("Playing beach.png")).toBeVisible();
+    expect((await screen.findByLabelText("Playing beach.png") as HTMLImageElement).tagName).toBe("IMG");
+
+    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    fireEvent.keyDown(window, { key: "ArrowLeft" });
+    expect(await screen.findByLabelText("Playing sunset.jpg")).toBeVisible();
+
+    // space toggles slideshow pause/play for images
+    fireEvent.keyDown(window, { key: " " });
+    expect(screen.getByRole("button", { name: "Play slideshow" })).toBeVisible();
+    fireEvent.keyDown(window, { key: " " });
+    expect(screen.getByRole("button", { name: "Pause slideshow" })).toBeVisible();
+
+    // auto-advance after interval
+    const beachAgain = { filePath: "/Photos/beach.png", playbackBackend: "web" };
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "prepare_video") return Promise.resolve(beachAgain);
+      return Promise.resolve();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(3100);
+    });
+    expect(await screen.findByLabelText("Playing beach.png")).toBeVisible();
+  } finally {
+    vi.useRealTimers();
+  }
 });

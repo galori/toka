@@ -214,7 +214,7 @@ impl SearchProvider for PlocateSearchProvider {
         if !whole_path {
             args.push("--basename");
         }
-        args.extend(["--existing", "--", term.as_str()]);
+        args.extend(["--existing", "--", term]);
         let args = args.into_iter().map(String::from).collect::<Vec<_>>();
         let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
         // plocate uses exit status 1 to report a successful search with no
@@ -229,62 +229,11 @@ impl SearchProvider for PlocateSearchProvider {
     }
 }
 
-fn longest_term(query: &str) -> Result<String, SearchError> {
-    let terms = extract_terms(query);
-    terms
-        .into_iter()
+fn longest_term(query: &str) -> Result<&str, SearchError> {
+    query
+        .split_whitespace()
         .max_by_key(|term| term.chars().count())
         .ok_or(SearchError::InvalidQuery)
-}
-
-fn extract_terms(query: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    let mut tokens: Vec<String> = Vec::new();
-    for ch in query.chars() {
-        if ch == '(' || ch == ')' {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-            tokens.push(ch.to_string());
-        } else if ch.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    for token in tokens {
-        if token == "(" || token == ")" {
-            continue;
-        }
-        if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") {
-            continue;
-        }
-        if let Some(colon) = token.find(':') {
-            let prefix = token[..colon].to_ascii_lowercase();
-            let suffix = &token[colon + 1..];
-            if !suffix.is_empty()
-                && matches!(
-                    prefix.as_str(),
-                    "tags" | "tag" | "filename" | "file" | "name" | "path"
-                )
-            {
-                if !suffix.is_empty() {
-                    terms.push(suffix.to_owned());
-                }
-                continue;
-            }
-        }
-        terms.push(token);
-    }
-    terms
 }
 
 fn parse_output(output: ProcessOutput, failure_message: &str) -> Result<Vec<PathBuf>, SearchError> {

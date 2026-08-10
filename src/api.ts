@@ -38,13 +38,17 @@ export const DEFAULT_SEARCH_FIELDS: SearchFields = {
   path: false,
 };
 
+export type MediaType = "videos" | "images" | "both";
+export const DEFAULT_MEDIA_TYPE: MediaType = "videos";
+
 export function searchVideos(
   query: string,
   page: number,
   fields: SearchFields = DEFAULT_SEARCH_FIELDS,
+  mediaType: MediaType = DEFAULT_MEDIA_TYPE,
 ): Promise<SearchPage> {
   return invoke<SearchPage>("search_videos", {
-    request: { query, page, pageSize: PAGE_SIZE, fields },
+    request: { query, page, pageSize: PAGE_SIZE, fields, mediaType },
   });
 }
 

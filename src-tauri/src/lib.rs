@@ -923,6 +923,7 @@ mod tests {
                 page: 1,
                 page_size: search::PAGE_SIZE,
                 fields: Default::default(),
+                media_type: Default::default(),
             })
             .unwrap();
         let ids = page.results.iter().map(|r| r.id.clone()).collect();

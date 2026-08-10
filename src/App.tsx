@@ -39,8 +39,10 @@ import {
   videoPreview,
   videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
+  DEFAULT_MEDIA_TYPE,
   type BulkTagUpdate,
   type ExternalPlayer,
+  type MediaType,
   type PreparedVideo,
   type SearchFields,
   type SearchPage,
@@ -48,6 +50,36 @@ import {
   type VideoTagUpdate,
 } from "./api";
 import { buildInfo } from "./buildInfo";
+
+const IMAGE_EXTENSIONS = new Set([
+  "jpg",
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+  "bmp",
+  "tiff",
+  "tif",
+  "heic",
+  "heif",
+  "avif",
+]);
+
+export function isImageExtension(extension: string): boolean {
+  return IMAGE_EXTENSIONS.has(extension.toLowerCase());
+}
+
+export function isImageResult(result: VideoResult): boolean {
+  return isImageExtension(result.extension);
+}
+
+export const SLIDESHOW_INTERVAL = 3_000;
+
+const MEDIA_TYPES: { value: MediaType; label: string; shortcut: string }[] = [
+  { value: "videos", label: "Videos", shortcut: "Ctrl+1" },
+  { value: "images", label: "Images", shortcut: "Ctrl+2" },
+  { value: "both", label: "Both", shortcut: "Ctrl+3" },
+];
 
 // A subtitle Toka can turn on, whichever backend supplies it: a sidecar file
 // detected by Rust, an mpv track, or a track the web engine found in the file.
@@ -852,9 +884,14 @@ function Player({
   const pointerOverVideo = useRef(false);
   const cursorTimer = useRef<number | undefined>(undefined);
   const video = playlist[index];
+  const isImage = isImageResult(video);
+  const [slideshowPlaying, setSlideshowPlaying] = useState(true);
   useEffect(() => {
     tagFieldOpen.current = addingTag;
   }, [addingTag]);
+  useEffect(() => {
+    if (isImage) setSlideshowPlaying(true);
+  }, [video.id, isImage]);
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -909,7 +946,7 @@ function Player({
     prepareVideo(video.id)
       .then(async (result) => {
         if (!active) return;
-        if (result.playbackBackend === "native") {
+        if (!isImage && result.playbackBackend === "native") {
           nativeActive = true;
           setNativeStarted(true);
           await loadNativeVideo(result.filePath);
@@ -927,7 +964,10 @@ function Player({
           await setNativePaused(false);
           if (active) setPlayingBack(true);
         }
-        if (active) setPrepared(result);
+        if (active) {
+          setPrepared(result);
+          if (isImage) setPlayingBack(true);
+        }
       })
       .catch((reason: unknown) => {
         if (active) setError(errorMessage(reason));
@@ -947,7 +987,7 @@ function Player({
     };
   }, [video.id]);
 
-  const native = prepared?.playbackBackend === "native";
+  const native = !isImage && prepared?.playbackBackend === "native";
   // GTK composites the native surface above the WebView. An invalid file can
   // fail after that surface has been started, so an error view alone is not
   // enough: the native layer must be hidden before it can cover the view (or
@@ -1259,6 +1299,21 @@ function Player({
       (current) => (current + direction + playlist.length) % playlist.length,
     );
   };
+
+  const toggleSlideshow = () => setSlideshowPlaying((playing) => !playing);
+
+  useEffect(() => {
+    if (!isImage || !slideshowPlaying) return;
+    const timer = window.setInterval(() => {
+      if (loop === "off" && index === playlist.length - 1) return;
+      if (playlist.length <= 1 && loop === "one") return;
+      setIndex((current) => {
+        if (loop === "off" && current === playlist.length - 1) return current;
+        return (current + 1) % playlist.length;
+      });
+    }, SLIDESHOW_INTERVAL);
+    return () => window.clearInterval(timer);
+  }, [isImage, slideshowPlaying, playlist.length, index, loop]);
 
   const removeCurrentVideo = async () => {
     const removed = playlist[index];
@@ -1725,17 +1780,18 @@ function Player({
         return;
       }
       if (event.key === " " || event.key === "Spacebar") {
-        run(playingBack ? pause : play);
+        run(isImage ? toggleSlideshow : playingBack ? pause : play);
       } else if (event.key === "[") {
         run(() => rotate(-90));
       } else if (event.key === "]") {
         run(() => rotate(90));
       } else if (event.key === "ArrowLeft") {
-        run(() => skip(-skipSeconds));
+        run(() => (isImage ? moveVideo(-1) : skip(-skipSeconds)));
       } else if (event.key === "ArrowRight") {
-        run(() => skip(skipSeconds));
+        run(() => (isImage ? moveVideo(1) : skip(skipSeconds)));
       } else if (event.key.toLowerCase() === "j") {
-        run(cycleSkipStep);
+        if (!isImage) run(cycleSkipStep);
+        else return;
       } else if (event.key === "PageUp") {
         run(() => moveVideo(-1));
       } else if (event.key === "PageDown") {
@@ -1760,8 +1816,9 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
-      } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
-        run(toggleSubtitles);
+      } else if (event.key.toLowerCase() === "s") {
+        if (isImage) run(toggleSlideshow);
+        else if (subtitles.length > 0) run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
         run(cycleLoop);
       } else if (event.key.toLowerCase() === "p") {
@@ -1781,6 +1838,7 @@ function Player({
     duration,
     fullscreen,
     index,
+    isImage,
     native,
     nativeBaseRotation,
     onBack,
@@ -1788,6 +1846,7 @@ function Player({
     playingBack,
     playlist.length,
     skipSeconds,
+    slideshowPlaying,
     speed,
     subtitleIndex,
     subtitles,
@@ -1900,6 +1959,22 @@ function Player({
       >
         {!prepared ? (
           <p className="message preparing-video">Preparing video…</p>
+        ) : isImage ? (
+          <img
+            src={playbackSource(prepared.filePath)}
+            alt={`Playing ${video.fileName}`}
+            aria-label={`Playing ${video.fileName}`}
+            className="slideshow-image"
+            style={{
+              transform: `rotate(${rotation}deg)`,
+              ...(aspectSides
+                ? {
+                    aspectRatio: `${aspectSides[0]} / ${aspectSides[1]}`,
+                    objectFit: "contain" as const,
+                  }
+                : {}),
+            }}
+          />
         ) : native ? (
           <div
             ref={nativeSurface}
@@ -1985,11 +2060,13 @@ function Player({
             max={duration || 0}
             step="0.1"
             value={Math.min(currentTime, duration || 0)}
+            disabled={isImage}
             // The sliver the bar collapses to in fullscreen paints its own fill:
             // a range input's track and thumb cannot be drawn legibly at six
             // pixels, so the progress is handed to the stylesheet instead.
             style={{ "--progress": `${elapsedShare}%` } as CSSProperties}
             onChange={(event) => {
+              if (isImage) return;
               const nextTime = Number(event.currentTarget.value);
               if (native)
                 void seekNativeVideo(nextTime).catch((reason: unknown) =>
@@ -2009,10 +2086,11 @@ function Player({
             </ControlButton>
             <ControlButton
               shortcut="ArrowLeft"
-              onClick={() => skip(-skipSeconds)}
-              aria-label={`Skip back ${skipStep.name}`}
+              onClick={() => (isImage ? moveVideo(-1) : skip(-skipSeconds))}
+              aria-label={isImage ? "Previous image" : `Skip back ${skipStep.name}`}
+              disabled={isImage ? false : undefined}
             >
-              <Label>{`−${skipStep.label}`}</Label>
+              <Label>{isImage ? "←" : `−${skipStep.label}`}</Label>
             </ControlButton>
             {/* Playing and pausing are one action whose meaning follows the
                 state, so they are one control rather than two, the way every
@@ -2020,20 +2098,24 @@ function Player({
             <ControlButton
               shortcut="Space"
               className="play-button"
-              onClick={playingBack ? pause : play}
-              aria-label={playingBack ? "Pause" : "Play"}
+              onClick={isImage ? toggleSlideshow : playingBack ? pause : play}
+              aria-label={isImage ? (slideshowPlaying ? "Pause" : "Play") : playingBack ? "Pause" : "Play"}
             >
               <span
-                className={playingBack ? "pause-glyph" : "play-glyph"}
+                className={
+                  (isImage ? slideshowPlaying : playingBack)
+                    ? "pause-glyph"
+                    : "play-glyph"
+                }
                 aria-hidden="true"
               />
             </ControlButton>
             <ControlButton
               shortcut="ArrowRight"
-              onClick={() => skip(skipSeconds)}
-              aria-label={`Skip forward ${skipStep.name}`}
+              onClick={() => (isImage ? moveVideo(1) : skip(skipSeconds))}
+              aria-label={isImage ? "Next image" : `Skip forward ${skipStep.name}`}
             >
-              <Label>{`+${skipStep.label}`}</Label>
+              <Label>{isImage ? "→" : `+${skipStep.label}`}</Label>
             </ControlButton>
             <ControlButton
               shortcut="PageDown"
@@ -2055,16 +2137,27 @@ function Player({
                   adding ? openTagField() : setAddingTag(false)
                 }
               />
-              <ControlButton
-                shortcut="S"
-                onClick={toggleSubtitles}
-                disabled={subtitles.length === 0}
-                aria-label="Subtitles"
-                aria-pressed={subtitleIndex >= 0}
-              >
-                <Label>CC</Label>
-              </ControlButton>
-              {subtitles.length > 1 ? (
+              {isImage ? (
+                <ControlButton
+                  shortcut="S"
+                  onClick={toggleSlideshow}
+                  aria-label={slideshowPlaying ? "Pause slideshow" : "Play slideshow"}
+                  aria-pressed={slideshowPlaying}
+                >
+                  <Label>{slideshowPlaying ? "Pause" : "Play"}</Label>
+                </ControlButton>
+              ) : (
+                <ControlButton
+                  shortcut="S"
+                  onClick={toggleSubtitles}
+                  disabled={subtitles.length === 0}
+                  aria-label="Subtitles"
+                  aria-pressed={subtitleIndex >= 0}
+                >
+                  <Label>CC</Label>
+                </ControlButton>
+              )}
+              {!isImage && subtitles.length > 1 ? (
                 <select
                   aria-label="Subtitle track"
                   title="Subtitle track"
@@ -2089,6 +2182,7 @@ function Player({
                 shortcut="J"
                 onClick={cycleSkipStep}
                 aria-label={`Skip step: ${skipStepName}`}
+                disabled={isImage}
               >
                 <Label>{skipStep.label}</Label>
               </ControlButton>
@@ -2098,6 +2192,7 @@ function Player({
                   aria-keyshortcuts="- ="
                   title="Playback speed"
                   value={speed}
+                  disabled={isImage}
                   onChange={(event) => {
                     applySpeed(Number(event.currentTarget.value));
                     focusPlayerShell();
@@ -2309,6 +2404,7 @@ function Player({
 export default function App() {
   const [query, setQuery] = useState("");
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
+  const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [page, setPage] = useState<SearchPage>();
   // Playback is always a playlist: choosing one result starts the whole page of
   // them, positioned at the one that was chosen.
@@ -2400,7 +2496,7 @@ export default function App() {
     setError(undefined);
     setPlaying(undefined);
     try {
-      const response = await searchVideos(trimmed, requestedPage, fields);
+      const response = await searchVideos(trimmed, requestedPage, fields, mediaType);
       if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
       if (currentRequest === requestNumber.current) {
@@ -2419,7 +2515,7 @@ export default function App() {
     if (loadedPages >= page.totalPages) return;
     setLoadingMore(true);
     try {
-      const next = await searchVideos(page.query, loadedPages + 1, fields);
+      const next = await searchVideos(page.query, loadedPages + 1, fields, mediaType);
       setPage((current) =>
         current && current.query === next.query
           ? { ...next, results: [...current.results, ...next.results] }
@@ -2503,6 +2599,12 @@ export default function App() {
   useEffect(() => {
     if (searchedFields.current === fields) return;
     searchedFields.current = fields;
+    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+  });
+  const searchedMediaType = useRef(mediaType);
+  useEffect(() => {
+    if (searchedMediaType.current === mediaType) return;
+    searchedMediaType.current = mediaType;
     if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
   });
 
@@ -2623,6 +2725,25 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  useEffect(() => {
+    if (playing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (event.key === "1") {
+        event.preventDefault();
+        setMediaType("videos");
+      } else if (event.key === "2") {
+        event.preventDefault();
+        setMediaType("images");
+      } else if (event.key === "3") {
+        event.preventDefault();
+        setMediaType("both");
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   // Every video the search matched, not only the pages scrolled to so far:
   // "play all" and "tag all" both mean all of them, however far down the list
   // the viewer has got.
@@ -2635,7 +2756,7 @@ export default function App() {
     const pages = needsAdditionalPages
       ? await Promise.all(
           Array.from({ length: totalPages - loadedPages }, (_, offset) =>
-            searchVideos(page.query, loadedPages + offset + 1, fields).then(
+            searchVideos(page.query, loadedPages + offset + 1, fields, mediaType).then(
               (response) => response?.results ?? [],
             ),
           ),
@@ -2805,6 +2926,20 @@ export default function App() {
               onClick={() => toggleField(scope.field)}
             >
               <Label>{scope.name}</Label>
+            </ControlButton>
+          ))}
+        </div>
+        <div className="search-scope" role="group" aria-label="Media type">
+          {MEDIA_TYPES.map((media) => (
+            <ControlButton
+              key={media.value}
+              shortcut={media.shortcut}
+              className="scope-toggle"
+              aria-label={media.label}
+              aria-pressed={mediaType === media.value}
+              onClick={() => setMediaType(media.value)}
+            >
+              <Label>{media.label}</Label>
             </ControlButton>
           ))}
         </div>
