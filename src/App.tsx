@@ -36,14 +36,11 @@ import {
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
-  addFolderTags,
-  removeFolderTags,
   videoPreview,
   videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
   type BulkTagUpdate,
   type ExternalPlayer,
-  type FolderTagUpdate,
   type PreparedVideo,
   type SearchFields,
   type SearchPage,
@@ -359,118 +356,6 @@ function VideoTags({
   );
 }
 
-// Minimal folder tagging UI — mirrors `VideoTags` but for the directory
-// containing the video. Requires discussion per issue #198: placement,
-// shortcut choice, and whether folders should appear as searchable results are
-// still open. Uses `ControlButton` so shortcut hint and
-// `aria-keyshortcuts` cannot drift apart, and reuses `tags::add` for
-// directories (bracket syntax, no extension).
-function parseFolderTags(folderName: string): string[] {
-  // Mirrors `tags::Tags::parse_dir_name` — tag block is `[...]` at end.
-  if (!folderName.endsWith("]")) return [];
-  const open = folderName.lastIndexOf("[");
-  if (open === -1) return [];
-  const block = folderName.slice(open + 1, -1);
-  if (!block || block.includes("]")) return [];
-  return block
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((t) => t.toLowerCase());
-}
-
-function FolderTags({
-  video,
-  folderName,
-  folderTags,
-  onChange,
-  adding: controlledAdding,
-  onAddingChange,
-  shortcut = "G",
-}: {
-  video: VideoResult;
-  folderName: string;
-  folderTags?: string[];
-  onChange: (update: FolderTagUpdate) => void;
-  adding?: boolean;
-  onAddingChange?: (adding: boolean) => void;
-  shortcut?: string;
-}) {
-  const field = useRef<HTMLInputElement>(null);
-  const [draft, setDraft] = useState("");
-  const [uncontrolledAdding, setUncontrolledAdding] = useState(false);
-  const [error, setError] = useState<string>();
-  const adding = controlledAdding ?? uncontrolledAdding;
-  const setAdding = (next: boolean) => {
-    setUncontrolledAdding(next);
-    onAddingChange?.(next);
-  };
-  const tags = folderTags ?? parseFolderTags(folderName);
-  useEffect(() => {
-    if (adding) field.current?.focus();
-  }, [adding]);
-  const save = async (update: Promise<FolderTagUpdate>) => {
-    try {
-      onChange(await update);
-      setError(undefined);
-    } catch (reason) {
-      setError(`Could not update folder tags: ${errorMessage(reason)}`);
-    }
-  };
-  const add = () => {
-    const tag = draft.trim();
-    if (!tag || tags.includes(tag.toLowerCase())) return;
-    void save(addFolderTags(video.id, [tag]));
-    setDraft("");
-    setAdding(false);
-  };
-  const folderLabel = folderName || "folder";
-  return (
-    <div className="video-tags folder-tags" aria-label={`Tags for folder ${folderLabel}`}>
-      <span className="folder-tag-prefix" aria-hidden="true">
-        {folderLabel}:
-      </span>
-      {tags.map((tag) => (
-        <button
-          key={tag}
-          type="button"
-          className="tag-pill"
-          aria-label={`Remove tag ${tag} from folder ${folderLabel}`}
-          onClick={() => void save(removeFolderTags(video.id, [tag]))}
-        >
-          <span className="tag-name">{tag}</span>
-          <TagRemoveIcon />
-        </button>
-      ))}
-      {adding ? (
-        <input
-          ref={field}
-          aria-label={`Add tag to folder ${folderLabel}`}
-          value={draft}
-          onChange={(event) => setDraft(event.currentTarget.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") add();
-            if (event.key === "Escape") setAdding(false);
-          }}
-        />
-      ) : (
-        <ControlButton
-          shortcut={shortcut}
-          className="tag-add"
-          aria-label={`Add tag to folder ${folderLabel}`}
-          onClick={() => setAdding(true)}
-        >
-          <Label>+</Label>
-        </ControlButton>
-      )}
-      {error ? (
-        <p className="tag-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-    </div>
-  );
-}
-
 function SearchIcon() {
   return (
     <svg viewBox="0 0 24 24" className="search-glyph" aria-hidden="true">
@@ -621,18 +506,16 @@ type FullscreenPlaylist = "hidden" | "peek" | "held";
 type FullscreenMode = "video" | "information" | "controls";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
-export const VOLUME_MAX = 150;
-export const VOLUME_STEP = 5;
+const VOLUME_STEP = 5;
 
 // The whole digit row once stepped the volume, which was a lot of reaching for
 // a scale the arrow keys walk in one place. Three of those digits are worth
 // keeping, because a preset is pressed once rather than held: each is named by
 // the digit its percentage starts with, so 0 is silence, 5 is half and 1 is
-// full. 150% is a boost past full for quiet recordings, on "2" because "1"
-// already means 100%.
+// full.
 // A preset without a label is drawn as the crossed-out speaker instead, which
 // says "silent" without spending the width a written "0%" would.
-export const VOLUME_PRESETS: {
+const VOLUME_PRESETS: {
   key: string;
   volume: number;
   name: string;
@@ -641,7 +524,6 @@ export const VOLUME_PRESETS: {
   { key: "0", volume: 0, name: "Mute" },
   { key: "5", volume: 50, name: "Half volume", label: "50%" },
   { key: "1", volume: 100, name: "Full volume", label: "100%" },
-  { key: "2", volume: 150, name: "Boost volume", label: "150%" },
 ];
 
 // How far each skip moves. Ten seconds suits scrubbing past an ad break and
@@ -925,11 +807,6 @@ function Player({
   const playlistDrawer = useRef<HTMLElement>(null);
   const fullscreenInfo = useRef<HTMLDivElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
-  const audioGraphRef = useRef<{
-    context: AudioContext;
-    gain: GainNode;
-    source: MediaElementAudioSourceNode;
-  } | null>(null);
   const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
@@ -968,7 +845,6 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
-  const [addingFolderTag, setAddingFolderTag] = useState(false);
   // Mirrored into a ref so the fullscreen idle timer can see it without
   // restarting, the way it already watches the pointer.
   const tagFieldOpen = useRef(false);
@@ -977,8 +853,8 @@ function Player({
   const cursorTimer = useRef<number | undefined>(undefined);
   const video = playlist[index];
   useEffect(() => {
-    tagFieldOpen.current = addingTag || addingFolderTag;
-  }, [addingTag, addingFolderTag]);
+    tagFieldOpen.current = addingTag;
+  }, [addingTag]);
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -986,31 +862,6 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
-  };
-  // Folder name for the current video — derived from the prepared path when
-  // available, otherwise from the playlist entry. Requires discussion: this is
-  // the minimal placement that mirrors file tagging without a dedicated
-  // folder browser.
-  const derivedFolderName = useMemo(() => {
-    const fullPath = prepared?.filePath ?? "";
-    if (fullPath) {
-      const parts = fullPath.split(/[\\/]/);
-      if (parts.length >= 2) return parts[parts.length - 2] ?? "";
-    }
-    return "";
-  }, [prepared?.filePath]);
-  const [folderNameOverride, setFolderNameOverride] = useState<string | null>(null);
-  const folderName = folderNameOverride ?? derivedFolderName;
-  useEffect(() => {
-    setFolderNameOverride(null);
-  }, [video.id]);
-  const handleFolderUpdate = (update: FolderTagUpdate) => {
-    setFolderNameOverride(update.folderName);
-    // Folder rename moves video; reflect new path in prepared state so
-    // subsequent actions target the renamed location.
-    setPrepared((current) =>
-      current ? { ...current, filePath: update.folderPath + "/" + video.fileName } : current,
-    );
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1273,11 +1124,6 @@ function Player({
     if (playingBack) pause();
     setAddingTag(true);
   };
-  // Folder tagging mirrors file tagging — minimal, requires discussion.
-  const openFolderTagField = () => {
-    if (playingBack) pause();
-    setAddingFolderTag(true);
-  };
 
   const restart = () => {
     if (native) {
@@ -1459,80 +1305,14 @@ function Player({
     else if (element.current) element.current.playbackRate = next;
   };
 
-  const ensureAudioGraph = (
-    media: HTMLVideoElement,
-  ): { context: AudioContext; gain: GainNode } | null => {
-    if (audioGraphRef.current) return audioGraphRef.current;
-    try {
-      if (typeof window === "undefined") return null;
-      const AudioContextClass =
-        (window.AudioContext as typeof AudioContext | undefined) ??
-        (
-          window as unknown as {
-            webkitAudioContext?: typeof AudioContext;
-          }
-        ).webkitAudioContext;
-      if (!AudioContextClass) return null;
-      const context = new AudioContextClass();
-      if (
-        typeof context.createMediaElementSource !== "function" ||
-        typeof context.createGain !== "function"
-      )
-        return null;
-      const source = context.createMediaElementSource(media);
-      const gain = context.createGain();
-      gain.gain.value = 1;
-      source.connect(gain);
-      gain.connect(context.destination);
-      audioGraphRef.current = { context, gain, source };
-      return audioGraphRef.current;
-    } catch {
-      return null;
-    }
-  };
-
-  // Release the Web Audio graph when the player unmounts or the media
-  // element changes, so a test that mounts many players does not leak a
-  // suspended AudioContext and so a re-used video element can be re-wired.
-  useEffect(() => {
-    return () => {
-      const graph = audioGraphRef.current;
-      if (!graph) return;
-      try {
-        graph.source.disconnect();
-        graph.gain.disconnect();
-        void graph.context.close?.().catch(() => {});
-      } catch {
-        // ignore cleanup errors in tests
-      }
-      audioGraphRef.current = null;
-    };
-  }, []);
-
   const applyVolume = (next: number) => {
-    const clamped = Math.max(0, Math.min(VOLUME_MAX, next));
+    const clamped = Math.max(0, Math.min(100, next));
     setVolume(clamped);
     if (native)
       void setNativeVolume(clamped).catch((reason: unknown) =>
         setError(errorMessage(reason)),
       );
-    else if (element.current) {
-      const media = element.current;
-      if (clamped > 100) {
-        const graph = ensureAudioGraph(media);
-        if (graph) {
-          media.volume = 1;
-          graph.gain.gain.value = clamped / 100;
-          if (graph.context.state === "suspended")
-            void graph.context.resume().catch(() => {});
-        } else {
-          media.volume = 1;
-        }
-      } else {
-        media.volume = clamped / 100;
-        if (audioGraphRef.current) audioGraphRef.current.gain.gain.value = 1;
-      }
-    }
+    else if (element.current) element.current.volume = clamped / 100;
   };
 
   // Holds at the ends of the range rather than wrapping, so holding the key
@@ -1940,13 +1720,8 @@ function Player({
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
       // focus itself, which the check above already returns on.
-      if (addingTag || addingFolderTag) {
-        if (event.key === "Escape") {
-          run(() => {
-            setAddingTag(false);
-            setAddingFolderTag(false);
-          });
-        }
+      if (addingTag) {
+        if (event.key === "Escape") run(() => setAddingTag(false));
         return;
       }
       if (event.key === " " || event.key === "Spacebar") {
@@ -1985,8 +1760,6 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
-      } else if (event.key.toLowerCase() === "g") {
-        run(openFolderTagField);
       } else if (event.key.toLowerCase() === "s" && subtitles.length > 0) {
         run(toggleSubtitles);
       } else if (event.key.toLowerCase() === "l") {
@@ -2012,7 +1785,6 @@ function Player({
     nativeBaseRotation,
     onBack,
     addingTag,
-    addingFolderTag,
     playingBack,
     playlist.length,
     skipSeconds,
@@ -2158,21 +1930,7 @@ function Player({
                   : 0,
               );
               event.currentTarget.playbackRate = speed;
-              if (volume > 100) {
-                const graph = ensureAudioGraph(event.currentTarget);
-                if (graph) {
-                  event.currentTarget.volume = 1;
-                  graph.gain.gain.value = volume / 100;
-                  if (graph.context.state === "suspended")
-                    void graph.context.resume().catch(() => {});
-                } else {
-                  event.currentTarget.volume = 1;
-                }
-              } else {
-                event.currentTarget.volume = volume / 100;
-                if (audioGraphRef.current)
-                  audioGraphRef.current.gain.gain.value = 1;
-              }
+              event.currentTarget.volume = volume / 100;
               play();
             }}
             onPlay={() => setPlayingBack(true)}
@@ -2297,18 +2055,6 @@ function Player({
                   adding ? openTagField() : setAddingTag(false)
                 }
               />
-              {folderName ? (
-                <FolderTags
-                  video={video}
-                  folderName={folderName}
-                  onChange={handleFolderUpdate}
-                  shortcut="G"
-                  adding={addingFolderTag}
-                  onAddingChange={(adding) =>
-                    adding ? openFolderTagField() : setAddingFolderTag(false)
-                  }
-                />
-              ) : null}
               <ControlButton
                 shortcut="S"
                 onClick={toggleSubtitles}
@@ -2372,34 +2118,18 @@ function Player({
               >
                 <SpeakerIcon waves={1} />
               </ControlButton>
-              <div className="volume-control">
-                <input
-                  className="volume-slider"
-                  aria-label="Volume"
-                  type="range"
-                  min="0"
-                  max={VOLUME_MAX}
-                  step={String(VOLUME_STEP)}
-                  value={volume}
-                  onChange={(event) =>
-                    applyVolume(Number(event.currentTarget.value))
-                  }
-                />
-                <div className="volume-markers" aria-hidden="true">
-                  <span className="volume-marker" style={{ left: "0%" }}>
-                    0%
-                  </span>
-                  <span
-                    className="volume-marker"
-                    style={{ left: `${(100 / VOLUME_MAX) * 100}%` }}
-                  >
-                    100%
-                  </span>
-                  <span className="volume-marker" style={{ left: "100%" }}>
-                    {VOLUME_MAX}%
-                  </span>
-                </div>
-              </div>
+              <input
+                className="volume-slider"
+                aria-label="Volume"
+                type="range"
+                min="0"
+                max="100"
+                step="5"
+                value={volume}
+                onChange={(event) =>
+                  applyVolume(Number(event.currentTarget.value))
+                }
+              />
               <ControlButton
                 shortcut="ArrowUp"
                 onClick={() => applyVolume(volume + VOLUME_STEP)}
