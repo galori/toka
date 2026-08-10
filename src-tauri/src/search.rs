@@ -14,6 +14,18 @@ use uuid::Uuid;
 
 pub const PAGE_SIZE: usize = 24;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaType {
+    #[default]
+    #[serde(rename = "videos")]
+    Videos,
+    #[serde(rename = "images")]
+    Images,
+    #[serde(rename = "both")]
+    Both,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
@@ -22,6 +34,8 @@ pub struct SearchRequest {
     pub page_size: usize,
     #[serde(default)]
     pub fields: SearchFields,
+    #[serde(default)]
+    pub media_type: MediaType,
 }
 
 /// Which part of a video a query is matched against. The three are separate
@@ -120,6 +134,7 @@ pub struct SearchEngine {
 struct Shuffle {
     query: String,
     fields: SearchFields,
+    media_type: MediaType,
     seed: u64,
 }
 
@@ -135,10 +150,13 @@ impl SearchEngine {
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
         let query = request.query.trim();
-        if query.is_empty() {
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .collect();
+        if terms.is_empty() {
             return Err(SearchError::InvalidQuery);
         }
-        let expr = parse_query(query)?;
         if !request.fields.any() {
             return Err(SearchError::NoSearchFields);
         }
@@ -147,13 +165,13 @@ impl SearchEngine {
         }
 
         let fields = request.fields;
-        let needs_whole_path = fields.path || query_needs_whole_path(&expr);
+        let media_type = request.media_type;
         let mut seen = HashSet::new();
         let mut paths = self
-            .candidates(query, needs_whole_path)?
+            .candidates(query, fields.path)?
             .into_iter()
-            .filter(|path| is_supported_video(path))
-            .filter(|path| matches_query(path, &expr, fields))
+            .filter(|path| is_supported_media(path, media_type))
+            .filter(|path| matches_terms(path, &terms, fields))
             .filter(|path| seen.insert(path.clone()))
             .collect::<Vec<_>>();
 
@@ -169,7 +187,10 @@ impl SearchEngine {
                 .cmp(&right_name.to_lowercase())
                 .then_with(|| left.cmp(right))
         });
-        shuffle(&mut paths, self.shuffle_seed(query, fields, request.page));
+        shuffle(
+            &mut paths,
+            self.shuffle_seed(query, fields, media_type, request.page),
+        );
 
         let total_results = paths.len();
         let total_pages = total_results.div_ceil(PAGE_SIZE);
@@ -198,11 +219,20 @@ impl SearchEngine {
     /// question and always gets a new one, so asking the same thing twice shows
     /// a different part of what matched rather than the same screenful again.
     /// The pages after it continue whatever order page one started.
-    fn shuffle_seed(&self, query: &str, fields: SearchFields, page: usize) -> u64 {
+    fn shuffle_seed(
+        &self,
+        query: &str,
+        fields: SearchFields,
+        media_type: MediaType,
+        page: usize,
+    ) -> u64 {
         let mut current = self.shuffle.lock().unwrap();
         if page > 1 {
             if let Some(shuffle) = current.as_ref() {
-                if shuffle.query == query && shuffle.fields == fields {
+                if shuffle.query == query
+                    && shuffle.fields == fields
+                    && shuffle.media_type == media_type
+                {
                     return shuffle.seed;
                 }
             }
@@ -211,6 +241,7 @@ impl SearchEngine {
         *current = Some(Shuffle {
             query: query.to_owned(),
             fields,
+            media_type,
             seed,
         });
         seed
@@ -275,7 +306,7 @@ impl SearchEngine {
             .get(result_id)
             .cloned()
             .ok_or(SearchError::VideoUnavailable)?;
-        if path.is_file() && is_supported_video(&path) {
+        if path.is_file() && is_supported_media(&path, MediaType::Both) {
             Ok(path)
         } else {
             Err(SearchError::VideoUnavailable)
@@ -314,12 +345,18 @@ impl SearchEngine {
 
     pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
         let path = self.video_path(result_id)?;
+        if is_supported_image(&path) {
+            return Ok(path);
+        }
         thumbnails::generate(&path).ok_or(SearchError::VideoUnavailable)
     }
 
     /// The frames a preview runs through for the video behind `result_id`.
     pub fn preview_paths(&self, result_id: &str) -> Result<Vec<PathBuf>, SearchError> {
         let path = self.video_path(result_id)?;
+        if is_supported_image(&path) {
+            return Ok(vec![path]);
+        }
         thumbnails::preview(&path).ok_or(SearchError::VideoUnavailable)
     }
 }
@@ -380,241 +417,10 @@ fn video_result(path: &Path) -> VideoResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Field {
-    Tags,
-    FileName,
-    Path,
-    Any,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Expr {
-    Term { field: Field, value: String },
-    And(Box<Expr>, Box<Expr>),
-    Or(Box<Expr>, Box<Expr>),
-}
-
-fn tokenize(query: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in query.chars() {
-        if ch == '(' || ch == ')' {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-            tokens.push(ch.to_string());
-        } else if ch.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(current.clone());
-                current.clear();
-            }
-        } else {
-            current.push(ch);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn parse_term_token(token: &str) -> Expr {
-    if let Some(colon) = token.find(':') {
-        let prefix = token[..colon].to_ascii_lowercase();
-        let suffix = &token[colon + 1..];
-        if !suffix.is_empty() {
-            let field = match prefix.as_str() {
-                "tags" | "tag" => Some(Field::Tags),
-                "filename" | "file" | "name" => Some(Field::FileName),
-                "path" => Some(Field::Path),
-                _ => None,
-            };
-            if let Some(field) = field {
-                return Expr::Term {
-                    field,
-                    value: suffix.to_lowercase(),
-                };
-            }
-        }
-    }
-    Expr::Term {
-        field: Field::Any,
-        value: token.to_lowercase(),
-    }
-}
-
-fn parse_query(query: &str) -> Result<Expr, SearchError> {
-    let tokens = tokenize(query);
-    if tokens.is_empty() {
-        return Err(SearchError::InvalidQuery);
-    }
-    let mut parser = Parser { tokens, pos: 0 };
-    let expr = parser.parse_expr()?;
-    if parser.pos != parser.tokens.len() {
-        return Err(SearchError::InvalidQuery);
-    }
-    Ok(expr)
-}
-
-struct Parser {
-    tokens: Vec<String>,
-    pos: usize,
-}
-
-impl Parser {
-    fn peek(&self) -> Option<&str> {
-        self.tokens.get(self.pos).map(|s| s.as_str())
-    }
-
-    fn consume(&mut self) -> Option<String> {
-        if self.pos < self.tokens.len() {
-            let tok = self.tokens[self.pos].clone();
-            self.pos += 1;
-            Some(tok)
-        } else {
-            None
-        }
-    }
-
-    fn parse_expr(&mut self) -> Result<Expr, SearchError> {
-        self.parse_or()
-    }
-
-    fn parse_or(&mut self) -> Result<Expr, SearchError> {
-        let mut left = self.parse_and()?;
-        while let Some(tok) = self.peek() {
-            if tok.eq_ignore_ascii_case("OR") {
-                self.consume();
-                // OR must be followed by an operand
-                if self.peek().is_none() {
-                    return Err(SearchError::InvalidQuery);
-                }
-                if self.peek().is_some_and(|t| {
-                    t.eq_ignore_ascii_case("OR") || t.eq_ignore_ascii_case("AND") || t == ")"
-                }) {
-                    return Err(SearchError::InvalidQuery);
-                }
-                let right = self.parse_and()?;
-                left = Expr::Or(Box::new(left), Box::new(right));
-            } else {
-                break;
-            }
-        }
-        Ok(left)
-    }
-
-    fn parse_and(&mut self) -> Result<Expr, SearchError> {
-        let mut left = self.parse_primary()?;
-        while let Some(peek) = self.peek() {
-            if peek.eq_ignore_ascii_case("OR") || peek == ")" {
-                break;
-            }
-            if peek.eq_ignore_ascii_case("AND") {
-                self.consume();
-                if self.peek().is_none() {
-                    return Err(SearchError::InvalidQuery);
-                }
-                if self.peek().is_some_and(|t| {
-                    t.eq_ignore_ascii_case("OR") || t.eq_ignore_ascii_case("AND") || t == ")"
-                }) {
-                    return Err(SearchError::InvalidQuery);
-                }
-                // explicit AND consumed, fall through to parse next primary
-            } else if peek == "("
-                || !peek.eq_ignore_ascii_case("AND") && !peek.eq_ignore_ascii_case("OR")
-            {
-                // implicit AND: no token consumed yet
-            } else {
-                break;
-            }
-            // guard double operator
-            if let Some(ntok) = self.peek() {
-                if ntok.eq_ignore_ascii_case("AND") || ntok.eq_ignore_ascii_case("OR") {
-                    return Err(SearchError::InvalidQuery);
-                }
-            }
-            let right = self.parse_primary()?;
-            left = Expr::And(Box::new(left), Box::new(right));
-        }
-        Ok(left)
-    }
-
-    fn parse_primary(&mut self) -> Result<Expr, SearchError> {
-        let tok = self.peek().ok_or(SearchError::InvalidQuery)?.to_string();
-        if tok == "(" {
-            self.consume();
-            if self.peek().is_none() {
-                return Err(SearchError::InvalidQuery);
-            }
-            if self.peek() == Some(")") {
-                return Err(SearchError::InvalidQuery);
-            }
-            let expr = self.parse_expr()?;
-            if self.peek() != Some(")") {
-                return Err(SearchError::InvalidQuery);
-            }
-            self.consume();
-            Ok(expr)
-        } else if tok == ")" || tok.eq_ignore_ascii_case("AND") || tok.eq_ignore_ascii_case("OR") {
-            Err(SearchError::InvalidQuery)
-        } else {
-            self.consume();
-            Ok(parse_term_token(&tok))
-        }
-    }
-}
-
-fn query_needs_whole_path(expr: &Expr) -> bool {
-    match expr {
-        Expr::Term { field, .. } => *field == Field::Path,
-        Expr::And(l, r) | Expr::Or(l, r) => query_needs_whole_path(l) || query_needs_whole_path(r),
-    }
-}
-
-fn matches_query(path: &Path, expr: &Expr, fields: SearchFields) -> bool {
-    match expr {
-        Expr::Term { field, value } => match field {
-            Field::Any => {
-                let haystacks = haystacks(path, fields);
-                haystacks.iter().any(|hay| hay.contains(value))
-            }
-            Field::Tags => tags_haystack(path).contains(value),
-            Field::FileName => file_name_haystack(path).contains(value),
-            Field::Path => path_haystack(path).contains(value),
-        },
-        Expr::And(left, right) => {
-            matches_query(path, left, fields) && matches_query(path, right, fields)
-        }
-        Expr::Or(left, right) => {
-            matches_query(path, left, fields) || matches_query(path, right, fields)
-        }
-    }
-}
-
-fn tags_haystack(path: &Path) -> String {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    tags::Tags::parse_file_name(&name).into_values().join(" ")
-}
-
-fn file_name_haystack(path: &Path) -> String {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    tags::Tags::default().apply_to_file(&name).to_lowercase()
-}
-
-fn path_haystack(path: &Path) -> String {
-    path.parent()
-        .unwrap_or_else(|| Path::new(""))
-        .to_string_lossy()
-        .to_lowercase()
-}
-
 /// Whether every term is somewhere in the parts of `path` the viewer chose to
 /// search. A term may land in any one of them, so a query can name a folder and
 /// a tag at once; all of them still have to land somewhere, which is what makes
 /// a second word narrow a search rather than widen it.
-#[allow(dead_code)]
 fn matches_terms(path: &Path, terms: &[String], fields: SearchFields) -> bool {
     let haystacks = haystacks(path, fields);
     terms
@@ -655,6 +461,36 @@ pub fn is_supported_video(path: &Path) -> bool {
     )
 }
 
+pub fn is_supported_image(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some(
+            "jpg"
+                | "jpeg"
+                | "png"
+                | "webp"
+                | "gif"
+                | "bmp"
+                | "tiff"
+                | "tif"
+                | "heic"
+                | "heif"
+                | "avif"
+        )
+    )
+}
+
+pub fn is_supported_media(path: &Path, media_type: MediaType) -> bool {
+    match media_type {
+        MediaType::Videos => is_supported_video(path),
+        MediaType::Images => is_supported_image(path),
+        MediaType::Both => is_supported_video(path) || is_supported_image(path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +524,7 @@ mod tests {
             page: 1,
             page_size: PAGE_SIZE,
             fields: SearchFields::default(),
+            media_type: MediaType::default(),
         }
     }
 
@@ -1110,322 +947,77 @@ mod tests {
     }
 
     #[test]
-    fn or_matches_either_term() {
+    fn search_defaults_to_videos_only() {
         let directory = tempdir().unwrap();
-        let beach = directory.path().join("beach.mp4");
-        let mountain = directory.path().join("mountain.mp4");
-        let other = directory.path().join("city.mp4");
-        for path in [&beach, &mountain, &other] {
+        let video = directory.path().join("sunset.mp4");
+        let image = directory.path().join("sunset.jpg");
+        for path in [&video, &image] {
             fs::write(path, b"test").unwrap();
         }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
-            beach.clone(),
-            mountain.clone(),
-            other.clone(),
-        ])));
-
-        let page = engine.search(request("beach OR mountain")).unwrap();
-        assert_eq!(page.total_results, 2);
-        let mut names = names(&page);
-        names.sort();
-        assert_eq!(names, vec!["beach.mp4", "mountain.mp4"]);
-
-        // case-insensitive OR
-        let page2 = engine.search(request("beach or mountain")).unwrap();
-        assert_eq!(page2.total_results, 2);
-    }
-
-    #[test]
-    fn and_explicit_requires_both_terms() {
-        let directory = tempdir().unwrap();
-        let both = directory.path().join("beach mountain.mp4");
-        let one = directory.path().join("beach.mp4");
-        for path in [&both, &one] {
-            fs::write(path, b"test").unwrap();
-        }
-        let engine =
-            SearchEngine::new(Arc::new(FakeProvider::new(vec![both.clone(), one.clone()])));
-
-        assert_eq!(
-            engine
-                .search(request("beach AND mountain"))
-                .unwrap()
-                .total_results,
-            1
-        );
-        assert_eq!(
-            engine
-                .search(request("beach AND mountain"))
-                .unwrap()
-                .results[0]
-                .file_name,
-            "beach mountain.mp4"
-        );
-        // implicit AND keeps backward compatibility
-        assert_eq!(
-            engine
-                .search(request("beach mountain"))
-                .unwrap()
-                .total_results,
-            1
-        );
-    }
-
-    #[test]
-    fn parentheses_group_or_before_and() {
-        let directory = tempdir().unwrap();
-        let beach_party = directory.path().join("beach party.mp4");
-        let mountain_party = directory.path().join("mountain party.mp4");
-        let beach_only = directory.path().join("beach.mp4");
-        for path in [&beach_party, &mountain_party, &beach_only] {
-            fs::write(path, b"test").unwrap();
-        }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
-            beach_party.clone(),
-            mountain_party.clone(),
-            beach_only.clone(),
-        ])));
-
-        // (beach OR mountain) AND party => both with party
-        let page = engine
-            .search(request("(beach OR mountain) AND party"))
-            .unwrap();
-        assert_eq!(page.total_results, 2);
-
-        // beach OR (mountain AND party) => beach_only + mountain_party + beach_party
-        let page2 = engine
-            .search(request("beach OR mountain AND party"))
-            .unwrap();
-        // AND binds tighter than OR, so mountain AND party requires both; beach matches any beach file
-        assert_eq!(page2.total_results, 3);
-
-        // Explicit parentheses same as implicit precedence
-        let page3 = engine
-            .search(request("beach OR (mountain AND party)"))
-            .unwrap();
-        assert_eq!(page3.total_results, 3);
-    }
-
-    #[test]
-    fn and_binds_tighter_than_or_without_parentheses() {
-        let directory = tempdir().unwrap();
-        let a = directory.path().join("a.mp4");
-        let b = directory.path().join("b.mp4");
-        let ab = directory.path().join("a b.mp4");
-        for path in [&a, &b, &ab] {
-            fs::write(path, b"test").unwrap();
-        }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
-            a.clone(),
-            b.clone(),
-            ab.clone(),
-        ])));
-        // a OR b AND a => a OR (b AND a) => a, ab
-        let page = engine.search(request("a OR b AND a")).unwrap();
-        assert_eq!(page.total_results, 2);
-    }
-
-    #[test]
-    fn field_prefix_tags_restricts_to_tags() {
-        let directory = tempdir().unwrap();
-        let tagged = directory.path().join("Beach day [home].mp4");
-        let untagged = directory.path().join("home video.mp4");
-        for path in [&tagged, &untagged] {
-            fs::write(path, b"test").unwrap();
-        }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
-            tagged.clone(),
-            untagged.clone(),
-        ])));
-
-        // tags:home matches only the tagged file's tag block
-        let page = engine.search(request("tags:home")).unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video.clone(), image.clone()]));
+        let engine = SearchEngine::new(provider);
+        let page = engine.search(request("sunset")).unwrap();
         assert_eq!(page.total_results, 1);
-        assert_eq!(page.results[0].file_name, "Beach day [home].mp4");
-
-        // tags:beach should find nothing because beach is in filename, not tags
-        assert_eq!(
-            engine.search(request("tags:beach")).unwrap().total_results,
-            0
-        );
-
-        // case-insensitive prefix
-        assert_eq!(
-            engine.search(request("TAGS:HOME")).unwrap().total_results,
-            1
-        );
-        assert_eq!(engine.search(request("tag:home")).unwrap().total_results, 1);
+        assert_eq!(page.results[0].extension, "mp4");
     }
 
     #[test]
-    fn field_prefix_filename_restricts_to_file_name_without_tags() {
+    fn search_with_images_only_returns_images() {
         let directory = tempdir().unwrap();
-        let video = directory.path().join("Beach day [home].mp4");
-        fs::write(&video, b"test").unwrap();
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
-
-        // filename:beach matches the name part (without tag block)
-        assert_eq!(
-            engine
-                .search(request("filename:beach"))
-                .unwrap()
-                .total_results,
-            1
-        );
-        // filename:home should not match because home is only in tags
-        assert_eq!(
-            engine
-                .search(request("filename:home"))
-                .unwrap()
-                .total_results,
-            0
-        );
-        // also file: alias
-        assert_eq!(
-            engine.search(request("file:beach")).unwrap().total_results,
-            1
-        );
-    }
-
-    #[test]
-    fn field_prefix_path_restricts_to_folders_and_widens_candidates() {
-        let directory = tempdir().unwrap();
-        let folder = directory.path().join("Holiday");
-        fs::create_dir(&folder).unwrap();
-        let video = folder.join("clip.mp4");
-        fs::write(&video, b"test").unwrap();
-        let other_folder = directory.path().join("Work");
-        fs::create_dir(&other_folder).unwrap();
-        let other_video = other_folder.join("clip.mp4");
-        fs::write(&other_video, b"test").unwrap();
-        let provider = Arc::new(FakeProvider::new(vec![video.clone(), other_video.clone()]));
-        let engine = SearchEngine::new(provider.clone());
-
-        // path:holiday should match only video in Holiday folder
-        let page = engine.search(request("path:holiday")).unwrap();
-        assert_eq!(page.total_results, 1);
-        assert_eq!(page.results[0].file_name, "clip.mp4");
-        // provider should have been asked with whole_path true because query uses path: prefix
-        assert_eq!(
-            *provider.whole_path_asks.lock().unwrap().last().unwrap(),
-            true
-        );
-
-        // filename:clip with path restriction should not match path term
-        assert_eq!(
-            engine.search(request("path:work")).unwrap().total_results,
-            1
-        );
-        // path:absent finds nothing
-        assert_eq!(
-            engine.search(request("path:absent")).unwrap().total_results,
-            0
-        );
-    }
-
-    #[test]
-    fn field_prefix_combined_with_boolean_operators() {
-        let directory = tempdir().unwrap();
-        let beach_home = directory.path().join("beach [home].mp4");
-        let mountain_home = directory.path().join("mountain [home].mp4");
-        let beach_work = directory.path().join("beach [work].mp4");
-        for path in [&beach_home, &mountain_home, &beach_work] {
+        let video = directory.path().join("sunset.mp4");
+        let image = directory.path().join("sunset.jpg");
+        for path in [&video, &image] {
             fs::write(path, b"test").unwrap();
         }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
-            beach_home.clone(),
-            mountain_home.clone(),
-            beach_work.clone(),
-        ])));
-
-        // tags:home AND filename:beach => only beach_home
-        let page = engine
-            .search(request("tags:home AND filename:beach"))
-            .unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video, image.clone()]));
+        let engine = SearchEngine::new(provider);
+        let mut req = request("sunset");
+        req.media_type = MediaType::Images;
+        let page = engine.search(req).unwrap();
         assert_eq!(page.total_results, 1);
-        assert_eq!(page.results[0].file_name, "beach [home].mp4");
-
-        // tags:home OR tags:work with filename:beach => beach_home and beach_work
-        let page2 = engine
-            .search(request("(tags:home OR tags:work) AND filename:beach"))
-            .unwrap();
-        assert_eq!(page2.total_results, 2);
-
-        // tags:home OR filename:mountain => beach_home, mountain_home
-        let page3 = engine
-            .search(request("tags:home OR filename:mountain"))
-            .unwrap();
-        assert_eq!(page3.total_results, 2);
+        assert_eq!(page.results[0].extension, "jpg");
     }
 
     #[test]
-    fn plain_terms_remain_and_across_all_fields() {
+    fn search_with_both_returns_videos_and_images() {
         let directory = tempdir().unwrap();
-        let folder = directory.path().join("Holiday");
-        fs::create_dir(&folder).unwrap();
-        let video = folder.join("beach [home].mp4");
-        fs::write(&video, b"test").unwrap();
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
-
-        let all_fields = SearchRequest {
-            fields: SearchFields {
-                tags: true,
-                file_name: true,
-                path: true,
-            },
-            ..request("holiday beach home")
-        };
-        assert_eq!(engine.search(all_fields).unwrap().total_results, 1);
-    }
-
-    #[test]
-    fn invalid_queries_are_rejected() {
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
-        assert!(matches!(
-            engine.search(request("")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("   ")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("AND beach")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("beach OR")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("(beach")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("beach)")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("()")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-        assert!(matches!(
-            engine.search(request("beach OR OR mountain")).unwrap_err(),
-            SearchError::InvalidQuery
-        ));
-    }
-
-    #[test]
-    fn parentheses_without_spaces_are_tokenized() {
-        let directory = tempdir().unwrap();
-        let beach = directory.path().join("beach.mp4");
-        let mountain = directory.path().join("mountain.mp4");
-        for path in [&beach, &mountain] {
+        let video = directory.path().join("clip.mp4");
+        let image = directory.path().join("clip.jpg");
+        for path in [&video, &image] {
             fs::write(path, b"test").unwrap();
         }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![beach, mountain])));
-        // no space after '(' or before ')'
-        let page = engine.search(request("(beach OR mountain)")).unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video, image]));
+        let engine = SearchEngine::new(provider);
+        let mut req = request("clip");
+        req.media_type = MediaType::Both;
+        let page = engine.search(req).unwrap();
         assert_eq!(page.total_results, 2);
+    }
+
+    #[test]
+    fn is_supported_image_recognises_common_extensions() {
+        assert!(is_supported_image(Path::new("photo.jpg")));
+        assert!(is_supported_image(Path::new("photo.JPEG")));
+        assert!(is_supported_image(Path::new("photo.png")));
+        assert!(is_supported_image(Path::new("photo.webp")));
+        assert!(is_supported_image(Path::new("photo.heic")));
+        assert!(!is_supported_image(Path::new("photo.mp4")));
+        assert!(!is_supported_image(Path::new("photo.txt")));
+    }
+
+    #[test]
+    fn is_supported_media_respects_filter() {
+        assert!(is_supported_media(Path::new("clip.mp4"), MediaType::Videos));
+        assert!(!is_supported_media(
+            Path::new("clip.jpg"),
+            MediaType::Videos
+        ));
+        assert!(is_supported_media(Path::new("clip.jpg"), MediaType::Images));
+        assert!(!is_supported_media(
+            Path::new("clip.mp4"),
+            MediaType::Images
+        ));
+        assert!(is_supported_media(Path::new("clip.mp4"), MediaType::Both));
+        assert!(is_supported_media(Path::new("clip.jpg"), MediaType::Both));
     }
 }

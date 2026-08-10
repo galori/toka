@@ -5,7 +5,7 @@
 //! format carries no structure beyond one entry per line, so a playlist made
 //! anywhere — by Toka's own handoff, by VLC, by hand — opens the same way.
 
-use crate::search::is_supported_video;
+use crate::search::{is_supported_media, is_supported_video, MediaType};
 use std::{
     borrow::Cow,
     ffi::OsString,
@@ -74,7 +74,7 @@ pub fn videos(path: &Path) -> Result<Vec<PathBuf>, String> {
     let directory = path.parent().unwrap_or_else(|| Path::new(""));
     let videos: Vec<PathBuf> = parse(&source, directory)
         .into_iter()
-        .filter(|entry| entry.is_file() && is_supported_video(entry))
+        .filter(|entry| entry.is_file() && is_supported_media(entry, MediaType::Both))
         .collect();
     if videos.is_empty() {
         return Err(format!("{} lists no videos Toka can play.", name(path)));
