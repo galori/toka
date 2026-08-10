@@ -1720,7 +1720,8 @@ test("names the file and its folder in the windowed heading", async () => {
     // the part that used to be missing, and it is what the fullscreen overlay
     // exists to supply.
     expect(heading).toBeVisible();
-    expect(screen.getByText("/Videos/clip.mp4")).toBeVisible();
+    expect(screen.getByDisplayValue("/Videos/clip.mp4")).toBeVisible();
+    expect(screen.getByLabelText("File path")).toBeVisible();
   } finally {
     vi.useRealTimers();
   }

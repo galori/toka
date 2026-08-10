@@ -517,6 +517,15 @@ function BackArrowIcon() {
   );
 }
 
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <rect x="8.5" y="8.5" width="9" height="11" rx="1.5" />
+      <path d="M15 8.5V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" />
+    </svg>
+  );
+}
+
 // How long the fullscreen overlay waits after the last movement before fading.
 const CONTROLS_IDLE_DELAY = 2_500;
 
@@ -686,14 +695,16 @@ const KEY_GLYPHS: Record<string, string> = {
 // The player's bar is full of form controls — the scrubber, the volume slider,
 // the speed and subtitle pickers — and none of them take typed text, so
 // treating every one of them as an editor left every shortcut dead for as long
-// as one of them held focus.
+// as one of them held focus. A read-only field (like the selectable path)
+// is for selecting, not typing — shortcuts remain active there.
 function acceptsTypedText(target: EventTarget | null): boolean {
   if (!(target instanceof Element)) return false;
   const control = target.closest(
     "input, textarea, [contenteditable], [role=textbox]",
   );
   if (!control) return false;
-  if (control instanceof HTMLInputElement)
+  if (control instanceof HTMLInputElement) {
+    if (control.readOnly) return false;
     return ![
       "range",
       "checkbox",
@@ -702,6 +713,13 @@ function acceptsTypedText(target: EventTarget | null): boolean {
       "submit",
       "reset",
     ].includes(control.type);
+  }
+  if (control instanceof HTMLTextAreaElement && control.readOnly) return false;
+  if (
+    control.hasAttribute("contenteditable") &&
+    control.getAttribute("contenteditable") === "false"
+  )
+    return false;
   return true;
 }
 
@@ -877,6 +895,8 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const copyTimeout = useRef<number | undefined>(undefined);
   // Mirrored into a ref so the fullscreen idle timer can see it without
   // restarting, the way it already watches the pointer.
   const tagFieldOpen = useRef(false);
@@ -892,6 +912,36 @@ function Player({
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
+  const copyPath = async () => {
+    const text = prepared?.filePath ?? video.fileName;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const field = document.createElement("textarea");
+        field.value = text;
+        field.setAttribute("readonly", "");
+        field.style.position = "absolute";
+        field.style.left = "-9999px";
+        document.body.appendChild(field);
+        field.select();
+        document.execCommand("copy");
+        document.body.removeChild(field);
+      }
+    } catch {
+      // Copy failed silently: the viewer can still select the field manually.
+      return;
+    }
+    setCopyFeedback(true);
+    if (copyTimeout.current !== undefined)
+      window.clearTimeout(copyTimeout.current);
+    copyTimeout.current = window.setTimeout(() => setCopyFeedback(false), 1500);
+    focusPlayerShell();
+  };
+  const copyPathRef = useRef(copyPath);
+  useEffect(() => {
+    copyPathRef.current = copyPath;
+  });
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -1814,6 +1864,8 @@ function Player({
         run(() => applyVolume(volumePreset.volume));
       } else if (event.key.toLowerCase() === "a") {
         run(cycleAspect);
+      } else if (event.key.toLowerCase() === "c") {
+        run(() => void copyPathRef.current());
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
       } else if (event.key.toLowerCase() === "s") {
@@ -1919,9 +1971,32 @@ function Player({
         <div className="player-title">
           <h1 title={prepared?.filePath ?? video.fileName}>{video.fileName}</h1>
           {prepared ? (
-            <p className="player-file-path" title={prepared.filePath}>
-              {prepared.filePath}
-            </p>
+            <div className="player-path-row">
+              <input
+                className="player-file-path"
+                title={prepared.filePath}
+                value={prepared.filePath}
+                readOnly
+                onFocus={(event) => event.currentTarget.select()}
+                onClick={(event) => event.currentTarget.select()}
+                aria-label="File path"
+              />
+              <ControlButton
+                shortcut="C"
+                className="copy-button"
+                aria-label={copyFeedback ? "Copied" : "Copy file path"}
+                onClick={() => void copyPath()}
+              >
+                {copyFeedback ? (
+                  <Label>Copied</Label>
+                ) : (
+                  <>
+                    <CopyIcon />
+                    <Label>Copy</Label>
+                  </>
+                )}
+              </ControlButton>
+            </div>
           ) : null}
         </div>
         <ControlButton

@@ -292,14 +292,56 @@ input[type="search"]:focus {
 
 /* A path is long and the name above it is the part being read, so the folder
    is set quieter and gives way first when the heading runs out of room. */
-.player-file-path {
+.player-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
-  margin: 2px 0 0;
+  margin-top: 2px;
+}
+
+.player-file-path {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
   color: #93a0b4;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.75rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 6px;
+  /* Keep the file selectable so part of the path can be copied. */
+  user-select: text;
+}
+
+.player-file-path:focus {
+  outline: none;
+  border-color: #3c8bff;
+  background: #171b23;
+  box-shadow: 0 0 0 2px rgb(60 139 255 / 20%);
+}
+
+.copy-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 10px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border-radius: 8px;
+}
+
+.player-heading h1 {
+  user-select: text;
+}
+
+.fullscreen-file-path {
+  user-select: text;
 }
 
 .player-shell {
