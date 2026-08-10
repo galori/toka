@@ -78,26 +78,30 @@ async function enterFullscreen(): Promise<boolean> {
   return true;
 }
 
-// The overlay is driven by the pointer, and both halves of it take themselves
-// away again on a timer, so the pointer is held where it is wanted rather than
-// moved once — otherwise the countdown can reclaim the screen in the middle of
-// a measurement.
-function holdPointer(atRightEdge: boolean) {
-  return browser.execute((edge) => {
+// The playlist still follows the pointer at the right edge and dismisses itself
+// after the pointer leaves, so hold it in place while measuring the drawer.
+function holdPointerAtRightEdge() {
+  return browser.execute(() => {
     const held = window as unknown as { __tokaPointer?: number };
     if (held.__tokaPointer) window.clearInterval(held.__tokaPointer);
     const send = () =>
       window.dispatchEvent(
         new MouseEvent("mousemove", {
-          clientX: edge
-            ? window.innerWidth - 1
-            : Math.round(window.innerWidth / 2),
+          clientX: window.innerWidth - 1,
           clientY: Math.round(window.innerHeight / 2),
         }),
       );
     send();
     held.__tokaPointer = window.setInterval(send, 100);
-  }, atRightEdge);
+  });
+}
+
+function advanceFullscreenMode() {
+  return browser.execute(() =>
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
+    ),
+  );
 }
 
 function releasePointer() {
@@ -231,20 +235,21 @@ describe("Toka fullscreen", () => {
     ).toBeLessThanOrEqual(1);
   });
 
-  it("overlays the controls and the playlist without moving the picture", async function () {
+  it("keeps F-selected controls and the playlist over the picture", async function () {
     if (!(await enterFullscreen())) this.skip();
     await releasePointer();
     const hidden = await layoutWhile(
       true,
-      "The fullscreen overlay never collapsed onto the scrubber",
+      "The information/scrubber mode was not selected",
     );
 
-    // Any movement brings the whole overlay back, and the scrubber goes up with
-    // it — over the picture this time, not below it.
-    await holdPointer(false);
+    // F advances to the complete controls. They remain selected without any
+    // pointer activity or idle timer changing the mode behind the viewer.
+    await advanceFullscreenMode();
+    await browser.pause(3_000);
     const shown = await layoutWhile(
       false,
-      "Moving the pointer never brought the fullscreen controls back",
+      "F never selected the complete fullscreen controls",
     );
     expect(shown.picture).toEqual(hidden.picture);
     if (!shown.timeline || !shown.picture)
@@ -256,7 +261,7 @@ describe("Toka fullscreen", () => {
     // The right-hand edge of the screen slides the playlist out over the top of
     // the picture. Nothing about the video may move: this is the whole of the
     // "same resolution, location and aspect ratio" rule.
-    await holdPointer(true);
+    await holdPointerAtRightEdge();
     await $(".playlist-drawer").waitForExist({
       timeoutMsg: "The right-hand edge never revealed the playlist",
     });
@@ -283,8 +288,8 @@ describe("Toka fullscreen", () => {
       timeoutMsg: "The playlist stayed up after the pointer left it",
     });
     const back = await layoutWhile(
-      true,
-      "The fullscreen overlay never collapsed onto the scrubber again",
+      false,
+      "The F-selected controls changed after the pointer left the playlist",
     );
     expect(back.picture).toEqual(hidden.picture);
   });
