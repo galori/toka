@@ -506,16 +506,18 @@ type FullscreenPlaylist = "hidden" | "peek" | "held";
 type FullscreenMode = "video" | "information" | "controls";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
-const VOLUME_STEP = 5;
+export const VOLUME_MAX = 150;
+export const VOLUME_STEP = 5;
 
 // The whole digit row once stepped the volume, which was a lot of reaching for
 // a scale the arrow keys walk in one place. Three of those digits are worth
 // keeping, because a preset is pressed once rather than held: each is named by
 // the digit its percentage starts with, so 0 is silence, 5 is half and 1 is
-// full.
+// full. 150% is a boost past full for quiet recordings, on "2" because "1"
+// already means 100%.
 // A preset without a label is drawn as the crossed-out speaker instead, which
 // says "silent" without spending the width a written "0%" would.
-const VOLUME_PRESETS: {
+export const VOLUME_PRESETS: {
   key: string;
   volume: number;
   name: string;
@@ -524,6 +526,7 @@ const VOLUME_PRESETS: {
   { key: "0", volume: 0, name: "Mute" },
   { key: "5", volume: 50, name: "Half volume", label: "50%" },
   { key: "1", volume: 100, name: "Full volume", label: "100%" },
+  { key: "2", volume: 150, name: "Boost volume", label: "150%" },
 ];
 
 // How far each skip moves. Ten seconds suits scrubbing past an ad break and
@@ -807,6 +810,11 @@ function Player({
   const playlistDrawer = useRef<HTMLElement>(null);
   const fullscreenInfo = useRef<HTMLDivElement>(null);
   const sidecarTracks = useRef<TextTrack[]>([]);
+  const audioGraphRef = useRef<{
+    context: AudioContext;
+    gain: GainNode;
+    source: MediaElementAudioSourceNode;
+  } | null>(null);
   const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
   const [duration, setDuration] = useState(0);
@@ -1305,14 +1313,80 @@ function Player({
     else if (element.current) element.current.playbackRate = next;
   };
 
+  const ensureAudioGraph = (
+    media: HTMLVideoElement,
+  ): { context: AudioContext; gain: GainNode } | null => {
+    if (audioGraphRef.current) return audioGraphRef.current;
+    try {
+      if (typeof window === "undefined") return null;
+      const AudioContextClass =
+        (window.AudioContext as typeof AudioContext | undefined) ??
+        (
+          window as unknown as {
+            webkitAudioContext?: typeof AudioContext;
+          }
+        ).webkitAudioContext;
+      if (!AudioContextClass) return null;
+      const context = new AudioContextClass();
+      if (
+        typeof context.createMediaElementSource !== "function" ||
+        typeof context.createGain !== "function"
+      )
+        return null;
+      const source = context.createMediaElementSource(media);
+      const gain = context.createGain();
+      gain.gain.value = 1;
+      source.connect(gain);
+      gain.connect(context.destination);
+      audioGraphRef.current = { context, gain, source };
+      return audioGraphRef.current;
+    } catch {
+      return null;
+    }
+  };
+
+  // Release the Web Audio graph when the player unmounts or the media
+  // element changes, so a test that mounts many players does not leak a
+  // suspended AudioContext and so a re-used video element can be re-wired.
+  useEffect(() => {
+    return () => {
+      const graph = audioGraphRef.current;
+      if (!graph) return;
+      try {
+        graph.source.disconnect();
+        graph.gain.disconnect();
+        void graph.context.close?.().catch(() => {});
+      } catch {
+        // ignore cleanup errors in tests
+      }
+      audioGraphRef.current = null;
+    };
+  }, []);
+
   const applyVolume = (next: number) => {
-    const clamped = Math.max(0, Math.min(100, next));
+    const clamped = Math.max(0, Math.min(VOLUME_MAX, next));
     setVolume(clamped);
     if (native)
       void setNativeVolume(clamped).catch((reason: unknown) =>
         setError(errorMessage(reason)),
       );
-    else if (element.current) element.current.volume = clamped / 100;
+    else if (element.current) {
+      const media = element.current;
+      if (clamped > 100) {
+        const graph = ensureAudioGraph(media);
+        if (graph) {
+          media.volume = 1;
+          graph.gain.gain.value = clamped / 100;
+          if (graph.context.state === "suspended")
+            void graph.context.resume().catch(() => {});
+        } else {
+          media.volume = 1;
+        }
+      } else {
+        media.volume = clamped / 100;
+        if (audioGraphRef.current) audioGraphRef.current.gain.gain.value = 1;
+      }
+    }
   };
 
   // Holds at the ends of the range rather than wrapping, so holding the key
@@ -1930,7 +2004,21 @@ function Player({
                   : 0,
               );
               event.currentTarget.playbackRate = speed;
-              event.currentTarget.volume = volume / 100;
+              if (volume > 100) {
+                const graph = ensureAudioGraph(event.currentTarget);
+                if (graph) {
+                  event.currentTarget.volume = 1;
+                  graph.gain.gain.value = volume / 100;
+                  if (graph.context.state === "suspended")
+                    void graph.context.resume().catch(() => {});
+                } else {
+                  event.currentTarget.volume = 1;
+                }
+              } else {
+                event.currentTarget.volume = volume / 100;
+                if (audioGraphRef.current)
+                  audioGraphRef.current.gain.gain.value = 1;
+              }
               play();
             }}
             onPlay={() => setPlayingBack(true)}
@@ -2118,18 +2206,34 @@ function Player({
               >
                 <SpeakerIcon waves={1} />
               </ControlButton>
-              <input
-                className="volume-slider"
-                aria-label="Volume"
-                type="range"
-                min="0"
-                max="100"
-                step="5"
-                value={volume}
-                onChange={(event) =>
-                  applyVolume(Number(event.currentTarget.value))
-                }
-              />
+              <div className="volume-control">
+                <input
+                  className="volume-slider"
+                  aria-label="Volume"
+                  type="range"
+                  min="0"
+                  max={VOLUME_MAX}
+                  step={String(VOLUME_STEP)}
+                  value={volume}
+                  onChange={(event) =>
+                    applyVolume(Number(event.currentTarget.value))
+                  }
+                />
+                <div className="volume-markers" aria-hidden="true">
+                  <span className="volume-marker" style={{ left: "0%" }}>
+                    0%
+                  </span>
+                  <span
+                    className="volume-marker"
+                    style={{ left: `${(100 / VOLUME_MAX) * 100}%` }}
+                  >
+                    100%
+                  </span>
+                  <span className="volume-marker" style={{ left: "100%" }}>
+                    {VOLUME_MAX}%
+                  </span>
+                </div>
+              </div>
               <ControlButton
                 shortcut="ArrowUp"
                 onClick={() => applyVolume(volume + VOLUME_STEP)}

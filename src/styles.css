@@ -1023,9 +1023,39 @@ button:focus-visible {
   color: oklch(0.9 0.01 90);
   font: 700 13px inherit;
 }
+.volume-control {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 92px;
+}
 .volume-slider {
   width: 92px;
   accent-color: oklch(0.68 0.19 38);
+}
+.volume-markers {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  height: 10px;
+  margin: 0 2px;
+  pointer-events: none;
+}
+.volume-marker {
+  position: absolute;
+  top: 0;
+  font-size: 9px;
+  line-height: 1;
+  color: oklch(0.6 0.02 60);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+.volume-marker:first-child {
+  transform: none;
+}
+.volume-marker:last-child {
+  transform: translateX(-100%);
 }
 .time-display {
   margin-left: 6px;
