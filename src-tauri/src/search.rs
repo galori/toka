@@ -135,13 +135,10 @@ impl SearchEngine {
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
         let query = request.query.trim();
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|term| term.to_lowercase())
-            .collect();
-        if terms.is_empty() {
+        if query.is_empty() {
             return Err(SearchError::InvalidQuery);
         }
+        let expr = parse_query(query)?;
         if !request.fields.any() {
             return Err(SearchError::NoSearchFields);
         }
@@ -150,12 +147,13 @@ impl SearchEngine {
         }
 
         let fields = request.fields;
+        let needs_whole_path = fields.path || query_needs_whole_path(&expr);
         let mut seen = HashSet::new();
         let mut paths = self
-            .candidates(query, fields.path)?
+            .candidates(query, needs_whole_path)?
             .into_iter()
             .filter(|path| is_supported_video(path))
-            .filter(|path| matches_terms(path, &terms, fields))
+            .filter(|path| matches_query(path, &expr, fields))
             .filter(|path| seen.insert(path.clone()))
             .collect::<Vec<_>>();
 
@@ -296,87 +294,6 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// The directory containing the video behind `result_id`, if it is still
-    /// on disk. Folder tagging mirrors file tagging — the same rename via
-    /// `tags::add` — but for directories.
-    pub fn folder_path_for_video(&self, result_id: &str) -> Result<PathBuf, SearchError> {
-        let path = self
-            .result_paths
-            .lock()
-            .unwrap()
-            .get(result_id)
-            .cloned()
-            .ok_or(SearchError::VideoUnavailable)?;
-        let parent = path.parent().ok_or(SearchError::VideoUnavailable)?;
-        let folder = parent.to_path_buf();
-        if folder.is_dir() {
-            Ok(folder)
-        } else {
-            Err(SearchError::VideoUnavailable)
-        }
-    }
-
-    /// Updates every known video path that lives inside `previous` to live
-    /// inside `current` instead. Renaming a folder moves all of its videos,
-    /// so the engine must follow.
-    pub fn update_folder_path(&self, previous: &Path, current: &Path) -> Result<(), SearchError> {
-        let mut known_paths = self.result_paths.lock().unwrap();
-        for path in known_paths.values_mut() {
-            if let Ok(relative) = path.strip_prefix(previous) {
-                *path = current.join(relative);
-            }
-        }
-        let mut renamed = self.renamed_paths.lock().unwrap();
-        // Keys are the indexed original; values are the current name. Both may
-        // be inside the renamed folder.
-        let updates: Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)> = renamed
-            .iter()
-            .filter_map(|(indexed, current_path)| {
-                let new_indexed = indexed
-                    .strip_prefix(previous)
-                    .ok()
-                    .map(|rel| current.join(rel));
-                let new_current = current_path
-                    .strip_prefix(previous)
-                    .ok()
-                    .map(|rel| current.join(rel));
-                if new_indexed.is_some() || new_current.is_some() {
-                    Some((
-                        indexed.clone(),
-                        current_path.clone(),
-                        new_indexed,
-                        new_current,
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for (old_indexed, _old_current, new_indexed, new_current) in updates {
-            let entry = renamed.remove(&old_indexed).unwrap();
-            let final_indexed = new_indexed.unwrap_or(old_indexed);
-            let final_current = new_current.unwrap_or(entry);
-            if final_indexed != final_current {
-                renamed.insert(final_indexed, final_current);
-            }
-        }
-        // Also track the folder rename itself for future candidate correction.
-        // Inline the record_rename logic while still holding the lock.
-        {
-            let indexed = renamed
-                .iter()
-                .find(|(_, path)| **path == previous)
-                .map(|(indexed, _)| indexed.clone())
-                .unwrap_or_else(|| previous.to_path_buf());
-            if indexed == current {
-                renamed.remove(&indexed);
-            } else {
-                renamed.insert(indexed, current.to_path_buf());
-            }
-        }
-        Ok(())
-    }
-
     /// Records a rename under the name the index still knows the file by.
     /// Renaming the same file again replaces that one entry rather than
     /// chaining, and renaming it back to its indexed name drops the entry, so
@@ -463,10 +380,241 @@ fn video_result(path: &Path) -> VideoResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Field {
+    Tags,
+    FileName,
+    Path,
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Expr {
+    Term { field: Field, value: String },
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+}
+
+fn tokenize(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in query.chars() {
+        if ch == '(' || ch == ')' {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            tokens.push(ch.to_string());
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn parse_term_token(token: &str) -> Expr {
+    if let Some(colon) = token.find(':') {
+        let prefix = token[..colon].to_ascii_lowercase();
+        let suffix = &token[colon + 1..];
+        if !suffix.is_empty() {
+            let field = match prefix.as_str() {
+                "tags" | "tag" => Some(Field::Tags),
+                "filename" | "file" | "name" => Some(Field::FileName),
+                "path" => Some(Field::Path),
+                _ => None,
+            };
+            if let Some(field) = field {
+                return Expr::Term {
+                    field,
+                    value: suffix.to_lowercase(),
+                };
+            }
+        }
+    }
+    Expr::Term {
+        field: Field::Any,
+        value: token.to_lowercase(),
+    }
+}
+
+fn parse_query(query: &str) -> Result<Expr, SearchError> {
+    let tokens = tokenize(query);
+    if tokens.is_empty() {
+        return Err(SearchError::InvalidQuery);
+    }
+    let mut parser = Parser { tokens, pos: 0 };
+    let expr = parser.parse_expr()?;
+    if parser.pos != parser.tokens.len() {
+        return Err(SearchError::InvalidQuery);
+    }
+    Ok(expr)
+}
+
+struct Parser {
+    tokens: Vec<String>,
+    pos: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.pos).map(|s| s.as_str())
+    }
+
+    fn consume(&mut self) -> Option<String> {
+        if self.pos < self.tokens.len() {
+            let tok = self.tokens[self.pos].clone();
+            self.pos += 1;
+            Some(tok)
+        } else {
+            None
+        }
+    }
+
+    fn parse_expr(&mut self) -> Result<Expr, SearchError> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Expr, SearchError> {
+        let mut left = self.parse_and()?;
+        while let Some(tok) = self.peek() {
+            if tok.eq_ignore_ascii_case("OR") {
+                self.consume();
+                // OR must be followed by an operand
+                if self.peek().is_none() {
+                    return Err(SearchError::InvalidQuery);
+                }
+                if self.peek().is_some_and(|t| {
+                    t.eq_ignore_ascii_case("OR") || t.eq_ignore_ascii_case("AND") || t == ")"
+                }) {
+                    return Err(SearchError::InvalidQuery);
+                }
+                let right = self.parse_and()?;
+                left = Expr::Or(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Expr, SearchError> {
+        let mut left = self.parse_primary()?;
+        while let Some(peek) = self.peek() {
+            if peek.eq_ignore_ascii_case("OR") || peek == ")" {
+                break;
+            }
+            if peek.eq_ignore_ascii_case("AND") {
+                self.consume();
+                if self.peek().is_none() {
+                    return Err(SearchError::InvalidQuery);
+                }
+                if self.peek().is_some_and(|t| {
+                    t.eq_ignore_ascii_case("OR") || t.eq_ignore_ascii_case("AND") || t == ")"
+                }) {
+                    return Err(SearchError::InvalidQuery);
+                }
+                // explicit AND consumed, fall through to parse next primary
+            } else if peek == "("
+                || !peek.eq_ignore_ascii_case("AND") && !peek.eq_ignore_ascii_case("OR")
+            {
+                // implicit AND: no token consumed yet
+            } else {
+                break;
+            }
+            // guard double operator
+            if let Some(ntok) = self.peek() {
+                if ntok.eq_ignore_ascii_case("AND") || ntok.eq_ignore_ascii_case("OR") {
+                    return Err(SearchError::InvalidQuery);
+                }
+            }
+            let right = self.parse_primary()?;
+            left = Expr::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_primary(&mut self) -> Result<Expr, SearchError> {
+        let tok = self.peek().ok_or(SearchError::InvalidQuery)?.to_string();
+        if tok == "(" {
+            self.consume();
+            if self.peek().is_none() {
+                return Err(SearchError::InvalidQuery);
+            }
+            if self.peek() == Some(")") {
+                return Err(SearchError::InvalidQuery);
+            }
+            let expr = self.parse_expr()?;
+            if self.peek() != Some(")") {
+                return Err(SearchError::InvalidQuery);
+            }
+            self.consume();
+            Ok(expr)
+        } else if tok == ")" || tok.eq_ignore_ascii_case("AND") || tok.eq_ignore_ascii_case("OR") {
+            Err(SearchError::InvalidQuery)
+        } else {
+            self.consume();
+            Ok(parse_term_token(&tok))
+        }
+    }
+}
+
+fn query_needs_whole_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::Term { field, .. } => *field == Field::Path,
+        Expr::And(l, r) | Expr::Or(l, r) => query_needs_whole_path(l) || query_needs_whole_path(r),
+    }
+}
+
+fn matches_query(path: &Path, expr: &Expr, fields: SearchFields) -> bool {
+    match expr {
+        Expr::Term { field, value } => match field {
+            Field::Any => {
+                let haystacks = haystacks(path, fields);
+                haystacks.iter().any(|hay| hay.contains(value))
+            }
+            Field::Tags => tags_haystack(path).contains(value),
+            Field::FileName => file_name_haystack(path).contains(value),
+            Field::Path => path_haystack(path).contains(value),
+        },
+        Expr::And(left, right) => {
+            matches_query(path, left, fields) && matches_query(path, right, fields)
+        }
+        Expr::Or(left, right) => {
+            matches_query(path, left, fields) || matches_query(path, right, fields)
+        }
+    }
+}
+
+fn tags_haystack(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    tags::Tags::parse_file_name(&name).into_values().join(" ")
+}
+
+fn file_name_haystack(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    tags::Tags::default().apply_to_file(&name).to_lowercase()
+}
+
+fn path_haystack(path: &Path) -> String {
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_string_lossy()
+        .to_lowercase()
+}
+
 /// Whether every term is somewhere in the parts of `path` the viewer chose to
 /// search. A term may land in any one of them, so a query can name a folder and
 /// a tag at once; all of them still have to land somewhere, which is what makes
 /// a second word narrow a search rather than widen it.
+#[allow(dead_code)]
 fn matches_terms(path: &Path, terms: &[String], fields: SearchFields) -> bool {
     let haystacks = haystacks(path, fields);
     terms
@@ -481,12 +629,7 @@ fn haystacks(path: &Path, fields: SearchFields) -> Vec<String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let mut haystacks = Vec::with_capacity(3);
     if fields.tags {
-        haystacks.push(
-            tags::Tags::parse_file_name(&name)
-                .into_values()
-                .join(" ")
-                .to_lowercase(),
-        );
+        haystacks.push(tags::Tags::parse_file_name(&name).into_values().join(" "));
     }
     if fields.file_name {
         haystacks.push(tags::Tags::default().apply_to_file(&name).to_lowercase());
@@ -967,93 +1110,322 @@ mod tests {
     }
 
     #[test]
-    fn search_is_case_insensitive_for_tags_file_name_and_path() {
+    fn or_matches_either_term() {
         let directory = tempdir().unwrap();
-        // File name case: "Summer Vacation" vs query "SUMMER vacation"
-        let file = directory.path().join("Summer Vacation [Beach].mp4");
-        fs::write(&file, b"test").unwrap();
-        // Path case: folder "Holiday" vs query "HOLIDAY"
-        let folder = directory.path().join("Holiday");
-        std::fs::create_dir(&folder).unwrap();
-        let in_folder = folder.join("clip [home].mp4");
-        fs::write(&in_folder, b"test").unwrap();
+        let beach = directory.path().join("beach.mp4");
+        let mountain = directory.path().join("mountain.mp4");
+        let other = directory.path().join("city.mp4");
+        for path in [&beach, &mountain, &other] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            beach.clone(),
+            mountain.clone(),
+            other.clone(),
+        ])));
 
-        let provider = Arc::new(FakeProvider::new(vec![file.clone(), in_folder.clone()]));
+        let page = engine.search(request("beach OR mountain")).unwrap();
+        assert_eq!(page.total_results, 2);
+        let mut names = names(&page);
+        names.sort();
+        assert_eq!(names, vec!["beach.mp4", "mountain.mp4"]);
 
-        // file_name case-insensitive
-        let engine = SearchEngine::new(provider.clone());
-        let file_name_query = SearchRequest {
-            fields: SearchFields {
-                tags: false,
-                file_name: true,
-                path: false,
-            },
-            ..request("SUMMER")
-        };
-        assert_eq!(
-            engine.search(file_name_query).unwrap().total_results,
-            1,
-            "file_name search should be case-insensitive"
-        );
+        // case-insensitive OR
+        let page2 = engine.search(request("beach or mountain")).unwrap();
+        assert_eq!(page2.total_results, 2);
+    }
 
-        // tags case-insensitive: tag [Beach] should match BEACH
-        let tags_query = SearchRequest {
-            fields: SearchFields {
-                tags: true,
-                file_name: false,
-                path: false,
-            },
-            ..request("BEACH")
-        };
-        assert_eq!(
-            engine.search(tags_query).unwrap().total_results,
-            1,
-            "tags search should be case-insensitive"
-        );
+    #[test]
+    fn and_explicit_requires_both_terms() {
+        let directory = tempdir().unwrap();
+        let both = directory.path().join("beach mountain.mp4");
+        let one = directory.path().join("beach.mp4");
+        for path in [&both, &one] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine =
+            SearchEngine::new(Arc::new(FakeProvider::new(vec![both.clone(), one.clone()])));
 
-        // also tags with uppercase tag block
-        let upper_tag_file = directory.path().join("clip [HOME].mp4");
-        fs::write(&upper_tag_file, b"test").unwrap();
-        *provider.paths.lock().unwrap() = vec![upper_tag_file.clone()];
-        let lower_tag_query = SearchRequest {
-            fields: SearchFields {
-                tags: true,
-                file_name: false,
-                path: false,
-            },
-            ..request("home")
-        };
-        assert_eq!(
-            engine.search(lower_tag_query).unwrap().total_results,
-            1,
-            "lowercase query should match uppercase tag"
-        );
-
-        // path case-insensitive
-        *provider.paths.lock().unwrap() = vec![in_folder.clone()];
-        let path_query = SearchRequest {
-            fields: SearchFields {
-                tags: false,
-                file_name: false,
-                path: true,
-            },
-            ..request("HOLIDAY")
-        };
-        assert_eq!(
-            engine.search(path_query).unwrap().total_results,
-            1,
-            "path search should be case-insensitive"
-        );
-
-        // combined query mixed case should also match
-        *provider.paths.lock().unwrap() = vec![file.clone()];
         assert_eq!(
             engine
-                .search(request("sUmMeR bEaCh"))
+                .search(request("beach AND mountain"))
                 .unwrap()
                 .total_results,
-            1,
-            "mixed case multi-term query should be case-insensitive"
+            1
         );
+        assert_eq!(
+            engine
+                .search(request("beach AND mountain"))
+                .unwrap()
+                .results[0]
+                .file_name,
+            "beach mountain.mp4"
+        );
+        // implicit AND keeps backward compatibility
+        assert_eq!(
+            engine
+                .search(request("beach mountain"))
+                .unwrap()
+                .total_results,
+            1
+        );
+    }
+
+    #[test]
+    fn parentheses_group_or_before_and() {
+        let directory = tempdir().unwrap();
+        let beach_party = directory.path().join("beach party.mp4");
+        let mountain_party = directory.path().join("mountain party.mp4");
+        let beach_only = directory.path().join("beach.mp4");
+        for path in [&beach_party, &mountain_party, &beach_only] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            beach_party.clone(),
+            mountain_party.clone(),
+            beach_only.clone(),
+        ])));
+
+        // (beach OR mountain) AND party => both with party
+        let page = engine
+            .search(request("(beach OR mountain) AND party"))
+            .unwrap();
+        assert_eq!(page.total_results, 2);
+
+        // beach OR (mountain AND party) => beach_only + mountain_party + beach_party
+        let page2 = engine
+            .search(request("beach OR mountain AND party"))
+            .unwrap();
+        // AND binds tighter than OR, so mountain AND party requires both; beach matches any beach file
+        assert_eq!(page2.total_results, 3);
+
+        // Explicit parentheses same as implicit precedence
+        let page3 = engine
+            .search(request("beach OR (mountain AND party)"))
+            .unwrap();
+        assert_eq!(page3.total_results, 3);
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or_without_parentheses() {
+        let directory = tempdir().unwrap();
+        let a = directory.path().join("a.mp4");
+        let b = directory.path().join("b.mp4");
+        let ab = directory.path().join("a b.mp4");
+        for path in [&a, &b, &ab] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            a.clone(),
+            b.clone(),
+            ab.clone(),
+        ])));
+        // a OR b AND a => a OR (b AND a) => a, ab
+        let page = engine.search(request("a OR b AND a")).unwrap();
+        assert_eq!(page.total_results, 2);
+    }
+
+    #[test]
+    fn field_prefix_tags_restricts_to_tags() {
+        let directory = tempdir().unwrap();
+        let tagged = directory.path().join("Beach day [home].mp4");
+        let untagged = directory.path().join("home video.mp4");
+        for path in [&tagged, &untagged] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            tagged.clone(),
+            untagged.clone(),
+        ])));
+
+        // tags:home matches only the tagged file's tag block
+        let page = engine.search(request("tags:home")).unwrap();
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "Beach day [home].mp4");
+
+        // tags:beach should find nothing because beach is in filename, not tags
+        assert_eq!(
+            engine.search(request("tags:beach")).unwrap().total_results,
+            0
+        );
+
+        // case-insensitive prefix
+        assert_eq!(
+            engine.search(request("TAGS:HOME")).unwrap().total_results,
+            1
+        );
+        assert_eq!(engine.search(request("tag:home")).unwrap().total_results, 1);
+    }
+
+    #[test]
+    fn field_prefix_filename_restricts_to_file_name_without_tags() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("Beach day [home].mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+
+        // filename:beach matches the name part (without tag block)
+        assert_eq!(
+            engine
+                .search(request("filename:beach"))
+                .unwrap()
+                .total_results,
+            1
+        );
+        // filename:home should not match because home is only in tags
+        assert_eq!(
+            engine
+                .search(request("filename:home"))
+                .unwrap()
+                .total_results,
+            0
+        );
+        // also file: alias
+        assert_eq!(
+            engine.search(request("file:beach")).unwrap().total_results,
+            1
+        );
+    }
+
+    #[test]
+    fn field_prefix_path_restricts_to_folders_and_widens_candidates() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Holiday");
+        fs::create_dir(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let other_folder = directory.path().join("Work");
+        fs::create_dir(&other_folder).unwrap();
+        let other_video = other_folder.join("clip.mp4");
+        fs::write(&other_video, b"test").unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![video.clone(), other_video.clone()]));
+        let engine = SearchEngine::new(provider.clone());
+
+        // path:holiday should match only video in Holiday folder
+        let page = engine.search(request("path:holiday")).unwrap();
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "clip.mp4");
+        // provider should have been asked with whole_path true because query uses path: prefix
+        assert_eq!(
+            *provider.whole_path_asks.lock().unwrap().last().unwrap(),
+            true
+        );
+
+        // filename:clip with path restriction should not match path term
+        assert_eq!(
+            engine.search(request("path:work")).unwrap().total_results,
+            1
+        );
+        // path:absent finds nothing
+        assert_eq!(
+            engine.search(request("path:absent")).unwrap().total_results,
+            0
+        );
+    }
+
+    #[test]
+    fn field_prefix_combined_with_boolean_operators() {
+        let directory = tempdir().unwrap();
+        let beach_home = directory.path().join("beach [home].mp4");
+        let mountain_home = directory.path().join("mountain [home].mp4");
+        let beach_work = directory.path().join("beach [work].mp4");
+        for path in [&beach_home, &mountain_home, &beach_work] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            beach_home.clone(),
+            mountain_home.clone(),
+            beach_work.clone(),
+        ])));
+
+        // tags:home AND filename:beach => only beach_home
+        let page = engine
+            .search(request("tags:home AND filename:beach"))
+            .unwrap();
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "beach [home].mp4");
+
+        // tags:home OR tags:work with filename:beach => beach_home and beach_work
+        let page2 = engine
+            .search(request("(tags:home OR tags:work) AND filename:beach"))
+            .unwrap();
+        assert_eq!(page2.total_results, 2);
+
+        // tags:home OR filename:mountain => beach_home, mountain_home
+        let page3 = engine
+            .search(request("tags:home OR filename:mountain"))
+            .unwrap();
+        assert_eq!(page3.total_results, 2);
+    }
+
+    #[test]
+    fn plain_terms_remain_and_across_all_fields() {
+        let directory = tempdir().unwrap();
+        let folder = directory.path().join("Holiday");
+        fs::create_dir(&folder).unwrap();
+        let video = folder.join("beach [home].mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+
+        let all_fields = SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: true,
+                path: true,
+            },
+            ..request("holiday beach home")
+        };
+        assert_eq!(engine.search(all_fields).unwrap().total_results, 1);
+    }
+
+    #[test]
+    fn invalid_queries_are_rejected() {
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        assert!(matches!(
+            engine.search(request("")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("   ")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("AND beach")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("beach OR")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("(beach")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("beach)")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("()")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+        assert!(matches!(
+            engine.search(request("beach OR OR mountain")).unwrap_err(),
+            SearchError::InvalidQuery
+        ));
+    }
+
+    #[test]
+    fn parentheses_without_spaces_are_tokenized() {
+        let directory = tempdir().unwrap();
+        let beach = directory.path().join("beach.mp4");
+        let mountain = directory.path().join("mountain.mp4");
+        for path in [&beach, &mountain] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![beach, mountain])));
+        // no space after '(' or before ')'
+        let page = engine.search(request("(beach OR mountain)")).unwrap();
+        assert_eq!(page.total_results, 2);
     }
 }

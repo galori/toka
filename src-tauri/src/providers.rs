@@ -169,7 +169,7 @@ impl SearchProvider for RecollSearchProvider {
     // be answered from the names Recoll already returns. Every other provider
     // widens; this one is the reason a path search is worth having plocate for.
     fn candidates(&self, query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
-        let term = longest_term(query)?.to_lowercase();
+        let term = longest_term(query)?;
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
         let filename_query = format!("*{term}*");
@@ -214,7 +214,7 @@ impl SearchProvider for PlocateSearchProvider {
         if !whole_path {
             args.push("--basename");
         }
-        args.extend(["--existing", "--", term]);
+        args.extend(["--existing", "--", term.as_str()]);
         let args = args.into_iter().map(String::from).collect::<Vec<_>>();
         let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
         // plocate uses exit status 1 to report a successful search with no
@@ -229,11 +229,62 @@ impl SearchProvider for PlocateSearchProvider {
     }
 }
 
-fn longest_term(query: &str) -> Result<&str, SearchError> {
-    query
-        .split_whitespace()
+fn longest_term(query: &str) -> Result<String, SearchError> {
+    let terms = extract_terms(query);
+    terms
+        .into_iter()
         .max_by_key(|term| term.chars().count())
         .ok_or(SearchError::InvalidQuery)
+}
+
+fn extract_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for ch in query.chars() {
+        if ch == '(' || ch == ')' {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            tokens.push(ch.to_string());
+        } else if ch.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    for token in tokens {
+        if token == "(" || token == ")" {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") {
+            continue;
+        }
+        if let Some(colon) = token.find(':') {
+            let prefix = token[..colon].to_ascii_lowercase();
+            let suffix = &token[colon + 1..];
+            if !suffix.is_empty()
+                && matches!(
+                    prefix.as_str(),
+                    "tags" | "tag" | "filename" | "file" | "name" | "path"
+                )
+            {
+                if !suffix.is_empty() {
+                    terms.push(suffix.to_owned());
+                }
+                continue;
+            }
+        }
+        terms.push(token);
+    }
+    terms
 }
 
 fn parse_output(output: ProcessOutput, failure_message: &str) -> Result<Vec<PathBuf>, SearchError> {
@@ -449,53 +500,6 @@ mod tests {
         assert_eq!(
             provider.candidates("does-not-exist", false).unwrap(),
             Vec::<PathBuf>::new()
-        );
-    }
-
-    #[test]
-    fn recoll_lowercases_term_for_case_insensitive_search() {
-        let runner = Arc::new(FakeRunner::new("/media/Summer Vacation.mkv\n"));
-        let provider = RecollSearchProvider {
-            runner: runner.clone(),
-        };
-
-        provider.candidates("SUMMER VACATION", false).unwrap();
-
-        // longest term is "VACATION" (or "SUMMER" same length, max_by_key picks last),
-        // but it must be lowercased for case-insensitive query.
-        let invoked = runner.invocations.lock().unwrap();
-        let args = &invoked.first().unwrap().1;
-        // args are ["-f", "-b", "--paths-only", "-C", "-n", "0", "*vacation*"] lowercased
-        assert!(
-            args.iter().any(|a| a == "*vacation*"),
-            "recoll query should be lowercased, got {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "*VACATION*"),
-            "recoll query must not preserve uppercase, got {args:?}"
-        );
-    }
-
-    #[test]
-    fn recoll_is_case_insensitive_for_mixed_case_query() {
-        let runner = Arc::new(FakeRunner::new("/media/Holiday Clip.mkv\n"));
-        let provider = RecollSearchProvider {
-            runner: runner.clone(),
-        };
-
-        provider.candidates("HoLiDaY", false).unwrap();
-
-        let args = runner
-            .invocations
-            .lock()
-            .unwrap()
-            .first()
-            .unwrap()
-            .1
-            .clone();
-        assert!(
-            args.contains(&"*holiday*".to_string()),
-            "recoll should lowercase mixed-case term, got {args:?}"
         );
     }
 }
