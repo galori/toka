@@ -352,7 +352,7 @@ impl SearchEngine {
                 }
             })
             .collect();
-        for (old_indexed, old_current, new_indexed, new_current) in updates {
+        for (old_indexed, _old_current, new_indexed, new_current) in updates {
             let entry = renamed.remove(&old_indexed).unwrap();
             let final_indexed = new_indexed.unwrap_or(old_indexed);
             let final_current = new_current.unwrap_or(entry);
