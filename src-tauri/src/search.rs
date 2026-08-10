@@ -296,6 +296,87 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// The directory containing the video behind `result_id`, if it is still
+    /// on disk. Folder tagging mirrors file tagging — the same rename via
+    /// `tags::add` — but for directories.
+    pub fn folder_path_for_video(&self, result_id: &str) -> Result<PathBuf, SearchError> {
+        let path = self
+            .result_paths
+            .lock()
+            .unwrap()
+            .get(result_id)
+            .cloned()
+            .ok_or(SearchError::VideoUnavailable)?;
+        let parent = path.parent().ok_or(SearchError::VideoUnavailable)?;
+        let folder = parent.to_path_buf();
+        if folder.is_dir() {
+            Ok(folder)
+        } else {
+            Err(SearchError::VideoUnavailable)
+        }
+    }
+
+    /// Updates every known video path that lives inside `previous` to live
+    /// inside `current` instead. Renaming a folder moves all of its videos,
+    /// so the engine must follow.
+    pub fn update_folder_path(&self, previous: &Path, current: &Path) -> Result<(), SearchError> {
+        let mut known_paths = self.result_paths.lock().unwrap();
+        for path in known_paths.values_mut() {
+            if let Ok(relative) = path.strip_prefix(previous) {
+                *path = current.join(relative);
+            }
+        }
+        let mut renamed = self.renamed_paths.lock().unwrap();
+        // Keys are the indexed original; values are the current name. Both may
+        // be inside the renamed folder.
+        let updates: Vec<(PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>)> = renamed
+            .iter()
+            .filter_map(|(indexed, current_path)| {
+                let new_indexed = indexed
+                    .strip_prefix(previous)
+                    .ok()
+                    .map(|rel| current.join(rel));
+                let new_current = current_path
+                    .strip_prefix(previous)
+                    .ok()
+                    .map(|rel| current.join(rel));
+                if new_indexed.is_some() || new_current.is_some() {
+                    Some((
+                        indexed.clone(),
+                        current_path.clone(),
+                        new_indexed,
+                        new_current,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for (old_indexed, _old_current, new_indexed, new_current) in updates {
+            let entry = renamed.remove(&old_indexed).unwrap();
+            let final_indexed = new_indexed.unwrap_or(old_indexed);
+            let final_current = new_current.unwrap_or(entry);
+            if final_indexed != final_current {
+                renamed.insert(final_indexed, final_current);
+            }
+        }
+        // Also track the folder rename itself for future candidate correction.
+        // Inline the record_rename logic while still holding the lock.
+        {
+            let indexed = renamed
+                .iter()
+                .find(|(_, path)| **path == previous)
+                .map(|(indexed, _)| indexed.clone())
+                .unwrap_or_else(|| previous.to_path_buf());
+            if indexed == current {
+                renamed.remove(&indexed);
+            } else {
+                renamed.insert(indexed, current.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
     /// Records a rename under the name the index still knows the file by.
     /// Renaming the same file again replaces that one entry rather than
     /// chaining, and renaming it back to its indexed name drops the entry, so
