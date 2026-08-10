@@ -400,7 +400,12 @@ fn haystacks(path: &Path, fields: SearchFields) -> Vec<String> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let mut haystacks = Vec::with_capacity(3);
     if fields.tags {
-        haystacks.push(tags::Tags::parse_file_name(&name).into_values().join(" "));
+        haystacks.push(
+            tags::Tags::parse_file_name(&name)
+                .into_values()
+                .join(" ")
+                .to_lowercase(),
+        );
     }
     if fields.file_name {
         haystacks.push(tags::Tags::default().apply_to_file(&name).to_lowercase());
@@ -877,6 +882,97 @@ mod tests {
         assert_eq!(
             engine.video_path(&first_page.results[0].id).unwrap(),
             first_path
+        );
+    }
+
+    #[test]
+    fn search_is_case_insensitive_for_tags_file_name_and_path() {
+        let directory = tempdir().unwrap();
+        // File name case: "Summer Vacation" vs query "SUMMER vacation"
+        let file = directory.path().join("Summer Vacation [Beach].mp4");
+        fs::write(&file, b"test").unwrap();
+        // Path case: folder "Holiday" vs query "HOLIDAY"
+        let folder = directory.path().join("Holiday");
+        std::fs::create_dir(&folder).unwrap();
+        let in_folder = folder.join("clip [home].mp4");
+        fs::write(&in_folder, b"test").unwrap();
+
+        let provider = Arc::new(FakeProvider::new(vec![file.clone(), in_folder.clone()]));
+
+        // file_name case-insensitive
+        let engine = SearchEngine::new(provider.clone());
+        let file_name_query = SearchRequest {
+            fields: SearchFields {
+                tags: false,
+                file_name: true,
+                path: false,
+            },
+            ..request("SUMMER")
+        };
+        assert_eq!(
+            engine.search(file_name_query).unwrap().total_results,
+            1,
+            "file_name search should be case-insensitive"
+        );
+
+        // tags case-insensitive: tag [Beach] should match BEACH
+        let tags_query = SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: false,
+                path: false,
+            },
+            ..request("BEACH")
+        };
+        assert_eq!(
+            engine.search(tags_query).unwrap().total_results,
+            1,
+            "tags search should be case-insensitive"
+        );
+
+        // also tags with uppercase tag block
+        let upper_tag_file = directory.path().join("clip [HOME].mp4");
+        fs::write(&upper_tag_file, b"test").unwrap();
+        *provider.paths.lock().unwrap() = vec![upper_tag_file.clone()];
+        let lower_tag_query = SearchRequest {
+            fields: SearchFields {
+                tags: true,
+                file_name: false,
+                path: false,
+            },
+            ..request("home")
+        };
+        assert_eq!(
+            engine.search(lower_tag_query).unwrap().total_results,
+            1,
+            "lowercase query should match uppercase tag"
+        );
+
+        // path case-insensitive
+        *provider.paths.lock().unwrap() = vec![in_folder.clone()];
+        let path_query = SearchRequest {
+            fields: SearchFields {
+                tags: false,
+                file_name: false,
+                path: true,
+            },
+            ..request("HOLIDAY")
+        };
+        assert_eq!(
+            engine.search(path_query).unwrap().total_results,
+            1,
+            "path search should be case-insensitive"
+        );
+
+        // combined query mixed case should also match
+        *provider.paths.lock().unwrap() = vec![file.clone()];
+        assert_eq!(
+            engine
+                .search(request("sUmMeR bEaCh"))
+                .unwrap()
+                .total_results,
+            1,
+            "mixed case multi-term query should be case-insensitive"
         );
     }
 }
