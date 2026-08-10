@@ -1987,13 +1987,13 @@ async function playForFullscreen(names = ["clip.mp4"]) {
   return user;
 }
 
-// Moving the pointer is what wakes the overlay, and how far to the right it has
-// come is what summons the playlist.
+// Pointer movement must leave the F-selected mode alone; only reaching the
+// right edge has a fullscreen action, where it summons the playlist.
 function movePointer(clientX = 10) {
   act(() => void fireEvent.mouseMove(window, { clientX, clientY: 10 }));
 }
 
-test("clears the whole overlay the moment fullscreen starts, leaving the scrubber", async () => {
+test("selects the fullscreen information and scrubber mode without delay", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen();
@@ -2005,7 +2005,7 @@ test("clears the whole overlay the moment fullscreen starts, leaving the scrubbe
 
     await enterFullscreen(user);
 
-    // Straight away, not after the idle delay: fullscreen is for watching.
+    // The selected mode takes effect immediately, without an idle delay.
     expect(controls).toHaveClass("idle");
     expect(
       screen.queryByRole("complementary", { name: "Playlist" }),
@@ -2027,35 +2027,16 @@ test("clears the whole overlay the moment fullscreen starts, leaving the scrubbe
   }
 });
 
-test("lets the fullscreen controls fade out and brings them back on movement", async () => {
+test("keeps the fullscreen controls selected with F visible", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen();
     const controls = await screen.findByLabelText("Video controls");
-    expect(controls).not.toHaveClass("idle");
-
     await enterFullscreen(user);
-    expect(controls).toHaveClass("idle");
 
-    movePointer();
+    fireEvent.keyDown(window, { key: "f" });
     expect(controls).not.toHaveClass("idle");
 
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).toHaveClass("idle");
-
-    movePointer();
-    expect(controls).not.toHaveClass("idle");
-
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).toHaveClass("idle");
-    act(() => void fireEvent.mouseMove(document, { clientX: 10, clientY: 10 }));
-    expect(controls).not.toHaveClass("idle");
-
-    // Leaving fullscreen has to restore them for good.
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).toHaveClass("idle");
-    reportFullscreen(false);
-    expect(controls).not.toHaveClass("idle");
     act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).not.toHaveClass("idle");
   } finally {
@@ -2064,20 +2045,15 @@ test("lets the fullscreen controls fade out and brings them back on movement", a
   }
 });
 
-test("keeps the fullscreen controls up while the pointer rests on them", async () => {
+test("keeps pointer movement from changing the selected fullscreen mode", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen();
     const controls = await screen.findByLabelText("Video controls");
     await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
 
     movePointer();
-    act(() => void fireEvent.mouseEnter(controls));
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).not.toHaveClass("idle");
-
-    act(() => void fireEvent.mouseLeave(controls));
-    act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
@@ -3390,7 +3366,7 @@ test("stays fullscreen when the playlist advances to the next video", async () =
   }
 });
 
-test("keeps fullscreen controls hidden when autoplay advances the playlist", async () => {
+test("keeps the fullscreen information mode when autoplay advances", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen(["clip-1.mp4", "clip-2.mp4"]);
@@ -3818,13 +3794,11 @@ test("hands the fullscreen native surface everything but the scrubber sliver", a
         x: 0,
         y: 0,
         width: 920,
-        height: 704,
+        height: 760,
         visible: true,
       }),
     );
-    expect(
-      screen.getByRole("button", { name: "Exit fullscreen" }),
-    ).toBeVisible();
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
     boxes.mockRestore();

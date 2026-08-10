@@ -526,9 +526,6 @@ function CopyIcon() {
   );
 }
 
-// How long the fullscreen overlay waits after the last movement before fading.
-const CONTROLS_IDLE_DELAY = 2_500;
-
 // How long the pointer can rest on the video while it is playing before the
 // cursor hides. Moving the pointer brings it back.
 const CURSOR_IDLE_DELAY = 2_000;
@@ -868,7 +865,9 @@ function Player({
   const [fullscreenMode, setFullscreenMode] = useState<FullscreenMode>("video");
   const fullscreenModeRef = useRef<FullscreenMode>("video");
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
-  const [controlsIdle, setControlsIdle] = useState(false);
+  // F selects video only, information with the scrubber, then complete controls.
+  // Pointer activity cannot rewrite that selection.
+  const controlsIdle = fullscreen && fullscreenMode !== "controls";
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
   const [volume, setVolume] = useState(100);
@@ -897,18 +896,12 @@ function Player({
   const [addingTag, setAddingTag] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
-  // Mirrored into a ref so the fullscreen idle timer can see it without
-  // restarting, the way it already watches the pointer.
-  const tagFieldOpen = useRef(false);
   const [cursorHidden, setCursorHidden] = useState(false);
   const pointerOverVideo = useRef(false);
   const cursorTimer = useRef<number | undefined>(undefined);
   const video = playlist[index];
   const isImage = isImageResult(video);
   const [slideshowPlaying, setSlideshowPlaying] = useState(true);
-  useEffect(() => {
-    tagFieldOpen.current = addingTag;
-  }, [addingTag]);
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
@@ -1538,59 +1531,13 @@ function Player({
       document.removeEventListener("fullscreenchange", updateFullscreen);
   }, []);
 
-  // Fullscreen is for watching, so the overlay gets out of the way at once and
-  // stays away until the viewer reaches for it — only the scrubber is left, as
-  // a sliver along the very bottom. Windowed playback always shows the controls.
+  // Fullscreen owns a transient playlist drawer; windowed playback uses the
+  // permanent drawer instead.
   useEffect(() => {
-    if (!fullscreen) {
-      setControlsIdle(false);
-      setFullscreenPlaylist("hidden");
-      pointerOverPlaylist.current = false;
-      return;
-    }
-    // Fullscreen is entered by clicking a control or pressing a key, either of
-    // which leaves the pointer resting on the overlay it is about to hide; that
-    // would otherwise pin the bar open until the viewer moved the mouse away.
-    pointerOverControls.current = false;
-    setControlsIdle(true);
-    let lastActivity = 0;
-    const showControls = () => {
-      lastActivity = Date.now();
-      fullscreenModeRef.current = "controls";
-      setFullscreenMode("controls");
-      setShowFullscreenInfo(true);
-      setControlsIdle(false);
-    };
-    const wakeFromKeyboard = () => {
-      if (fullscreenModeRef.current !== "controls") return;
-      lastActivity = Date.now();
-      setControlsIdle(false);
-    };
-    if (fullscreenMode === "controls") setControlsIdle(false);
-    // Polling rather than a one-shot timer so that moving the pointer off the
-    // controls re-arms the countdown without needing its own listener.
-    // Keyboard use keeps them up through the keydown listener below; focus is
-    // deliberately not consulted, because clicking a control focuses it and
-    // would then pin the overlay open for the rest of the session.
-    const tick = window.setInterval(() => {
-      if (fullscreenModeRef.current !== "controls") return;
-      if (pointerOverControls.current || tagFieldOpen.current)
-        lastActivity = Date.now();
-      else if (Date.now() - lastActivity >= CONTROLS_IDLE_DELAY)
-        setControlsIdle(true);
-    }, 250);
-    window.addEventListener("mousemove", showControls);
-    document.addEventListener("mousemove", showControls);
-    document.addEventListener("pointermove", showControls);
-    window.addEventListener("keydown", wakeFromKeyboard);
-    return () => {
-      window.clearInterval(tick);
-      window.removeEventListener("mousemove", showControls);
-      document.removeEventListener("mousemove", showControls);
-      document.removeEventListener("pointermove", showControls);
-      window.removeEventListener("keydown", wakeFromKeyboard);
-    };
-  }, [fullscreen, fullscreenMode]);
+    if (fullscreen) return;
+    setFullscreenPlaylist("hidden");
+    pointerOverPlaylist.current = false;
+  }, [fullscreen]);
 
   // Bringing the pointer all the way to the right-hand edge of the screen slides
   // the playlist out over the picture; it stays for as long as the pointer is on
@@ -1603,9 +1550,8 @@ function Player({
       lastNearPlaylist = Date.now();
       setFullscreenPlaylist((state) => (state === "hidden" ? "peek" : state));
     };
-    // Polled for the same reason the controls are: the pointer resting on the
-    // drawer has to hold it open without a listener of its own re-arming a
-    // one-shot timer on every movement.
+    // Polling lets the pointer rest on the drawer to hold it open without
+    // re-arming a one-shot timer on every movement.
     const tick = window.setInterval(() => {
       if (pointerOverPlaylist.current) {
         lastNearPlaylist = Date.now();
