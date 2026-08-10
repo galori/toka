@@ -2703,16 +2703,19 @@ export default function App() {
     }
   };
 
-  // A playlist Toka was launched with plays as soon as the window is up. Its
-  // entries arrive as a page of results, so everything a search's results reach
-  // — the player, its drawer, prev and next, coming back to the list — works for
-  // a playlist file without a second way through any of it.
+  // A playlist — or single video, or folder — Toka was launched with plays
+  // as soon as the window is up. Its entries arrive as a page of results, so
+  // everything a search's results reach — the player, its drawer, prev and
+  // next, coming back to the list — works without a second way through any
+  // of it. The launch clears any existing playlist and search term, and a
+  // folder's videos arrive shuffled like any other playlist.
   useEffect(() => {
     void launchPlaylist()
       .then((launched) => {
         // A viewer who got a search in first has asked for something newer than
         // the command line did, and keeps it.
         if (!launched?.results.length || requestNumber.current) return;
+        setQuery("");
         setPage(launched);
         setPlaying({ videos: launched.results, startIndex: 0 });
       })
