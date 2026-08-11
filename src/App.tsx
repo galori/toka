@@ -79,6 +79,8 @@ export function isImageResult(result: VideoResult): boolean {
 }
 
 export const SLIDESHOW_INTERVAL = 3_000;
+const IMAGE_DURATION_SECONDS = SLIDESHOW_INTERVAL / 1_000;
+const IMAGE_PROGRESS_TICK = 100;
 
 const MEDIA_TYPES: { value: MediaType; label: string; shortcut: string }[] = [
   { value: "videos", label: "Videos", shortcut: "Ctrl+1" },
@@ -921,6 +923,7 @@ function Player({
   const [cursorHidden, setCursorHidden] = useState(false);
   const pointerOverVideo = useRef(false);
   const cursorTimer = useRef<number | undefined>(undefined);
+  const imageElapsed = useRef(0);
   const video = playlist[index];
   const isImage = isImageResult(video);
   const [slideshowPlaying, setSlideshowPlaying] = useState(true);
@@ -991,6 +994,7 @@ function Player({
     setPrepared(undefined);
     setDuration(0);
     setCurrentTime(0);
+    imageElapsed.current = 0;
     setError(undefined);
     setNativeStarted(false);
     setFullscreenError(undefined);
@@ -1031,7 +1035,12 @@ function Player({
         }
         if (active) {
           setPrepared(result);
-          if (isImage) setPlayingBack(true);
+          if (isImage) {
+            imageElapsed.current = 0;
+            setCurrentTime(0);
+            setDuration(IMAGE_DURATION_SECONDS);
+            setPlayingBack(true);
+          }
         }
       })
       .catch((reason: unknown) => {
@@ -1315,10 +1324,10 @@ function Player({
   // repeats it — so the default waits for it, and stands aside for good once
   // the viewer has said what they want for this file.
   useEffect(() => {
-    if (chosenSkipStep.current) return;
+    if (isImage || chosenSkipStep.current) return;
     const step = skipStepForDuration(duration);
     if (step !== undefined) setSkipStepIndex(step);
-  }, [duration]);
+  }, [duration, isImage]);
 
   const skipStep = SKIP_STEPS[skipStepIndex];
   // A frame is only as exact as the rate behind it, so the control says which
@@ -1370,13 +1379,27 @@ function Player({
   useEffect(() => {
     if (!isImage || !slideshowPlaying) return;
     const timer = window.setInterval(() => {
+      imageElapsed.current = Math.min(
+        IMAGE_DURATION_SECONDS,
+        Math.round(
+          (imageElapsed.current + IMAGE_PROGRESS_TICK / 1_000) * 1_000,
+        ) / 1_000,
+      );
+      setCurrentTime(imageElapsed.current);
+      if (imageElapsed.current < IMAGE_DURATION_SECONDS) return;
       if (loop === "off" && index === playlist.length - 1) return;
-      if (playlist.length <= 1 && loop === "one") return;
+      if (playlist.length <= 1 && loop === "one") {
+        imageElapsed.current = 0;
+        setCurrentTime(0);
+        return;
+      }
+      imageElapsed.current = 0;
+      setCurrentTime(0);
       setIndex((current) => {
         if (loop === "off" && current === playlist.length - 1) return current;
         return (current + 1) % playlist.length;
       });
-    }, SLIDESHOW_INTERVAL);
+    }, IMAGE_PROGRESS_TICK);
     return () => window.clearInterval(timer);
   }, [isImage, slideshowPlaying, playlist.length, index, loop]);
 
@@ -1781,6 +1804,13 @@ function Player({
       )
         return;
 
+      if (
+        target instanceof HTMLInputElement &&
+        target.classList.contains("player-timeline") &&
+        (event.key === "ArrowLeft" || event.key === "ArrowRight")
+      )
+        return;
+
       const run = (action: () => void) => {
         event.preventDefault();
         action();
@@ -2099,21 +2129,24 @@ function Player({
         >
           <input
             className="player-timeline"
-            aria-label="Video timeline"
-            title="Video timeline"
+            aria-label={isImage ? "Image timeline" : "Video timeline"}
+            title={isImage ? "Image timeline" : "Video timeline"}
             type="range"
             min="0"
             max={duration || 0}
             step="0.1"
             value={Math.min(currentTime, duration || 0)}
-            disabled={isImage}
             // The sliver the bar collapses to in fullscreen paints its own fill:
             // a range input's track and thumb cannot be drawn legibly at six
             // pixels, so the progress is handed to the stylesheet instead.
             style={{ "--progress": `${elapsedShare}%` } as CSSProperties}
             onChange={(event) => {
-              if (isImage) return;
               const nextTime = Number(event.currentTarget.value);
+              if (isImage) {
+                imageElapsed.current = nextTime;
+                setCurrentTime(nextTime);
+                return;
+              }
               if (native)
                 void seekNativeVideo(nextTime).catch((reason: unknown) =>
                   setError(errorMessage(reason)),

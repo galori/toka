@@ -5272,8 +5272,23 @@ test("shows image results and handles slideshow controls", async () => {
     expect(image.tagName).toBe("IMG");
     expect(image).toHaveAttribute("src", "asset:///Photos/sunset.jpg");
 
-    // timeline and speed disabled for images
-    expect(screen.getByLabelText("Video timeline")).toBeDisabled();
+    // images stay on screen for the slideshow interval, so their timeline is
+    // an active scrubber rather than a disabled video-only control
+    const timeline = screen.getByLabelText("Image timeline");
+    expect(timeline).toBeEnabled();
+    expect(timeline).toHaveAttribute("max", "3");
+    expect(timeline).toHaveValue("0");
+    await act(async () => {
+      vi.advanceTimersByTime(1_500);
+    });
+    expect(timeline).toHaveValue("1.5");
+    fireEvent.change(timeline, { target: { value: "2.25" } });
+    expect(timeline).toHaveValue("2.25");
+    timeline.focus();
+    fireEvent.keyDown(timeline, { key: "ArrowRight" });
+    expect(screen.getByLabelText("Playing sunset.jpg")).toBeVisible();
+
+    // speed remains a video-only setting
     expect(screen.getByLabelText("Playback speed")).toBeDisabled();
     expect(
       screen.getByRole("button", { name: "Skip step: 10 seconds" }),
