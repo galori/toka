@@ -214,6 +214,31 @@ input[type="search"]:focus {
   border-radius: inherit;
   background: linear-gradient(180deg, transparent 55%, rgb(0 0 0 / 35%));
 }
+.media-type-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: rgb(11 13 18 / 82%);
+  color: #edf1f7;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+.media-type-badge.image {
+  color: #b8d7ff;
+}
+.media-type-badge.video {
+  color: #ffc48f;
+}
 
 .video-tile:hover .video-art,
 .video-tile:focus-visible .video-art {
@@ -225,7 +250,8 @@ input[type="search"]:focus {
   outline: none;
 }
 
-.video-icon {
+.video-icon,
+.image-icon {
   width: 38%;
   fill: none;
   stroke: #8fbcff;
@@ -662,7 +688,8 @@ button:focus-visible {
   border-color: oklch(0.68 0.19 38);
   transform: translateY(-2px);
 }
-.video-icon {
+.video-icon,
+.image-icon {
   width: 34%;
   stroke: oklch(0.68 0.19 38);
 }
