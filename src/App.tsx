@@ -2238,7 +2238,7 @@ function Player({
             </div>
           ) : null}
         </div>
-        <HelpButton className="playlist-toggle help-toggle" onClick={onHelp} />
+        <HelpButton className="player-help-toggle" onClick={onHelp} />
         <ControlButton
           shortcut="P"
           className="playlist-toggle"

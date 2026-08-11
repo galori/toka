@@ -646,6 +646,7 @@ button:focus-visible {
 .player-controls button,
 .copy-button,
 .playlist-toggle,
+.player-help-toggle,
 .playlist-drawer button {
   transition:
     background-color 140ms ease,
@@ -660,7 +661,8 @@ button:focus-visible {
 .back-button:hover,
 .player-controls .transport-button:not(:disabled):hover,
 .copy-button:hover,
-.playlist-toggle:hover {
+.playlist-toggle:hover,
+.player-help-toggle:hover {
   border-color: oklch(0.68 0.19 38);
   background: oklch(0.28 0.02 40);
 }
@@ -702,7 +704,8 @@ button:focus-visible {
 .back-button,
 .player-controls button,
 .copy-button,
-.playlist-toggle {
+.playlist-toggle,
+.player-help-toggle {
   border: 1px solid oklch(0.3 0.02 40);
   border-radius: 9px;
   background: oklch(0.22 0.02 40);
@@ -724,7 +727,8 @@ button:focus-visible {
    arrow and the shortcut hint are three different sizes, and on a baseline
    they sit visibly off-centre inside the button. */
 .back-button,
-.playlist-toggle {
+.playlist-toggle,
+.player-help-toggle {
   display: inline-flex;
   align-items: center;
   /* Trimming the labels takes the line box out of the height, so the design's
@@ -748,6 +752,10 @@ button:focus-visible {
 }
 .playlist-toggle {
   margin-left: auto;
+  padding: 9px 16px;
+}
+.player-help-toggle {
+  margin-left: 0;
   padding: 9px 16px;
 }
 .playlist-toggle .playlist-count {
@@ -1121,7 +1129,8 @@ button:focus-visible {
   color: oklch(0.3 0.03 40);
 }
 .playlist-toggle .key-hint,
-.back-button .key-hint {
+.back-button .key-hint,
+.player-help-toggle .key-hint {
   color: oklch(0.55 0.02 60);
 }
 .labelled-control {
@@ -1307,10 +1316,6 @@ button:focus-visible {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
-}
-
-.help-toggle {
-  margin-left: 0;
 }
 
 .help-backdrop {
