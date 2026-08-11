@@ -95,12 +95,26 @@ fn index_error(message: String) -> CommandError {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "e2e")))]
 #[tauri::command]
 fn index_state(
     manager: State<'_, managed_index::IndexManager>,
 ) -> Result<managed_index::IndexState, CommandError> {
     manager.state().map_err(index_error)
+}
+
+// Integration builds use a fixture search provider rather than a persistent
+// Linux index. Reporting that index management is unsupported keeps the
+// fixture's search screen deterministic and prevents tests from writing the
+// developer's real folder configuration.
+#[cfg(all(target_os = "linux", feature = "e2e"))]
+#[tauri::command]
+fn index_state() -> managed_index::IndexState {
+    managed_index::IndexState {
+        supported: false,
+        revision: 0,
+        folders: Vec::new(),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -950,6 +964,12 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(all(target_os = "linux", feature = "e2e"))]
+    #[test]
+    fn fixture_search_builds_do_not_open_real_folder_setup() {
+        assert!(!index_state().supported);
+    }
 
     fn outcome(succeeded: bool, stderr: &str, still_on_disk: bool) -> Result<String, CommandError> {
         trash_outcome(
