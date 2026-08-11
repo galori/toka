@@ -646,6 +646,7 @@ button:focus-visible {
 .player-controls button,
 .copy-button,
 .playlist-toggle,
+.player-help-toggle,
 .playlist-drawer button {
   transition:
     background-color 140ms ease,
@@ -660,7 +661,8 @@ button:focus-visible {
 .back-button:hover,
 .player-controls .transport-button:not(:disabled):hover,
 .copy-button:hover,
-.playlist-toggle:hover {
+.playlist-toggle:hover,
+.player-help-toggle:hover {
   border-color: oklch(0.68 0.19 38);
   background: oklch(0.28 0.02 40);
 }
@@ -702,7 +704,8 @@ button:focus-visible {
 .back-button,
 .player-controls button,
 .copy-button,
-.playlist-toggle {
+.playlist-toggle,
+.player-help-toggle {
   border: 1px solid oklch(0.3 0.02 40);
   border-radius: 9px;
   background: oklch(0.22 0.02 40);
@@ -724,7 +727,8 @@ button:focus-visible {
    arrow and the shortcut hint are three different sizes, and on a baseline
    they sit visibly off-centre inside the button. */
 .back-button,
-.playlist-toggle {
+.playlist-toggle,
+.player-help-toggle {
   display: inline-flex;
   align-items: center;
   /* Trimming the labels takes the line box out of the height, so the design's
@@ -748,6 +752,10 @@ button:focus-visible {
 }
 .playlist-toggle {
   margin-left: auto;
+  padding: 9px 16px;
+}
+.player-help-toggle {
+  margin-left: 0;
   padding: 9px 16px;
 }
 .playlist-toggle .playlist-count {
@@ -1121,7 +1129,8 @@ button:focus-visible {
   color: oklch(0.3 0.03 40);
 }
 .playlist-toggle .key-hint,
-.back-button .key-hint {
+.back-button .key-hint,
+.player-help-toggle .key-hint {
   color: oklch(0.55 0.02 60);
 }
 .labelled-control {
@@ -1307,6 +1316,136 @@ button:focus-visible {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+.help-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  overflow: auto;
+  padding: clamp(24px, 7vh, 72px) 20px;
+  background: rgb(4 5 7 / 78%);
+  backdrop-filter: blur(5px);
+}
+
+.help-pane {
+  width: min(780px, 100%);
+  margin: 0 auto;
+  border: 1px solid oklch(0.34 0.02 40);
+  border-radius: 16px;
+  padding: clamp(24px, 4vw, 40px);
+  background: oklch(0.17 0.02 40);
+  box-shadow: 0 24px 80px rgb(0 0 0 / 45%);
+}
+
+.help-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.help-kicker {
+  margin: 0 0 6px;
+  color: oklch(0.68 0.19 38);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.help-pane h1 {
+  margin: 0;
+  font-size: clamp(24px, 4vw, 34px);
+}
+
+.help-intro {
+  max-width: 58ch;
+  margin: 14px 0 28px;
+  color: oklch(0.68 0.02 60);
+  line-height: 1.5;
+}
+
+.help-close {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  min-height: 38px;
+  border: 1px solid oklch(0.3 0.02 40);
+  border-radius: 9px;
+  padding: 9px 14px;
+  background: oklch(0.22 0.02 40);
+  color: inherit;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.help-close:hover {
+  border-color: oklch(0.68 0.19 38);
+  background: oklch(0.28 0.02 40);
+}
+
+.help-sections {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px 36px;
+}
+
+.help-section h2 {
+  margin: 0 0 10px;
+  color: oklch(0.95 0.01 90);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+}
+
+.help-section dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.help-section dl > div {
+  display: grid;
+  grid-template-columns: minmax(84px, max-content) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+}
+
+.help-section dt,
+.help-section dd {
+  margin: 0;
+}
+
+.help-section dt {
+  text-align: right;
+}
+
+.help-section kbd {
+  display: inline-block;
+  border: 1px solid oklch(0.38 0.02 40);
+  border-radius: 5px;
+  padding: 2px 6px;
+  background: oklch(0.22 0.02 40);
+  color: oklch(0.8 0.02 60);
+  font:
+    700 11px ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  white-space: nowrap;
+}
+
+.help-section dd {
+  color: oklch(0.68 0.02 60);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+@media (max-width: 640px) {
+  .help-sections {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
 }
 
 .folder-setup {
