@@ -124,6 +124,8 @@ fn index_state() -> managed_index::IndexState {
 struct UnsupportedIndexState {
     supported: bool,
     revision: u64,
+    indexed_videos: u64,
+    indexed_images: u64,
     folders: Vec<String>,
 }
 
