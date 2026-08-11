@@ -701,7 +701,9 @@ const SEARCH_SCOPES: {
 const SEARCH_SHORTCUT = "Ctrl+K";
 
 export const THUMBNAIL_SIZE_DEFAULT = 180;
-export const THUMBNAIL_SIZE_MIN = 120;
+// Keep three additional 20px steps below the original minimum so large result
+// sets can be scanned quickly without making the default thumbnails smaller.
+export const THUMBNAIL_SIZE_MIN = 60;
 export const THUMBNAIL_SIZE_MAX = 360;
 export const THUMBNAIL_SIZE_STEP = 20;
 

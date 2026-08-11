@@ -5206,9 +5206,11 @@ test("clamps thumbnail size and disables controls at the limits", async () => {
     name: "Smaller thumbnails",
   });
 
-  // Decrease to the minimum.
-  for (let index = 0; index < 20; index += 1)
+  // The default is 180px. Six steps should expose the three new smaller sizes
+  // below the old 120px minimum and stop at the new 60px floor.
+  for (let index = 0; index < 6; index += 1)
     fireEvent.keyDown(window, { key: "-" });
+  expect(THUMBNAIL_SIZE_MIN).toBe(60);
   expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
     `${THUMBNAIL_SIZE_MIN}px`,
   );
