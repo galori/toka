@@ -1924,15 +1924,15 @@ function Player({
         run(() => void removeCurrentVideo());
       } else if (event.key.toLowerCase() === "r") {
         run(shufflePlaylist);
-      } else if (event.key === "-") {
+      } else if (event.key === "-" && !isImage) {
         run(() => stepSpeed(-1));
-      } else if (event.key === "=" || event.key === "+") {
+      } else if ((event.key === "=" || event.key === "+") && !isImage) {
         run(() => stepSpeed(1));
-      } else if (event.key === "ArrowDown") {
+      } else if (event.key === "ArrowDown" && !isImage) {
         run(() => applyVolume(volume - VOLUME_STEP));
-      } else if (event.key === "ArrowUp") {
+      } else if (event.key === "ArrowUp" && !isImage) {
         run(() => applyVolume(volume + VOLUME_STEP));
-      } else if (volumePreset) {
+      } else if (volumePreset && !isImage) {
         run(() => applyVolume(volumePreset.volume));
       } else if (event.key.toLowerCase() === "a") {
         run(cycleAspect);
@@ -2346,81 +2346,83 @@ function Player({
                   ))}
                 </select>
               ) : null}
-              {/* Named after the step it is on rather than the one it moves
-                  to, like the aspect and loop controls, so the button reads as
-                  the setting it is. */}
-              <ControlButton
-                shortcut="J"
-                onClick={cycleSkipStep}
-                aria-label={`Skip step: ${skipStepName}`}
-                disabled={isImage}
-              >
-                <Label>{skipStep.label}</Label>
-              </ControlButton>
-              <span className="labelled-control">
-                <select
-                  aria-label="Playback speed"
-                  aria-keyshortcuts="- ="
-                  title="Playback speed"
-                  value={speed}
-                  disabled={isImage}
-                  onChange={(event) => {
-                    applySpeed(Number(event.currentTarget.value));
-                    focusPlayerShell();
-                  }}
-                >
-                  {SPEEDS.map((value) => (
-                    <option key={value} value={value}>
-                      {value}×
-                    </option>
+              {!isImage ? (
+                <>
+                  {/* Named after the step it is on rather than the one it moves
+                      to, like the aspect and loop controls, so the button reads
+                      as the setting it is. */}
+                  <ControlButton
+                    shortcut="J"
+                    onClick={cycleSkipStep}
+                    aria-label={`Skip step: ${skipStepName}`}
+                  >
+                    <Label>{skipStep.label}</Label>
+                  </ControlButton>
+                  <span className="labelled-control">
+                    <select
+                      aria-label="Playback speed"
+                      aria-keyshortcuts="- ="
+                      title="Playback speed"
+                      value={speed}
+                      onChange={(event) => {
+                        applySpeed(Number(event.currentTarget.value));
+                        focusPlayerShell();
+                      }}
+                    >
+                      {SPEEDS.map((value) => (
+                        <option key={value} value={value}>
+                          {value}×
+                        </option>
+                      ))}
+                    </select>
+                    <KeyHint shortcut="- =" />
+                  </span>
+                  <ControlButton
+                    shortcut="ArrowDown"
+                    onClick={() => applyVolume(volume - VOLUME_STEP)}
+                    aria-label="Decrease volume"
+                  >
+                    <SpeakerIcon waves={1} />
+                  </ControlButton>
+                  <input
+                    className="volume-slider"
+                    aria-label="Volume"
+                    type="range"
+                    min="0"
+                    max="100"
+                    step="5"
+                    value={volume}
+                    onChange={(event) =>
+                      applyVolume(Number(event.currentTarget.value))
+                    }
+                  />
+                  <ControlButton
+                    shortcut="ArrowUp"
+                    onClick={() => applyVolume(volume + VOLUME_STEP)}
+                    aria-label="Increase volume"
+                  >
+                    <SpeakerIcon waves={2} />
+                  </ControlButton>
+                  {/* The volumes worth going straight to, each pressed rather
+                      than stepped towards, and each lit while the volume is
+                      sitting on it. */}
+                  {VOLUME_PRESETS.map((preset) => (
+                    <ControlButton
+                      key={preset.key}
+                      shortcut={preset.key}
+                      onClick={() => applyVolume(preset.volume)}
+                      aria-label={preset.name}
+                      aria-pressed={volume === preset.volume}
+                    >
+                      {preset.label ? (
+                        <Label>{preset.label}</Label>
+                      ) : (
+                        <SpeakerIcon waves={0} />
+                      )}
+                    </ControlButton>
                   ))}
-                </select>
-                <KeyHint shortcut="- =" />
-              </span>
-              <ControlButton
-                shortcut="ArrowDown"
-                onClick={() => applyVolume(volume - VOLUME_STEP)}
-                aria-label="Decrease volume"
-              >
-                <SpeakerIcon waves={1} />
-              </ControlButton>
-              <input
-                className="volume-slider"
-                aria-label="Volume"
-                type="range"
-                min="0"
-                max="100"
-                step="5"
-                value={volume}
-                onChange={(event) =>
-                  applyVolume(Number(event.currentTarget.value))
-                }
-              />
-              <ControlButton
-                shortcut="ArrowUp"
-                onClick={() => applyVolume(volume + VOLUME_STEP)}
-                aria-label="Increase volume"
-              >
-                <SpeakerIcon waves={2} />
-              </ControlButton>
-              {/* The volumes worth going straight to, each pressed rather than
-                  stepped towards, and each lit while the volume is sitting on
-                  it. */}
-              {VOLUME_PRESETS.map((preset) => (
-                <ControlButton
-                  key={preset.key}
-                  shortcut={preset.key}
-                  onClick={() => applyVolume(preset.volume)}
-                  aria-label={preset.name}
-                  aria-pressed={volume === preset.volume}
-                >
-                  {preset.label ? (
-                    <Label>{preset.label}</Label>
-                  ) : (
-                    <SpeakerIcon waves={0} />
-                  )}
-                </ControlButton>
-              ))}
+                </>
+              ) : null}
               <ControlButton
                 shortcut="["
                 onClick={() => rotate(-90)}

@@ -5413,6 +5413,39 @@ test("shows image results and handles slideshow controls", async () => {
     const image = await screen.findByLabelText("Playing sunset.jpg");
     expect(image.tagName).toBe("IMG");
     expect(image).toHaveAttribute("src", "asset:///Photos/sunset.jpg");
+    expect(
+      screen.queryByRole("button", { name: /Skip step:/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("combobox", { name: "Playback speed" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Decrease volume" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("slider", { name: "Volume" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Increase volume" }),
+    ).not.toBeInTheDocument();
+    for (const name of ["Mute", "Half volume", "Full volume"]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    for (const key of [
+      "j",
+      "-",
+      "=",
+      "+",
+      "ArrowDown",
+      "ArrowUp",
+      "0",
+      "5",
+      "1",
+    ]) {
+      const event = new KeyboardEvent("keydown", { key, cancelable: true });
+      window.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
 
     // images stay on screen for the slideshow interval, so their timeline is
     // an active scrubber rather than a disabled video-only control
@@ -5430,11 +5463,11 @@ test("shows image results and handles slideshow controls", async () => {
     fireEvent.keyDown(timeline, { key: "ArrowRight" });
     expect(screen.getByLabelText("Playing sunset.jpg")).toBeVisible();
 
-    // speed remains a video-only setting
-    expect(screen.getByLabelText("Playback speed")).toBeDisabled();
+    // video-only controls are omitted rather than left as disabled controls
+    expect(screen.queryByLabelText("Playback speed")).not.toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Skip step: 10 seconds" }),
-    ).toBeDisabled();
+      screen.queryByRole("button", { name: "Skip step: 10 seconds" }),
+    ).not.toBeInTheDocument();
 
     // slideshow control with shortcut S
     const slideshowButton = screen.getByRole("button", {
