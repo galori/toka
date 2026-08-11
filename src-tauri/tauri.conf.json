@@ -37,10 +37,20 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "Search and play videos indexed by your operating system",
+    "shortDescription": "Search and play videos in your Toka folders",
     "linux": {
       "deb": {
-        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libepoxy0", "libegl1", "libglx0", "libmpv2", "plocate"],
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libepoxy0",
+          "libegl1",
+          "libglx0",
+          "libmpv2",
+          "libstdc++6",
+          "liburing2",
+          "libzstd1"
+        ],
         "files": {
           "/usr/share/toka/build-info.json": "build-info.json"
         }

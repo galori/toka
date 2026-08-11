@@ -24,7 +24,8 @@ The native integration test uses an embedded WebDriver and a generated video fix
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
 - macOS search runs `/usr/bin/mdfind`.
-- Linux search uses `plocate` by default. Set `TOKA_SEARCH_PROVIDER=recoll` before launching Toka to use `recollq` instead.
+- Linux release builds bundle plocate 1.1.24 and use one private database per configured folder. Set `TOKA_SEARCH_PROVIDER=plocate` to exercise the legacy system database or `TOKA_SEARCH_PROVIDER=recoll` to use `recollq`.
+- `scripts/build-plocate.mjs` verifies the upstream source checksum, builds `plocate` and `updatedb`, and stages the GPL source and license beside the generated sidecars. Meson, Ninja, and the zstd development headers are required.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
@@ -42,8 +43,8 @@ to see its version, build age, Git SHA, and number of commits behind
 
 ## Linux troubleshooting
 
-- No results: check `/etc/updatedb.conf`, then run `sudo updatedb` to refresh plocate's index.
-- `plocate` not found: install the `plocate` package and launch Toka from a session where the executable is available on `PATH`.
+- No results: press `Ctrl+,` and check that the folder is configured and reports Ready. A disconnected drive reports Drive disconnected and keeps its existing database.
+- Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux` refreshes and restarts the user service.
 - Optional Recoll provider: install `recoll`, run `recollindex`, and launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.

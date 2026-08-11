@@ -8,7 +8,8 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { externalPlayers, launchPlaylist } from "./api";
+import { open } from "@tauri-apps/plugin-dialog";
+import { externalPlayers, indexState, launchPlaylist } from "./api";
 import App, {
   playbackSource,
   shuffleVideos,
@@ -32,6 +33,10 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowApiMock,
 }));
 
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(),
+}));
+
 // Asked for once at startup each, on a screen most of these tests never reach.
 // Left on the real `invoke` they would take the first queued responses out of
 // every test's mock, so these calls are stubbed at the module seam instead;
@@ -40,13 +45,18 @@ vi.mock("@tauri-apps/api/window", () => ({
 vi.mock("./api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./api")>()),
   externalPlayers: vi.fn(() => Promise.resolve([])),
+  indexState: vi.fn(() =>
+    Promise.resolve({ supported: false, revision: 0, folders: [] }),
+  ),
   launchPlaylist: vi.fn(() => Promise.resolve(null)),
 }));
 
 const invokeMock = vi.mocked(invoke);
 const externalPlayersMock = vi.mocked(externalPlayers);
+const indexStateMock = vi.mocked(indexState);
 const launchPlaylistMock = vi.mocked(launchPlaylist);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
+const openMock = vi.mocked(open);
 const randomMock = vi.spyOn(Math, "random");
 
 test("shuffles without mutating the original video list", () => {
@@ -81,13 +91,142 @@ test("shows build provenance on the initial home screen", () => {
 beforeEach(() => {
   invokeMock.mockReset();
   externalPlayersMock.mockReset().mockResolvedValue([]);
+  indexStateMock
+    .mockReset()
+    .mockResolvedValue({ supported: false, revision: 0, folders: [] });
   launchPlaylistMock.mockReset().mockResolvedValue(null);
   convertFileSrcMock.mockClear();
+  openMock.mockReset();
   randomMock.mockReset().mockReturnValue(0.999999);
   windowApiMock.isFullscreen.mockReset();
   windowApiMock.setFullscreen.mockReset();
   windowApiMock.isFullscreen.mockResolvedValue(false);
   windowApiMock.setFullscreen.mockResolvedValue(undefined);
+});
+
+test("opens folder setup on an unconfigured Linux first launch", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 0,
+    folders: [],
+  });
+
+  render(<App />);
+
+  expect(
+    await screen.findByRole("heading", { name: "Choose where Toka searches" }),
+  ).toBeVisible();
+  const addFolder = screen.getByRole("button", { name: "Add folder" });
+  expect(addFolder).toHaveAttribute("aria-keyshortcuts", "Ctrl+O");
+  expect(addFolder.querySelector(".key-hint")).toHaveTextContent("Ctrl+O");
+  expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+});
+
+test("adds a search folder and makes the setup completable", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 0,
+    folders: [],
+  });
+  openMock.mockResolvedValue("/Media/Videos");
+  invokeMock.mockResolvedValue({
+    supported: true,
+    revision: 0,
+    folders: [{ id: "videos", path: "/Media/Videos", status: "pending" }],
+  });
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Add folder" });
+  fireEvent.keyDown(window, { key: "o", ctrlKey: true });
+
+  await waitFor(() =>
+    expect(openMock).toHaveBeenCalledWith({ directory: true, multiple: false }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("add_index_folder", {
+    path: "/Media/Videos",
+  });
+  expect(await screen.findByText("/Media/Videos")).toBeVisible();
+  expect(screen.getByText("Waiting to index")).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "Start searching" }),
+  ).toHaveAttribute("aria-keyshortcuts", "Ctrl+Enter");
+  fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+  expect(screen.getByRole("searchbox")).toBeVisible();
+});
+
+test("reopens configured search folders from Ctrl+,", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 1,
+    folders: [{ id: "videos", path: "/Videos", status: "ready" }],
+  });
+  render(<App />);
+  expect(
+    await screen.findByRole("button", { name: "Search folders" }),
+  ).toHaveAttribute("aria-keyshortcuts", "Ctrl+,");
+
+  fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+
+  expect(
+    await screen.findByRole("heading", { name: "Choose where Toka searches" }),
+  ).toBeVisible();
+});
+
+test("a launch playlist bypasses first-launch folder setup", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 0,
+    folders: [],
+  });
+  launchPlaylistMock.mockResolvedValue({
+    query: "summer.m3u8",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
+
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing summer.mp4")).toBeVisible();
+  expect(
+    screen.queryByRole("heading", { name: "Choose where Toka searches" }),
+  ).not.toBeInTheDocument();
+});
+
+test("offers to refresh search results when the managed index advances", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 2,
+    folders: [{ id: "videos", path: "/Videos", status: "ready" }],
+  });
+  invokeMock.mockResolvedValue({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    indexRevision: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
+  const refresh = await screen.findByRole("button", {
+    name: "Refresh search results",
+  });
+  expect(refresh).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+R");
+  expect(screen.getByText("New files are ready to search.")).toBeVisible();
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "r", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
+      request: expect.objectContaining({ query: "clip", page: 1 }),
+    }),
+  );
 });
 
 afterEach(() => {
@@ -4776,29 +4915,43 @@ test("hides the cursor when it rests on the video during playback", async () => 
     .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(await screen.findByRole("button", { name: "Play clip.mp4" }));
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
   const video = await screen.findByLabelText("Playing clip.mp4");
   const shell = document.querySelector(".player-shell")!;
   fireEvent.play(video);
-  await act(async () => { vi.advanceTimersByTime(10); });
+  await act(async () => {
+    vi.advanceTimersByTime(10);
+  });
   expect(shell).not.toHaveClass("cursor-hidden");
   // Resting the pointer on the picture hides the cursor after a short idle.
   await user.hover(video);
-  await act(async () => { vi.advanceTimersByTime(2100); });
+  await act(async () => {
+    vi.advanceTimersByTime(2100);
+  });
   expect(shell).toHaveClass("cursor-hidden");
   // Moving brings it back.
   fireEvent.mouseMove(video);
-  await act(async () => { vi.advanceTimersByTime(10); });
+  await act(async () => {
+    vi.advanceTimersByTime(10);
+  });
   expect(shell).not.toHaveClass("cursor-hidden");
   // When the pointer is not over the picture it stays visible even after idle.
   fireEvent.mouseLeave(video);
-  window.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }));
-  await act(async () => { vi.advanceTimersByTime(3000); });
+  window.dispatchEvent(
+    new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }),
+  );
+  await act(async () => {
+    vi.advanceTimersByTime(3000);
+  });
   expect(shell).not.toHaveClass("cursor-hidden");
   // Paused playback never hides.
   await user.hover(video);
   fireEvent.pause(video);
-  await act(async () => { vi.advanceTimersByTime(3000); });
+  await act(async () => {
+    vi.advanceTimersByTime(3000);
+  });
   expect(shell).not.toHaveClass("cursor-hidden");
   vi.useRealTimers();
 });
@@ -4929,7 +5082,8 @@ test("clamps thumbnail size and disables controls at the limits", async () => {
   });
 
   // Decrease to the minimum.
-  for (let index = 0; index < 20; index += 1) fireEvent.keyDown(window, { key: "-" });
+  for (let index = 0; index < 20; index += 1)
+    fireEvent.keyDown(window, { key: "-" });
   expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
     `${THUMBNAIL_SIZE_MIN}px`,
   );
@@ -4937,7 +5091,8 @@ test("clamps thumbnail size and disables controls at the limits", async () => {
   expect(larger).not.toBeDisabled();
 
   // Increase to the maximum.
-  for (let index = 0; index < 20; index += 1) fireEvent.keyDown(window, { key: "+" });
+  for (let index = 0; index < 20; index += 1)
+    fireEvent.keyDown(window, { key: "+" });
   expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
     `${THUMBNAIL_SIZE_MAX}px`,
   );
@@ -4960,9 +5115,13 @@ test("defaults media type to videos and toggles with shortcuts", async () => {
   expect(both).toHaveAttribute("aria-pressed", "false");
 
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play holiday.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play holiday.mp4" }),
+  ).toBeVisible();
   const lastMediaType = () => {
-    const call = invokeMock.mock.calls.filter(([c]) => c === "search_videos").at(-1);
+    const call = invokeMock.mock.calls
+      .filter(([c]) => c === "search_videos")
+      .at(-1);
     return (call?.[1] as { request: { mediaType: string } })?.request.mediaType;
   };
   expect(lastMediaType()).toBe("videos");
@@ -4994,7 +5153,11 @@ test("shows image results and handles slideshow controls", async () => {
   };
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") return Promise.resolve(imagePage);
-    if (command === "prepare_video") return Promise.resolve({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    if (command === "prepare_video")
+      return Promise.resolve({
+        filePath: "/Photos/sunset.jpg",
+        playbackBackend: "web",
+      });
     return Promise.resolve();
   });
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
@@ -5003,9 +5166,14 @@ test("shows image results and handles slideshow controls", async () => {
     // switch to images before searching
     await user.click(screen.getByRole("button", { name: "Images" }));
     await user.type(screen.getByRole("searchbox"), "sunset{Enter}");
-    expect(await screen.findByRole("button", { name: "Play sunset.jpg" })).toBeVisible();
+    expect(
+      await screen.findByRole("button", { name: "Play sunset.jpg" }),
+    ).toBeVisible();
     // play first image
-    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    invokeMock.mockResolvedValueOnce({
+      filePath: "/Photos/sunset.jpg",
+      playbackBackend: "web",
+    });
     await user.click(screen.getByRole("button", { name: "Play sunset.jpg" }));
     const image = await screen.findByLabelText("Playing sunset.jpg");
     expect(image.tagName).toBe("IMG");
@@ -5014,39 +5182,63 @@ test("shows image results and handles slideshow controls", async () => {
     // timeline and speed disabled for images
     expect(screen.getByLabelText("Video timeline")).toBeDisabled();
     expect(screen.getByLabelText("Playback speed")).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Skip step: 10 seconds" })).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "Skip step: 10 seconds" }),
+    ).toBeDisabled();
 
     // slideshow control with shortcut S
-    const slideshowButton = screen.getByRole("button", { name: "Pause slideshow" });
+    const slideshowButton = screen.getByRole("button", {
+      name: "Pause slideshow",
+    });
     expect(slideshowButton).toHaveAttribute("aria-keyshortcuts", "S");
     expect(slideshowButton).toHaveAttribute("aria-pressed", "true");
 
     // pause slideshow
     await user.click(slideshowButton);
-    expect(screen.getByRole("button", { name: "Play slideshow" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Play slideshow" }),
+    ).toBeVisible();
 
     // resume
     fireEvent.keyDown(window, { key: "s" });
-    expect(await screen.findByRole("button", { name: "Pause slideshow" })).toBeVisible();
+    expect(
+      await screen.findByRole("button", { name: "Pause slideshow" }),
+    ).toBeVisible();
 
     // arrow navigation
-    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/beach.png", playbackBackend: "web" });
+    invokeMock.mockResolvedValueOnce({
+      filePath: "/Photos/beach.png",
+      playbackBackend: "web",
+    });
     fireEvent.keyDown(window, { key: "ArrowRight" });
     expect(await screen.findByLabelText("Playing beach.png")).toBeVisible();
-    expect((await screen.findByLabelText("Playing beach.png") as HTMLImageElement).tagName).toBe("IMG");
+    expect(
+      ((await screen.findByLabelText("Playing beach.png")) as HTMLImageElement)
+        .tagName,
+    ).toBe("IMG");
 
-    invokeMock.mockResolvedValueOnce({ filePath: "/Photos/sunset.jpg", playbackBackend: "web" });
+    invokeMock.mockResolvedValueOnce({
+      filePath: "/Photos/sunset.jpg",
+      playbackBackend: "web",
+    });
     fireEvent.keyDown(window, { key: "ArrowLeft" });
     expect(await screen.findByLabelText("Playing sunset.jpg")).toBeVisible();
 
     // space toggles slideshow pause/play for images
     fireEvent.keyDown(window, { key: " " });
-    expect(screen.getByRole("button", { name: "Play slideshow" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Play slideshow" }),
+    ).toBeVisible();
     fireEvent.keyDown(window, { key: " " });
-    expect(screen.getByRole("button", { name: "Pause slideshow" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Pause slideshow" }),
+    ).toBeVisible();
 
     // auto-advance after interval
-    const beachAgain = { filePath: "/Photos/beach.png", playbackBackend: "web" };
+    const beachAgain = {
+      filePath: "/Photos/beach.png",
+      playbackBackend: "web",
+    };
     invokeMock.mockImplementation((command: string) => {
       if (command === "prepare_video") return Promise.resolve(beachAgain);
       return Promise.resolve();

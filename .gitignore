@@ -4,6 +4,8 @@
 /.worktrees/
 /src-tauri/target/
 /src-tauri/build-info.json
+/src-tauri/binaries/
+/src-tauri/resources/
 .DS_Store
 *.log
 .scratch

@@ -1,5 +1,7 @@
 mod external_players;
 #[cfg(target_os = "linux")]
+mod managed_index;
+#[cfg(target_os = "linux")]
 mod player_linux;
 mod playlist;
 mod providers;
@@ -11,7 +13,7 @@ mod thumbnails;
 #[cfg(target_os = "macos")]
 use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
-use providers::{PlocateSearchProvider, RecollSearchProvider};
+use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -83,6 +85,72 @@ struct BulkTagUpdate {
     /// Why the first video that could not be tagged was left alone. A page of
     /// identical failures says no more than the first one of them does.
     problem: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn index_error(message: String) -> CommandError {
+    CommandError {
+        kind: "Index",
+        message,
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "e2e")))]
+#[tauri::command]
+fn index_state(
+    manager: State<'_, managed_index::IndexManager>,
+) -> Result<managed_index::IndexState, CommandError> {
+    manager.state().map_err(index_error)
+}
+
+// Integration builds use a fixture search provider rather than a persistent
+// Linux index. Reporting that index management is unsupported keeps the
+// fixture's search screen deterministic and prevents tests from writing the
+// developer's real folder configuration.
+#[cfg(all(target_os = "linux", feature = "e2e"))]
+#[tauri::command]
+fn index_state() -> managed_index::IndexState {
+    managed_index::IndexState {
+        supported: false,
+        revision: 0,
+        folders: Vec::new(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Serialize)]
+struct UnsupportedIndexState {
+    supported: bool,
+    revision: u64,
+    folders: Vec<String>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[tauri::command]
+fn index_state() -> UnsupportedIndexState {
+    UnsupportedIndexState {
+        supported: false,
+        revision: 0,
+        folders: Vec::new(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn add_index_folder(
+    path: String,
+    manager: State<'_, managed_index::IndexManager>,
+) -> Result<managed_index::IndexState, CommandError> {
+    manager.add_folder(Path::new(&path)).map_err(index_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn remove_index_folder(
+    id: String,
+    manager: State<'_, managed_index::IndexManager>,
+) -> Result<managed_index::IndexState, CommandError> {
+    manager.remove_folder(&id).map_err(index_error)
 }
 
 impl From<SearchError> for CommandError {
@@ -731,7 +799,11 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
     {
         match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
             Ok("recoll") => Arc::new(RecollSearchProvider::system()),
-            Ok("plocate") | Err(_) => Arc::new(PlocateSearchProvider::system()),
+            Ok("plocate") => Arc::new(PlocateSearchProvider::system()),
+            Err(_) => Arc::new(ManagedPlocateSearchProvider::system(
+                managed_index::IndexPaths::system()
+                    .expect("Toka could not find its private index paths"),
+            )),
             Ok(name) => Arc::new(InvalidProvider(format!(
                 "Unknown Linux search provider: {name}"
             ))),
@@ -771,7 +843,19 @@ impl SearchProvider for InvalidProvider {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default();
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--indexer")) {
+        let paths = managed_index::IndexPaths::system().unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(1);
+        });
+        if let Err(message) = managed_index::run_daemon(paths) {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     #[cfg(feature = "e2e")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
@@ -785,9 +869,17 @@ pub fn run() {
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
     #[cfg(target_os = "linux")]
+    let builder = builder.manage(
+        managed_index::IndexManager::system()
+            .expect("Toka could not find its private index settings"),
+    );
+    #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
         builder.invoke_handler(tauri::generate_handler![
             search_videos,
+            index_state,
+            add_index_folder,
+            remove_index_folder,
             launch_playlist,
             video_thumbnail,
             video_preview,
@@ -811,6 +903,9 @@ pub fn run() {
             .setup(move |app| player_linux::install(app, setup_player.clone()))
             .invoke_handler(tauri::generate_handler![
                 search_videos,
+                index_state,
+                add_index_folder,
+                remove_index_folder,
                 launch_playlist,
                 video_thumbnail,
                 video_preview,
@@ -843,6 +938,7 @@ pub fn run() {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
+        index_state,
         launch_playlist,
         video_thumbnail,
         video_preview,
@@ -868,6 +964,12 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[cfg(all(target_os = "linux", feature = "e2e"))]
+    #[test]
+    fn fixture_search_builds_do_not_open_real_folder_setup() {
+        assert!(!index_state().supported);
+    }
 
     fn outcome(succeeded: bool, stderr: &str, still_on_disk: bool) -> Result<String, CommandError> {
         trash_outcome(

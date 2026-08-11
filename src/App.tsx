@@ -10,7 +10,9 @@ import {
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
+  addIndexFolder,
   launchPlaylist,
   loadNativeVideo,
   nativePlaybackState,
@@ -31,6 +33,8 @@ import {
   deleteVideo,
   undoDelete,
   externalPlayers,
+  indexState,
+  removeIndexFolder,
   openInExternalPlayer,
   openNewWindow,
   addVideoTags,
@@ -45,6 +49,7 @@ import {
   type MediaType,
   type PreparedVideo,
   type SearchFields,
+  type IndexState,
   type SearchPage,
   type VideoResult,
   type VideoTagUpdate,
@@ -1630,7 +1635,10 @@ function Player({
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("mouseout", (event) => {
       // Leaving the video element fires mouseout with relatedTarget outside.
-      if (isOverVideo(event.target) && !isOverVideo(event.relatedTarget as EventTarget)) {
+      if (
+        isOverVideo(event.target) &&
+        !isOverVideo(event.relatedTarget as EventTarget)
+      ) {
         onLeaveVideo();
       }
     });
@@ -2108,7 +2116,9 @@ function Player({
             <ControlButton
               shortcut="ArrowLeft"
               onClick={() => (isImage ? moveVideo(-1) : skip(-skipSeconds))}
-              aria-label={isImage ? "Previous image" : `Skip back ${skipStep.name}`}
+              aria-label={
+                isImage ? "Previous image" : `Skip back ${skipStep.name}`
+              }
               disabled={isImage ? false : undefined}
             >
               <Label>{isImage ? "←" : `−${skipStep.label}`}</Label>
@@ -2120,7 +2130,15 @@ function Player({
               shortcut="Space"
               className="play-button"
               onClick={isImage ? toggleSlideshow : playingBack ? pause : play}
-              aria-label={isImage ? (slideshowPlaying ? "Pause" : "Play") : playingBack ? "Pause" : "Play"}
+              aria-label={
+                isImage
+                  ? slideshowPlaying
+                    ? "Pause"
+                    : "Play"
+                  : playingBack
+                    ? "Pause"
+                    : "Play"
+              }
             >
               <span
                 className={
@@ -2134,7 +2152,9 @@ function Player({
             <ControlButton
               shortcut="ArrowRight"
               onClick={() => (isImage ? moveVideo(1) : skip(skipSeconds))}
-              aria-label={isImage ? "Next image" : `Skip forward ${skipStep.name}`}
+              aria-label={
+                isImage ? "Next image" : `Skip forward ${skipStep.name}`
+              }
             >
               <Label>{isImage ? "→" : `+${skipStep.label}`}</Label>
             </ControlButton>
@@ -2162,7 +2182,9 @@ function Player({
                 <ControlButton
                   shortcut="S"
                   onClick={toggleSlideshow}
-                  aria-label={slideshowPlaying ? "Pause slideshow" : "Play slideshow"}
+                  aria-label={
+                    slideshowPlaying ? "Pause slideshow" : "Play slideshow"
+                  }
                   aria-pressed={slideshowPlaying}
                 >
                   <Label>{slideshowPlaying ? "Pause" : "Play"}</Label>
@@ -2423,6 +2445,8 @@ function Player({
 }
 
 export default function App() {
+  const [showFolderSetup, setShowFolderSetup] = useState(false);
+  const [managedIndex, setManagedIndex] = useState<IndexState>();
   const [query, setQuery] = useState("");
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
@@ -2451,6 +2475,7 @@ export default function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  const [folderError, setFolderError] = useState<string>();
   // Tagging the whole page of results: whether its field is open, what has been
   // typed into it, whether the renames are still running, and what they did.
   const [taggingAll, setTaggingAll] = useState(false);
@@ -2517,7 +2542,12 @@ export default function App() {
     setError(undefined);
     setPlaying(undefined);
     try {
-      const response = await searchVideos(trimmed, requestedPage, fields, mediaType);
+      const response = await searchVideos(
+        trimmed,
+        requestedPage,
+        fields,
+        mediaType,
+      );
       if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
       if (currentRequest === requestNumber.current) {
@@ -2536,7 +2566,12 @@ export default function App() {
     if (loadedPages >= page.totalPages) return;
     setLoadingMore(true);
     try {
-      const next = await searchVideos(page.query, loadedPages + 1, fields, mediaType);
+      const next = await searchVideos(
+        page.query,
+        loadedPages + 1,
+        fields,
+        mediaType,
+      );
       setPage((current) =>
         current && current.query === next.query
           ? { ...next, results: [...current.results, ...next.results] }
@@ -2749,7 +2784,8 @@ export default function App() {
   useEffect(() => {
     if (playing) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
+        return;
       if (event.key === "1") {
         event.preventDefault();
         setMediaType("videos");
@@ -2777,9 +2813,12 @@ export default function App() {
     const pages = needsAdditionalPages
       ? await Promise.all(
           Array.from({ length: totalPages - loadedPages }, (_, offset) =>
-            searchVideos(page.query, loadedPages + offset + 1, fields, mediaType).then(
-              (response) => response?.results ?? [],
-            ),
+            searchVideos(
+              page.query,
+              loadedPages + offset + 1,
+              fields,
+              mediaType,
+            ).then((response) => response?.results ?? []),
           ),
         )
       : [];
@@ -2852,17 +2891,98 @@ export default function App() {
   // of it. The launch clears any existing playlist and search term, and a
   // folder's videos arrive shuffled like any other playlist.
   useEffect(() => {
-    void launchPlaylist()
-      .then((launched) => {
+    let cancelled = false;
+    void Promise.allSettled([launchPlaylist(), indexState()]).then(
+      ([playlistResult, indexResult]) => {
+        if (cancelled) return;
+        const launched =
+          playlistResult.status === "fulfilled" ? playlistResult.value : null;
+        if (playlistResult.status === "rejected")
+          setError(errorMessage(playlistResult.reason));
+        if (indexResult.status === "fulfilled") {
+          setManagedIndex(indexResult.value);
+          if (
+            !launched?.results.length &&
+            indexResult.value.supported &&
+            indexResult.value.folders.length === 0
+          )
+            setShowFolderSetup(true);
+        }
         // A viewer who got a search in first has asked for something newer than
         // the command line did, and keeps it.
         if (!launched?.results.length || requestNumber.current) return;
         setQuery("");
         setPage(launched);
         setPlaying({ videos: launched.results, startIndex: 0 });
-      })
-      .catch((reason) => setError(errorMessage(reason)));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  useEffect(() => {
+    if (!managedIndex?.supported) return;
+    const poll = window.setInterval(() => {
+      void indexState()
+        .then(setManagedIndex)
+        .catch(() => {});
+    }, 2_000);
+    return () => window.clearInterval(poll);
+  }, [managedIndex?.supported]);
+
+  const chooseIndexFolder = async () => {
+    setFolderError(undefined);
+    try {
+      const path = await open({ directory: true, multiple: false });
+      if (typeof path === "string") setManagedIndex(await addIndexFolder(path));
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    }
+  };
+
+  const forgetIndexFolder = async (id: string) => {
+    setFolderError(undefined);
+    try {
+      setManagedIndex(await removeIndexFolder(id));
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    }
+  };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (playing || event.metaKey || event.altKey) return;
+      if (
+        showFolderSetup &&
+        event.ctrlKey &&
+        !event.shiftKey &&
+        event.key.toLowerCase() === "o"
+      ) {
+        event.preventDefault();
+        void chooseIndexFolder();
+      } else if (
+        showFolderSetup &&
+        managedIndex?.folders.length &&
+        event.ctrlKey &&
+        !event.shiftKey &&
+        event.key === "Enter"
+      ) {
+        event.preventDefault();
+        setShowFolderSetup(false);
+      } else if (
+        managedIndex?.supported &&
+        event.ctrlKey &&
+        !event.shiftKey &&
+        event.key === ","
+      ) {
+        event.preventDefault();
+        setShowFolderSetup(true);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -2887,9 +3007,96 @@ export default function App() {
 
   const hasSubmitted =
     loading || Boolean(page) || Boolean(error) || Boolean(playing);
+  const indexHasAdvanced = Boolean(
+    page?.indexRevision !== undefined &&
+    managedIndex?.supported &&
+    managedIndex.revision > page.indexRevision,
+  );
+
+  useEffect(() => {
+    if (!indexHasAdvanced || playing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        !event.ctrlKey ||
+        !event.shiftKey ||
+        event.metaKey ||
+        event.altKey ||
+        event.key.toLowerCase() !== "r"
+      )
+        return;
+      event.preventDefault();
+      if (page) void runSearch(page.query, 1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   // The same name on the control and on the field it opens, so a viewer who
   // reached one by keyboard is still in the same place after it opens.
   const tagAllLabel = `Tag all ${page?.totalResults ?? 0} videos`;
+
+  if (showFolderSetup && !playing) {
+    return (
+      <main className="app folder-setup">
+        <section aria-label="Search folder setup">
+          <h1>Choose where Toka searches</h1>
+          <p>
+            Add the folders that contain your videos and images. Toka keeps
+            their search indexes up to date in the background.
+          </p>
+          <ControlButton
+            shortcut="Ctrl+O"
+            className="scope-toggle"
+            aria-label="Add folder"
+            onClick={() => void chooseIndexFolder()}
+          >
+            <Label>Add folder</Label>
+          </ControlButton>
+          {managedIndex?.folders.length ? (
+            <ul className="folder-list">
+              {managedIndex.folders.map((folder) => (
+                <li key={folder.id}>
+                  <span className="folder-path">{folder.path}</span>
+                  <span className={`folder-status ${folder.status}`}>
+                    {folder.status === "pending"
+                      ? "Waiting to index"
+                      : folder.status === "indexing"
+                        ? "Indexing…"
+                        : folder.status === "ready"
+                          ? "Ready"
+                          : folder.status === "offline"
+                            ? "Drive disconnected"
+                            : (folder.message ?? "Indexing failed")}
+                  </span>
+                  <ControlButton
+                    shortcut="Delete"
+                    className="scope-toggle"
+                    aria-label={`Remove ${folder.path}`}
+                    onClick={() => void forgetIndexFolder(folder.id)}
+                  >
+                    <Label>Remove</Label>
+                  </ControlButton>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+          {folderError ? (
+            <p role="alert" className="message error">
+              {folderError}
+            </p>
+          ) : null}
+          <ControlButton
+            shortcut="Ctrl+Enter"
+            className="scope-toggle"
+            aria-label="Start searching"
+            disabled={!managedIndex?.folders.length}
+            onClick={() => setShowFolderSetup(false)}
+          >
+            <Label>Start searching</Label>
+          </ControlButton>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className={hasSubmitted ? "app" : "app initial"}>
@@ -2967,6 +3174,16 @@ export default function App() {
         {/* Always here rather than beside the results: a second Toka is worth
             asking for before there is anything to show. */}
         <div className="search-actions">
+          {managedIndex?.supported ? (
+            <ControlButton
+              shortcut="Ctrl+,"
+              className="scope-toggle"
+              aria-label="Search folders"
+              onClick={() => setShowFolderSetup(true)}
+            >
+              <Label>Search folders</Label>
+            </ControlButton>
+          ) : null}
           <ControlButton
             shortcut="Ctrl+N"
             className="scope-toggle"
@@ -2995,6 +3212,19 @@ export default function App() {
         <p role="alert" className="message error">
           {error}
         </p>
+      ) : null}
+      {indexHasAdvanced && page && !playing ? (
+        <aside className="index-refresh" aria-live="polite">
+          <span>New files are ready to search.</span>
+          <ControlButton
+            shortcut="Ctrl+Shift+R"
+            className="scope-toggle"
+            aria-label="Refresh search results"
+            onClick={() => void runSearch(page.query, 1)}
+          >
+            <Label>Refresh</Label>
+          </ControlButton>
+        </aside>
       ) : null}
       {playing && page ? (
         <Player

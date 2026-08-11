@@ -1236,3 +1236,67 @@ button:focus-visible {
   gap: 8px;
   margin-top: 10px;
 }
+
+.folder-setup {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+}
+
+.folder-setup > section {
+  width: min(720px, calc(100vw - 40px));
+  padding: 32px;
+  border: 1px solid var(--border-color, #343434);
+  border-radius: 14px;
+  background: var(--panel-background, #181818);
+}
+
+.folder-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
+  margin: 24px 0;
+  list-style: none;
+}
+
+.folder-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 4%);
+}
+
+.folder-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-status {
+  color: #aaa;
+  font-size: 0.85rem;
+}
+
+.folder-status.ready {
+  color: #83d99b;
+}
+
+.folder-status.offline,
+.folder-status.error {
+  color: #f2a2a2;
+}
+
+.index-refresh {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 16px 0;
+  padding: 12px 16px;
+  border: 1px solid #6d6530;
+  border-radius: 8px;
+  background: #2a2716;
+}
