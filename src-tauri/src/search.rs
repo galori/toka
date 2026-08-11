@@ -1,3 +1,4 @@
+use crate::search_log::{SearchLogContext, SearchLogger};
 use crate::tags;
 use crate::thumbnails;
 use serde::{Deserialize, Serialize};
@@ -110,7 +111,12 @@ pub trait SearchProvider: Send + Sync {
     /// search needs: every index Toka reads answers on file names alone unless
     /// it is told otherwise, and a video in a matching folder has no reason to
     /// carry the term in its own name.
-    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError>;
+    fn candidates(
+        &self,
+        query: &str,
+        whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError>;
 
     fn revision(&self) -> u64 {
         0
@@ -119,6 +125,7 @@ pub trait SearchProvider: Send + Sync {
 
 pub struct SearchEngine {
     provider: Arc<dyn SearchProvider>,
+    logger: Arc<SearchLogger>,
     result_paths: Mutex<HashMap<String, PathBuf>>,
     /// Files this session has renamed, indexed by the name the search provider
     /// knew them under. Every provider Toka uses answers from an index that is
@@ -144,9 +151,15 @@ struct Shuffle {
 }
 
 impl SearchEngine {
+    #[cfg(test)]
     pub fn new(provider: Arc<dyn SearchProvider>) -> Self {
+        Self::new_with_logger(provider, Arc::new(SearchLogger::disabled()))
+    }
+
+    pub fn new_with_logger(provider: Arc<dyn SearchProvider>, logger: Arc<SearchLogger>) -> Self {
         Self {
             provider,
+            logger,
             result_paths: Mutex::new(HashMap::new()),
             renamed_paths: Mutex::new(HashMap::new()),
             shuffle: Mutex::new(None),
@@ -154,6 +167,15 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
+        let context = SearchLogContext::from(&request);
+        let result = self.search_page(request);
+        if let Err(error) = &result {
+            self.logger.record_error(&context, &error.to_string());
+        }
+        result
+    }
+
+    fn search_page(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
         let (query, mut paths) = self.matching_paths(&request)?;
         let fields = request.fields;
         let media_type = request.media_type;
@@ -202,7 +224,12 @@ impl SearchEngine {
     /// Answers whether a query's match count changed without creating result
     /// ids or replacing the shuffle used by the visible result pages.
     pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
-        Ok(self.matching_paths(&request)?.1.len())
+        let context = SearchLogContext::from(&request);
+        let result = self.matching_paths(&request).map(|(_, paths)| paths.len());
+        if let Err(error) = &result {
+            self.logger.record_error(&context, &error.to_string());
+        }
+        result
     }
 
     fn matching_paths(
@@ -225,8 +252,9 @@ impl SearchEngine {
         }
 
         let mut seen = HashSet::new();
+        let context = SearchLogContext::from(request);
         let paths = self
-            .candidates(query, request.fields.path)?
+            .candidates(query, request.fields.path, &context)?
             .into_iter()
             .filter(|path| is_supported_media(path, request.media_type))
             .filter(|path| matches_terms(path, &terms, request.fields))
@@ -272,8 +300,13 @@ impl SearchEngine {
     /// every renamed file the index has already dropped is added back. The
     /// caller still filters these by the search terms, so a rename only shows
     /// up when the query matches the name the file actually has.
-    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
-        let mut paths = self.provider.candidates(query, whole_path)?;
+    fn candidates(
+        &self,
+        query: &str,
+        whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError> {
+        let mut paths = self.provider.candidates(query, whole_path, context)?;
         let renamed = self.renamed_paths.lock().unwrap();
         if renamed.is_empty() {
             return Ok(paths);
@@ -537,7 +570,12 @@ mod tests {
     }
 
     impl SearchProvider for FakeProvider {
-        fn candidates(&self, _query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+        fn candidates(
+            &self,
+            _query: &str,
+            whole_path: bool,
+            _context: &SearchLogContext,
+        ) -> Result<Vec<PathBuf>, SearchError> {
             self.whole_path_asks.lock().unwrap().push(whole_path);
             Ok(self.paths.lock().unwrap().clone())
         }
@@ -551,6 +589,48 @@ mod tests {
             fields: SearchFields::default(),
             media_type: MediaType::default(),
         }
+    }
+
+    struct ErrorProvider;
+
+    impl SearchProvider for ErrorProvider {
+        fn candidates(
+            &self,
+            _query: &str,
+            _whole_path: bool,
+            _context: &SearchLogContext,
+        ) -> Result<Vec<PathBuf>, SearchError> {
+            Err(SearchError::Provider("backend unavailable".into()))
+        }
+    }
+
+    #[test]
+    fn records_search_provider_errors_with_the_original_request() {
+        let directory = tempdir().unwrap();
+        let log_path = directory.path().join("search.log");
+        let logger = Arc::new(SearchLogger::new(log_path.clone()));
+        let engine = SearchEngine::new_with_logger(Arc::new(ErrorProvider), logger);
+        let mut search = request("  summer vacation  ");
+        search.fields = SearchFields {
+            tags: false,
+            file_name: true,
+            path: true,
+        };
+        search.media_type = MediaType::Both;
+
+        assert_eq!(
+            engine.search(search).unwrap_err().to_string(),
+            "backend unavailable"
+        );
+        let line = fs::read_to_string(log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["kind"], "error");
+        assert_eq!(entry["query"], "  summer vacation  ");
+        assert_eq!(entry["fields"]["tags"], false);
+        assert_eq!(entry["fields"]["fileName"], true);
+        assert_eq!(entry["fields"]["path"], true);
+        assert_eq!(entry["mediaType"], "both");
+        assert_eq!(entry["error"], "backend unavailable");
     }
 
     #[test]

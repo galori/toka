@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::managed_index::{self, IndexPaths};
 use crate::search::{SearchError, SearchProvider};
+use crate::search_log::{SearchLogContext, SearchLogger};
 #[cfg(all(target_os = "macos", not(test)))]
 use std::sync::Once;
 use std::{path::PathBuf, sync::Arc};
@@ -12,28 +13,60 @@ use std::process::Command;
 #[derive(Debug)]
 struct ProcessOutput {
     success: bool,
-    #[cfg(any(target_os = "linux", test))]
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
 trait ProcessRunner: Send + Sync {
-    fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error>;
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        context: &SearchLogContext,
+    ) -> Result<ProcessOutput, std::io::Error>;
 }
 
-struct SystemProcessRunner;
+struct SystemProcessRunner {
+    logger: Arc<SearchLogger>,
+}
+
+impl SystemProcessRunner {
+    fn new(logger: Arc<SearchLogger>) -> Self {
+        Self { logger }
+    }
+}
 
 impl ProcessRunner for SystemProcessRunner {
-    fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
-        let output = Command::new(program).args(args).output()?;
-        Ok(ProcessOutput {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        context: &SearchLogContext,
+    ) -> Result<ProcessOutput, std::io::Error> {
+        let output = match Command::new(program).args(args).output() {
+            Ok(output) => output,
+            Err(error) => {
+                self.logger
+                    .record_error(context, &format!("{program} could not start: {error}"));
+                return Err(error);
+            }
+        };
+        let process_output = ProcessOutput {
             success: output.status.success(),
-            #[cfg(any(target_os = "linux", test))]
             exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
+        };
+        self.logger.record_command(
+            context,
+            program,
+            args,
+            process_output.success,
+            process_output.exit_code,
+            &process_output.stderr,
+        );
+        Ok(process_output)
     }
 }
 
@@ -45,16 +78,21 @@ pub struct MdfindSearchProvider {
 #[cfg(any(target_os = "macos", test))]
 impl MdfindSearchProvider {
     #[cfg(target_os = "macos")]
-    pub fn system() -> Self {
+    pub fn system(logger: Arc<SearchLogger>) -> Self {
         Self {
-            runner: Arc::new(SystemProcessRunner),
+            runner: Arc::new(SystemProcessRunner::new(logger)),
         }
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl SearchProvider for MdfindSearchProvider {
-    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(
+        &self,
+        query: &str,
+        whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError> {
         prepare_macos_downloads_folder_access();
         let term = longest_term(query)?;
         let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
@@ -68,19 +106,25 @@ impl SearchProvider for MdfindSearchProvider {
         let predicate = format!(
             "{attribute} == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
         );
-        let mut paths = run_mdfind(&*self.runner, vec![predicate])?;
+        let mut paths = run_mdfind(&*self.runner, vec![predicate], context)?;
         paths.extend(macos_download_candidates(query)?);
         Ok(paths)
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn run_mdfind(runner: &dyn ProcessRunner, args: Vec<String>) -> Result<Vec<PathBuf>, SearchError> {
-    let output = runner.run("/usr/bin/mdfind", &args).map_err(|error| {
-        SearchError::Provider(format!(
+fn run_mdfind(
+    runner: &dyn ProcessRunner,
+    args: Vec<String>,
+    context: &SearchLogContext,
+) -> Result<Vec<PathBuf>, SearchError> {
+    let output = runner
+        .run("/usr/bin/mdfind", &args, context)
+        .map_err(|error| {
+            SearchError::Provider(format!(
             "Spotlight search could not start. Check macOS privacy and indexing settings: {error}"
         ))
-    })?;
+        })?;
     parse_output(output, "Spotlight search failed")
 }
 
@@ -157,9 +201,9 @@ pub struct RecollSearchProvider {
 #[cfg(any(target_os = "linux", test))]
 impl RecollSearchProvider {
     #[cfg(target_os = "linux")]
-    pub fn system() -> Self {
+    pub fn system(logger: Arc<SearchLogger>) -> Self {
         Self {
-            runner: Arc::new(SystemProcessRunner),
+            runner: Arc::new(SystemProcessRunner::new(logger)),
         }
     }
 }
@@ -170,7 +214,12 @@ impl SearchProvider for RecollSearchProvider {
     // substring match over a file's folders, so a folder search here can only
     // be answered from the names Recoll already returns. Every other provider
     // widens; this one is the reason a path search is worth having plocate for.
-    fn candidates(&self, query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(
+        &self,
+        query: &str,
+        _whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
@@ -179,7 +228,7 @@ impl SearchProvider for RecollSearchProvider {
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>();
-        let output = self.runner.run("recollq", &args).map_err(|error| {
+        let output = self.runner.run("recollq", &args, context).map_err(|error| {
             SearchError::Provider(format!(
                 "Recoll search could not start. Install Recoll and create an index with recollindex: {error}"
             ))
@@ -199,16 +248,21 @@ pub struct PlocateSearchProvider {
 #[cfg(any(target_os = "linux", test))]
 impl PlocateSearchProvider {
     #[cfg(target_os = "linux")]
-    pub fn system() -> Self {
+    pub fn system(logger: Arc<SearchLogger>) -> Self {
         Self {
-            runner: Arc::new(SystemProcessRunner),
+            runner: Arc::new(SystemProcessRunner::new(logger)),
         }
     }
 }
 
 #[cfg(any(target_os = "linux", test))]
 impl SearchProvider for PlocateSearchProvider {
-    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(
+        &self,
+        query: &str,
+        whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
         // plocate matches the whole path unless it is confined to the base
         // name, so a folder search is the flag left off rather than added.
@@ -218,7 +272,7 @@ impl SearchProvider for PlocateSearchProvider {
         }
         args.extend(["--existing", "--", term]);
         let args = args.into_iter().map(String::from).collect::<Vec<_>>();
-        let output = self.runner.run("plocate", &args).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
+        let output = self.runner.run("plocate", &args, context).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
         // plocate uses exit status 1 to report a successful search with no
         // matches. Other non-zero statuses still indicate a provider error.
         if output.exit_code == Some(1) {
@@ -239,9 +293,9 @@ pub struct ManagedPlocateSearchProvider {
 
 #[cfg(target_os = "linux")]
 impl ManagedPlocateSearchProvider {
-    pub fn system(paths: IndexPaths) -> Self {
+    pub fn system(paths: IndexPaths, logger: Arc<SearchLogger>) -> Self {
         Self {
-            runner: Arc::new(SystemProcessRunner),
+            runner: Arc::new(SystemProcessRunner::new(logger)),
             paths,
         }
     }
@@ -249,7 +303,12 @@ impl ManagedPlocateSearchProvider {
 
 #[cfg(target_os = "linux")]
 impl SearchProvider for ManagedPlocateSearchProvider {
-    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+    fn candidates(
+        &self,
+        query: &str,
+        whole_path: bool,
+        context: &SearchLogContext,
+    ) -> Result<Vec<PathBuf>, SearchError> {
         let term = longest_term(query)?;
         let databases = managed_index::database_paths(&self.paths);
         if databases.is_empty() {
@@ -268,7 +327,7 @@ impl SearchProvider for ManagedPlocateSearchProvider {
         let program = managed_index::plocate_path();
         let output = self
             .runner
-            .run(program.to_string_lossy().as_ref(), &args)
+            .run(program.to_string_lossy().as_ref(), &args, context)
             .map_err(|error| {
                 SearchError::Provider(format!(
                     "Toka's private search index could not start: {error}"
@@ -349,7 +408,12 @@ mod tests {
     }
 
     impl ProcessRunner for FakeRunner {
-        fn run(&self, program: &str, args: &[String]) -> Result<ProcessOutput, std::io::Error> {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            _context: &SearchLogContext,
+        ) -> Result<ProcessOutput, std::io::Error> {
             self.invocations
                 .lock()
                 .unwrap()
@@ -363,6 +427,36 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn system_runner_writes_the_executed_command_to_the_search_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("search.log");
+        let logger = Arc::new(SearchLogger::new(log_path.clone()));
+        let runner = SystemProcessRunner::new(logger);
+        let context = context("clip");
+
+        runner.run("true", &[], &context).unwrap();
+
+        let line = std::fs::read_to_string(log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["kind"], "command");
+        assert_eq!(entry["query"], "clip");
+        assert_eq!(entry["program"], "true");
+        assert_eq!(entry["command"], "true");
+        assert_eq!(entry["success"], true);
+    }
+
+    fn context(query: &str) -> SearchLogContext {
+        SearchLogContext {
+            query: query.into(),
+            page: 1,
+            page_size: crate::search::PAGE_SIZE,
+            fields: crate::search::SearchFields::default(),
+            media_type: crate::search::MediaType::default(),
+        }
+    }
+
     #[test]
     fn mdfind_uses_display_name_movie_search_with_longest_term_and_parses_paths() {
         let runner = Arc::new(FakeRunner::new(
@@ -372,7 +466,9 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation", false).unwrap();
+        let paths = provider
+            .candidates("summer vacation", false, &context("summer vacation"))
+            .unwrap();
 
         let invocations = runner.invocations.lock().unwrap();
         assert_eq!(
@@ -395,7 +491,9 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation", false).unwrap();
+        let paths = provider
+            .candidates("summer vacation", false, &context("summer vacation"))
+            .unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -433,7 +531,9 @@ mod tests {
             runner: runner.clone(),
         };
 
-        let paths = provider.candidates("summer vacation", false).unwrap();
+        let paths = provider
+            .candidates("summer vacation", false, &context("summer vacation"))
+            .unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -461,7 +561,9 @@ mod tests {
             runner: runner.clone(),
         };
 
-        provider.candidates("holiday", true).unwrap();
+        provider
+            .candidates("holiday", true, &context("holiday"))
+            .unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -482,7 +584,9 @@ mod tests {
             runner: runner.clone(),
         };
 
-        provider.candidates("holiday", true).unwrap();
+        provider
+            .candidates("holiday", true, &context("holiday"))
+            .unwrap();
 
         assert_eq!(
             runner.invocations.lock().unwrap().first(),
@@ -503,7 +607,9 @@ mod tests {
         };
 
         assert_eq!(
-            provider.candidates("does-not-exist", false).unwrap(),
+            provider
+                .candidates("does-not-exist", false, &context("does-not-exist"),)
+                .unwrap(),
             Vec::<PathBuf>::new()
         );
     }
