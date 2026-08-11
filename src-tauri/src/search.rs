@@ -419,7 +419,11 @@ fn video_result(path: &Path) -> VideoResult {
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase(),
-        thumbnail_path: None,
+        thumbnail_path: if is_supported_video(path) {
+            thumbnails::cached(path).map(|thumbnail| thumbnail.to_string_lossy().into_owned())
+        } else {
+            None
+        },
         tags: tags::get(path),
     }
 }
@@ -572,6 +576,25 @@ mod tests {
         assert_eq!(page.total_results, 1);
         assert_eq!(page.results[0].file_name, "Untitled.mov");
         assert_eq!(page.results[0].extension, "mov");
+    }
+
+    #[test]
+    fn search_reports_a_thumbnail_the_background_indexer_already_generated() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let cached = thumbnails::cache_path(&video).unwrap();
+        fs::write(&cached, b"thumbnail").unwrap();
+
+        let page = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])))
+            .search(request("clip"))
+            .unwrap();
+
+        assert_eq!(
+            page.results[0].thumbnail_path,
+            Some(cached.to_string_lossy().into_owned())
+        );
+        let _ = fs::remove_file(cached);
     }
 
     /// `count` clips named `clip-00.mp4` upwards, handed to the provider in
