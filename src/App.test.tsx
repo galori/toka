@@ -1029,6 +1029,42 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("keeps the copy control in the design system and gives the path room", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({
+      filePath: "/Videos/long/path/with/a/current/video/clip.mp4",
+    });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+
+  const copyButton = await screen.findByRole("button", {
+    name: "Copy file path",
+  });
+  expect(getComputedStyle(copyButton).backgroundColor).toBe(
+    "oklch(0.22 0.02 40)",
+  );
+  expect(getComputedStyle(copyButton).borderRadius).toBe("9px");
+  expect(copyButton).toHaveAttribute("aria-keyshortcuts", "C");
+  expect(copyButton.querySelector(".key-hint")).toHaveTextContent("C");
+
+  const playerTitle = copyButton.closest(".player-title");
+  expect(playerTitle).toBeInTheDocument();
+  expect(getComputedStyle(playerTitle!).flexGrow).toBe("1");
+});
+
 test("uses the overlay player controls from the design", async () => {
   invokeMock
     .mockResolvedValueOnce({
