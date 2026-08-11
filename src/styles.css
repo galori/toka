@@ -1554,3 +1554,49 @@ button:focus-visible {
   border-radius: 8px;
   background: #2a2716;
 }
+
+.index-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: min(720px, calc(100vw - 40px));
+  margin: 16px auto;
+  padding: 10px 16px;
+  border: 1px solid #3d5b46;
+  border-radius: 8px;
+  background: #17231a;
+}
+
+.index-status.indexing {
+  border-color: #6d6530;
+  background: #2a2716;
+}
+
+.index-status-dot {
+  flex: 0 0 auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #83d99b;
+}
+
+.index-status.indexing .index-status-dot {
+  background: #f0c674;
+  animation: index-status-pulse 1.2s ease-in-out infinite;
+}
+
+.index-status-copy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.index-status-copy > span {
+  color: #bbb;
+}
+
+@keyframes index-status-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}

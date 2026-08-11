@@ -52,6 +52,8 @@ export type IndexFolder = {
 export type IndexState = {
   supported: boolean;
   revision: number;
+  indexedVideos?: number;
+  indexedImages?: number;
   folders: IndexFolder[];
 };
 
@@ -75,6 +77,16 @@ export function searchVideos(
 ): Promise<SearchPage> {
   return invoke<SearchPage>("search_videos", {
     request: { query, page, pageSize: PAGE_SIZE, fields, mediaType },
+  });
+}
+
+export function searchMatchCount(
+  query: string,
+  fields: SearchFields = DEFAULT_SEARCH_FIELDS,
+  mediaType: MediaType = DEFAULT_MEDIA_TYPE,
+): Promise<number> {
+  return invoke<number>("search_match_count", {
+    request: { query, page: 1, pageSize: PAGE_SIZE, fields, mediaType },
   });
 }
 

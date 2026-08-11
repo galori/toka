@@ -154,31 +154,9 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
-        let query = request.query.trim();
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|term| term.to_lowercase())
-            .collect();
-        if terms.is_empty() {
-            return Err(SearchError::InvalidQuery);
-        }
-        if !request.fields.any() {
-            return Err(SearchError::NoSearchFields);
-        }
-        if request.page == 0 || request.page_size != PAGE_SIZE {
-            return Err(SearchError::InvalidPage);
-        }
-
+        let (query, mut paths) = self.matching_paths(&request)?;
         let fields = request.fields;
         let media_type = request.media_type;
-        let mut seen = HashSet::new();
-        let mut paths = self
-            .candidates(query, fields.path)?
-            .into_iter()
-            .filter(|path| is_supported_media(path, media_type))
-            .filter(|path| matches_terms(path, &terms, fields))
-            .filter(|path| seen.insert(path.clone()))
-            .collect::<Vec<_>>();
 
         // Sorted not to be read in this order — the shuffle below undoes it —
         // but so that the shuffle has something fixed to work from. A provider
@@ -194,7 +172,7 @@ impl SearchEngine {
         });
         shuffle(
             &mut paths,
-            self.shuffle_seed(query, fields, media_type, request.page),
+            self.shuffle_seed(&query, fields, media_type, request.page),
         );
 
         let total_results = paths.len();
@@ -219,6 +197,42 @@ impl SearchEngine {
             index_revision: self.provider.revision(),
             results,
         })
+    }
+
+    /// Answers whether a query's match count changed without creating result
+    /// ids or replacing the shuffle used by the visible result pages.
+    pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
+        Ok(self.matching_paths(&request)?.1.len())
+    }
+
+    fn matching_paths(
+        &self,
+        request: &SearchRequest,
+    ) -> Result<(String, Vec<PathBuf>), SearchError> {
+        let query = request.query.trim();
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .map(|term| term.to_lowercase())
+            .collect();
+        if terms.is_empty() {
+            return Err(SearchError::InvalidQuery);
+        }
+        if !request.fields.any() {
+            return Err(SearchError::NoSearchFields);
+        }
+        if request.page == 0 || request.page_size != PAGE_SIZE {
+            return Err(SearchError::InvalidPage);
+        }
+
+        let mut seen = HashSet::new();
+        let paths = self
+            .candidates(query, request.fields.path)?
+            .into_iter()
+            .filter(|path| is_supported_media(path, request.media_type))
+            .filter(|path| matches_terms(path, &terms, request.fields))
+            .filter(|path| seen.insert(path.clone()))
+            .collect();
+        Ok((query.to_owned(), paths))
     }
 
     /// The seed the order of this page is drawn from. Page one is a new
@@ -576,6 +590,17 @@ mod tests {
         assert_eq!(page.total_results, 1);
         assert_eq!(page.results[0].file_name, "Untitled.mov");
         assert_eq!(page.results[0].extension, "mov");
+    }
+
+    #[test]
+    fn match_count_checks_current_results_without_changing_search_order() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 25);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        assert_eq!(engine.match_count(request("clip")).unwrap(), 25);
+        let first = engine.search(request("clip")).unwrap();
+        assert_eq!(first.total_results, 25);
     }
 
     #[test]

@@ -38,6 +38,7 @@ import {
   removeIndexFolder,
   openInExternalPlayer,
   openNewWindow,
+  searchMatchCount,
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
@@ -104,6 +105,15 @@ function errorMessage(error: unknown): string {
     return String(error.message);
   }
   return "Something went wrong while searching for videos.";
+}
+
+function indexIsActive(index?: IndexState): boolean {
+  return Boolean(
+    index?.supported &&
+    index.folders.some(
+      (folder) => folder.status === "pending" || folder.status === "indexing",
+    ),
+  );
 }
 
 function parseWebVttTimestamp(timestamp: string): number | undefined {
@@ -2830,6 +2840,8 @@ export default function App() {
     if (taggingAll) tagAllField.current?.focus();
   }, [taggingAll]);
   const requestNumber = useRef(0);
+  const indexRefreshCheckRevision = useRef<number | undefined>(undefined);
+  const [indexRefreshAvailable, setIndexRefreshAvailable] = useState(false);
   // State, not a ref: the results list unmounts for as long as a video plays,
   // so coming back puts a brand new marker on screen. A ref would leave the
   // observer watching the detached original — which can never intersect again —
@@ -2881,6 +2893,8 @@ export default function App() {
     if (!trimmed) return;
     searchedQuery.current = trimmed;
     const currentRequest = ++requestNumber.current;
+    if (page) indexRefreshCheckRevision.current = managedIndex?.revision;
+    setIndexRefreshAvailable(false);
     setLoading(true);
     setError(undefined);
     setPlaying(undefined);
@@ -3304,6 +3318,8 @@ export default function App() {
     return () => window.clearInterval(poll);
   }, [managedIndex?.supported]);
 
+  const managedIndexIsActive = indexIsActive(managedIndex);
+
   const chooseIndexFolder = async () => {
     setFolderError(undefined);
     try {
@@ -3365,6 +3381,43 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  useEffect(() => {
+    if (
+      playing ||
+      !page ||
+      !managedIndex?.supported ||
+      managedIndexIsActive ||
+      page.indexRevision === undefined ||
+      managedIndex.revision <= page.indexRevision
+    ) {
+      if (managedIndexIsActive) setIndexRefreshAvailable(false);
+      return;
+    }
+    const revision = managedIndex.revision;
+    if (indexRefreshCheckRevision.current === revision) return;
+    indexRefreshCheckRevision.current = revision;
+    let cancelled = false;
+    void searchMatchCount(page.query, fields, mediaType)
+      .then((totalResults) => {
+        if (!cancelled)
+          setIndexRefreshAvailable(totalResults > page.totalResults);
+      })
+      .catch(() => {
+        if (!cancelled) setIndexRefreshAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    fields,
+    managedIndex?.revision,
+    managedIndex?.supported,
+    managedIndexIsActive,
+    mediaType,
+    page,
+    playing,
+  ]);
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     void runSearch(query, 1);
@@ -3388,14 +3441,9 @@ export default function App() {
 
   const hasSubmitted =
     loading || Boolean(page) || Boolean(error) || Boolean(playing);
-  const indexHasAdvanced = Boolean(
-    page?.indexRevision !== undefined &&
-    managedIndex?.supported &&
-    managedIndex.revision > page.indexRevision,
-  );
 
   useEffect(() => {
-    if (!indexHasAdvanced || playing) return;
+    if (!indexRefreshAvailable || playing) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (
         !event.ctrlKey ||
@@ -3590,6 +3638,31 @@ export default function App() {
         </div>
       </form>
 
+      {managedIndex?.supported ? (
+        <aside
+          className={`index-status ${managedIndexIsActive ? "indexing" : "idle"}`}
+          role="status"
+          aria-label="Search index status"
+          aria-live="polite"
+        >
+          <span className="index-status-dot" aria-hidden="true" />
+          <span className="index-status-copy">
+            <strong>
+              {managedIndexIsActive
+                ? "Indexing search folders…"
+                : "Search index idle"}
+            </strong>
+            <span>
+              Indexed: {managedIndex.indexedVideos ?? 0}{" "}
+              {(managedIndex.indexedVideos ?? 0) === 1 ? "video" : "videos"}
+              {" · "}
+              {managedIndex.indexedImages ?? 0}{" "}
+              {(managedIndex.indexedImages ?? 0) === 1 ? "image" : "images"}
+            </span>
+          </span>
+        </aside>
+      ) : null}
+
       {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
 
       {!hasSubmitted ? (
@@ -3610,7 +3683,7 @@ export default function App() {
           {error}
         </p>
       ) : null}
-      {indexHasAdvanced && page && !playing ? (
+      {indexRefreshAvailable && page && !playing ? (
         <aside className="index-refresh" aria-live="polite">
           <span>New files are ready to search.</span>
           <ControlButton
