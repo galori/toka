@@ -280,7 +280,68 @@ test("offers to refresh search results when the managed index advances", async (
   indexStateMock.mockResolvedValue({
     supported: true,
     revision: 2,
+    indexedVideos: 12,
+    indexedImages: 4,
     folders: [{ id: "videos", path: "/Videos", status: "ready" }],
+  });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      indexRevision: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce(2);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
+  const refresh = await screen.findByRole("button", {
+    name: "Refresh search results",
+  });
+  expect(
+    screen.getByRole("status", { name: "Search index status" }),
+  ).toHaveTextContent("Search index idle");
+  expect(refresh).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+R");
+  expect(screen.getByText("New files are ready to search.")).toBeVisible();
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "r", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
+      request: expect.objectContaining({ query: "clip", page: 1 }),
+    }),
+  );
+});
+
+test("shows indexing activity and managed media totals", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 1,
+    indexedVideos: 12,
+    indexedImages: 4,
+    folders: [{ id: "videos", path: "/Videos", status: "indexing" }],
+  });
+
+  render(<App />);
+
+  const status = await screen.findByRole("status", {
+    name: "Search index status",
+  });
+  expect(status).toHaveTextContent("Indexing search folders");
+  expect(status).toHaveTextContent("12 videos");
+  expect(status).toHaveTextContent("4 images");
+});
+
+test("does not offer refresh while the managed index is still indexing", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 2,
+    indexedVideos: 12,
+    indexedImages: 4,
+    folders: [{ id: "videos", path: "/Videos", status: "indexing" }],
   });
   invokeMock.mockResolvedValue({
     query: "clip",
@@ -295,18 +356,47 @@ test("offers to refresh search results when the managed index advances", async (
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
 
-  const refresh = await screen.findByRole("button", {
-    name: "Refresh search results",
+  expect(
+    await screen.findByRole("status", { name: "Search index status" }),
+  ).toHaveTextContent("Indexing search folders");
+  expect(
+    screen.queryByRole("button", { name: "Refresh search results" }),
+  ).not.toBeInTheDocument();
+});
+
+test("does not offer refresh when an index update leaves the current matches unchanged", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 2,
+    indexedVideos: 12,
+    indexedImages: 4,
+    folders: [{ id: "videos", path: "/Videos", status: "ready" }],
   });
-  expect(refresh).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+R");
-  expect(screen.getByText("New files are ready to search.")).toBeVisible();
-  invokeMock.mockClear();
-  fireEvent.keyDown(window, { key: "r", ctrlKey: true, shiftKey: true });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      indexRevision: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce(1);
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
   await waitFor(() =>
-    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
-      request: expect.objectContaining({ query: "clip", page: 1 }),
-    }),
+    expect(
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "search_match_count",
+      ),
+    ).toHaveLength(1),
   );
+  expect(
+    screen.queryByRole("button", { name: "Refresh search results" }),
+  ).not.toBeInTheDocument();
 });
 
 afterEach(() => {

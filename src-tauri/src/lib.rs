@@ -113,6 +113,8 @@ fn index_state() -> managed_index::IndexState {
     managed_index::IndexState {
         supported: false,
         revision: 0,
+        indexed_videos: 0,
+        indexed_images: 0,
         folders: Vec::new(),
     }
 }
@@ -131,6 +133,8 @@ fn index_state() -> UnsupportedIndexState {
     UnsupportedIndexState {
         supported: false,
         revision: 0,
+        indexed_videos: 0,
+        indexed_images: 0,
         folders: Vec::new(),
     }
 }
@@ -196,6 +200,21 @@ async fn search_videos(
             }
             Ok(page)
         })
+}
+
+#[tauri::command]
+async fn search_match_count(
+    request: SearchRequest,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<usize, CommandError> {
+    let engine = Arc::clone(engine.inner());
+    tauri::async_runtime::spawn_blocking(move || engine.match_count(request))
+        .await
+        .map_err(|error| CommandError {
+            kind: "Provider",
+            message: format!("The search worker stopped unexpectedly: {error}"),
+        })?
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -884,6 +903,7 @@ pub fn run() {
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
         builder.invoke_handler(tauri::generate_handler![
             search_videos,
+            search_match_count,
             index_state,
             add_index_folder,
             remove_index_folder,
@@ -910,6 +930,7 @@ pub fn run() {
             .setup(move |app| player_linux::install(app, setup_player.clone()))
             .invoke_handler(tauri::generate_handler![
                 search_videos,
+                search_match_count,
                 index_state,
                 add_index_folder,
                 remove_index_folder,
@@ -945,6 +966,7 @@ pub fn run() {
     #[cfg(not(target_os = "linux"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
+        search_match_count,
         index_state,
         launch_playlist,
         video_thumbnail,

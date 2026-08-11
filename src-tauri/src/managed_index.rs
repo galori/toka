@@ -1,3 +1,4 @@
+use crate::search::{is_supported_image, is_supported_video};
 use crate::thumbnails;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc,
+    sync::{mpsc, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -97,6 +98,14 @@ struct PersistedStatus {
     revision: u64,
     #[serde(default)]
     folders: HashMap<String, PersistedFolderStatus>,
+    #[serde(default)]
+    counts: Option<MediaCounts>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct MediaCounts {
+    videos: u64,
+    images: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -113,12 +122,15 @@ pub struct IndexFolder {
 pub struct IndexState {
     pub supported: bool,
     pub revision: u64,
+    pub indexed_videos: u64,
+    pub indexed_images: u64,
     pub folders: Vec<IndexFolder>,
 }
 
 #[derive(Clone)]
 pub struct IndexManager {
     paths: IndexPaths,
+    legacy_counts: Arc<Mutex<Option<MediaCounts>>>,
 }
 
 impl IndexManager {
@@ -127,12 +139,19 @@ impl IndexManager {
     }
 
     fn new(paths: IndexPaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            legacy_counts: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn state(&self) -> Result<IndexState, String> {
         let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
         let status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
+        let counts = status.counts.unwrap_or_else(|| {
+            let mut cached = self.legacy_counts.lock().unwrap();
+            *cached.get_or_insert_with(|| count_indexed_media(&config.folders))
+        });
         let folders = config
             .folders
             .into_iter()
@@ -161,6 +180,8 @@ impl IndexManager {
         Ok(IndexState {
             supported: true,
             revision: status.revision,
+            indexed_videos: counts.videos,
+            indexed_images: counts.images,
             folders,
         })
     }
@@ -207,6 +228,7 @@ impl IndexManager {
         }
         let mut status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
         status.folders.remove(id);
+        status.counts = Some(count_indexed_media(&config.folders));
         write_json(&self.paths.status, &status)?;
         self.wake_indexer()?;
         self.state()
@@ -390,8 +412,42 @@ fn set_folder_status(
     );
     if advance_revision {
         status.revision = status.revision.saturating_add(1);
+        let config = load_json::<IndexConfig>(&paths.config)?.unwrap_or_default();
+        status.counts = Some(count_indexed_media(&config.folders));
     }
     write_json(&paths.status, &status)
+}
+
+fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
+    let mut counts = MediaCounts::default();
+    let mut pending = folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect::<Vec<_>>();
+
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() {
+                if is_supported_video(&path) {
+                    counts.videos = counts.videos.saturating_add(1);
+                }
+                if is_supported_image(&path) {
+                    counts.images = counts.images.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    counts
 }
 
 struct ThumbnailWorker {
@@ -712,6 +768,7 @@ mod tests {
         let media = root.path().join("Media");
         fs::create_dir(&media).unwrap();
         fs::write(media.join("clip.mp4"), b"media").unwrap();
+        fs::write(media.join("cover.jpg"), b"media").unwrap();
         let paths = IndexPaths::under(root.path().join("state"));
         let folder = ConfiguredFolder {
             id: "folder".into(),
@@ -725,6 +782,13 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
+        write_json(
+            &paths.config,
+            &IndexConfig {
+                folders: vec![folder.clone()],
+            },
+        )
+        .unwrap();
 
         let (finished, received) = mpsc::channel();
         let worker = ThumbnailWorker::with_generator(move |folder| {
@@ -743,6 +807,33 @@ mod tests {
                 .folders["folder"]
                 .status,
             FolderStatus::Ready
+        );
+        let state = IndexManager::new(paths).state().unwrap();
+        assert_eq!(state.indexed_videos, 1);
+        assert_eq!(state.indexed_images, 1);
+    }
+
+    #[test]
+    fn counts_supported_media_across_configured_folders() {
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        let nested = media.join("Nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(media.join("clip.mp4"), b"video").unwrap();
+        fs::write(nested.join("cover.PNG"), b"image").unwrap();
+        fs::write(nested.join("notes.txt"), b"other").unwrap();
+        let folders = vec![ConfiguredFolder {
+            id: "media".into(),
+            path: media,
+            mount: None,
+        }];
+
+        assert_eq!(
+            count_indexed_media(&folders),
+            MediaCounts {
+                videos: 1,
+                images: 1,
+            }
         );
     }
 
