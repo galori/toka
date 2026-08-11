@@ -34,7 +34,9 @@ every other setting here.
 ## Playlists
 
 Every page of results is a playlist: playing one video plays the rest after it,
-with `PageUp` and `PageDown` for the previous and next entry.
+with `PageUp` and `PageDown` for the previous and next entry. Later search pages
+are fetched as playback reaches them, so a large result set does not need to be
+loaded into the player all at once.
 
 Toka can also be launched with a playlist file, and starts playing it straight
 away:

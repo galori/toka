@@ -2,6 +2,7 @@ import {
   ButtonHTMLAttributes,
   CSSProperties,
   FormEvent,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -879,11 +880,15 @@ function prefersWindowFullscreen(): boolean {
 function Player({
   videos,
   startIndex,
+  hasMore = false,
+  onLoadMore,
   onBack,
   onTagsChange,
 }: {
   videos: VideoResult[];
   startIndex: number;
+  hasMore?: boolean;
+  onLoadMore?: () => Promise<VideoResult[]>;
   onBack: () => void;
   onTagsChange: (
     videoId: string,
@@ -934,6 +939,9 @@ function Player({
   const [subtitleIndex, setSubtitleIndex] = useState(-1);
   const [sidecarTextTrack, setSidecarTextTrack] = useState<TextTrack>();
   const [playlist, setPlaylist] = useState(videos);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [playlistExhausted, setPlaylistExhausted] = useState(!hasMore);
+  const canLoadMore = Boolean(onLoadMore && hasMore && !playlistExhausted);
   const [deletedVideo, setDeletedVideo] = useState<{
     video: VideoResult;
     index: number;
@@ -1273,6 +1281,27 @@ function Player({
     setCurrentTime(0);
   };
 
+  // Search playlists start with the results already on screen. Fetching the
+  // next page only when playback reaches it keeps a large search from opening
+  // hundreds of backend requests and thousands of drawer rows at once.
+  const loadMoreAndAdvance = useCallback(async () => {
+    if (!canLoadMore || !onLoadMore || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const nextVideos = await onLoadMore();
+      if (!nextVideos.length) {
+        setPlaylistExhausted(true);
+        return;
+      }
+      setPlaylist((current) => [...current, ...nextVideos]);
+      setIndex((current) => current + 1);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [canLoadMore, loadingMore, onLoadMore]);
+
   // What happens when the current video runs out. Both backends end a video the
   // same way, but the native one only finds out by polling, so the poll reaches
   // this through a ref rather than rebuilding its interval whenever the loop
@@ -1290,6 +1319,10 @@ function Player({
     // not move on to the next entry even in the middle of a playlist.
     if (loop === "off") return;
     const next = index < playlist.length - 1 ? index + 1 : 0;
+    if (index === playlist.length - 1 && canLoadMore) {
+      void loadMoreAndAdvance();
+      return;
+    }
     // Wrapping a one-entry playlist lands back on the video that just ended,
     // and React drops a state change that changes nothing, so that entry has to
     // be started again rather than waited on.
@@ -1390,6 +1423,10 @@ function Player({
 
   const moveVideo = (direction: -1 | 1) => {
     if (playlist.length === 0) return;
+    if (direction === 1 && index === playlist.length - 1 && canLoadMore) {
+      void loadMoreAndAdvance();
+      return;
+    }
     setIndex(
       (current) => (current + direction + playlist.length) % playlist.length,
     );
@@ -1416,13 +1453,26 @@ function Player({
       }
       imageElapsed.current = 0;
       setCurrentTime(0);
+      if (index === playlist.length - 1 && canLoadMore && !loadingMore) {
+        void loadMoreAndAdvance();
+        return;
+      }
       setIndex((current) => {
         if (loop === "off" && current === playlist.length - 1) return current;
         return (current + 1) % playlist.length;
       });
     }, IMAGE_PROGRESS_TICK);
     return () => window.clearInterval(timer);
-  }, [isImage, slideshowPlaying, playlist.length, index, loop]);
+  }, [
+    canLoadMore,
+    index,
+    isImage,
+    loadMoreAndAdvance,
+    loadingMore,
+    loop,
+    playlist.length,
+    slideshowPlaying,
+  ]);
 
   const removeCurrentVideo = async () => {
     const removed = playlist[index];
@@ -1957,15 +2007,21 @@ function Player({
             <BackArrowIcon />
             <Label>Back to results</Label>
           </ControlButton>
-          {index < playlist.length - 1 ? (
-            <button
-              type="button"
+          {index < playlist.length - 1 || canLoadMore ? (
+            <ControlButton
+              shortcut="PageDown"
               className="playlist-button"
+              aria-label="Skip to next video"
               title="Skip to next video"
-              onClick={() => setIndex((current) => current + 1)}
+              disabled={loadingMore}
+              onClick={() =>
+                index < playlist.length - 1
+                  ? setIndex((current) => current + 1)
+                  : void loadMoreAndAdvance()
+              }
             >
               <Label>Skip to next</Label>
-            </button>
+            </ControlButton>
           ) : null}
         </div>
       </section>
@@ -2233,6 +2289,7 @@ function Player({
               shortcut="PageDown"
               onClick={() => moveVideo(1)}
               aria-label="Next video"
+              disabled={loadingMore}
             >
               <NextIcon />
             </ControlButton>
@@ -2510,9 +2567,50 @@ function Player({
       </div>
       <p className="playlist-status" aria-live="polite">
         Playlist video {index + 1} of {playlist.length}
+        {canLoadMore ? "+" : ""}
       </p>
+      {loadingMore ? (
+        <p className="message" aria-live="polite">
+          Loading next video…
+        </p>
+      ) : null}
     </section>
   );
+}
+
+const RESULT_PAGE_CONCURRENCY = 4;
+
+async function loadResultPages(
+  query: string,
+  firstPage: number,
+  lastPage: number,
+  fields: SearchFields,
+  mediaType: MediaType,
+): Promise<VideoResult[][]> {
+  const pages = Array.from(
+    { length: Math.max(0, lastPage - firstPage + 1) },
+    () => [] as VideoResult[],
+  );
+  let nextPage = 0;
+  const loadWorker = async () => {
+    while (nextPage < pages.length) {
+      const pageIndex = nextPage++;
+      const response = await searchVideos(
+        query,
+        firstPage + pageIndex,
+        fields,
+        mediaType,
+      );
+      pages[pageIndex] = response.results;
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(RESULT_PAGE_CONCURRENCY, pages.length) },
+      loadWorker,
+    ),
+  );
+  return pages;
 }
 
 export default function App() {
@@ -2542,7 +2640,6 @@ export default function App() {
   useEffect(() => {
     if (!playing) searchField.current?.focus({ preventScroll: true });
   }, [playing]);
-  const [playlistLoading, setPlaylistLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
@@ -2653,6 +2750,24 @@ export default function App() {
     } finally {
       setLoadingMore(false);
     }
+  };
+
+  const loadMorePlaylist = async (): Promise<VideoResult[]> => {
+    if (!page || page.results.length >= page.totalResults) return [];
+    const loadedPage = Math.max(1, page.page);
+    if (loadedPage >= Math.max(1, page.totalPages || 1)) return [];
+    const next = await searchVideos(
+      page.query,
+      loadedPage + 1,
+      fields,
+      mediaType,
+    );
+    setPage((current) =>
+      current && current.query === next.query && current.page === loadedPage
+        ? { ...next, results: [...current.results, ...next.results] }
+        : current,
+    );
+    return next.results;
   };
 
   useEffect(() => {
@@ -2873,8 +2988,9 @@ export default function App() {
   });
 
   // Every video the search matched, not only the pages scrolled to so far:
-  // "play all" and "tag all" both mean all of them, however far down the list
-  // the viewer has got.
+  // "tag all" means all of them, however far down the list the viewer has got.
+  // Playback stays lazy so a large result set does not have to be materialized
+  // before the first video can start.
   const everyResult = async (): Promise<VideoResult[]> => {
     if (!page) return [];
     const totalPages = Math.max(1, page.totalPages || 1);
@@ -2882,35 +2998,22 @@ export default function App() {
     const needsAdditionalPages =
       page.results.length < page.totalResults && totalPages > loadedPages;
     const pages = needsAdditionalPages
-      ? await Promise.all(
-          Array.from({ length: totalPages - loadedPages }, (_, offset) =>
-            searchVideos(
-              page.query,
-              loadedPages + offset + 1,
-              fields,
-              mediaType,
-            ).then((response) => response?.results ?? []),
-          ),
+      ? await loadResultPages(
+          page.query,
+          loadedPages + 1,
+          totalPages,
+          fields,
+          mediaType,
         )
       : [];
     return [page.results, ...pages].flat();
   };
 
-  const playSearchResults = async (position: number) => {
+  const playSearchResults = (position: number) => {
     if (!page) return;
     resultsScrollOffset.current = window.scrollY;
-    setPlaylistLoading(true);
     setError(undefined);
-    try {
-      setPlaying({
-        videos: await everyResult(),
-        startIndex: position,
-      });
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setPlaylistLoading(false);
-    }
+    setPlaying({ videos: page.results, startIndex: position });
   };
 
   // One entry, every result. The videos off the bottom of the list are tagged
@@ -3302,6 +3405,8 @@ export default function App() {
         <Player
           videos={playing.videos}
           startIndex={playing.startIndex}
+          hasMore={page.results.length < page.totalResults}
+          onLoadMore={loadMorePlaylist}
           onBack={() => {
             restoreResultsScroll.current = true;
             setPlaying(undefined);
@@ -3322,12 +3427,9 @@ export default function App() {
                 type="button"
                 className="playlist-button"
                 title="Play all videos"
-                disabled={playlistLoading}
-                onClick={() => void playSearchResults(0)}
+                onClick={() => playSearchResults(0)}
               >
-                <Label>
-                  {playlistLoading ? "Loading playlist…" : "Play all"}
-                </Label>
+                <Label>Play all</Label>
               </button>
             ) : null}
             {page.results.length > 1 ? (

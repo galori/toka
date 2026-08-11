@@ -814,6 +814,52 @@ test("tags the results that are not on screen yet as well", async () => {
   );
 });
 
+test("bounds bulk loading for a large tag-all result set", async () => {
+  let activeSearches = 0;
+  let peakSearches = 0;
+  invokeMock.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      const request = (args as { request: { page: number } }).request;
+      activeSearches += 1;
+      peakSearches = Math.max(peakSearches, activeSearches);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeSearches -= 1;
+      return {
+        query: "bulk",
+        page: request.page,
+        pageSize: 24,
+        totalResults: 120,
+        totalPages: 5,
+        results: Array.from({ length: 24 }, (_, index) => ({
+          id: `video-${request.page}-${index}`,
+          fileName: `bulk-${request.page}-${index}.mp4`,
+          extension: "mp4",
+        })),
+      };
+    }
+    if (command === "add_tags_to_videos") return { tagged: [], failed: 0 };
+    return undefined;
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "bulk{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Tag all 120 videos" }),
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "Tag all 120 videos" }),
+    "archive{Enter}",
+  );
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_tags_to_videos", {
+      resultIds: expect.arrayContaining(["video-1-0", "video-5-23"]),
+      tags: ["archive"],
+    }),
+  );
+  expect(peakSearches).toBeLessThanOrEqual(4);
+});
+
 test("says how many results could not be tagged", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") return Promise.resolve(tagAllPage);
@@ -1312,6 +1358,45 @@ test("starts the whole result page as a playlist positioned at the chosen video"
   // And the rest of the page is reachable from there in both directions.
   expect(screen.getByRole("button", { name: "Previous video" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Next video" })).toBeEnabled();
+});
+
+test("does not load every page when opening a video from a large search", async () => {
+  const firstPage = Array.from({ length: 24 }, (_, index) => ({
+    id: `video-${index + 1}`,
+    fileName: `large-${index + 1}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "large",
+        page: 1,
+        pageSize: 24,
+        totalResults: 6_000,
+        totalPages: 250,
+        results: firstPage,
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/large-1.mp4" });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "large{Enter}");
+  invokeMock.mockClear();
+
+  await user.click(
+    await screen.findByRole("button", { name: "Play large-1.mp4" }),
+  );
+
+  const playlist = await screen.findByRole("complementary", {
+    name: "Playlist",
+  });
+  expect(playlist.querySelectorAll("li")).toHaveLength(24);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
 });
 
 test("deletes the current video, advances, and restores it with the undo shortcut", async () => {
@@ -3301,41 +3386,63 @@ test("returns to where the results were scrolled to after a video", async () => 
   focusSearchField.mockRestore();
 });
 
-test("loads every search page into the playlist before playing all", async () => {
+test("loads the next search page only when a lazy playlist reaches it", async () => {
   const firstPage = Array.from({ length: 24 }, (_, index) => ({
     id: `video-${index + 1}`,
     fileName: `clip-${index + 1}.mp4`,
     extension: "mp4",
   }));
   const last = { id: "video-25", fileName: "clip-25.mp4", extension: "mp4" };
-  invokeMock
-    .mockResolvedValueOnce({
-      query: "clip",
-      page: 1,
-      pageSize: 24,
-      totalResults: 25,
-      totalPages: 2,
-      results: firstPage,
-    })
-    .mockResolvedValueOnce({
-      query: "clip",
-      page: 2,
-      pageSize: 24,
-      totalResults: 25,
-      totalPages: 2,
-      results: [last],
-    })
-    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      const request = (args as { request: { page: number } }).request;
+      return Promise.resolve(
+        request.page === 1
+          ? {
+              query: "clip",
+              page: 1,
+              pageSize: 24,
+              totalResults: 25,
+              totalPages: 2,
+              results: firstPage,
+            }
+          : {
+              query: "clip",
+              page: 2,
+              pageSize: 24,
+              totalResults: 25,
+              totalPages: 2,
+              results: [last],
+            },
+      );
+    }
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    return Promise.resolve();
+  });
   const user = userEvent.setup();
   render(<App />);
 
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  invokeMock.mockClear();
   await user.click(await screen.findByRole("button", { name: "Play all" }));
   const playlist = await screen.findByRole("complementary", {
     name: "Playlist",
   });
+  expect(playlist.querySelectorAll("li")).toHaveLength(24);
+  expect(screen.getByText("Playlist video 1 of 24+")).toBeVisible();
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.objectContaining({ request: expect.objectContaining({ page: 2 }) }),
+  );
+
+  await user.click(screen.getByRole("button", { name: "clip-24.mp4" }));
+  const next = screen.getByRole("button", { name: "Next video" });
+  expect(next).toHaveAttribute("aria-keyshortcuts", "PageDown");
+  fireEvent.keyDown(window, { key: "PageDown" });
+  expect(await screen.findByLabelText("Playing clip-25.mp4")).toBeVisible();
   expect(playlist.querySelectorAll("li")).toHaveLength(25);
-  expect(screen.getByText("Playlist video 1 of 25")).toBeVisible();
+  expect(screen.getByText("Playlist video 25 of 25")).toBeVisible();
 });
 
 test("playlist mode advances through every search result", async () => {
