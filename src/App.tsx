@@ -160,6 +160,16 @@ function VideoIcon() {
   );
 }
 
+function ImageIcon() {
+  return (
+    <svg viewBox="0 0 64 64" aria-hidden="true" className="image-icon">
+      <rect x="7" y="10" width="50" height="44" rx="8" />
+      <circle cx="23" cy="24" r="5" />
+      <path d="m12 49 15-16 9 9 6-7 10 14" />
+    </svg>
+  );
+}
+
 // How long the pointer has to rest on a result before its preview is made.
 // Sweeping the pointer across a grid of results should not set eight seeks
 // through a file going for every tile it happens to cross.
@@ -180,6 +190,7 @@ function VideoThumbnail({
   const [thumbnailPath, setThumbnailPath] = useState(video.thumbnailPath);
   const [frames, setFrames] = useState<string[]>();
   const [frame, setFrame] = useState(0);
+  const image = isImageResult(video);
 
   // Asked for once per video and then kept: the frames are files on disk that
   // do not change, so pointing at the same result again costs nothing.
@@ -246,9 +257,17 @@ function VideoThumbnail({
     >
       {showing ? (
         <span className="thumbnail-overlay" aria-hidden="true" />
+      ) : image ? (
+        <ImageIcon />
       ) : (
         <VideoIcon />
       )}
+      <span
+        className={`media-type-badge ${image ? "image" : "video"}`}
+        aria-hidden="true"
+      >
+        {image ? "Image" : "Video"}
+      </span>
     </span>
   );
 }

@@ -488,6 +488,39 @@ test("displays an app-generated thumbnail when search returns one", async () => 
   });
 });
 
+test("labels mixed image and video results in the search grid", async () => {
+  invokeMock.mockResolvedValueOnce({
+    query: "mixed",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      { id: "image-1", fileName: "photo.jpg", extension: "jpg" },
+      { id: "video-1", fileName: "clip.mp4", extension: "mp4" },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "mixed{Enter}");
+
+  const imageTile = await screen.findByRole("button", {
+    name: "Play photo.jpg",
+  });
+  const videoTile = screen.getByRole("button", { name: "Play clip.mp4" });
+  expect(within(imageTile).getByText("Image")).toHaveClass(
+    "media-type-badge",
+    "image",
+  );
+  expect(within(videoTile).getByText("Video")).toHaveClass(
+    "media-type-badge",
+    "video",
+  );
+  expect(imageTile.querySelector(".image-icon")).toBeInTheDocument();
+  expect(videoTile.querySelector(".video-icon")).toBeInTheDocument();
+});
+
 const previewPage = {
   query: "clip",
   page: 1,
