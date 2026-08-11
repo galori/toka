@@ -81,8 +81,13 @@ export function isImageResult(result: VideoResult): boolean {
 }
 
 export const SLIDESHOW_INTERVAL = 3_000;
-const IMAGE_DURATION_SECONDS = SLIDESHOW_INTERVAL / 1_000;
+const DEFAULT_IMAGE_DURATION_SECONDS = SLIDESHOW_INTERVAL / 1_000;
+const IMAGE_DURATION_OPTIONS = [1, 3, 5, 10] as const;
 const IMAGE_PROGRESS_TICK = 100;
+
+function formatImageDuration(seconds: number): string {
+  return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
 
 const MEDIA_TYPES: { value: MediaType; label: string; shortcut: string }[] = [
   { value: "videos", label: "Videos", shortcut: "Ctrl+1" },
@@ -834,6 +839,7 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "L", description: "Cycle loop mode" },
       { shortcut: "P", description: "Show or hide the playlist" },
       { shortcut: "R", description: "Shuffle the playlist" },
+      { shortcut: "D", description: "Change image display duration" },
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
       { shortcut: "T", description: "Edit tags" },
@@ -1144,6 +1150,9 @@ function Player({
   const video = playlist[index];
   const isImage = isImageResult(video);
   const [slideshowPlaying, setSlideshowPlaying] = useState(true);
+  const [imageDurationSeconds, setImageDurationSeconds] = useState(
+    DEFAULT_IMAGE_DURATION_SECONDS,
+  );
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
@@ -1255,7 +1264,7 @@ function Player({
           if (isImage) {
             imageElapsed.current = 0;
             setCurrentTime(0);
-            setDuration(IMAGE_DURATION_SECONDS);
+            setDuration(imageDurationSeconds);
             setPlayingBack(true);
           }
         }
@@ -1622,17 +1631,31 @@ function Player({
 
   const toggleSlideshow = () => setSlideshowPlaying((playing) => !playing);
 
+  const cycleImageDuration = () => {
+    const currentIndex = IMAGE_DURATION_OPTIONS.findIndex(
+      (option) => option === imageDurationSeconds,
+    );
+    const nextDuration =
+      IMAGE_DURATION_OPTIONS[
+        (currentIndex + 1) % IMAGE_DURATION_OPTIONS.length
+      ];
+    setImageDurationSeconds(nextDuration);
+    imageElapsed.current = 0;
+    setCurrentTime(0);
+    setDuration(nextDuration);
+  };
+
   useEffect(() => {
     if (!isImage || !slideshowPlaying) return;
     const timer = window.setInterval(() => {
       imageElapsed.current = Math.min(
-        IMAGE_DURATION_SECONDS,
+        imageDurationSeconds,
         Math.round(
           (imageElapsed.current + IMAGE_PROGRESS_TICK / 1_000) * 1_000,
         ) / 1_000,
       );
       setCurrentTime(imageElapsed.current);
-      if (imageElapsed.current < IMAGE_DURATION_SECONDS) return;
+      if (imageElapsed.current < imageDurationSeconds) return;
       if (loop === "off" && index === playlist.length - 1) return;
       if (playlist.length <= 1 && loop === "one") {
         imageElapsed.current = 0;
@@ -1658,6 +1681,7 @@ function Player({
     loadMoreAndAdvance,
     loadingMore,
     loop,
+    imageDurationSeconds,
     playlist.length,
     slideshowPlaying,
   ]);
@@ -2132,6 +2156,8 @@ function Player({
       } else if (event.key.toLowerCase() === "s") {
         if (isImage) run(toggleSlideshow);
         else if (subtitles.length > 0) run(toggleSubtitles);
+      } else if (event.key.toLowerCase() === "d") {
+        if (isImage) run(cycleImageDuration);
       } else if (event.key.toLowerCase() === "l") {
         run(cycleLoop);
       } else if (event.key.toLowerCase() === "p") {
@@ -2151,6 +2177,7 @@ function Player({
     duration,
     fullscreen,
     helpOpen,
+    imageDurationSeconds,
     index,
     isImage,
     native,
@@ -2498,16 +2525,26 @@ function Player({
                 }
               />
               {isImage ? (
-                <ControlButton
-                  shortcut="S"
-                  onClick={toggleSlideshow}
-                  aria-label={
-                    slideshowPlaying ? "Pause slideshow" : "Play slideshow"
-                  }
-                  aria-pressed={slideshowPlaying}
-                >
-                  <Label>{slideshowPlaying ? "Pause" : "Play"}</Label>
-                </ControlButton>
+                <>
+                  <ControlButton
+                    shortcut="D"
+                    onClick={cycleImageDuration}
+                    aria-label={`Image duration: ${formatImageDuration(imageDurationSeconds)}`}
+                    title="Change image display duration"
+                  >
+                    <Label>{`${imageDurationSeconds}s`}</Label>
+                  </ControlButton>
+                  <ControlButton
+                    shortcut="S"
+                    onClick={toggleSlideshow}
+                    aria-label={
+                      slideshowPlaying ? "Pause slideshow" : "Play slideshow"
+                    }
+                    aria-pressed={slideshowPlaying}
+                  >
+                    <Label>{slideshowPlaying ? "Pause" : "Play"}</Label>
+                  </ControlButton>
+                </>
               ) : (
                 <ControlButton
                   shortcut="S"

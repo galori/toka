@@ -140,6 +140,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
+  expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
@@ -5717,6 +5718,23 @@ test("shows image results and handles slideshow controls", async () => {
     expect(timeline).toBeEnabled();
     expect(timeline).toHaveAttribute("max", "3");
     expect(timeline).toHaveValue("0");
+
+    const duration = screen.getByRole("button", {
+      name: "Image duration: 3 seconds",
+    });
+    expect(duration).toHaveAttribute("aria-keyshortcuts", "D");
+    expect(duration.querySelector(".key-hint")).toHaveTextContent("D");
+    await user.click(duration);
+    expect(
+      screen.getByRole("button", { name: "Image duration: 5 seconds" }),
+    ).toBeVisible();
+    expect(timeline).toHaveAttribute("max", "5");
+    fireEvent.keyDown(window, { key: "d" });
+    expect(
+      screen.getByRole("button", { name: "Image duration: 10 seconds" }),
+    ).toBeVisible();
+    expect(timeline).toHaveAttribute("max", "10");
+
     await act(async () => {
       vi.advanceTimersByTime(1_500);
     });
@@ -5781,6 +5799,15 @@ test("shows image results and handles slideshow controls", async () => {
       screen.getByRole("button", { name: "Pause slideshow" }),
     ).toBeVisible();
 
+    // choose the shortest setting before checking the existing auto-advance
+    // behavior, since the duration choice persists across images
+    await user.click(
+      screen.getByRole("button", { name: "Image duration: 10 seconds" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Image duration: 1 second" }),
+    ).toBeVisible();
+
     // auto-advance after interval
     const beachAgain = {
       filePath: "/Photos/beach.png",
@@ -5791,7 +5818,7 @@ test("shows image results and handles slideshow controls", async () => {
       return Promise.resolve();
     });
     await act(async () => {
-      vi.advanceTimersByTime(3100);
+      vi.advanceTimersByTime(1100);
     });
     expect(await screen.findByLabelText("Playing beach.png")).toBeVisible();
   } finally {
