@@ -540,6 +540,9 @@ test("displays an app-generated thumbnail when search returns one", async () => 
   ).toHaveStyle({
     backgroundImage: 'url("asset:///tmp/toka-thumbnails/clip.jpg")',
   });
+  expect(invokeMock).not.toHaveBeenCalledWith("video_thumbnail", {
+    resultId: "video-1",
+  });
 });
 
 test("labels mixed image and video results in the search grid", async () => {

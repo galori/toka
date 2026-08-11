@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 /// How many frames a preview runs through. Enough to show what a video is —
@@ -9,13 +10,59 @@ use std::{
 /// without asking ffmpeg for so many that the first hover has to wait.
 pub const PREVIEW_FRAMES: usize = 8;
 
-pub fn generate(video: &Path) -> Option<PathBuf> {
+/// A thumbnail already made by the indexer's background worker, if one is in
+/// the shared cache. Reading this never starts ffmpeg, which keeps search
+/// results cheap even when the cache is still catching up with a folder.
+pub(crate) fn cached(video: &Path) -> Option<PathBuf> {
+    let output = cache_output(video);
+    output.is_file().then_some(output)
+}
+
+/// The cache file for a video. This is crate-visible so search tests can set
+/// up the same handoff the background worker makes without invoking ffmpeg.
+pub(crate) fn cache_path(video: &Path) -> Option<PathBuf> {
     let cache = cache_dir()?;
-    let output = cache.join(format!("{}.jpg", fingerprint(video)));
-    if output.is_file() {
+    Some(cache.join(format!("{}.jpg", fingerprint(video))))
+}
+
+pub fn generate(video: &Path) -> Option<PathBuf> {
+    if let Some(output) = cached(video) {
         return Some(output);
     }
+    let output = cache_path(video)?;
     extract(video, 1.0, &output, 640)
+}
+
+/// Fill the shared cache for every supported video below `folder`. The
+/// caller owns the worker thread, so this deliberately processes one folder
+/// serially and lets the indexer continue watching while ffmpeg does the
+/// expensive work.
+pub fn generate_folder(folder: &Path) {
+    for video in video_paths(folder) {
+        let _ = generate(&video);
+    }
+}
+
+fn video_paths(folder: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![folder.to_path_buf()];
+    let mut videos = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() && crate::search::is_supported_video(&path) {
+                videos.push(path);
+            }
+        }
+    }
+    videos
 }
 
 /// Frames sampled evenly across the video, for the preview that runs while the
@@ -54,9 +101,17 @@ fn preview_offsets(duration: f64, count: usize) -> Vec<f64> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let cache = std::env::temp_dir().join("toka-thumbnails");
+    let cache = cache_output_root();
     fs::create_dir_all(&cache).ok()?;
     Some(cache)
+}
+
+fn cache_output(video: &Path) -> PathBuf {
+    cache_output_root().join(format!("{}.jpg", fingerprint(video)))
+}
+
+fn cache_output_root() -> PathBuf {
+    std::env::temp_dir().join("toka-thumbnails")
 }
 
 fn fingerprint(video: &Path) -> String {
@@ -96,7 +151,12 @@ fn duration(video: &Path) -> Option<f64> {
 /// video from the beginning to reach the offset, which for the later frames of
 /// a feature-length file is seconds of work each.
 fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Option<PathBuf> {
-    let temporary = output.with_extension("tmp.jpg");
+    static TEMPORARY_FILES: AtomicU64 = AtomicU64::new(0);
+    let temporary = output.with_extension(format!(
+        "tmp-{}-{}.jpg",
+        std::process::id(),
+        TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
+    ));
     let status = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{at:.3}"))
@@ -112,7 +172,10 @@ fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Option<PathBuf> 
         let _ = fs::remove_file(&temporary);
         return None;
     }
-    fs::rename(&temporary, output).ok()?;
+    if fs::rename(&temporary, output).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return None;
+    }
     Some(output.to_path_buf())
 }
 
@@ -132,6 +195,8 @@ fn md5_fingerprint(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn preview_offsets_are_spread_inside_the_video() {
@@ -161,5 +226,22 @@ mod tests {
             offsets.iter().all(|at| *at > 0.0 && *at < 0.4),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn background_scanning_finds_supported_videos_recursively() {
+        let root = tempdir().unwrap();
+        let clip = root.path().join("clip.mp4");
+        let notes = root.path().join("notes.txt");
+        let nested = root.path().join("nested");
+        let movie = nested.join("movie.MKV");
+        fs::write(&clip, b"video").unwrap();
+        fs::write(&notes, b"text").unwrap();
+        fs::create_dir(&nested).unwrap();
+        fs::write(&movie, b"video").unwrap();
+
+        let mut found = video_paths(root.path());
+        found.sort();
+        assert_eq!(found, vec![clip, movie]);
     }
 }

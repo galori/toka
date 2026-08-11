@@ -1,3 +1,4 @@
+use crate::thumbnails;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -393,14 +394,67 @@ fn set_folder_status(
     write_json(&paths.status, &status)
 }
 
-fn refresh_folder(paths: &IndexPaths, folder: &ConfiguredFolder) -> Result<(), String> {
-    refresh_folder_with_program(paths, folder, &updatedb_path())
+struct ThumbnailWorker {
+    sender: mpsc::Sender<PathBuf>,
 }
 
+impl ThumbnailWorker {
+    fn new() -> Self {
+        Self::with_generator(thumbnails::generate_folder)
+    }
+
+    fn with_generator<F>(generator: F) -> Self
+    where
+        F: Fn(&Path) + Send + 'static,
+    {
+        let (sender, receiver): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("toka-thumbnail-worker".into())
+            .spawn(move || {
+                while let Ok(folder) = receiver.recv() {
+                    generator(&folder);
+                }
+            })
+            .expect("Toka could not start its thumbnail worker");
+        Self { sender }
+    }
+
+    fn enqueue(&self, folder: &Path) {
+        let _ = self.sender.send(folder.to_path_buf());
+    }
+}
+
+fn refresh_folder(
+    paths: &IndexPaths,
+    folder: &ConfiguredFolder,
+    worker: &ThumbnailWorker,
+) -> Result<(), String> {
+    refresh_folder_with_program_and_worker(paths, folder, &updatedb_path(), worker)
+}
+
+#[cfg(test)]
 fn refresh_folder_with_program(
     paths: &IndexPaths,
     folder: &ConfiguredFolder,
     program: &Path,
+) -> Result<(), String> {
+    refresh_folder_with_optional_worker(paths, folder, program, None)
+}
+
+fn refresh_folder_with_program_and_worker(
+    paths: &IndexPaths,
+    folder: &ConfiguredFolder,
+    program: &Path,
+    worker: &ThumbnailWorker,
+) -> Result<(), String> {
+    refresh_folder_with_optional_worker(paths, folder, program, Some(worker))
+}
+
+fn refresh_folder_with_optional_worker(
+    paths: &IndexPaths,
+    folder: &ConfiguredFolder,
+    program: &Path,
+    worker: Option<&ThumbnailWorker>,
 ) -> Result<(), String> {
     if !folder_available(folder) {
         return set_folder_status(paths, &folder.id, FolderStatus::Offline, None, false);
@@ -448,7 +502,11 @@ fn refresh_folder_with_program(
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Toka could not protect its private index: {error}"))?;
     }
-    set_folder_status(paths, &folder.id, FolderStatus::Ready, None, true)
+    set_folder_status(paths, &folder.id, FolderStatus::Ready, None, true)?;
+    if let Some(worker) = worker {
+        worker.enqueue(&folder.path);
+    }
+    Ok(())
 }
 
 fn is_path_change(kind: &EventKind) -> bool {
@@ -471,6 +529,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
     watcher
         .watch(&paths.root, RecursiveMode::NonRecursive)
         .map_err(|error| format!("Toka could not watch its settings: {error}"))?;
+    let thumbnail_worker = ThumbnailWorker::new();
 
     let mut watched = HashSet::<PathBuf>::new();
     let mut first_pass = true;
@@ -496,13 +555,13 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         if first_pass {
             first_pass = false;
             for folder in &config.folders {
-                let _ = refresh_folder(&paths, folder);
+                let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
             continue;
         }
         if !reconnected.is_empty() {
             for folder in reconnected {
-                let _ = refresh_folder(&paths, folder);
+                let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
             continue;
         }
@@ -566,7 +625,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
 
         for folder in &config.folders {
             if dirty.contains(&folder.id) {
-                let _ = refresh_folder(&paths, folder);
+                let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
         }
     }
@@ -575,7 +634,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, sync::mpsc};
     use tempfile::tempdir;
 
     #[test]
@@ -641,6 +700,49 @@ mod tests {
                 "--prune-bind-mounts",
                 "no",
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ready_folder_is_queued_for_background_thumbnail_generation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        fs::write(media.join("clip.mp4"), b"media").unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        let folder = ConfiguredFolder {
+            id: "folder".into(),
+            path: media.clone(),
+            mount: None,
+        };
+        let fake_updatedb = root.path().join("updatedb");
+        fs::write(
+            &fake_updatedb,
+            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then shift; printf indexed > \"$1\"; exit 0; fi\n  shift\ndone\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (finished, received) = mpsc::channel();
+        let worker = ThumbnailWorker::with_generator(move |folder| {
+            finished.send(folder.to_path_buf()).unwrap();
+        });
+        refresh_folder_with_program_and_worker(&paths, &folder, &fake_updatedb, &worker).unwrap();
+
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(1)).unwrap(),
+            media
+        );
+        assert_eq!(
+            load_json::<PersistedStatus>(&paths.status)
+                .unwrap()
+                .unwrap()
+                .folders["folder"]
+                .status,
+            FolderStatus::Ready
         );
     }
 
