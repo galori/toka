@@ -42,7 +42,6 @@ import {
   addTagsToVideos,
   removeVideoTags,
   videoPreview,
-  videoThumbnail,
   DEFAULT_SEARCH_FIELDS,
   DEFAULT_MEDIA_TYPE,
   type BulkTagUpdate,
@@ -56,6 +55,7 @@ import {
   type VideoTagUpdate,
 } from "./api";
 import { buildInfo } from "./buildInfo";
+import { thumbnailQueue } from "./thumbnailQueue";
 
 const IMAGE_EXTENSIONS = new Set([
   "jpg",
@@ -189,6 +189,7 @@ function VideoThumbnail({
 }) {
   const container = useRef<HTMLSpanElement>(null);
   const [thumbnailPath, setThumbnailPath] = useState(video.thumbnailPath);
+  const [thumbnailLoading, setThumbnailLoading] = useState(false);
   const [frames, setFrames] = useState<string[]>();
   const [frame, setFrame] = useState(0);
   const image = isImageResult(video);
@@ -234,11 +235,14 @@ function VideoThumbnail({
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
         observer.disconnect();
-        void videoThumbnail(video.id)
+        setThumbnailLoading(true);
+        void thumbnailQueue
+          .load(video.id)
           .then(setThumbnailPath)
-          .catch(() => {});
+          .catch(() => {})
+          .finally(() => setThumbnailLoading(false));
       },
-      { rootMargin: "200px" },
+      { rootMargin: "1000px" },
     );
     observer.observe(container.current);
     return () => observer.disconnect();
@@ -258,6 +262,11 @@ function VideoThumbnail({
     >
       {showing ? (
         <span className="thumbnail-overlay" aria-hidden="true" />
+      ) : thumbnailLoading ? (
+        <span className="thumbnail-loading" role="status">
+          <span className="thumbnail-spinner" aria-hidden="true" />
+          <span>Generating thumbnail…</span>
+        </span>
       ) : image ? (
         <ImageIcon />
       ) : (
@@ -3759,7 +3768,7 @@ export default function App() {
               }
             >
               {page.results.map((video, position) => (
-                <li key={video.id}>
+                <li key={video.id} className="video-result-row">
                   <VideoTile
                     video={video}
                     onPlay={() => void playSearchResults(position)}

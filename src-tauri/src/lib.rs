@@ -199,13 +199,20 @@ async fn search_videos(
 }
 
 #[tauri::command]
-fn video_thumbnail(
+async fn video_thumbnail(
     result_id: String,
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<String, CommandError> {
-    let path = engine
-        .thumbnail_path(&result_id)
+    // Thumbnail generation invokes ffmpeg. Keep it off the command thread so
+    // a rapid scroll cannot freeze the WebView while a tile is being filled.
+    let engine = Arc::clone(engine.inner());
+    let path = tauri::async_runtime::spawn_blocking(move || engine.thumbnail_path(&result_id))
+        .await
+        .map_err(|error| CommandError {
+            kind: "Thumbnail",
+            message: format!("The thumbnail worker stopped unexpectedly: {error}"),
+        })?
         .map_err(CommandError::from)?;
     app.asset_protocol_scope()
         .allow_file(&path)
