@@ -119,6 +119,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
 
   const help = screen.getByRole("dialog", { name: "Keyboard shortcuts" });
   expect(help).toHaveTextContent("Search tags");
+  expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Space");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(
@@ -225,6 +226,30 @@ test("reopens configured search folders from Ctrl+,", async () => {
   expect(
     await screen.findByRole("heading", { name: "Choose where Toka searches" }),
   ).toBeVisible();
+});
+
+test("leaves configured search folder setup with Escape", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 1,
+    folders: [{ id: "videos", path: "/Videos", status: "ready" }],
+  });
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Search folders" });
+  fireEvent.keyDown(window, { key: ",", ctrlKey: true });
+  const back = await screen.findByRole("button", {
+    name: "Back to search",
+  });
+  expect(back).toHaveAttribute("aria-keyshortcuts", "Escape");
+  expect(back.querySelector(".key-hint")).toHaveTextContent("Esc");
+
+  fireEvent.keyDown(window, { key: "Escape" });
+
+  expect(await screen.findByRole("searchbox")).toBeVisible();
+  expect(
+    screen.queryByRole("heading", { name: "Choose where Toka searches" }),
+  ).not.toBeInTheDocument();
 });
 
 test("a launch playlist bypasses first-launch folder setup", async () => {

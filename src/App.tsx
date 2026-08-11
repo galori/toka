@@ -791,6 +791,7 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "Ctrl+O", description: "Add a folder" },
       { shortcut: "Delete", description: "Remove a folder" },
       { shortcut: "Ctrl+Enter", description: "Start searching" },
+      { shortcut: "Escape", description: "Return to search" },
     ],
   },
   {
@@ -3324,8 +3325,16 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (playing || event.metaKey || event.altKey) return;
+      if (playing || showHelp || event.metaKey || event.altKey) return;
       if (
+        showFolderSetup &&
+        !event.ctrlKey &&
+        !event.shiftKey &&
+        event.key === "Escape"
+      ) {
+        event.preventDefault();
+        setShowFolderSetup(false);
+      } else if (
         showFolderSetup &&
         event.ctrlKey &&
         !event.shiftKey &&
@@ -3458,15 +3467,25 @@ export default function App() {
               {folderError}
             </p>
           ) : null}
-          <ControlButton
-            shortcut="Ctrl+Enter"
-            className="scope-toggle"
-            aria-label="Start searching"
-            disabled={!managedIndex?.folders.length}
-            onClick={() => setShowFolderSetup(false)}
-          >
-            <Label>Start searching</Label>
-          </ControlButton>
+          <div className="folder-actions">
+            <ControlButton
+              shortcut="Escape"
+              className="scope-toggle"
+              aria-label="Back to search"
+              onClick={() => setShowFolderSetup(false)}
+            >
+              <Label>Back</Label>
+            </ControlButton>
+            <ControlButton
+              shortcut="Ctrl+Enter"
+              className="scope-toggle"
+              aria-label="Start searching"
+              disabled={!managedIndex?.folders.length}
+              onClick={() => setShowFolderSetup(false)}
+            >
+              <Label>Start searching</Label>
+            </ControlButton>
+          </div>
           <HelpButton onClick={() => setShowHelp(true)} />
         </section>
       </main>
