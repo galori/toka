@@ -418,7 +418,7 @@ input[type="search"]:focus {
 }
 
 .app {
-  width: min(1120px, calc(100% - 80px));
+  width: calc(100% - 80px);
   padding: 36px 0 64px;
 }
 
