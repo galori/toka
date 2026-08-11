@@ -6,6 +6,7 @@ mod player_linux;
 mod playlist;
 mod providers;
 mod search;
+mod search_log;
 mod subtitles;
 mod tags;
 mod thumbnails;
@@ -15,6 +16,7 @@ use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
+use search_log::{SearchLogContext, SearchLogger};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -799,7 +801,7 @@ fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: boo
     player_linux::set_bounds(x, y, width, height, visible);
 }
 
-fn platform_provider() -> Arc<dyn SearchProvider> {
+fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
     #[cfg(feature = "e2e")]
     {
         struct FixtureSearchProvider;
@@ -808,6 +810,7 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
                 &self,
                 _query: &str,
                 _whole_path: bool,
+                _context: &SearchLogContext,
             ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 let paths = std::env::var_os("TOKA_E2E_VIDEOS").ok_or_else(|| {
                     SearchError::Provider("The integration-test videos were not configured.".into())
@@ -821,16 +824,17 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(MdfindSearchProvider::system())
+        Arc::new(MdfindSearchProvider::system(logger))
     }
     #[cfg(target_os = "linux")]
     {
         match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
-            Ok("recoll") => Arc::new(RecollSearchProvider::system()),
-            Ok("plocate") => Arc::new(PlocateSearchProvider::system()),
+            Ok("recoll") => Arc::new(RecollSearchProvider::system(logger)),
+            Ok("plocate") => Arc::new(PlocateSearchProvider::system(logger)),
             Err(_) => Arc::new(ManagedPlocateSearchProvider::system(
                 managed_index::IndexPaths::system()
                     .expect("Toka could not find its private index paths"),
+                logger,
             )),
             Ok(name) => Arc::new(InvalidProvider(format!(
                 "Unknown Linux search provider: {name}"
@@ -845,6 +849,7 @@ fn platform_provider() -> Arc<dyn SearchProvider> {
                 &self,
                 _query: &str,
                 _whole_path: bool,
+                _context: &SearchLogContext,
             ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 Err(SearchError::Provider(
                     "Toka currently supports video search on macOS and Linux.".into(),
@@ -864,6 +869,7 @@ impl SearchProvider for InvalidProvider {
         &self,
         _query: &str,
         _whole_path: bool,
+        _context: &SearchLogContext,
     ) -> Result<Vec<std::path::PathBuf>, SearchError> {
         Err(SearchError::Provider(self.0.clone()))
     }
@@ -893,7 +899,13 @@ pub fn run() {
     // with is the whole of what it was asked to open.
     let launched = LaunchPlaylist(playlist::from_arguments(std::env::args_os()));
     let builder = builder
-        .manage(Arc::new(SearchEngine::new(platform_provider())))
+        .manage({
+            let logger = Arc::new(SearchLogger::system());
+            Arc::new(SearchEngine::new_with_logger(
+                platform_provider(logger.clone()),
+                logger,
+            ))
+        })
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
     #[cfg(target_os = "linux")]
@@ -1041,7 +1053,12 @@ mod tests {
     struct FakeProvider(Vec<PathBuf>);
 
     impl SearchProvider for FakeProvider {
-        fn candidates(&self, _query: &str, _whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+        fn candidates(
+            &self,
+            _query: &str,
+            _whole_path: bool,
+            _context: &SearchLogContext,
+        ) -> Result<Vec<PathBuf>, SearchError> {
             Ok(self.0.clone())
         }
     }
