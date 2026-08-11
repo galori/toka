@@ -94,8 +94,7 @@ impl SearchProvider for MdfindSearchProvider {
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
         prepare_macos_downloads_folder_access();
-        let term = longest_term(query)?;
-        let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
+        let terms = query_terms(query)?;
         // Spotlight's display name is the file's own name; its path attribute
         // covers the folders above it, which is what a folder search needs.
         let attribute = if whole_path {
@@ -103,9 +102,19 @@ impl SearchProvider for MdfindSearchProvider {
         } else {
             "kMDItemDisplayName"
         };
-        let predicate = format!(
-            "{attribute} == \"*{escaped}*\"cd && kMDItemContentTypeTree == \"public.movie\""
-        );
+        let term_predicates = terms
+            .iter()
+            .map(|term| {
+                let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("{attribute} == \"*{escaped}*\"cd")
+            })
+            .collect::<Vec<_>>();
+        let matching = if term_predicates.len() == 1 {
+            term_predicates[0].clone()
+        } else {
+            format!("({})", term_predicates.join(" || "))
+        };
+        let predicate = format!("{matching} && kMDItemContentTypeTree == \"public.movie\"");
         let mut paths = run_mdfind(&*self.runner, vec![predicate], context)?;
         paths.extend(macos_download_candidates(query)?);
         Ok(paths)
@@ -146,10 +155,13 @@ fn macos_download_candidates(_query: &str) -> Result<Vec<PathBuf>, SearchError> 
 
 #[cfg(any(target_os = "macos", test))]
 fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
-    let Ok(term) = longest_term(query) else {
+    let Ok(terms) = query_terms(query) else {
         return Vec::new();
     };
-    let term = term.to_lowercase();
+    let terms = terms
+        .into_iter()
+        .map(|term| term.to_lowercase())
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     let mut pending = vec![root.to_path_buf()];
 
@@ -164,13 +176,13 @@ fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
             };
             if file_type.is_dir() {
                 pending.push(path);
-            } else if path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-                .contains(&term)
-            {
+            } else if terms.iter().any(|term| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(term)
+            }) {
                 candidates.push(path);
             }
         }
@@ -220,10 +232,14 @@ impl SearchProvider for RecollSearchProvider {
         _whole_path: bool,
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let term = longest_term(query)?;
+        let terms = query_terms(query)?;
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
-        let filename_query = format!("*{term}*");
+        let filename_query = terms
+            .iter()
+            .map(|term| format!("*{term}*"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
         let args = ["-f", "-b", "--paths-only", "-C", "-n", "0", &filename_query]
             .into_iter()
             .map(String::from)
@@ -263,14 +279,15 @@ impl SearchProvider for PlocateSearchProvider {
         whole_path: bool,
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let term = longest_term(query)?;
+        let terms = query_terms(query)?;
         // plocate matches the whole path unless it is confined to the base
         // name, so a folder search is the flag left off rather than added.
         let mut args = vec!["--ignore-case"];
         if !whole_path {
             args.push("--basename");
         }
-        args.extend(["--existing", "--", term]);
+        args.extend(["--existing", "--"]);
+        args.extend(terms.iter().map(String::as_str));
         let args = args.into_iter().map(String::from).collect::<Vec<_>>();
         let output = self.runner.run("plocate", &args, context).map_err(|error| SearchError::Provider(format!("plocate search could not start. Install plocate and build its index with updatedb: {error}")))?;
         // plocate uses exit status 1 to report a successful search with no
@@ -309,7 +326,7 @@ impl SearchProvider for ManagedPlocateSearchProvider {
         whole_path: bool,
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let term = longest_term(query)?;
+        let terms = query_terms(query)?;
         let databases = managed_index::database_paths(&self.paths);
         if databases.is_empty() {
             return Ok(Vec::new());
@@ -323,7 +340,8 @@ impl SearchProvider for ManagedPlocateSearchProvider {
         if !whole_path {
             args.push("--basename".into());
         }
-        args.extend(["--existing".into(), "--".into(), term.into()]);
+        args.extend(["--existing".into(), "--".into()]);
+        args.extend(terms);
         let program = managed_index::plocate_path();
         let output = self
             .runner
@@ -344,11 +362,53 @@ impl SearchProvider for ManagedPlocateSearchProvider {
     }
 }
 
-fn longest_term(query: &str) -> Result<&str, SearchError> {
-    query
-        .split_whitespace()
-        .max_by_key(|term| term.chars().count())
-        .ok_or(SearchError::InvalidQuery)
+fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in query.chars() {
+        if matches!(character, '(' | ')') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            tokens.push(character.to_string());
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    let terms = tokens
+        .into_iter()
+        .filter(|token| {
+            token != "("
+                && token != ")"
+                && !token.eq_ignore_ascii_case("AND")
+                && !token.eq_ignore_ascii_case("OR")
+        })
+        .map(|token| {
+            token
+                .split_once(':')
+                .and_then(|(field, value)| {
+                    (matches!(
+                        field.to_ascii_lowercase().as_str(),
+                        "tags" | "tag" | "filename" | "file" | "name" | "path"
+                    ) && !value.is_empty())
+                    .then_some(value.to_owned())
+                })
+                .unwrap_or(token)
+        })
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        Err(SearchError::InvalidQuery)
+    } else {
+        Ok(terms)
+    }
 }
 
 fn parse_output(output: ProcessOutput, failure_message: &str) -> Result<Vec<PathBuf>, SearchError> {
@@ -458,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn mdfind_uses_display_name_movie_search_with_longest_term_and_parses_paths() {
+    fn mdfind_uses_display_name_movie_search_for_all_terms_and_parses_paths() {
         let runner = Arc::new(FakeRunner::new(
             "/Videos/Summer Vacation.mp4\n/Videos/another.mov\n",
         ));
@@ -476,7 +536,7 @@ mod tests {
             Some(&(
                 "/usr/bin/mdfind".into(),
                 vec![
-                    "kMDItemDisplayName == \"*vacation*\"cd && kMDItemContentTypeTree == \"public.movie\""
+                    "(kMDItemDisplayName == \"*summer*\"cd || kMDItemDisplayName == \"*vacation*\"cd) && kMDItemContentTypeTree == \"public.movie\""
                         .into()
                 ]
             ))
@@ -499,10 +559,18 @@ mod tests {
             runner.invocations.lock().unwrap().first(),
             Some(&(
                 "recollq".into(),
-                vec!["-f", "-b", "--paths-only", "-C", "-n", "0", "*vacation*"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect()
+                vec![
+                    "-f",
+                    "-b",
+                    "--paths-only",
+                    "-C",
+                    "-n",
+                    "0",
+                    "*summer* OR *vacation*",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
             ))
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
@@ -544,6 +612,7 @@ mod tests {
                     "--basename",
                     "--existing",
                     "--",
+                    "summer",
                     "vacation"
                 ]
                 .into_iter()
@@ -573,6 +642,71 @@ mod tests {
                     .into_iter()
                     .map(String::from)
                     .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn plocate_keeps_special_characters_and_all_terms_in_the_query() {
+        let runner = Arc::new(FakeRunner::new("/media/@ 12 [clip].mkv\n"));
+        let provider = PlocateSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider
+            .candidates("@ 12 [", false, &context("@ 12 ["))
+            .unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "plocate".into(),
+                [
+                    "--ignore-case",
+                    "--basename",
+                    "--existing",
+                    "--",
+                    "@",
+                    "12",
+                    "["
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn providers_search_the_value_of_a_qualified_term() {
+        let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
+        let provider = PlocateSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider
+            .candidates(
+                "tags:home OR filename:clip OR path:Holiday",
+                true,
+                &context("tags:home OR filename:clip OR path:Holiday"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "plocate".into(),
+                [
+                    "--ignore-case",
+                    "--existing",
+                    "--",
+                    "home",
+                    "clip",
+                    "Holiday",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect()
             ))
         );
     }
