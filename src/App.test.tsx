@@ -4976,6 +4976,9 @@ test("makes the results grid responsive and fills the width with as many thumbna
   expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(
     `${THUMBNAIL_SIZE_DEFAULT}px`,
   );
+  expect(getComputedStyle(grid).gridTemplateColumns).toContain(
+    "minmax(var(--thumbnail-size, 180px), var(--thumbnail-size, 180px))",
+  );
   // The grid should use auto-fill/minmax via the CSS variable.
   expect(grid).toBeVisible();
 });
