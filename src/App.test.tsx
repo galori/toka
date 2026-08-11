@@ -5169,6 +5169,7 @@ test("shows image results and handles slideshow controls", async () => {
     expect(
       await screen.findByRole("button", { name: "Play sunset.jpg" }),
     ).toBeVisible();
+    expect(screen.getByText("2 images")).toBeVisible();
     // play first image
     invokeMock.mockResolvedValueOnce({
       filePath: "/Photos/sunset.jpg",
