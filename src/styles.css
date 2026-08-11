@@ -557,9 +557,28 @@ button:focus-visible {
   min-height: 42px;
   color: oklch(0.65 0.02 60);
   font-size: 15px;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 12px;
 }
 .results-summary p {
   margin: 0;
+}
+.results-summary > p:first-child {
+  margin-right: auto;
+}
+.results-summary > p:last-child {
+  margin-left: auto;
+}
+.results-summary > .playlist-button,
+.results-summary > .labelled-control,
+.results-summary > .tag-all-field {
+  flex: none;
+  flex-shrink: 0;
+}
+.results-summary .playlist-button {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .thumbnail-controls {

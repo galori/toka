@@ -4991,6 +4991,38 @@ test("lets the app use the full available width", () => {
   );
 });
 
+test("keeps result actions from shrinking into tall buttons", async () => {
+  externalPlayersMock.mockResolvedValueOnce([{ command: "vlc", name: "VLC" }]);
+  invokeMock.mockResolvedValueOnce({
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 84,
+    totalPages: 4,
+    results: [
+      { id: "video-1", fileName: "clip-1.mp4", extension: "mp4" },
+      { id: "video-2", fileName: "clip-2.mp4", extension: "mp4" },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+
+  const openInPlayer = await screen.findByRole("button", {
+    name: "Open in player",
+  });
+  const summary = openInPlayer.closest(".results-summary");
+  expect(summary).toBeInTheDocument();
+  expect(getComputedStyle(summary!).flexWrap).toBe("wrap");
+
+  for (const control of summary!.querySelectorAll<HTMLElement>(
+    ".playlist-button",
+  )) {
+    expect(getComputedStyle(control).flexShrink).toBe("0");
+    expect(getComputedStyle(control).whiteSpace).toBe("nowrap");
+  }
+});
+
 test("resizes thumbnails with the larger and smaller controls", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "clip",
