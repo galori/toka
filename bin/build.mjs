@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareBuild } from "./prepare-build.mjs";
+import { buildPlocate } from "../scripts/build-plocate.mjs";
 
 const root = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const target = process.argv[2];
@@ -13,6 +14,8 @@ if (!["linux", "mac"].includes(target)) throw new Error("Usage: node bin/build.m
 // and leaves bundling to release builds. See OPTIMIZE_BUILD_SPEED.md.
 const wantsAppImage = target === "linux" && process.argv.includes("--appimage");
 
+if (target === "linux") await buildPlocate();
+
 const info = prepareBuild();
 const env = {
   ...process.env,
@@ -23,7 +26,8 @@ const env = {
 
 function bundleArguments() {
   if (target === "mac") return ["--bundles", "app,dmg"];
-  return wantsAppImage ? ["--bundles", "appimage"] : ["--no-bundle"];
+  const bundle = wantsAppImage ? ["--bundles", "appimage"] : ["--no-bundle"];
+  return [...bundle, "--config", "src-tauri/tauri.linux-owned-index.conf.json"];
 }
 
 const build = spawnSync("npm", ["run", "tauri", "build", "--", ...bundleArguments()], {

@@ -86,6 +86,7 @@ pub struct SearchPage {
     pub page_size: usize,
     pub total_results: usize,
     pub total_pages: usize,
+    pub index_revision: u64,
     pub results: Vec<VideoResult>,
 }
 
@@ -110,6 +111,10 @@ pub trait SearchProvider: Send + Sync {
     /// it is told otherwise, and a video in a matching folder has no reason to
     /// carry the term in its own name.
     fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError>;
+
+    fn revision(&self) -> u64 {
+        0
+    }
 }
 
 pub struct SearchEngine {
@@ -211,6 +216,7 @@ impl SearchEngine {
             page_size: PAGE_SIZE,
             total_results,
             total_pages,
+            index_revision: self.provider.revision(),
             results,
         })
     }
@@ -294,6 +300,7 @@ impl SearchEngine {
             page_size: PAGE_SIZE,
             total_results: results.len(),
             total_pages: 1,
+            index_revision: self.provider.revision(),
             results,
         }
     }

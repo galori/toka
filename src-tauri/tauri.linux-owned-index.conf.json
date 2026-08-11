@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "externalBin": ["binaries/toka-plocate", "binaries/toka-updatedb"],
+    "resources": {
+      "resources/plocate-1.1.24.tar.gz": "share/doc/toka/plocate-1.1.24.tar.gz",
+      "resources/plocate-COPYING": "share/doc/toka/plocate-COPYING"
+    }
+  }
+}

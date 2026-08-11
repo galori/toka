@@ -1,6 +1,6 @@
 # Toka
 
-Toka is a small desktop app for finding and playing videos on macOS and Linux. It searches the operating system's existing index—Spotlight on macOS or plocate on Linux. It never changes the contents of your files; the only thing it writes is a video's tags, which live in its filename.
+Toka is a small desktop app for finding and playing videos on macOS and Linux. On Linux it maintains a private search index for the folders you choose; on macOS it uses Spotlight. It never changes the contents of your files except when you edit a video's tags, which live in its filename.
 
 ## Quick start
 
@@ -10,13 +10,13 @@ Toka is a small desktop app for finding and playing videos on macOS and Linux. I
 ## Build
 
 ```sh
-npm run build:linux # Linux: builds and installs the .deb
+npm run build:linux # Linux: builds and installs for the current user
 npm run build:mac   # macOS: builds the .app and .dmg
 ```
 
-Build Linux bundles on Linux and macOS bundles on macOS. The Linux command installs
-the generated `.deb` so Toka appears in the Applications menu and can be launched
-from there. See the platform quick-start guide for details.
+Build Linux artifacts on Linux and macOS bundles on macOS. The Linux command installs
+Toka, its private indexer, and its bundled plocate tools under your home directory,
+so no system-wide plocate setup is needed. See the platform quick-start guide for details.
 
 ## Search
 
@@ -67,6 +67,7 @@ taken.
 
 - Supported search results: MP4, MOV, MKV, AVI, WebM, M4V, MPEG, MPG, and MPE.
 - Linux playback uses the embedded libmpv/FFmpeg media engine; other platforms use the system WebKit media engine. Toka does not transcode files.
-- Search results are based on the current Spotlight or plocate index, not a live filesystem scan.
+- On Linux, `Ctrl+,` opens the search-folder screen. Toka updates those private indexes after files are created, removed, moved, or renamed, even while its window is closed.
+- A disconnected external folder is shown as offline. Its index is retained and incrementally refreshed when the same drive returns at the same mount path.
 
 See [Development](docs/development.md) for tests, project structure, troubleshooting, and implementation details. The official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) cover other Linux distributions.

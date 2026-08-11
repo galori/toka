@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::managed_index::{self, IndexPaths};
 use crate::search::{SearchError, SearchProvider};
 #[cfg(all(target_os = "macos", not(test)))]
 use std::sync::Once;
@@ -226,6 +228,60 @@ impl SearchProvider for PlocateSearchProvider {
             output,
             "plocate search failed. Ensure plocate is installed and its index has been built",
         )
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct ManagedPlocateSearchProvider {
+    runner: Arc<dyn ProcessRunner>,
+    paths: IndexPaths,
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedPlocateSearchProvider {
+    pub fn system(paths: IndexPaths) -> Self {
+        Self {
+            runner: Arc::new(SystemProcessRunner),
+            paths,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SearchProvider for ManagedPlocateSearchProvider {
+    fn candidates(&self, query: &str, whole_path: bool) -> Result<Vec<PathBuf>, SearchError> {
+        let term = longest_term(query)?;
+        let databases = managed_index::database_paths(&self.paths);
+        if databases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = Vec::new();
+        for database in databases {
+            args.push("--database".into());
+            args.push(database.to_string_lossy().into_owned());
+        }
+        args.push("--ignore-case".into());
+        if !whole_path {
+            args.push("--basename".into());
+        }
+        args.extend(["--existing".into(), "--".into(), term.into()]);
+        let program = managed_index::plocate_path();
+        let output = self
+            .runner
+            .run(program.to_string_lossy().as_ref(), &args)
+            .map_err(|error| {
+                SearchError::Provider(format!(
+                    "Toka's private search index could not start: {error}"
+                ))
+            })?;
+        if output.exit_code == Some(1) {
+            return Ok(Vec::new());
+        }
+        parse_output(output, "Toka's private search failed")
+    }
+
+    fn revision(&self) -> u64 {
+        managed_index::revision(&self.paths)
     }
 }
 

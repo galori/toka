@@ -18,6 +18,7 @@ export type SearchPage = {
   pageSize: typeof PAGE_SIZE;
   totalResults: number;
   totalPages: number;
+  indexRevision?: number;
   results: VideoResult[];
 };
 
@@ -40,6 +41,31 @@ export const DEFAULT_SEARCH_FIELDS: SearchFields = {
 
 export type MediaType = "videos" | "images" | "both";
 export const DEFAULT_MEDIA_TYPE: MediaType = "videos";
+
+export type IndexFolder = {
+  id: string;
+  path: string;
+  status: "pending" | "indexing" | "ready" | "offline" | "error";
+  message?: string;
+};
+
+export type IndexState = {
+  supported: boolean;
+  revision: number;
+  folders: IndexFolder[];
+};
+
+export function indexState(): Promise<IndexState> {
+  return invoke<IndexState>("index_state");
+}
+
+export function addIndexFolder(path: string): Promise<IndexState> {
+  return invoke<IndexState>("add_index_folder", { path });
+}
+
+export function removeIndexFolder(id: string): Promise<IndexState> {
+  return invoke<IndexState>("remove_index_folder", { id });
+}
 
 export function searchVideos(
   query: string,
