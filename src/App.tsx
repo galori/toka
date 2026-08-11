@@ -765,6 +765,7 @@ const HELP_SECTIONS: HelpSection[] = [
     title: "Everywhere",
     entries: [
       { shortcut: "?", description: "Open or close keyboard shortcuts" },
+      { shortcut: "Ctrl+W", description: "Close this Toka window" },
       {
         shortcut: "Escape",
         description: "Close help, leave fullscreen, or return to results",
@@ -2983,6 +2984,29 @@ export default function App() {
   // Whichever player is picked, or the first Toka found if the viewer has not
   // picked one.
   const activePlayer = chosenPlayer ?? players[0]?.command;
+
+  // Ctrl+W is the window manager's close gesture, but the webview owns the
+  // keyboard before the native window does. Handle it at the app boundary so
+  // it works from search, folder setup, help, and playback alike.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        !event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        event.shiftKey ||
+        event.key.toLowerCase() !== "w"
+      )
+        return;
+      event.preventDefault();
+      void getCurrentWindow()
+        .close()
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

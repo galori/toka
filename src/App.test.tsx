@@ -21,6 +21,7 @@ import App, {
 import "./styles.css";
 
 const windowApiMock = vi.hoisted(() => ({
+  close: vi.fn(),
   isFullscreen: vi.fn(),
   setFullscreen: vi.fn(),
 }));
@@ -101,8 +102,21 @@ beforeEach(() => {
   randomMock.mockReset().mockReturnValue(0.999999);
   windowApiMock.isFullscreen.mockReset();
   windowApiMock.setFullscreen.mockReset();
+  windowApiMock.close.mockReset();
   windowApiMock.isFullscreen.mockResolvedValue(false);
   windowApiMock.setFullscreen.mockResolvedValue(undefined);
+  windowApiMock.close.mockResolvedValue(undefined);
+});
+
+test("closes the Toka window from Ctrl+W", () => {
+  render(<App />);
+
+  fireEvent.keyDown(screen.getByRole("searchbox"), {
+    key: "w",
+    ctrlKey: true,
+  });
+
+  expect(windowApiMock.close).toHaveBeenCalledTimes(1);
 });
 
 test("opens the keyboard shortcuts help from its button and question-mark shortcut", async () => {
@@ -120,6 +134,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   const help = screen.getByRole("dialog", { name: "Keyboard shortcuts" });
   expect(help).toHaveTextContent("Search tags");
   expect(help).toHaveTextContent("Return to search");
+  expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(
