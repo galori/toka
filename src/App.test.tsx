@@ -5010,6 +5010,18 @@ test("resizes thumbnails with the larger and smaller controls", async () => {
   const smaller = await screen.findByRole("button", {
     name: "Smaller thumbnails",
   });
+  const thumbnailControls = screen.getByRole("group", {
+    name: "Thumbnail size",
+  });
+  expect(getComputedStyle(thumbnailControls).marginTop).toBe("8px");
+  expect(smaller.querySelector(".thumbnail-size-icon")).toHaveClass(
+    "thumbnail-size-smaller",
+  );
+  expect(larger.querySelector(".thumbnail-size-icon")).toHaveClass(
+    "thumbnail-size-larger",
+  );
+  expect(smaller.querySelector(".control-label:not(.key-hint)")).toBeNull();
+  expect(larger.querySelector(".control-label:not(.key-hint)")).toBeNull();
   expect(larger).toHaveAttribute("aria-keyshortcuts", "+");
   expect(smaller).toHaveAttribute("aria-keyshortcuts", "-");
   expect(grid.style.getPropertyValue("--thumbnail-size")).toBe(

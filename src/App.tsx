@@ -402,6 +402,23 @@ function SearchIcon() {
   );
 }
 
+function ThumbnailSizeIcon({ larger }: { larger: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+      className={`control-icon thumbnail-size-icon ${
+        larger ? "thumbnail-size-larger" : "thumbnail-size-smaller"
+      }`}
+    >
+      <circle cx="10.5" cy="10.5" r="6.25" />
+      <path d="m15.5 15.5 4.5 4.5" />
+      <path d="M7.5 10.5h6" />
+      {larger ? <path d="M10.5 7.5v6" /> : null}
+    </svg>
+  );
+}
+
 // Text-glyph icons (⏮ ⌕ ↶ …) fall back to whichever font a Linux system has
 // installed for that codepoint, which can render far smaller and thinner
 // than the same character on macOS. Drawing these as SVG keeps their size
@@ -3351,6 +3368,8 @@ export default function App() {
           ) : null}
           <div
             className="thumbnail-controls"
+            role="group"
+            aria-label="Thumbnail size"
             style={{
               display: "flex",
               gap: "8px",
@@ -3365,7 +3384,7 @@ export default function App() {
               onClick={decreaseThumbnailSize}
               disabled={thumbnailSize <= THUMBNAIL_SIZE_MIN}
             >
-              <Label>Smaller</Label>
+              <ThumbnailSizeIcon larger={false} />
             </ControlButton>
             <ControlButton
               shortcut="+"
@@ -3374,7 +3393,7 @@ export default function App() {
               onClick={increaseThumbnailSize}
               disabled={thumbnailSize >= THUMBNAIL_SIZE_MAX}
             >
-              <Label>Larger</Label>
+              <ThumbnailSizeIcon larger />
             </ControlButton>
           </div>
           {page.results.length ? (
