@@ -18,6 +18,7 @@ import App, {
   THUMBNAIL_SIZE_MIN,
   THUMBNAIL_SIZE_STEP,
 } from "./App";
+import "./styles.css";
 
 const windowApiMock = vi.hoisted(() => ({
   isFullscreen: vi.fn(),
@@ -4977,6 +4978,14 @@ test("makes the results grid responsive and fills the width with as many thumbna
   );
   // The grid should use auto-fill/minmax via the CSS variable.
   expect(grid).toBeVisible();
+});
+
+test("lets the app use the full available width", () => {
+  render(<App />);
+
+  expect(getComputedStyle(screen.getByRole("main")).width).toBe(
+    "calc(100% - 80px)",
+  );
 });
 
 test("resizes thumbnails with the larger and smaller controls", async () => {
