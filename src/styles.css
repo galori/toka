@@ -562,6 +562,10 @@ button:focus-visible {
   margin: 0;
 }
 
+.thumbnail-controls {
+  margin-top: 8px;
+}
+
 .playlist-button {
   border: 0;
   background: oklch(0.68 0.19 38);
