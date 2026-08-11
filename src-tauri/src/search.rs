@@ -237,13 +237,7 @@ impl SearchEngine {
         request: &SearchRequest,
     ) -> Result<(String, Vec<PathBuf>), SearchError> {
         let query = request.query.trim();
-        let terms: Vec<String> = query
-            .split_whitespace()
-            .map(|term| term.to_lowercase())
-            .collect();
-        if terms.is_empty() {
-            return Err(SearchError::InvalidQuery);
-        }
+        let expression = parse_query(query)?;
         if !request.fields.any() {
             return Err(SearchError::NoSearchFields);
         }
@@ -253,11 +247,12 @@ impl SearchEngine {
 
         let mut seen = HashSet::new();
         let context = SearchLogContext::from(request);
+        let needs_whole_path = request.fields.path || query_needs_whole_path(&expression);
         let paths = self
-            .candidates(query, request.fields.path, &context)?
+            .candidates(query, needs_whole_path, &context)?
             .into_iter()
             .filter(|path| is_supported_media(path, request.media_type))
-            .filter(|path| matches_terms(path, &terms, request.fields))
+            .filter(|path| matches_query(path, &expression, request.fields))
             .filter(|path| seen.insert(path.clone()))
             .collect();
         Ok((query.to_owned(), paths))
@@ -475,38 +470,208 @@ fn video_result(path: &Path) -> VideoResult {
     }
 }
 
-/// Whether every term is somewhere in the parts of `path` the viewer chose to
-/// search. A term may land in any one of them, so a query can name a folder and
-/// a tag at once; all of them still have to land somewhere, which is what makes
-/// a second word narrow a search rather than widen it.
-fn matches_terms(path: &Path, terms: &[String], fields: SearchFields) -> bool {
-    let haystacks = haystacks(path, fields);
-    terms
-        .iter()
-        .all(|term| haystacks.iter().any(|hay| hay.contains(term)))
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryField {
+    Tags,
+    FileName,
+    Path,
+    Any,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryExpr {
+    Term { field: QueryField, value: String },
+    And(Box<QueryExpr>, Box<QueryExpr>),
+    Or(Box<QueryExpr>, Box<QueryExpr>),
+}
+
+fn tokenize_query(query: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for character in query.chars() {
+        if matches!(character, '(' | ')') {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            tokens.push(character.to_string());
+        } else if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
+    let tokens = tokenize_query(query);
+    if tokens.is_empty() {
+        return Err(SearchError::InvalidQuery);
+    }
+    let mut parser = QueryParser {
+        tokens,
+        position: 0,
+    };
+    let expression = parser.parse_or()?;
+    if parser.position != parser.tokens.len() {
+        return Err(SearchError::InvalidQuery);
+    }
+    Ok(expression)
+}
+
+struct QueryParser {
+    tokens: Vec<String>,
+    position: usize,
+}
+
+impl QueryParser {
+    fn peek(&self) -> Option<&str> {
+        self.tokens.get(self.position).map(String::as_str)
+    }
+
+    fn consume(&mut self) -> Option<String> {
+        let token = self.tokens.get(self.position).cloned()?;
+        self.position += 1;
+        Some(token)
+    }
+
+    fn parse_or(&mut self) -> Result<QueryExpr, SearchError> {
+        let mut expression = self.parse_and()?;
+        while self
+            .peek()
+            .is_some_and(|token| token.eq_ignore_ascii_case("OR"))
+        {
+            self.consume();
+            expression = QueryExpr::Or(Box::new(expression), Box::new(self.parse_and()?));
+        }
+        Ok(expression)
+    }
+
+    fn parse_and(&mut self) -> Result<QueryExpr, SearchError> {
+        let mut expression = self.parse_primary()?;
+        loop {
+            match self.peek() {
+                None | Some(")") => break,
+                Some(token) if token.eq_ignore_ascii_case("OR") => break,
+                Some(token) if token.eq_ignore_ascii_case("AND") => {
+                    self.consume();
+                }
+                Some(_) => {}
+            }
+            expression = QueryExpr::And(Box::new(expression), Box::new(self.parse_primary()?));
+        }
+        Ok(expression)
+    }
+
+    fn parse_primary(&mut self) -> Result<QueryExpr, SearchError> {
+        match self.peek() {
+            Some("(") => {
+                self.consume();
+                let expression = self.parse_or()?;
+                if self.consume().as_deref() != Some(")") {
+                    return Err(SearchError::InvalidQuery);
+                }
+                Ok(expression)
+            }
+            Some(")") | None => Err(SearchError::InvalidQuery),
+            Some(token)
+                if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") =>
+            {
+                Err(SearchError::InvalidQuery)
+            }
+            Some(_) => Ok(parse_query_term(&self.consume().unwrap())),
+        }
+    }
+}
+
+fn parse_query_term(token: &str) -> QueryExpr {
+    let (field, value) = token
+        .split_once(':')
+        .map(|(field, value)| (field.to_ascii_lowercase(), value))
+        .and_then(|(field, value)| {
+            let field = match field.as_str() {
+                "tags" | "tag" => QueryField::Tags,
+                "filename" | "file" | "name" => QueryField::FileName,
+                "path" => QueryField::Path,
+                _ => return None,
+            };
+            (!value.is_empty()).then_some((field, value))
+        })
+        .unwrap_or((QueryField::Any, token));
+    QueryExpr::Term {
+        field,
+        value: value.to_lowercase(),
+    }
+}
+
+fn query_needs_whole_path(expression: &QueryExpr) -> bool {
+    match expression {
+        QueryExpr::Term { field, .. } => *field == QueryField::Path,
+        QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
+            query_needs_whole_path(left) || query_needs_whole_path(right)
+        }
+    }
+}
+
+fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> bool {
+    match expression {
+        QueryExpr::Term { field, value } => match field {
+            QueryField::Any => haystacks(path, fields)
+                .iter()
+                .any(|hay| hay.contains(value)),
+            QueryField::Tags => tags_haystack(path).contains(value),
+            QueryField::FileName => file_name_haystack(path).contains(value),
+            QueryField::Path => path_haystack(path).contains(value),
+        },
+        QueryExpr::And(left, right) => {
+            matches_query(path, left, fields) && matches_query(path, right, fields)
+        }
+        QueryExpr::Or(left, right) => {
+            matches_query(path, left, fields) || matches_query(path, right, fields)
+        }
+    }
 }
 
 /// The lowercased text of each part of `path` that is being searched. The tags
 /// are read from the name rather than the filesystem, so this stays free of the
 /// per-candidate `stat` a lookup would cost.
 fn haystacks(path: &Path, fields: SearchFields) -> Vec<String> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
     let mut haystacks = Vec::with_capacity(3);
     if fields.tags {
-        haystacks.push(tags::Tags::parse_file_name(&name).into_values().join(" "));
+        haystacks.push(tags_haystack(path));
     }
     if fields.file_name {
-        haystacks.push(tags::Tags::default().apply_to_file(&name).to_lowercase());
+        haystacks.push(file_name_haystack(path));
     }
     if fields.path {
-        haystacks.push(
-            path.parent()
-                .unwrap_or_else(|| Path::new(""))
-                .to_string_lossy()
-                .to_lowercase(),
-        );
+        haystacks.push(path_haystack(path));
     }
     haystacks
+}
+
+fn tags_haystack(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    tags::Tags::parse_file_name(&name)
+        .into_values()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn file_name_haystack(path: &Path) -> String {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    tags::Tags::default().apply_to_file(&name).to_lowercase()
+}
+
+fn path_haystack(path: &Path) -> String {
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_string_lossy()
+        .to_lowercase()
 }
 
 pub fn is_supported_video(path: &Path) -> bool {
@@ -913,6 +1078,103 @@ mod tests {
                 .total_results,
             0
         );
+    }
+
+    #[test]
+    fn advanced_search_or_matches_either_branch() {
+        let directory = tempdir().unwrap();
+        let summer = directory.path().join("summer.mp4");
+        let winter = directory.path().join("winter.mp4");
+        let spring = directory.path().join("spring.mp4");
+        for path in [&summer, &winter, &spring] {
+            fs::write(path, b"test").unwrap();
+        }
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            summer.clone(),
+            winter.clone(),
+            spring,
+        ])));
+        let page = engine.search(request("summer OR winter")).unwrap();
+
+        let mut found = names(&page);
+        found.sort();
+        assert_eq!(found, ["summer.mp4", "winter.mp4"]);
+    }
+
+    #[test]
+    fn advanced_search_and_binds_tighter_than_or() {
+        let directory = tempdir().unwrap();
+        let summer = directory.path().join("summer.mp4");
+        let winter_beach = directory.path().join("winter beach.mp4");
+        let winter_party = directory.path().join("winter party.mp4");
+        for path in [&summer, &winter_beach, &winter_party] {
+            fs::write(path, b"test").unwrap();
+        }
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            summer,
+            winter_beach,
+            winter_party,
+        ])));
+        let page = engine.search(request("summer OR winter beach")).unwrap();
+
+        let mut found = names(&page);
+        found.sort();
+        assert_eq!(found, ["summer.mp4", "winter beach.mp4"]);
+    }
+
+    #[test]
+    fn advanced_search_supports_parentheses_and_field_qualifiers() {
+        let directory = tempdir().unwrap();
+        let holiday = directory.path().join("Holiday");
+        let other = directory.path().join("Other");
+        fs::create_dir(&holiday).unwrap();
+        fs::create_dir(&other).unwrap();
+        let holiday_home = holiday.join("clip [home].mp4");
+        let holiday_work = holiday.join("clip [work].mp4");
+        let other_home = other.join("different [home].mp4");
+        let other_filename = other.join("home clip.mp4");
+        for path in [&holiday_home, &holiday_work, &other_home, &other_filename] {
+            fs::write(path, b"test").unwrap();
+        }
+
+        let provider = Arc::new(FakeProvider::new(vec![
+            holiday_home,
+            holiday_work,
+            other_home,
+            other_filename.clone(),
+        ]));
+        let engine = SearchEngine::new(provider.clone());
+
+        let page = engine
+            .search(request("(tags:home OR path:Holiday) AND filename:clip"))
+            .unwrap();
+        let mut found = names(&page);
+        found.sort();
+        assert_eq!(found, ["clip [home].mp4", "clip [work].mp4"]);
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [true]);
+
+        let filename_only = engine.search(request("filename:home")).unwrap();
+        assert_eq!(names(&filename_only), ["home clip.mp4"]);
+    }
+
+    #[test]
+    fn advanced_search_rejects_incomplete_expressions() {
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+
+        assert!(matches!(
+            engine.search(request("(clip OR movie")),
+            Err(SearchError::InvalidQuery)
+        ));
+        assert!(matches!(
+            engine.search(request("clip AND")),
+            Err(SearchError::InvalidQuery)
+        ));
+        assert!(matches!(
+            engine.search(request("AND clip")),
+            Err(SearchError::InvalidQuery)
+        ));
     }
 
     #[test]

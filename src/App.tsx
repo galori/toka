@@ -781,6 +781,14 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "Ctrl+F", description: "Search filenames" },
       { shortcut: "Ctrl+P", description: "Search paths" },
       {
+        shortcut: "AND OR ( )",
+        description: "Combine terms and group them with parentheses",
+      },
+      {
+        shortcut: "tags: filename: path:",
+        description: "Limit a term to a specific search field",
+      },
+      {
         shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",
         description: "Show videos, images, or both",
       },
