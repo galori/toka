@@ -545,6 +545,79 @@ test("displays an app-generated thumbnail when search returns one", async () => 
   });
 });
 
+test("shows a bounded generating state while a nearby thumbnail is pending", async () => {
+  let resolveThumbnail!: (path: string) => void;
+  const thumbnail = new Promise<string>((resolve) => {
+    resolveThumbnail = resolve;
+  });
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "pending",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "pending-video", fileName: "pending.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "video_thumbnail") return thumbnail;
+    return Promise.resolve();
+  });
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      constructor(private readonly callback: IntersectionObserverCallback) {}
+      observe(target: Element) {
+        if (!target.classList.contains("video-art")) return;
+        queueMicrotask(() =>
+          this.callback(
+            [
+              {
+                target,
+                isIntersecting: true,
+              } as unknown as IntersectionObserverEntry,
+            ],
+            this as unknown as IntersectionObserver,
+          ),
+        );
+      }
+      disconnect() {}
+      unobserve() {}
+      takeRecords() {
+        return [];
+      }
+      root = null;
+      rootMargin = "0px";
+      thresholds = [];
+    },
+  );
+
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "pending{Enter}");
+
+  expect(await screen.findByText("Generating thumbnail…")).toBeVisible();
+  expect(invokeMock).toHaveBeenCalledWith("video_thumbnail", {
+    resultId: "pending-video",
+  });
+  const result = screen.getByRole("button", { name: "Play pending.mp4" });
+  expect(getComputedStyle(result.parentElement!)).toMatchObject({
+    contentVisibility: "auto",
+    containIntrinsicSize: "320px",
+  });
+
+  resolveThumbnail("/tmp/pending.jpg");
+  await waitFor(() =>
+    expect(result.querySelector(".thumbnail-loading")).not.toBeInTheDocument(),
+  );
+  expect(result.querySelector(".video-art")).toHaveStyle({
+    backgroundImage: 'url("asset:///tmp/pending.jpg")',
+  });
+});
+
 test("labels mixed image and video results in the search grid", async () => {
   invokeMock.mockResolvedValueOnce({
     query: "mixed",
