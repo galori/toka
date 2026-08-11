@@ -5501,3 +5501,55 @@ test("shows image results and handles slideshow controls", async () => {
     vi.useRealTimers();
   }
 });
+
+test("fits an image inside the player in windowed and fullscreen modes", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15");
+  const imagePage = {
+    query: "portrait",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "image-1", fileName: "portrait.jpg", extension: "jpg" }],
+  };
+  invokeMock.mockImplementation((command: string) =>
+    command === "search_videos"
+      ? Promise.resolve(imagePage)
+      : Promise.resolve({
+          filePath: "/Photos/portrait.jpg",
+          playbackBackend: "web",
+        }),
+  );
+  const user = userEvent.setup();
+
+  try {
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "Images" }));
+    await user.type(screen.getByRole("searchbox"), "portrait{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play portrait.jpg" }),
+    );
+
+    const image = await screen.findByLabelText("Playing portrait.jpg");
+    const shell = image.closest(".player-shell");
+    expect(shell).toBeInTheDocument();
+    expect(shell).toHaveClass("image-player");
+    expect(getComputedStyle(shell!).display).toBe("grid");
+    const imageStyle = getComputedStyle(image);
+    expect(imageStyle.display).toBe("block");
+    expect(imageStyle.maxWidth).toBe("100%");
+    expect(imageStyle.maxHeight).toBe("100%");
+    expect(imageStyle.objectFit).toBe("contain");
+    expect(imageStyle.objectPosition).toBe("center");
+
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() => expect(shell).toHaveClass("fullscreen"));
+    expect(getComputedStyle(image).maxHeight).toBe(
+      "calc(100% - var(--scrubber-sliver))",
+    );
+  } finally {
+    userAgent.mockRestore();
+  }
+});

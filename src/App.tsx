@@ -2104,7 +2104,7 @@ function Player({
           refuse the request to grant it. */}
       <div
         ref={playerShell}
-        className={`player-shell${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}${cursorHidden ? " cursor-hidden" : ""}`}
+        className={`player-shell${isImage ? " image-player" : ""}${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}${cursorHidden ? " cursor-hidden" : ""}`}
         tabIndex={-1}
         onMouseMove={() => {
           if (cursorHidden) setCursorHidden(false);
