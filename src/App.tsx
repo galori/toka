@@ -734,6 +734,88 @@ const KEY_GLYPHS: Record<string, string> = {
   PageDown: "PgDn",
 };
 
+type HelpSection = {
+  title: string;
+  entries: { shortcut: string; description: string }[];
+};
+
+// Keep this list short enough to scan, but complete enough that the help pane
+// is the place to learn the app rather than a second, partial set of hints.
+const HELP_SECTIONS: HelpSection[] = [
+  {
+    title: "Everywhere",
+    entries: [
+      { shortcut: "?", description: "Open or close keyboard shortcuts" },
+      {
+        shortcut: "Escape",
+        description: "Close help, leave fullscreen, or return to results",
+      },
+    ],
+  },
+  {
+    title: "Search",
+    entries: [
+      { shortcut: "Ctrl+K", description: "Focus and select the search field" },
+      { shortcut: "Enter", description: "Run the search" },
+      { shortcut: "Ctrl+T", description: "Search tags" },
+      { shortcut: "Ctrl+F", description: "Search filenames" },
+      { shortcut: "Ctrl+P", description: "Search paths" },
+      {
+        shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",
+        description: "Show videos, images, or both",
+      },
+      { shortcut: "Ctrl+,", description: "Manage search folders" },
+      { shortcut: "Ctrl+N", description: "Open a new Toka window" },
+      { shortcut: "Ctrl+O", description: "Open results in another player" },
+      { shortcut: "Ctrl+Shift+T", description: "Tag all results" },
+      {
+        shortcut: "Ctrl+Shift+R",
+        description: "Refresh results after indexing",
+      },
+      { shortcut: "R", description: "Shuffle results" },
+      { shortcut: "- +", description: "Resize thumbnails" },
+    ],
+  },
+  {
+    title: "Folder setup",
+    entries: [
+      { shortcut: "Ctrl+O", description: "Add a folder" },
+      { shortcut: "Delete", description: "Remove a folder" },
+      { shortcut: "Ctrl+Enter", description: "Start searching" },
+    ],
+  },
+  {
+    title: "Player",
+    entries: [
+      { shortcut: "Space", description: "Play or pause video / slideshow" },
+      {
+        shortcut: "ArrowLeft ArrowRight",
+        description: "Seek, or move between images",
+      },
+      { shortcut: "PageUp PageDown", description: "Previous or next item" },
+      { shortcut: "J", description: "Change the skip step" },
+      { shortcut: "- =", description: "Decrease or increase playback speed" },
+      {
+        shortcut: "ArrowDown ArrowUp",
+        description: "Decrease or increase volume",
+      },
+      { shortcut: "0 5 1", description: "Mute, half, or full volume" },
+      { shortcut: "[ ]", description: "Rotate left or right" },
+      { shortcut: "A", description: "Cycle aspect ratio" },
+      { shortcut: "L", description: "Cycle loop mode" },
+      { shortcut: "P", description: "Show or hide the playlist" },
+      { shortcut: "R", description: "Shuffle the playlist" },
+      { shortcut: "S", description: "Toggle subtitles or slideshow" },
+      { shortcut: "C", description: "Copy the file path" },
+      { shortcut: "T", description: "Edit tags" },
+      { shortcut: "F", description: "Cycle fullscreen modes" },
+      { shortcut: "I", description: "Show or hide fullscreen information" },
+      { shortcut: "Shift+Delete", description: "Delete the current item" },
+      { shortcut: "Ctrl+Shift+Delete", description: "Undo a deletion" },
+    ],
+  },
+];
+
 // Whether a keystroke belongs to the control under it rather than to the app.
 // The player's bar is full of form controls — the scrubber, the volume slider,
 // the speed and subtitle pickers — and none of them take typed text, so
@@ -766,8 +848,8 @@ function acceptsTypedText(target: EventTarget | null): boolean {
   return true;
 }
 
-function KeyHint({ shortcut }: { shortcut: string }) {
-  const label = shortcut
+function shortcutLabel(shortcut: string): string {
+  return shortcut
     .split(" ")
     .map((combination) =>
       combination
@@ -778,10 +860,13 @@ function KeyHint({ shortcut }: { shortcut: string }) {
         .join("+"),
     )
     .join("/");
+}
+
+function KeyHint({ shortcut }: { shortcut: string }) {
   // Assistive technology already gets this from aria-keyshortcuts.
   return (
     <span className="key-hint control-label" aria-hidden="true">
-      {label}
+      {shortcutLabel(shortcut)}
     </span>
   );
 }
@@ -845,6 +930,76 @@ function ControlButton({
   );
 }
 
+function HelpPane({ onClose }: { onClose: () => void }) {
+  return (
+    <div className="help-backdrop">
+      <section
+        className="help-pane"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="help-title"
+      >
+        <div className="help-heading">
+          <div>
+            <p className="help-kicker">Toka help</p>
+            <h1 id="help-title">Keyboard shortcuts</h1>
+          </div>
+          <ControlButton
+            shortcut="Escape"
+            className="help-close"
+            aria-label="Close keyboard shortcuts"
+            autoFocus
+            onClick={onClose}
+          >
+            <Label>Close</Label>
+          </ControlButton>
+        </div>
+        <p className="help-intro">
+          Shortcuts depend on whether you are searching or playing. The same
+          actions are also available from the controls on screen.
+        </p>
+        <div className="help-sections">
+          {HELP_SECTIONS.map((section) => (
+            <section className="help-section" key={section.title}>
+              <h2>{section.title}</h2>
+              <dl>
+                {section.entries.map((entry) => (
+                  <div key={`${section.title}-${entry.shortcut}`}>
+                    <dt>
+                      <kbd>{shortcutLabel(entry.shortcut)}</kbd>
+                    </dt>
+                    <dd>{entry.description}</dd>
+                  </div>
+                ))}
+              </dl>
+            </section>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HelpButton({
+  className = "scope-toggle",
+  onClick,
+}: {
+  className?: string;
+  onClick: () => void;
+}) {
+  return (
+    <ControlButton
+      shortcut="?"
+      className={className}
+      aria-label="Keyboard shortcuts"
+      title="Keyboard shortcuts"
+      onClick={onClick}
+    >
+      <Label>Help</Label>
+    </ControlButton>
+  );
+}
+
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const wholeSeconds = Math.floor(seconds);
@@ -883,6 +1038,8 @@ function Player({
   hasMore = false,
   onLoadMore,
   onBack,
+  onHelp,
+  helpOpen,
   onTagsChange,
 }: {
   videos: VideoResult[];
@@ -890,6 +1047,8 @@ function Player({
   hasMore?: boolean;
   onLoadMore?: () => Promise<VideoResult[]>;
   onBack: () => void;
+  onHelp: () => void;
+  helpOpen: boolean;
   onTagsChange: (
     videoId: string,
     update: Pick<VideoResult, "fileName" | "tags">,
@@ -1865,6 +2024,7 @@ function Player({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (helpOpen) return;
       const target = event.target;
       if (
         event.defaultPrevented ||
@@ -1961,6 +2121,7 @@ function Player({
     currentTime,
     duration,
     fullscreen,
+    helpOpen,
     index,
     isImage,
     native,
@@ -2077,6 +2238,7 @@ function Player({
             </div>
           ) : null}
         </div>
+        <HelpButton className="playlist-toggle help-toggle" onClick={onHelp} />
         <ControlButton
           shortcut="P"
           className="playlist-toggle"
@@ -2617,6 +2779,7 @@ async function loadResultPages(
 
 export default function App() {
   const [showFolderSetup, setShowFolderSetup] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [managedIndex, setManagedIndex] = useState<IndexState>();
   const [query, setQuery] = useState("");
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
@@ -2796,6 +2959,30 @@ export default function App() {
   // Whichever player is picked, or the first Toka found if the viewer has not
   // picked one.
   const activePlayer = chosenPlayer ?? players[0]?.command;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      // A question mark is valid search text, so the global shortcut yields to
+      // an editor just as the player's letter shortcuts do.
+      if (
+        event.defaultPrevented ||
+        event.ctrlKey ||
+        event.metaKey ||
+        event.altKey ||
+        acceptsTypedText(event.target)
+      )
+        return;
+      if (event.key === "?") {
+        event.preventDefault();
+        setShowHelp((open) => !open);
+      } else if (showHelp && event.key === "Escape") {
+        event.preventDefault();
+        setShowHelp(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showHelp]);
 
   // The desktop launcher raises the Toka that is already running rather than
   // starting a second one, so watching two things at once has to be asked for
@@ -3214,6 +3401,7 @@ export default function App() {
   if (showFolderSetup && !playing) {
     return (
       <main className="app folder-setup">
+        {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
         <section aria-label="Search folder setup">
           <h1>Choose where Toka searches</h1>
           <p>
@@ -3270,6 +3458,7 @@ export default function App() {
           >
             <Label>Start searching</Label>
           </ControlButton>
+          <HelpButton onClick={() => setShowHelp(true)} />
         </section>
       </main>
     );
@@ -3369,8 +3558,11 @@ export default function App() {
           >
             <Label>New window</Label>
           </ControlButton>
+          <HelpButton onClick={() => setShowHelp(true)} />
         </div>
       </form>
+
+      {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
 
       {!hasSubmitted ? (
         <section className="build-info" aria-label="Build information">
@@ -3413,6 +3605,8 @@ export default function App() {
             restoreResultsScroll.current = true;
             setPlaying(undefined);
           }}
+          onHelp={() => setShowHelp(true)}
+          helpOpen={showHelp}
           onTagsChange={updateTags}
         />
       ) : null}

@@ -105,6 +105,60 @@ beforeEach(() => {
   windowApiMock.setFullscreen.mockResolvedValue(undefined);
 });
 
+test("opens the keyboard shortcuts help from its button and question-mark shortcut", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+
+  const helpButton = screen.getByRole("button", {
+    name: "Keyboard shortcuts",
+  });
+  expect(helpButton).toHaveAttribute("aria-keyshortcuts", "?");
+  expect(helpButton.querySelector(".key-hint")).toHaveTextContent("?");
+
+  await user.click(helpButton);
+
+  const help = screen.getByRole("dialog", { name: "Keyboard shortcuts" });
+  expect(help).toHaveTextContent("Search tags");
+  expect(help).toHaveTextContent("Space");
+  expect(help).toHaveTextContent("Ctrl+Shift+T");
+  expect(
+    screen.getByRole("button", { name: "Close keyboard shortcuts" }),
+  ).toHaveAttribute("aria-keyshortcuts", "Escape");
+
+  await user.keyboard("{Escape}");
+  expect(
+    screen.queryByRole("dialog", { name: "Keyboard shortcuts" }),
+  ).not.toBeInTheDocument();
+
+  fireEvent.keyDown(window, { key: "?", shiftKey: true });
+  expect(
+    screen.getByRole("dialog", { name: "Keyboard shortcuts" }),
+  ).toBeVisible();
+});
+
+test("opens help over the player without letting Escape leave playback", async () => {
+  launchPlaylistMock.mockResolvedValue({
+    query: "summer.m3u8",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
+
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing summer.mp4")).toBeVisible();
+  fireEvent.keyDown(window, { key: "?", shiftKey: true });
+  expect(
+    screen.getByRole("dialog", { name: "Keyboard shortcuts" }),
+  ).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.getByLabelText("Playing summer.mp4")).toBeVisible();
+});
+
 test("opens folder setup on an unconfigured Linux first launch", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
