@@ -609,7 +609,7 @@ const PLAYLIST_HIDE_DELAY = 800;
 // stays with it, and the P key holds it open until the pointer visits and
 // leaves, or until P is pressed again.
 type FullscreenPlaylist = "hidden" | "peek" | "held";
-type FullscreenMode = "video" | "information" | "controls";
+type FullscreenMode = "information" | "controls";
 
 const SPEEDS = [0.1, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4];
 const VOLUME_STEP = 5;
@@ -843,7 +843,10 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
       { shortcut: "T", description: "Edit tags" },
-      { shortcut: "F", description: "Cycle fullscreen modes" },
+      {
+        shortcut: "F",
+        description: "Enter fullscreen, show controls, or exit",
+      },
       { shortcut: "I", description: "Show or hide fullscreen information" },
       { shortcut: "Shift+Delete", description: "Delete the current item" },
       { shortcut: "Ctrl+Shift+Delete", description: "Undo a deletion" },
@@ -1106,10 +1109,11 @@ function Player({
   const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
-  const [fullscreenMode, setFullscreenMode] = useState<FullscreenMode>("video");
-  const fullscreenModeRef = useRef<FullscreenMode>("video");
+  const [fullscreenMode, setFullscreenMode] =
+    useState<FullscreenMode>("information");
+  const fullscreenModeRef = useRef<FullscreenMode>("information");
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
-  // F selects video only, information with the scrubber, then complete controls.
+  // F selects information with the scrubber, then complete controls.
   // Pointer activity cannot rewrite that selection.
   const controlsIdle = fullscreen && fullscreenMode !== "controls";
   const [loop, setLoop] = useState<LoopMode>("playlist");
@@ -2034,12 +2038,6 @@ function Player({
 
   const cycleFullscreen = () => {
     if (fullscreen) {
-      if (fullscreenModeRef.current === "video") {
-        setShowFullscreenInfo(true);
-        fullscreenModeRef.current = "information";
-        setFullscreenMode("information");
-        return;
-      }
       if (fullscreenModeRef.current === "information") {
         fullscreenModeRef.current = "controls";
         setFullscreenMode("controls");
@@ -2048,9 +2046,9 @@ function Player({
       leaveFullscreen();
       return;
     }
-    fullscreenModeRef.current = "video";
-    setFullscreenMode("video");
-    setShowFullscreenInfo(false);
+    fullscreenModeRef.current = "information";
+    setFullscreenMode("information");
+    setShowFullscreenInfo(true);
     setFullscreenError(undefined);
     const shell = playerShell.current;
     const enterWindowFullscreen = () =>
@@ -2322,7 +2320,7 @@ function Player({
           refuse the request to grant it. */}
       <div
         ref={playerShell}
-        className={`player-shell${isImage ? " image-player" : ""}${fullscreen ? " fullscreen" : ""}${fullscreen && fullscreenMode === "video" ? " video-only" : ""}${controlsIdle ? " idle" : ""}${cursorHidden ? " cursor-hidden" : ""}`}
+        className={`player-shell${isImage ? " image-player" : ""}${fullscreen ? " fullscreen" : ""}${controlsIdle ? " idle" : ""}${cursorHidden ? " cursor-hidden" : ""}`}
         tabIndex={-1}
         onMouseMove={() => {
           if (cursorHidden) setCursorHidden(false);
@@ -2394,7 +2392,7 @@ function Player({
             }
           ></video>
         )}
-        {fullscreen && fullscreenMode !== "video" && showFullscreenInfo ? (
+        {fullscreen && showFullscreenInfo ? (
           <div
             ref={fullscreenInfo}
             className="fullscreen-info"
@@ -2412,7 +2410,6 @@ function Player({
         <div
           ref={playerControls}
           className={controlsIdle ? "player-controls idle" : "player-controls"}
-          hidden={fullscreen && fullscreenMode === "video"}
           aria-label="Video controls"
           onClick={releaseFocus}
           onMouseEnter={() => {

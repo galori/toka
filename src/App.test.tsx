@@ -140,6 +140,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
+  expect(help).toHaveTextContent("Enter fullscreen, show controls, or exit");
   expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(
@@ -2171,7 +2172,7 @@ test("enters fullscreen mode for the player", async () => {
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
 
-test("cycles F through video, information, controls, and windowed modes", async () => {
+test("enters fullscreen with the scrubber and cycles F through controls and windowed modes", async () => {
   const userAgent = vi
     .spyOn(window.navigator, "userAgent", "get")
     .mockReturnValue("AppleWebKit Mac OS X");
@@ -2205,20 +2206,11 @@ test("cycles F through video, information, controls, and windowed modes", async 
     await waitFor(() =>
       expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
     );
-    expect(document.querySelector(".player-shell")).toHaveClass("video-only");
     expect(
       screen.queryByRole("region", { name: "Fullscreen video information" }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Video controls")).not.toBeVisible();
-
-    fireEvent.keyDown(window, { key: "f" });
-    expect(document.querySelector(".player-shell")).not.toHaveClass(
-      "video-only",
-    );
-    expect(
-      screen.getByRole("region", { name: "Fullscreen video information" }),
     ).toBeVisible();
     expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+    expect(screen.getByLabelText("Video timeline")).toBeVisible();
 
     fireEvent.keyDown(window, { key: "f" });
     await waitFor(() =>
@@ -2348,7 +2340,8 @@ test("uses Tauri window fullscreen when the web fullscreen request fails", async
     screen.queryByRole("heading", { name: "This video could not be played" }),
   ).not.toBeInTheDocument();
   expect(screen.getByLabelText("Playing clip.mp4")).toBeVisible();
-  expect(screen.getByLabelText("Video controls")).not.toBeVisible();
+  expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+  expect(screen.getByLabelText("Video timeline")).toBeVisible();
 });
 
 // WebKitGTK's own fullscreen mode takes keys before the page is offered them:
@@ -2391,7 +2384,8 @@ test("uses Tauri window fullscreen first on Linux", async () => {
       expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
     );
     expect(requestFullscreen).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("Video controls")).not.toBeVisible();
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+    expect(screen.getByLabelText("Video timeline")).toBeVisible();
   } finally {
     userAgent.mockRestore();
   }
@@ -2503,10 +2497,6 @@ async function enterFullscreen(user: ReturnType<typeof userEvent.setup>) {
     await screen.findByRole("button", { name: "Enter fullscreen" }),
   );
   reportFullscreen(true);
-  // Most legacy fullscreen tests exercise the information/scrubber mode that
-  // used to be the only entry state. The first F now advances there from the
-  // new video-only state.
-  fireEvent.keyDown(window, { key: "f" });
   await screen.findByRole("region", {
     name: "Fullscreen video information",
   });
@@ -5713,7 +5703,7 @@ test("shows image results and handles slideshow controls", async () => {
     }
 
     // images stay on screen for the slideshow interval, so their timeline is
-    // an active scrubber rather than a disabled video-only control
+    // an active scrubber rather than a disabled video-specific control
     const timeline = screen.getByLabelText("Image timeline");
     expect(timeline).toBeEnabled();
     expect(timeline).toHaveAttribute("max", "3");
@@ -5745,7 +5735,7 @@ test("shows image results and handles slideshow controls", async () => {
     fireEvent.keyDown(timeline, { key: "ArrowRight" });
     expect(screen.getByLabelText("Playing sunset.jpg")).toBeVisible();
 
-    // video-only controls are omitted rather than left as disabled controls
+    // video-specific controls are omitted rather than left as disabled controls
     expect(screen.queryByLabelText("Playback speed")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Skip step: 10 seconds" }),
