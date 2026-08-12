@@ -1460,6 +1460,7 @@ test("keeps the copy control in the design system and gives the path room", asyn
     "oklch(0.22 0.02 40)",
   );
   expect(getComputedStyle(copyButton).borderRadius).toBe("9px");
+  expect(getComputedStyle(copyButton).minHeight).toBe("38px");
   expect(copyButton).toHaveAttribute("aria-keyshortcuts", "C");
   expect(copyButton.querySelector(".key-hint")).toHaveTextContent("C");
 
