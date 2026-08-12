@@ -251,17 +251,25 @@ input[type="search"]:focus {
   z-index: 1;
   display: inline-flex;
   align-items: center;
-  min-height: 22px;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
   border: 1px solid rgb(255 255 255 / 20%);
   border-radius: 999px;
-  padding: 3px 8px;
+  padding: 4px;
   background: rgb(11 13 18 / 82%);
   color: #edf1f7;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  line-height: 1;
-  text-transform: uppercase;
+}
+.media-type-badge-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+}
+.media-type-badge .video-icon,
+.media-type-badge .image-icon {
+  width: 100%;
+  height: 100%;
+  stroke: currentColor;
 }
 .media-type-badge.image {
   color: #b8d7ff;
