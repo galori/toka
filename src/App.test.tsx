@@ -5909,6 +5909,8 @@ test("fits an image inside the player in windowed and fullscreen modes", async (
     expect(getComputedStyle(shell!).display).toBe("grid");
     const imageStyle = getComputedStyle(image);
     expect(imageStyle.display).toBe("block");
+    expect(imageStyle.width).toBe("100%");
+    expect(imageStyle.height).toBe("100%");
     expect(imageStyle.maxWidth).toBe("100%");
     expect(imageStyle.maxHeight).toBe("100%");
     expect(imageStyle.objectFit).toBe("contain");
