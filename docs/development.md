@@ -19,6 +19,21 @@ way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.
 
+## Search diagnostics
+
+Toka writes the normal search log as JSON lines under the platform data
+directory. Print it with `npm run search-log`, or follow new entries with
+`npm run search-log -- --follow`; pass a path to either command to inspect a
+different log. Each running Toka window has its own session marker, so closing
+one window does not delete the shared log while another window is active. The
+indexer writes its own `indexer.log` beside the search log.
+
+The Search logging settings pane, available from the keyboard-help pane, can
+enable verbose per-search logs and choose their destination folder. Verbose
+logs include the provider command, filtered candidates, returned paths, and
+errors. Zero-byte media is ignored by indexing, search results, and thumbnail
+discovery.
+
 ## How it works
 
 - `src/` contains the React interface and Tauri command client.
@@ -27,7 +42,7 @@ The native integration test uses an embedded WebDriver and a generated video fix
 - Linux release builds bundle plocate 1.1.24 and use one private database per configured folder. Set `TOKA_SEARCH_PROVIDER=plocate` to exercise the legacy system database or `TOKA_SEARCH_PROVIDER=recoll` to use `recollq`.
 - `scripts/build-plocate.mjs` verifies the upstream source checksum, builds `plocate` and `updatedb`, and stages the GPL source and license beside the generated sidecars. Meson, Ninja, and the zstd development headers are required.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
-- Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, and results are sorted, deduplicated, and paginated in groups of 24.
+- Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, zero-byte media is ignored, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
 - Tags live in the filename inside a trailing `[...]` block. `src-tauri/src/tags.rs` owns the whole convention — parsing, normalizing (lowercase, sorted, deduplicated), and the get/set/add/remove renames — ported from the standalone `tag` library so Toka needs no external command. A rename refuses to overwrite an existing name, and the search engine repoints its result ID at the new path.
 - Subtitles come from sidecar files beside the video (`talk.srt`, `talk.en.srt`) and from tracks inside it. Rust detects the sidecars and converts SRT to WebVTT for the web media engine; on Linux mpv supplies both sidecar and embedded tracks. `S` toggles them.
