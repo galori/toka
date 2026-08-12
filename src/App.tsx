@@ -2818,7 +2818,7 @@ function Player({
         ) : null}
       </div>
       <p className="playlist-status" aria-live="polite">
-        Playlist video {index + 1} of {playlist.length}
+        Playlist {isImage ? "image" : "video"} {index + 1} of {playlist.length}
         {canLoadMore ? "+" : ""}
       </p>
       {loadingMore ? (
@@ -3636,7 +3636,12 @@ export default function App() {
   // The same name on the control and on the field it opens, so a viewer who
   // reached one by keyboard is still in the same place after it opens.
   const tagAllLabel = `Tag all ${page?.totalResults ?? 0} videos`;
-  const resultNoun = mediaType === "images" ? "image" : "video";
+  const resultNoun =
+    mediaType === "images"
+      ? "image"
+      : mediaType === "videos"
+        ? "video"
+        : "result";
 
   if (showSearchLogSettings && !playing) {
     return (

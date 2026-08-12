@@ -825,7 +825,10 @@ test("labels mixed image and video results in the search grid", async () => {
   const user = userEvent.setup();
   render(<App />);
 
+  await user.click(screen.getByRole("button", { name: "Both" }));
   await user.type(screen.getByRole("searchbox"), "mixed{Enter}");
+
+  expect(screen.getByText("2 results")).toBeVisible();
 
   const imageTile = await screen.findByRole("button", {
     name: "Play photo.jpg",
@@ -5727,6 +5730,7 @@ test("shows image results and handles slideshow controls", async () => {
     const image = await screen.findByLabelText("Playing sunset.jpg");
     expect(image.tagName).toBe("IMG");
     expect(image).toHaveAttribute("src", "asset:///Photos/sunset.jpg");
+    expect(screen.getByText("Playlist image 1 of 2")).toBeVisible();
     expect(
       screen.queryByRole("button", { name: /Skip step:/ }),
     ).not.toBeInTheDocument();
