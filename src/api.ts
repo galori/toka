@@ -57,6 +57,11 @@ export type IndexState = {
   folders: IndexFolder[];
 };
 
+export type SearchLogSettings = {
+  verbose: boolean;
+  path?: string | null;
+};
+
 export function indexState(): Promise<IndexState> {
   return invoke<IndexState>("index_state");
 }
@@ -67,6 +72,20 @@ export function addIndexFolder(path: string): Promise<IndexState> {
 
 export function removeIndexFolder(id: string): Promise<IndexState> {
   return invoke<IndexState>("remove_index_folder", { id });
+}
+
+export function searchLogSettings(): Promise<SearchLogSettings> {
+  return invoke<SearchLogSettings>("search_log_settings");
+}
+
+export function setSearchLogSettings(
+  verbose: boolean,
+  path?: string,
+): Promise<SearchLogSettings> {
+  return invoke<SearchLogSettings>("set_search_log_settings", {
+    verbose,
+    path,
+  });
 }
 
 export function searchVideos(

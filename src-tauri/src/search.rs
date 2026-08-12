@@ -4,6 +4,7 @@ use crate::thumbnails;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -167,16 +168,20 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
-        let context = SearchLogContext::from(&request);
-        let result = self.search_page(request);
+        let context = self.logger.context(&request, true);
+        let result = self.search_page(request, &context);
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
         }
         result
     }
 
-    fn search_page(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
-        let (query, mut paths) = self.matching_paths(&request)?;
+    fn search_page(
+        &self,
+        request: SearchRequest,
+        context: &SearchLogContext,
+    ) -> Result<SearchPage, SearchError> {
+        let (query, mut paths) = self.matching_paths(&request, context)?;
         let fields = request.fields;
         let media_type = request.media_type;
 
@@ -200,9 +205,15 @@ impl SearchEngine {
         let total_results = paths.len();
         let total_pages = total_results.div_ceil(PAGE_SIZE);
         let start = (request.page - 1).saturating_mul(PAGE_SIZE);
-        let page_paths = paths.into_iter().skip(start).take(PAGE_SIZE);
+        let page_paths = paths
+            .into_iter()
+            .skip(start)
+            .take(PAGE_SIZE)
+            .collect::<Vec<_>>();
+        self.logger.record_returned(context, &page_paths);
         let mut known_paths = self.result_paths.lock().unwrap();
         let results = page_paths
+            .into_iter()
             .map(|path| {
                 let result = video_result(&path);
                 known_paths.insert(result.id.clone(), path);
@@ -224,8 +235,10 @@ impl SearchEngine {
     /// Answers whether a query's match count changed without creating result
     /// ids or replacing the shuffle used by the visible result pages.
     pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
-        let context = SearchLogContext::from(&request);
-        let result = self.matching_paths(&request).map(|(_, paths)| paths.len());
+        let context = self.logger.context(&request, false);
+        let result = self
+            .matching_paths(&request, &context)
+            .map(|(_, paths)| paths.len());
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
         }
@@ -235,6 +248,7 @@ impl SearchEngine {
     fn matching_paths(
         &self,
         request: &SearchRequest,
+        context: &SearchLogContext,
     ) -> Result<(String, Vec<PathBuf>), SearchError> {
         let query = request.query.trim();
         let expression = parse_query(query)?;
@@ -246,15 +260,30 @@ impl SearchEngine {
         }
 
         let mut seen = HashSet::new();
-        let context = SearchLogContext::from(request);
         let needs_whole_path = request.fields.path || query_needs_whole_path(&expression);
-        let paths = self
-            .candidates(query, needs_whole_path, &context)?
-            .into_iter()
-            .filter(|path| is_supported_media(path, request.media_type))
-            .filter(|path| matches_query(path, &expression, request.fields))
-            .filter(|path| seen.insert(path.clone()))
-            .collect();
+        let mut paths = Vec::new();
+        for path in self.candidates(query, needs_whole_path, context)? {
+            if !is_supported_media(&path, request.media_type) {
+                self.logger
+                    .record_filtered(context, &path, "unsupported media type");
+                continue;
+            }
+            if path.is_file() && !is_non_empty_file(&path) {
+                self.logger.record_filtered(context, &path, "empty file");
+                continue;
+            }
+            if !matches_query(&path, &expression, request.fields) {
+                self.logger
+                    .record_filtered(context, &path, "query did not match");
+                continue;
+            }
+            if !seen.insert(path.clone()) {
+                self.logger
+                    .record_filtered(context, &path, "duplicate path");
+                continue;
+            }
+            paths.push(path);
+        }
         Ok((query.to_owned(), paths))
     }
 
@@ -355,7 +384,8 @@ impl SearchEngine {
             .get(result_id)
             .cloned()
             .ok_or(SearchError::VideoUnavailable)?;
-        if path.is_file() && is_supported_media(&path, MediaType::Both) {
+        if path.is_file() && is_non_empty_file(&path) && is_supported_media(&path, MediaType::Both)
+        {
             Ok(path)
         } else {
             Err(SearchError::VideoUnavailable)
@@ -714,6 +744,12 @@ pub fn is_supported_media(path: &Path, media_type: MediaType) -> bool {
     }
 }
 
+pub(crate) fn is_non_empty_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +857,22 @@ mod tests {
         assert_eq!(page.results[0].file_name, "Summer Family Vacation.MP4");
         assert_eq!(page.results[0].extension, "mp4");
         assert!(!page.results[0].id.is_empty());
+    }
+
+    #[test]
+    fn search_skips_empty_media_files() {
+        let directory = tempdir().unwrap();
+        let empty = directory.path().join("empty.mp4");
+        let matching = directory.path().join("matching.mp4");
+        fs::write(&empty, b"").unwrap();
+        fs::write(&matching, b"video").unwrap();
+
+        let page = SearchEngine::new(Arc::new(FakeProvider::new(vec![empty, matching])))
+            .search(request("mp4"))
+            .unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "matching.mp4");
     }
 
     #[test]

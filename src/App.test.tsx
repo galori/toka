@@ -9,7 +9,12 @@ import {
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { externalPlayers, indexState, launchPlaylist } from "./api";
+import {
+  externalPlayers,
+  indexState,
+  launchPlaylist,
+  searchLogSettings,
+} from "./api";
 import App, {
   playbackSource,
   shuffleVideos,
@@ -51,12 +56,16 @@ vi.mock("./api", async (importOriginal) => ({
     Promise.resolve({ supported: false, revision: 0, folders: [] }),
   ),
   launchPlaylist: vi.fn(() => Promise.resolve(null)),
+  searchLogSettings: vi.fn(() =>
+    Promise.resolve({ verbose: false, path: undefined }),
+  ),
 }));
 
 const invokeMock = vi.mocked(invoke);
 const externalPlayersMock = vi.mocked(externalPlayers);
 const indexStateMock = vi.mocked(indexState);
 const launchPlaylistMock = vi.mocked(launchPlaylist);
+const searchLogSettingsMock = vi.mocked(searchLogSettings);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
 const openMock = vi.mocked(open);
 const randomMock = vi.spyOn(Math, "random");
@@ -97,6 +106,9 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({ supported: false, revision: 0, folders: [] });
   launchPlaylistMock.mockReset().mockResolvedValue(null);
+  searchLogSettingsMock
+    .mockReset()
+    .mockResolvedValue({ verbose: false, path: undefined });
   convertFileSrcMock.mockClear();
   openMock.mockReset();
   randomMock.mockReset().mockReturnValue(0.999999);
@@ -146,6 +158,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
   ).toHaveAttribute("aria-keyshortcuts", "Escape");
+  expect(help).toHaveTextContent("Ctrl+Shift+L");
 
   await user.keyboard("{Escape}");
   expect(
@@ -155,6 +168,49 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   fireEvent.keyDown(window, { key: "?", shiftKey: true });
   expect(
     screen.getByRole("dialog", { name: "Keyboard shortcuts" }),
+  ).toBeVisible();
+});
+
+test("opens and saves verbose search logging from its discoverable shortcuts", async () => {
+  const user = userEvent.setup();
+  openMock.mockResolvedValue("/Logs");
+  render(<App />);
+  await waitFor(() => expect(searchLogSettingsMock).toHaveBeenCalled());
+
+  const openButton = screen.getByRole("button", { name: "Search logging" });
+  expect(openButton).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+L");
+  expect(openButton.querySelector(".key-hint")).toHaveTextContent(
+    "Ctrl+Shift+L",
+  );
+
+  fireEvent.keyDown(window, { key: "l", ctrlKey: true, shiftKey: true });
+  expect(
+    await screen.findByRole("heading", { name: "Search logging" }),
+  ).toBeVisible();
+
+  const toggle = screen.getByRole("button", {
+    name: "Verbose search logging",
+  });
+  expect(toggle).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+L");
+  await user.click(toggle);
+  fireEvent.keyDown(window, { key: "o", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(openMock).toHaveBeenCalledWith({ directory: true, multiple: false }),
+  );
+  await waitFor(() =>
+    expect(screen.getByLabelText("Verbose log folder")).toHaveValue("/Logs"),
+  );
+
+  invokeMock.mockResolvedValue({ verbose: true, path: "/Logs" });
+  fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_search_log_settings", {
+      verbose: true,
+      path: "/Logs",
+    }),
+  );
+  expect(
+    await screen.findByRole("button", { name: "Search logging" }),
   ).toBeVisible();
 });
 

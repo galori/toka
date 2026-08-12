@@ -1509,6 +1509,45 @@ button:focus-visible {
   margin-top: 24px;
 }
 
+.log-settings-field {
+  margin-top: 24px;
+}
+
+.log-settings-field > label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 700;
+}
+
+.log-settings-path {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.log-settings-path input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--border-color, #343434);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel-background, #101010);
+  color: inherit;
+  font: inherit;
+}
+
+.log-settings-path input:focus {
+  outline: none;
+  border-color: oklch(0.68 0.19 38);
+  box-shadow: 0 0 0 3px oklch(0.68 0.19 38 / 0.18);
+}
+
+.settings-help {
+  margin: 8px 0 0;
+  color: #aaa;
+  font-size: 0.85rem;
+}
+
 .folder-list li {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;

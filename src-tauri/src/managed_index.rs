@@ -1,10 +1,11 @@
-use crate::search::{is_supported_image, is_supported_video};
+use crate::search::{is_non_empty_file, is_supported_image, is_supported_video};
 use crate::thumbnails;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},
@@ -18,6 +19,7 @@ pub struct IndexPaths {
     status: PathBuf,
     wake: PathBuf,
     databases: PathBuf,
+    index_log: PathBuf,
 }
 
 impl IndexPaths {
@@ -37,6 +39,7 @@ impl IndexPaths {
             status: data_home.join("toka/index-status.json"),
             wake: config_home.join("toka/indexer-wake"),
             databases: data_home.join("toka/indexes"),
+            index_log: data_home.join("app.toka.desktop/logs/indexer.log"),
         })
     }
 
@@ -47,12 +50,49 @@ impl IndexPaths {
             status: root.join("index-status.json"),
             wake: root.join("indexer-wake"),
             databases: root.join("indexes"),
+            index_log: root.join("indexer.log"),
             root,
         }
     }
 
     pub fn database(&self, id: &str) -> PathBuf {
         self.databases.join(format!("{id}.db"))
+    }
+}
+
+struct IndexLogger {
+    path: PathBuf,
+    write_lock: Mutex<()>,
+}
+
+impl IndexLogger {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    fn record(&self, message: impl AsRef<str>) {
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let _guard = self.write_lock.lock().unwrap();
+        if let Err(error) = fs::create_dir_all(parent) {
+            eprintln!("Could not create Toka indexer log directory: {error}");
+            return;
+        }
+        let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
+            eprintln!("Could not open Toka indexer log: {}", self.path.display());
+            return;
+        };
+        if let Err(error) = writeln!(file, "[{}] {}", now_millis(), message.as_ref()) {
+            eprintln!("Could not write Toka indexer log: {error}");
+        }
     }
 }
 
@@ -131,6 +171,7 @@ pub struct IndexState {
 pub struct IndexManager {
     paths: IndexPaths,
     legacy_counts: Arc<Mutex<Option<MediaCounts>>>,
+    logger: Arc<IndexLogger>,
 }
 
 impl IndexManager {
@@ -140,6 +181,7 @@ impl IndexManager {
 
     fn new(paths: IndexPaths) -> Self {
         Self {
+            logger: Arc::new(IndexLogger::new(paths.index_log.clone())),
             paths,
             legacy_counts: Arc::new(Mutex::new(None)),
         }
@@ -206,9 +248,11 @@ impl IndexManager {
         config.folders.push(ConfiguredFolder {
             id: uuid::Uuid::new_v4().to_string(),
             mount: mount_identity(&path),
-            path,
+            path: path.clone(),
         });
         write_json(&self.paths.config, &config)?;
+        self.logger
+            .record(format!("folder added: {}", path.display()));
         self.wake_indexer()?;
         self.state()
     }
@@ -216,6 +260,11 @@ impl IndexManager {
     pub fn remove_folder(&self, id: &str) -> Result<IndexState, String> {
         let mut config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
         let before = config.folders.len();
+        let removed_path = config
+            .folders
+            .iter()
+            .find(|folder| folder.id == id)
+            .map(|folder| folder.path.clone());
         config.folders.retain(|folder| folder.id != id);
         if config.folders.len() == before {
             return Err("That search folder is no longer configured.".into());
@@ -230,6 +279,10 @@ impl IndexManager {
         status.folders.remove(id);
         status.counts = Some(count_indexed_media(&config.folders));
         write_json(&self.paths.status, &status)?;
+        if let Some(path) = removed_path {
+            self.logger
+                .record(format!("folder removed: {}", path.display()));
+        }
         self.wake_indexer()?;
         self.state()
     }
@@ -437,10 +490,10 @@ fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
-                if is_supported_video(&path) {
+                if is_supported_video(&path) && is_non_empty_file(&path) {
                     counts.videos = counts.videos.saturating_add(1);
                 }
-                if is_supported_image(&path) {
+                if is_supported_image(&path) && is_non_empty_file(&path) {
                     counts.images = counts.images.saturating_add(1);
                 }
             }
@@ -512,11 +565,14 @@ fn refresh_folder_with_optional_worker(
     program: &Path,
     worker: Option<&ThumbnailWorker>,
 ) -> Result<(), String> {
+    let logger = IndexLogger::new(paths.index_log.clone());
     if !folder_available(folder) {
+        logger.record(format!("folder offline: {}", folder.path.display()));
         return set_folder_status(paths, &folder.id, FolderStatus::Offline, None, false);
     }
     fs::create_dir_all(&paths.databases)
         .map_err(|error| format!("Toka could not create its index folder: {error}"))?;
+    logger.record(format!("indexing folder: {}", folder.path.display()));
     set_folder_status(paths, &folder.id, FolderStatus::Indexing, None, false)?;
     let database = paths.database(&folder.id);
     let output = match Command::new(program)
@@ -526,6 +582,10 @@ fn refresh_folder_with_optional_worker(
         Ok(output) => output,
         Err(error) => {
             let message = format!("Toka's indexer could not start: {error}");
+            logger.record(format!(
+                "indexing failed for {}: {message}",
+                folder.path.display()
+            ));
             set_folder_status(
                 paths,
                 &folder.id,
@@ -543,6 +603,10 @@ fn refresh_folder_with_optional_worker(
         } else {
             detail
         };
+        logger.record(format!(
+            "indexing failed for {}: {message}",
+            folder.path.display()
+        ));
         set_folder_status(
             paths,
             &folder.id,
@@ -558,6 +622,13 @@ fn refresh_folder_with_optional_worker(
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("Toka could not protect its private index: {error}"))?;
     }
+    let counts = count_indexed_media(std::slice::from_ref(folder));
+    logger.record(format!(
+        "indexing complete for {}: {} videos, {} images",
+        folder.path.display(),
+        counts.videos,
+        counts.images
+    ));
     set_folder_status(paths, &folder.id, FolderStatus::Ready, None, true)?;
     if let Some(worker) = worker {
         worker.enqueue(&folder.path);
@@ -577,6 +648,8 @@ fn is_path_change(kind: &EventKind) -> bool {
 pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
     fs::create_dir_all(&paths.root)
         .map_err(|error| format!("Toka could not create its settings folder: {error}"))?;
+    let logger = IndexLogger::new(paths.index_log.clone());
+    logger.record("indexer started");
     let (sender, receiver) = mpsc::channel();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
         let _ = sender.send(event);
@@ -610,12 +683,17 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
 
         if first_pass {
             first_pass = false;
+            logger.record(format!(
+                "initial index pass: {} folder(s)",
+                config.folders.len()
+            ));
             for folder in &config.folders {
                 let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
             continue;
         }
         if !reconnected.is_empty() {
+            logger.record(format!("reconnected {} folder(s)", reconnected.len()));
             for folder in reconnected {
                 let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
@@ -675,12 +753,14 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         }
 
         if config_changed {
+            logger.record("index configuration changed");
             first_pass = true;
             continue;
         }
 
         for folder in &config.folders {
             if dirty.contains(&folder.id) {
+                logger.record(format!("folder changed: {}", folder.path.display()));
                 let _ = refresh_folder(&paths, folder, &thumbnail_worker);
             }
         }
@@ -715,6 +795,9 @@ mod tests {
         assert!(media.join("clip.mp4").is_file());
         assert!(!database.exists());
         assert!(manager.state().unwrap().folders.is_empty());
+        let log = fs::read_to_string(paths.index_log).unwrap();
+        assert!(log.contains("folder added:"));
+        assert!(log.contains("folder removed:"));
     }
 
     #[test]
@@ -808,6 +891,9 @@ mod tests {
                 .status,
             FolderStatus::Ready
         );
+        let log = fs::read_to_string(&paths.index_log).unwrap();
+        assert!(log.contains("indexing folder:"));
+        assert!(log.contains("indexing complete for"));
         let state = IndexManager::new(paths).state().unwrap();
         assert_eq!(state.indexed_videos, 1);
         assert_eq!(state.indexed_images, 1);
@@ -820,7 +906,9 @@ mod tests {
         let nested = media.join("Nested");
         fs::create_dir_all(&nested).unwrap();
         fs::write(media.join("clip.mp4"), b"video").unwrap();
+        fs::write(media.join("empty.mp4"), b"").unwrap();
         fs::write(nested.join("cover.PNG"), b"image").unwrap();
+        fs::write(nested.join("empty.jpg"), b"").unwrap();
         fs::write(nested.join("notes.txt"), b"other").unwrap();
         let folders = vec![ConfiguredFolder {
             id: "media".into(),
