@@ -831,14 +831,16 @@ test("labels mixed image and video results in the search grid", async () => {
     name: "Play photo.jpg",
   });
   const videoTile = screen.getByRole("button", { name: "Play clip.mp4" });
-  expect(within(imageTile).getByText("Image")).toHaveClass(
+  expect(within(imageTile).getByRole("img", { name: "Image" })).toHaveClass(
     "media-type-badge",
     "image",
   );
-  expect(within(videoTile).getByText("Video")).toHaveClass(
+  expect(within(videoTile).getByRole("img", { name: "Video" })).toHaveClass(
     "media-type-badge",
     "video",
   );
+  expect(within(imageTile).queryByText("Image")).not.toBeInTheDocument();
+  expect(within(videoTile).queryByText("Video")).not.toBeInTheDocument();
   expect(imageTile.querySelector(".image-icon")).toBeInTheDocument();
   expect(videoTile.querySelector(".video-icon")).toBeInTheDocument();
 });

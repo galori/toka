@@ -292,9 +292,12 @@ function VideoThumbnail({
       )}
       <span
         className={`media-type-badge ${image ? "image" : "video"}`}
-        aria-hidden="true"
+        role="img"
+        aria-label={image ? "Image" : "Video"}
       >
-        {image ? "Image" : "Video"}
+        <span className="media-type-badge-icon" aria-hidden="true">
+          {image ? <ImageIcon /> : <VideoIcon />}
+        </span>
       </span>
     </span>
   );
