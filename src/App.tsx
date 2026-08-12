@@ -39,6 +39,8 @@ import {
   openInExternalPlayer,
   openNewWindow,
   searchMatchCount,
+  searchLogSettings as loadSearchLogSettings,
+  setSearchLogSettings,
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
@@ -52,6 +54,7 @@ import {
   type SearchFields,
   type IndexState,
   type SearchPage,
+  type SearchLogSettings,
   type VideoResult,
   type VideoTagUpdate,
 } from "./api";
@@ -798,6 +801,10 @@ const HELP_SECTIONS: HelpSection[] = [
         description: "Show videos, images, or both",
       },
       { shortcut: "Ctrl+,", description: "Manage search folders" },
+      {
+        shortcut: "Ctrl+Shift+L",
+        description: "Configure verbose search logging",
+      },
       { shortcut: "Ctrl+N", description: "Open a new Toka window" },
       { shortcut: "Ctrl+O", description: "Open results in another player" },
       { shortcut: "Ctrl+Shift+T", description: "Tag all results" },
@@ -815,6 +822,21 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "Ctrl+O", description: "Add a folder" },
       { shortcut: "Delete", description: "Remove a folder" },
       { shortcut: "Ctrl+Enter", description: "Start searching" },
+      { shortcut: "Escape", description: "Return to search" },
+    ],
+  },
+  {
+    title: "Search logging",
+    entries: [
+      {
+        shortcut: "Ctrl+Shift+L",
+        description: "Open or toggle verbose logging",
+      },
+      {
+        shortcut: "Ctrl+Shift+O",
+        description: "Choose the verbose log folder",
+      },
+      { shortcut: "Ctrl+Enter", description: "Save logging settings" },
       { shortcut: "Escape", description: "Return to search" },
     ],
   },
@@ -2842,8 +2864,16 @@ async function loadResultPages(
 
 export default function App() {
   const [showFolderSetup, setShowFolderSetup] = useState(false);
+  const [showSearchLogSettings, setShowSearchLogSettings] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const [managedIndex, setManagedIndex] = useState<IndexState>();
+  const [logSettings, setLogSettings] = useState<SearchLogSettings>({
+    verbose: false,
+  });
+  const [logVerboseDraft, setLogVerboseDraft] = useState(false);
+  const [logPathDraft, setLogPathDraft] = useState("");
+  const [logError, setLogError] = useState<string>();
+  const [logBusy, setLogBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
@@ -3345,30 +3375,37 @@ export default function App() {
   // folder's videos arrive shuffled like any other playlist.
   useEffect(() => {
     let cancelled = false;
-    void Promise.allSettled([launchPlaylist(), indexState()]).then(
-      ([playlistResult, indexResult]) => {
-        if (cancelled) return;
-        const launched =
-          playlistResult.status === "fulfilled" ? playlistResult.value : null;
-        if (playlistResult.status === "rejected")
-          setError(errorMessage(playlistResult.reason));
-        if (indexResult.status === "fulfilled") {
-          setManagedIndex(indexResult.value);
-          if (
-            !launched?.results.length &&
-            indexResult.value.supported &&
-            indexResult.value.folders.length === 0
-          )
-            setShowFolderSetup(true);
-        }
-        // A viewer who got a search in first has asked for something newer than
-        // the command line did, and keeps it.
-        if (!launched?.results.length || requestNumber.current) return;
-        setQuery("");
-        setPage(launched);
-        setPlaying({ videos: launched.results, startIndex: 0 });
-      },
-    );
+    void Promise.allSettled([
+      launchPlaylist(),
+      indexState(),
+      loadSearchLogSettings(),
+    ]).then(([playlistResult, indexResult, logResult]) => {
+      if (cancelled) return;
+      const launched =
+        playlistResult.status === "fulfilled" ? playlistResult.value : null;
+      if (playlistResult.status === "rejected")
+        setError(errorMessage(playlistResult.reason));
+      if (indexResult.status === "fulfilled") {
+        setManagedIndex(indexResult.value);
+        if (
+          !launched?.results.length &&
+          indexResult.value.supported &&
+          indexResult.value.folders.length === 0
+        )
+          setShowFolderSetup(true);
+      }
+      if (logResult.status === "fulfilled") {
+        setLogSettings(logResult.value);
+        setLogVerboseDraft(logResult.value.verbose);
+        setLogPathDraft(logResult.value.path ?? "");
+      }
+      // A viewer who got a search in first has asked for something newer than
+      // the command line did, and keeps it.
+      if (!launched?.results.length || requestNumber.current) return;
+      setQuery("");
+      setPage(launched);
+      setPlaying({ videos: launched.results, startIndex: 0 });
+    });
     return () => {
       cancelled = true;
     };
@@ -3405,9 +3442,69 @@ export default function App() {
     }
   };
 
+  const openSearchLogSettings = () => {
+    setLogError(undefined);
+    setLogVerboseDraft(logSettings.verbose);
+    setLogPathDraft(logSettings.path ?? "");
+    setShowSearchLogSettings(true);
+  };
+
+  const chooseSearchLogPath = async () => {
+    setLogError(undefined);
+    try {
+      const path = await open({ directory: true, multiple: false });
+      if (typeof path === "string") setLogPathDraft(path);
+    } catch (reason) {
+      setLogError(errorMessage(reason));
+    }
+  };
+
+  const saveSearchLogSettings = async () => {
+    setLogError(undefined);
+    setLogBusy(true);
+    try {
+      const next = await setSearchLogSettings(
+        logVerboseDraft,
+        logPathDraft.trim() || undefined,
+      );
+      setLogSettings(next);
+      setLogVerboseDraft(next.verbose);
+      setLogPathDraft(next.path ?? "");
+      setShowSearchLogSettings(false);
+    } catch (reason) {
+      setLogError(errorMessage(reason));
+    } finally {
+      setLogBusy(false);
+    }
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (playing || showHelp || event.metaKey || event.altKey) return;
+      if (showSearchLogSettings) {
+        if (!event.ctrlKey && !event.shiftKey && event.key === "Escape") {
+          event.preventDefault();
+          setShowSearchLogSettings(false);
+        } else if (
+          event.ctrlKey &&
+          event.shiftKey &&
+          event.key.toLowerCase() === "l"
+        ) {
+          event.preventDefault();
+          setLogVerboseDraft((verbose) => !verbose);
+        } else if (
+          event.ctrlKey &&
+          event.shiftKey &&
+          event.key.toLowerCase() === "o"
+        ) {
+          event.preventDefault();
+          void chooseSearchLogPath();
+        } else if (event.ctrlKey && !event.shiftKey && event.key === "Enter") {
+          event.preventDefault();
+          void saveSearchLogSettings();
+        }
+        return;
+      }
       if (
         showFolderSetup &&
         !event.ctrlKey &&
@@ -3433,6 +3530,14 @@ export default function App() {
       ) {
         event.preventDefault();
         setShowFolderSetup(false);
+      } else if (
+        !showFolderSetup &&
+        event.ctrlKey &&
+        event.shiftKey &&
+        event.key.toLowerCase() === "l"
+      ) {
+        event.preventDefault();
+        openSearchLogSettings();
       } else if (
         managedIndex?.supported &&
         event.ctrlKey &&
@@ -3529,6 +3634,83 @@ export default function App() {
   // reached one by keyboard is still in the same place after it opens.
   const tagAllLabel = `Tag all ${page?.totalResults ?? 0} videos`;
   const resultNoun = mediaType === "images" ? "image" : "video";
+
+  if (showSearchLogSettings && !playing) {
+    return (
+      <main className="app folder-setup">
+        {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
+        <section aria-label="Search logging settings">
+          <h1>Search logging</h1>
+          <p>
+            The normal search log records each command as JSON. Turn on verbose
+            logging when you need one readable file for each search, including
+            provider results and the files Toka filtered out.
+          </p>
+          <ControlButton
+            shortcut="Ctrl+Shift+L"
+            className="scope-toggle"
+            aria-label="Verbose search logging"
+            aria-pressed={logVerboseDraft}
+            onClick={() => setLogVerboseDraft((verbose) => !verbose)}
+          >
+            <Label>
+              {logVerboseDraft ? "Verbose logging on" : "Verbose logging off"}
+            </Label>
+          </ControlButton>
+          <div className="log-settings-field">
+            <label htmlFor="verbose-log-path">Verbose log folder</label>
+            <div className="log-settings-path">
+              <input
+                id="verbose-log-path"
+                type="text"
+                value={logPathDraft}
+                onChange={(event) => setLogPathDraft(event.currentTarget.value)}
+                placeholder="Choose a folder"
+                aria-describedby="verbose-log-help"
+              />
+              <ControlButton
+                shortcut="Ctrl+Shift+O"
+                className="scope-toggle"
+                aria-label="Choose verbose log folder"
+                onClick={() => void chooseSearchLogPath()}
+              >
+                <Label>Choose</Label>
+              </ControlButton>
+            </div>
+            <p id="verbose-log-help" className="settings-help">
+              Required while verbose logging is on. The folder must already
+              exist and be writable.
+            </p>
+          </div>
+          {logError ? (
+            <p role="alert" className="message error">
+              {logError}
+            </p>
+          ) : null}
+          <div className="folder-actions">
+            <ControlButton
+              shortcut="Escape"
+              className="scope-toggle"
+              aria-label="Back to search"
+              onClick={() => setShowSearchLogSettings(false)}
+            >
+              <Label>Back</Label>
+            </ControlButton>
+            <ControlButton
+              shortcut="Ctrl+Enter"
+              className="scope-toggle"
+              aria-label="Save search logging settings"
+              disabled={logBusy}
+              onClick={() => void saveSearchLogSettings()}
+            >
+              <Label>{logBusy ? "Saving…" : "Save"}</Label>
+            </ControlButton>
+          </div>
+          <HelpButton onClick={() => setShowHelp(true)} />
+        </section>
+      </main>
+    );
+  }
 
   if (showFolderSetup && !playing) {
     return (
@@ -3692,6 +3874,14 @@ export default function App() {
               <Label>Search folders</Label>
             </ControlButton>
           ) : null}
+          <ControlButton
+            shortcut="Ctrl+Shift+L"
+            className="scope-toggle"
+            aria-label="Search logging"
+            onClick={openSearchLogSettings}
+          >
+            <Label>Search logging</Label>
+          </ControlButton>
           <ControlButton
             shortcut="Ctrl+N"
             className="scope-toggle"

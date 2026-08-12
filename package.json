@@ -9,6 +9,7 @@
     "build:linux": "node bin/build.mjs linux",
     "build:mac": "node bin/build.mjs mac",
     "build": "tsc && node bin/build-frontend.mjs",
+    "search-log": "node bin/toka-search-log.mjs --follow",
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check package.json package-lock.json eslint.config.js .prettierrc.json .github/workflows/pr-quality.yml",
     "test": "vitest run",

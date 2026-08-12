@@ -57,7 +57,10 @@ fn video_paths(folder: &Path) -> Vec<PathBuf> {
             };
             if file_type.is_dir() {
                 pending.push(path);
-            } else if file_type.is_file() && crate::search::is_supported_video(&path) {
+            } else if file_type.is_file()
+                && crate::search::is_supported_video(&path)
+                && crate::search::is_non_empty_file(&path)
+            {
                 videos.push(path);
             }
         }
@@ -232,10 +235,12 @@ mod tests {
     fn background_scanning_finds_supported_videos_recursively() {
         let root = tempdir().unwrap();
         let clip = root.path().join("clip.mp4");
+        let empty = root.path().join("empty.mp4");
         let notes = root.path().join("notes.txt");
         let nested = root.path().join("nested");
         let movie = nested.join("movie.MKV");
         fs::write(&clip, b"video").unwrap();
+        fs::write(&empty, b"").unwrap();
         fs::write(&notes, b"text").unwrap();
         fs::create_dir(&nested).unwrap();
         fs::write(&movie, b"video").unwrap();

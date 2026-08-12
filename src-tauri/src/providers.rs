@@ -1,7 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::managed_index::{self, IndexPaths};
 use crate::search::{SearchError, SearchProvider};
-use crate::search_log::{SearchLogContext, SearchLogger};
+use crate::search_log::{CommandOutcome, SearchLogContext, SearchLogger};
 #[cfg(all(target_os = "macos", not(test)))]
 use std::sync::Once;
 use std::{path::PathBuf, sync::Arc};
@@ -62,9 +62,12 @@ impl ProcessRunner for SystemProcessRunner {
             context,
             program,
             args,
-            process_output.success,
-            process_output.exit_code,
-            &process_output.stderr,
+            CommandOutcome {
+                success: process_output.success,
+                exit_code: process_output.exit_code,
+                stdout: &process_output.stdout,
+                stderr: &process_output.stderr,
+            },
         );
         Ok(process_output)
     }
@@ -508,13 +511,13 @@ mod tests {
     }
 
     fn context(query: &str) -> SearchLogContext {
-        SearchLogContext {
+        SearchLogContext::from(&crate::search::SearchRequest {
             query: query.into(),
             page: 1,
             page_size: crate::search::PAGE_SIZE,
             fields: crate::search::SearchFields::default(),
             media_type: crate::search::MediaType::default(),
-        }
+        })
     }
 
     #[test]

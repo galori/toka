@@ -16,7 +16,7 @@ use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
-use search_log::{SearchLogContext, SearchLogger};
+use search_log::{SearchLogContext, SearchLogSettings, SearchLogger};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -175,6 +175,25 @@ impl From<SearchError> for CommandError {
             message: error.to_string(),
         }
     }
+}
+
+#[tauri::command]
+fn search_log_settings(logger: State<'_, Arc<SearchLogger>>) -> SearchLogSettings {
+    logger.settings()
+}
+
+#[tauri::command]
+fn set_search_log_settings(
+    verbose: bool,
+    path: Option<String>,
+    logger: State<'_, Arc<SearchLogger>>,
+) -> Result<SearchLogSettings, CommandError> {
+    logger
+        .set_settings(verbose, path.map(PathBuf::from))
+        .map_err(|message| CommandError {
+            kind: "SearchLog",
+            message,
+        })
 }
 
 #[tauri::command]
@@ -898,14 +917,14 @@ pub fn run() {
     // Read before the window exists, because the command line Toka was started
     // with is the whole of what it was asked to open.
     let launched = LaunchPlaylist(playlist::from_arguments(std::env::args_os()));
+    let logger = Arc::new(SearchLogger::system());
+    let engine = Arc::new(SearchEngine::new_with_logger(
+        platform_provider(logger.clone()),
+        logger.clone(),
+    ));
     let builder = builder
-        .manage({
-            let logger = Arc::new(SearchLogger::system());
-            Arc::new(SearchEngine::new_with_logger(
-                platform_provider(logger.clone()),
-                logger,
-            ))
-        })
+        .manage(logger.clone())
+        .manage(engine)
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
     #[cfg(target_os = "linux")]
@@ -918,6 +937,8 @@ pub fn run() {
         builder.invoke_handler(tauri::generate_handler![
             search_videos,
             search_match_count,
+            search_log_settings,
+            set_search_log_settings,
             index_state,
             add_index_folder,
             remove_index_folder,
@@ -945,6 +966,8 @@ pub fn run() {
             .invoke_handler(tauri::generate_handler![
                 search_videos,
                 search_match_count,
+                search_log_settings,
+                set_search_log_settings,
                 index_state,
                 add_index_folder,
                 remove_index_folder,
@@ -981,6 +1004,8 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
         search_match_count,
+        search_log_settings,
+        set_search_log_settings,
         index_state,
         launch_playlist,
         video_thumbnail,
