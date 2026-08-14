@@ -116,6 +116,11 @@ describe("Toka player controls", () => {
     await $(".playlist-drawer").waitForExist({ reverse: true });
   });
 
+  after(async () => {
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
+  });
+
   it("shows the scrub timeline across the overlay", async () => {
     // The scrubber is a range input, not a button: the design draws it as a
     // thin bar, so it is held to spanning the overlay rather than to the

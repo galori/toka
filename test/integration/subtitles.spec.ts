@@ -25,6 +25,11 @@ describe("Toka subtitles", () => {
     await $(".playlist-drawer").waitForExist({ reverse: true });
   });
 
+  after(async () => {
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
+  });
+
   it("turns the sidecar subtitle on and off from the overlay", async () => {
     const toggle = await $('.player-utilities button[aria-label="Subtitles"]');
     await expect(toggle).toBeDisplayed();
