@@ -31,12 +31,12 @@ export type SearchFields = {
   path: boolean;
 };
 
-// What a search covered before the parts could be chosen: the whole file name,
-// tag block included, and nothing of the folders above it.
+// What a search covers before the parts can be chosen: tags, the whole file
+// name, and the folders above it.
 export const DEFAULT_SEARCH_FIELDS: SearchFields = {
   tags: true,
   fileName: true,
-  path: false,
+  path: true,
 };
 
 export type MediaType = "videos" | "images" | "both";
