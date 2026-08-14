@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, ExitStatus},
     sync::{mpsc, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -312,6 +312,32 @@ pub fn revision(paths: &IndexPaths) -> u64 {
         .flatten()
         .unwrap_or_default()
         .revision
+}
+
+const INDEXER_SERVICE: &str = "toka-indexer.service";
+
+fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
+where
+    F: FnMut(&[&str]) -> io::Result<ExitStatus>,
+{
+    let arguments = ["--user", "start", INDEXER_SERVICE];
+    let status = run(&arguments)
+        .map_err(|error| format!("Toka could not start its indexer service: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Toka's indexer service could not be started (systemctl exited with {status})"
+        ))
+    }
+}
+
+pub fn ensure_indexer() {
+    if let Err(message) =
+        ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
+    {
+        eprintln!("{message}");
+    }
 }
 
 fn ensure_parent(path: &Path) -> Result<(), String> {
@@ -964,6 +990,31 @@ mod tests {
                 videos: 1,
                 images: 1,
             }
+        );
+    }
+
+    #[test]
+    fn starts_the_user_indexer_service_when_toka_launches() {
+        let mut commands: Vec<Vec<String>> = Vec::new();
+
+        ensure_indexer_with_runner(|arguments| {
+            commands.push(
+                arguments
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            );
+            std::process::Command::new("true").status()
+        })
+        .unwrap();
+
+        assert_eq!(
+            commands,
+            vec![vec![
+                "--user".to_owned(),
+                "start".to_owned(),
+                "toka-indexer.service".to_owned(),
+            ]]
         );
     }
 
