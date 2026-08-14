@@ -26,10 +26,10 @@ switched on: a video's tags (`Ctrl+T`), its filename without the tag block
 begin with. Each search term has to be found in one of the parts being searched,
 so a second word still narrows a search even when it lands somewhere else.
 
-Changing what is searched runs the search again straight away. The last part
-left on cannot be switched off, because a search with nothing to look at could
-only ever answer "no videos". The choice lasts as long as Toka is open, like
-every other setting here.
+All three parts are on to begin with. Changing what is searched runs the search
+again straight away. The last part left on cannot be switched off, because a
+search with nothing to look at could only ever answer "no videos". The choice
+lasts as long as Toka is open, like every other setting here.
 
 ## Playlists
 

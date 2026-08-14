@@ -546,7 +546,7 @@ test("starts with a focused search field and displays submitted results", async 
       query: "summer vacation",
       page: 1,
       pageSize: 24,
-      fields: { tags: true, fileName: true, path: false },
+      fields: { tags: true, fileName: true, path: true },
       mediaType: "videos",
     },
   });
@@ -582,7 +582,7 @@ test("chooses which parts of a video a search looks at", async () => {
   expect(path).toHaveAttribute("aria-keyshortcuts", "Ctrl+P");
   expect(tags).toHaveAttribute("aria-pressed", "true");
   expect(filename).toHaveAttribute("aria-pressed", "true");
-  expect(path).toHaveAttribute("aria-pressed", "false");
+  expect(path).toHaveAttribute("aria-pressed", "true");
   // Nothing has been searched for yet, so a choice about the next search is
   // not a search of its own.
   await user.click(path);
@@ -590,6 +590,7 @@ test("chooses which parts of a video a search looks at", async () => {
     "search_videos",
     expect.anything(),
   );
+  await user.click(path);
 
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
 
@@ -648,7 +649,7 @@ test("searches again as soon as the parts being searched change", async () => {
     expect(lastSearchFields()).toEqual({
       tags: true,
       fileName: false,
-      path: false,
+      path: true,
     }),
   );
   expect(
@@ -661,6 +662,7 @@ test("keeps the last part of a search selected", async () => {
   const tags = await screen.findByRole("button", { name: "Search tags" });
 
   fireEvent.keyDown(window, { key: "f", ctrlKey: true });
+  fireEvent.keyDown(window, { key: "p", ctrlKey: true });
 
   // Tags are all that is left, and a search with nothing to match against can
   // only ever answer "no videos".

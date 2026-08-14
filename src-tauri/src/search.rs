@@ -58,14 +58,14 @@ impl SearchFields {
     }
 }
 
-/// What a search covered before the fields could be chosen: the whole file
-/// name, tag block included, and nothing of the folders above it.
+/// What a search covers before the fields can be chosen: tags, the whole file
+/// name, and the folders above it.
 impl Default for SearchFields {
     fn default() -> Self {
         Self {
             tags: true,
             file_name: true,
-            path: false,
+            path: true,
         }
     }
 }
@@ -1022,20 +1022,23 @@ mod tests {
     }
 
     #[test]
-    fn search_covers_the_whole_file_name_including_its_tags_by_default() {
+    fn search_covers_tags_filename_and_path_by_default() {
         let directory = tempdir().unwrap();
-        let video = directory.path().join("Beach day [home summer].mp4");
+        let folder = directory.path().join("holiday-footage");
+        fs::create_dir(&folder).unwrap();
+        let video = folder.join("Beach day [home].mp4");
         fs::write(&video, b"test").unwrap();
         let provider = Arc::new(FakeProvider::new(vec![video]));
         let engine = SearchEngine::new(provider.clone());
 
         assert_eq!(
-            engine.search(request("beach home")).unwrap().total_results,
+            engine
+                .search(request("beach holiday-footage"))
+                .unwrap()
+                .total_results,
             1
         );
-        // The folder is not part of that default, so the provider is never
-        // asked for the wider candidate set either.
-        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [false]);
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [true]);
     }
 
     #[test]
