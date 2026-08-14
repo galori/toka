@@ -508,8 +508,15 @@ struct ThumbnailWorker {
 }
 
 impl ThumbnailWorker {
-    fn new() -> Self {
-        Self::with_generator(thumbnails::generate_folder)
+    fn new(logger: Arc<IndexLogger>) -> Self {
+        Self::with_generator(move |folder| {
+            thumbnails::generate_folder_with_failures(folder, |video, message| {
+                logger.record(format!(
+                    "thumbnail generation failed for {}: {message}",
+                    video.display()
+                ));
+            });
+        })
     }
 
     fn with_generator<F>(generator: F) -> Self
@@ -648,7 +655,7 @@ fn is_path_change(kind: &EventKind) -> bool {
 pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
     fs::create_dir_all(&paths.root)
         .map_err(|error| format!("Toka could not create its settings folder: {error}"))?;
-    let logger = IndexLogger::new(paths.index_log.clone());
+    let logger = Arc::new(IndexLogger::new(paths.index_log.clone()));
     logger.record("indexer started");
     let (sender, receiver) = mpsc::channel();
     let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
@@ -658,7 +665,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
     watcher
         .watch(&paths.root, RecursiveMode::NonRecursive)
         .map_err(|error| format!("Toka could not watch its settings: {error}"))?;
-    let thumbnail_worker = ThumbnailWorker::new();
+    let thumbnail_worker = ThumbnailWorker::new(Arc::clone(&logger));
 
     let mut watched = HashSet::<PathBuf>::new();
     let mut first_pass = true;
@@ -770,7 +777,12 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, sync::mpsc};
+    use std::{
+        fs,
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -897,6 +909,36 @@ mod tests {
         let state = IndexManager::new(paths).state().unwrap();
         assert_eq!(state.indexed_videos, 1);
         assert_eq!(state.indexed_images, 1);
+    }
+
+    #[test]
+    fn background_thumbnail_failures_are_written_to_the_index_log() {
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        let video = media.join("broken.mp4");
+        fs::write(&video, b"not a video").unwrap();
+        let failure = thumbnails::cache_path(&video)
+            .unwrap()
+            .with_extension("failed");
+        let _ = fs::remove_file(&failure);
+        let paths = IndexPaths::under(root.path().join("state"));
+
+        let logger = Arc::new(IndexLogger::new(paths.index_log.clone()));
+        let worker = ThumbnailWorker::new(logger);
+        worker.enqueue(&media);
+
+        let expected = format!("thumbnail generation failed for {}: ", video.display());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut log = String::new();
+        while !log.contains(&expected) && Instant::now() < deadline {
+            log = fs::read_to_string(&paths.index_log).unwrap_or_default();
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(log.contains(&expected), "{log}");
+        assert!(failure.is_file());
+        let _ = fs::remove_file(failure);
     }
 
     #[test]

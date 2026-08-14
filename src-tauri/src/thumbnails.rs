@@ -54,13 +54,14 @@ fn generate_result(video: &Path) -> Result<PathBuf, GenerationFailure> {
     }
 }
 
-/// Fill the shared cache for every supported video below `folder`. The
-/// caller owns the worker thread, so this deliberately processes one folder
-/// serially and lets the indexer continue watching while ffmpeg does the
-/// expensive work.
-pub fn generate_folder(folder: &Path) {
+pub(crate) fn generate_folder_with_failures<F>(folder: &Path, mut on_failure: F)
+where
+    F: FnMut(&Path, &str),
+{
     for video in video_paths(folder) {
-        let _ = generate(&video);
+        if let Err(GenerationFailure::New(message)) = generate_result(&video) {
+            on_failure(&video, &message);
+        }
     }
 }
 
@@ -356,5 +357,27 @@ mod tests {
         assert_ne!(changed_failure, failure);
         assert!(generate(&video).is_none());
         assert!(changed_failure.is_file());
+    }
+
+    #[test]
+    fn cached_thumbnail_failures_are_reported_only_once() {
+        let root = tempdir().unwrap();
+        let video = root.path().join("not-a-video.mp4");
+        fs::write(&video, b"this is not a video").unwrap();
+        let failure = cache_path(&video).unwrap().with_extension("failed");
+        let _ = fs::remove_file(&failure);
+        let mut failures = Vec::new();
+
+        generate_folder_with_failures(root.path(), |path, message| {
+            failures.push((path.to_path_buf(), message.to_owned()));
+        });
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, video);
+
+        generate_folder_with_failures(root.path(), |path, message| {
+            failures.push((path.to_path_buf(), message.to_owned()));
+        });
+        assert_eq!(failures.len(), 1);
+        let _ = fs::remove_file(failure);
     }
 }
