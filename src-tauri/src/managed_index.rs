@@ -7,10 +7,13 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus},
+    process::Command,
     sync::{mpsc, Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(feature = "e2e"))]
+use std::process::ExitStatus;
 
 #[derive(Clone, Debug)]
 pub struct IndexPaths {
@@ -314,8 +317,10 @@ pub fn revision(paths: &IndexPaths) -> u64 {
         .revision
 }
 
+#[cfg(not(feature = "e2e"))]
 const INDEXER_SERVICE: &str = "toka-indexer.service";
 
+#[cfg(not(feature = "e2e"))]
 fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
 where
     F: FnMut(&[&str]) -> io::Result<ExitStatus>,
@@ -332,6 +337,7 @@ where
     }
 }
 
+#[cfg(not(feature = "e2e"))]
 pub fn ensure_indexer() {
     if let Err(message) =
         ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
@@ -993,6 +999,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "e2e"))]
     #[test]
     fn starts_the_user_indexer_service_when_toka_launches() {
         let mut commands: Vec<Vec<String>> = Vec::new();

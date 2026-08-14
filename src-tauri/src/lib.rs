@@ -908,7 +908,7 @@ pub fn run() {
         }
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
     managed_index::ensure_indexer();
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     #[cfg(feature = "e2e")]
