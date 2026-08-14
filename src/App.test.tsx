@@ -1023,7 +1023,15 @@ test("shows video tags and edits them with the tag helper", async () => {
   expect(
     await screen.findByRole("button", { name: "Remove tag review" }),
   ).toBeVisible();
+  expect(
+    await screen.findByRole("button", {
+      name: "Play tagged [review work].mp4",
+    }),
+  ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+  expect(
+    await screen.findByRole("button", { name: "Play tagged [review].mp4" }),
+  ).toBeVisible();
   expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
     resultId: "video-1",
     tags: ["review"],
@@ -1583,7 +1591,13 @@ test("edits the playing video's tags from the playback controls with T", async (
   expect(
     await screen.findByRole("button", { name: "Remove tag review" }),
   ).toBeVisible();
+  expect(
+    await screen.findByLabelText("Playing tagged [review work].mp4"),
+  ).toBeVisible();
   await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+  expect(
+    await screen.findByLabelText("Playing tagged [review].mp4"),
+  ).toBeVisible();
 
   expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
     resultId: "video-1",
