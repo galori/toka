@@ -108,6 +108,9 @@ impl SearchProvider for MdfindSearchProvider {
         let term_predicates = terms
             .iter()
             .map(|term| {
+                if term == "*" {
+                    return format!("{attribute} == \"*\"cd");
+                }
                 let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
                 format!("{attribute} == \"*{escaped}*\"cd")
             })
@@ -238,11 +241,15 @@ impl SearchProvider for RecollSearchProvider {
         let terms = query_terms(query)?;
         // Leading wildcard also prevents a query beginning with `-` from being
         // interpreted as another command-line option.
-        let filename_query = terms
-            .iter()
-            .map(|term| format!("*{term}*"))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let filename_query = if terms.len() == 1 && terms[0] == "*" {
+            "*".into()
+        } else {
+            terms
+                .iter()
+                .map(|term| format!("*{term}*"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        };
         let args = ["-f", "-b", "--paths-only", "-C", "-n", "0", &filename_query]
             .into_iter()
             .map(String::from)
@@ -386,27 +393,37 @@ fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
         tokens.push(current);
     }
 
-    let terms = tokens
-        .into_iter()
-        .filter(|token| {
-            token != "("
-                && token != ")"
-                && !token.eq_ignore_ascii_case("AND")
-                && !token.eq_ignore_ascii_case("OR")
-        })
-        .map(|token| {
-            token
-                .split_once(':')
-                .and_then(|(field, value)| {
-                    (matches!(
-                        field.to_ascii_lowercase().as_str(),
-                        "tags" | "tag" | "filename" | "file" | "name" | "path"
-                    ) && !value.is_empty())
-                    .then_some(value.to_owned())
-                })
-                .unwrap_or(token)
-        })
-        .collect::<Vec<_>>();
+    let mut terms = Vec::new();
+    let mut has_metadata_predicate = false;
+    for token in tokens {
+        if token == "("
+            || token == ")"
+            || token.eq_ignore_ascii_case("AND")
+            || token.eq_ignore_ascii_case("OR")
+        {
+            continue;
+        }
+        if let Some((field, value)) = token.split_once(':') {
+            match field.to_ascii_lowercase().as_str() {
+                "size" | "created" | "modified" => {
+                    has_metadata_predicate = true;
+                    continue;
+                }
+                "tags" | "tag" | "filename" | "file" | "name" | "path" if !value.is_empty() => {
+                    terms.push(value.to_owned());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        terms.push(token);
+    }
+    if has_metadata_predicate {
+        // A metadata term can match a file regardless of its name. Ask each
+        // provider for its complete indexed set, then let SearchEngine apply
+        // the full expression and media filter locally.
+        terms = vec!["*".into()];
+    }
     if terms.is_empty() {
         Err(SearchError::InvalidQuery)
     } else {
@@ -710,6 +727,33 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn metadata_qualifiers_request_all_indexed_paths_for_local_filtering() {
+        let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
+        let provider = PlocateSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider
+            .candidates(
+                "size:>=100kb filename:clip",
+                false,
+                &context("size:>=100kb filename:clip"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "plocate".into(),
+                ["--ignore-case", "--basename", "--existing", "--", "*"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
             ))
         );
     }

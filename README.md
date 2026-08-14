@@ -31,6 +31,11 @@ again straight away. The last part left on cannot be switched off, because a
 search with nothing to look at could only ever answer "no videos". The choice
 lasts as long as Toka is open, like every other setting here.
 
+File-size predicates can be added to a search without a separate control:
+`size:36.3mb` matches that exact size, while `size:<1.5gb` and
+`size:>=100kb` express ranges. `kb`, `mb`, `gb`, and `tb` use decimal units;
+the corresponding `kib`, `mib`, `gib`, and `tib` suffixes use binary units.
+
 ## Playlists
 
 Every page of results is a playlist: playing one video plays the rest after it,
