@@ -25,12 +25,33 @@ pub(crate) fn cache_path(video: &Path) -> Option<PathBuf> {
     Some(cache.join(format!("{}.jpg", fingerprint(video))))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum GenerationFailure {
+    New(String),
+    Cached(String),
+}
+
 pub fn generate(video: &Path) -> Option<PathBuf> {
+    generate_result(video).ok()
+}
+
+fn generate_result(video: &Path) -> Result<PathBuf, GenerationFailure> {
     if let Some(output) = cached(video) {
-        return Some(output);
+        return Ok(output);
     }
-    let output = cache_path(video)?;
-    extract(video, 1.0, &output, 640)
+    let output = cache_path(video)
+        .ok_or_else(|| GenerationFailure::New("the thumbnail cache could not be created".into()))?;
+    let failure = failure_marker(&output);
+    if let Some(message) = cached_failure(&failure) {
+        return Err(GenerationFailure::Cached(message));
+    }
+    match extract(video, 1.0, &output, 640) {
+        Ok(output) => Ok(output),
+        Err(message) => {
+            remember_failure(&failure, &message);
+            Err(GenerationFailure::New(message))
+        }
+    }
 }
 
 /// Fill the shared cache for every supported video below `folder`. The
@@ -86,9 +107,25 @@ pub fn preview(video: &Path) -> Option<Vec<PathBuf>> {
     if frames.iter().all(|frame| frame.is_file()) {
         return Some(frames);
     }
-    let offsets = preview_offsets(duration(video)?, PREVIEW_FRAMES);
+    let failure = failure_marker(&cache.join(format!("{key}.jpg")));
+    if cached_failure(&failure).is_some() {
+        return None;
+    }
+    let offsets = match duration(video) {
+        Ok(duration) => preview_offsets(duration, PREVIEW_FRAMES),
+        Err(message) => {
+            remember_failure(&failure, &message);
+            return None;
+        }
+    };
     for (offset, frame) in offsets.into_iter().zip(&frames) {
-        extract(video, offset, frame, 320)?;
+        if let Err(message) = extract(video, offset, frame, 320) {
+            for partial in &frames {
+                let _ = fs::remove_file(partial);
+            }
+            remember_failure(&failure, &message);
+            return None;
+        }
     }
     Some(frames)
 }
@@ -123,7 +160,7 @@ fn fingerprint(video: &Path) -> String {
 
 /// How long the video runs, so a preview can be spread across it. A file
 /// ffprobe cannot read the length of is one Toka leaves showing its still.
-fn duration(video: &Path) -> Option<f64> {
+fn duration(video: &Path) -> Result<f64, String> {
     let output = Command::new("ffprobe")
         .args([
             "-v",
@@ -135,15 +172,21 @@ fn duration(video: &Path) -> Option<f64> {
         ])
         .arg(video)
         .output()
-        .ok()?;
+        .map_err(|error| format!("could not run ffprobe: {error}"))?;
     if !output.status.success() {
-        return None;
+        return Err(command_error(&output));
     }
     String::from_utf8_lossy(&output.stdout)
         .trim()
         .parse::<f64>()
-        .ok()
-        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map_err(|error| format!("ffprobe returned an invalid duration: {error}"))
+        .and_then(|seconds| {
+            if seconds.is_finite() && seconds > 0.0 {
+                Ok(seconds)
+            } else {
+                Err("ffprobe returned a non-positive duration".into())
+            }
+        })
 }
 
 /// One frame from `at` seconds in, written whole: ffmpeg is given a temporary
@@ -153,14 +196,14 @@ fn duration(video: &Path) -> Option<f64> {
 /// `-ss` before `-i` is what keeps this quick. After it, ffmpeg decodes the
 /// video from the beginning to reach the offset, which for the later frames of
 /// a feature-length file is seconds of work each.
-fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Option<PathBuf> {
+fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Result<PathBuf, String> {
     static TEMPORARY_FILES: AtomicU64 = AtomicU64::new(0);
     let temporary = output.with_extension(format!(
         "tmp-{}-{}.jpg",
         std::process::id(),
         TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
     ));
-    let status = Command::new("ffmpeg")
+    let result = Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-ss"])
         .arg(format!("{at:.3}"))
         .arg("-i")
@@ -169,17 +212,56 @@ fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Option<PathBuf> 
         .arg(format!("scale={width}:-2"))
         .args(["-q:v", "5", "-y"])
         .arg(&temporary)
-        .status()
-        .ok()?;
-    if !status.success() || !temporary.is_file() {
+        .output()
+        .map_err(|error| format!("could not run ffmpeg: {error}"));
+    let output_result = match result {
+        Ok(output) => output,
+        Err(message) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(message);
+        }
+    };
+    if !output_result.status.success() {
         let _ = fs::remove_file(&temporary);
-        return None;
+        return Err(command_error(&output_result));
+    }
+    if !temporary.is_file() {
+        return Err("ffmpeg succeeded without writing a thumbnail".into());
     }
     if fs::rename(&temporary, output).is_err() {
         let _ = fs::remove_file(&temporary);
+        return Err("could not move the generated thumbnail into the cache".into());
+    }
+    Ok(output.to_path_buf())
+}
+
+fn failure_marker(output: &Path) -> PathBuf {
+    output.with_extension("failed")
+}
+
+fn cached_failure(marker: &Path) -> Option<String> {
+    if !marker.is_file() {
         return None;
     }
-    Some(output.to_path_buf())
+    Some(
+        fs::read_to_string(marker)
+            .ok()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| "thumbnail generation previously failed".into()),
+    )
+}
+
+fn remember_failure(marker: &Path, message: &str) {
+    let _ = fs::write(marker, message);
+}
+
+fn command_error(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if stderr.is_empty() {
+        format!("decoder exited with {}", output.status)
+    } else {
+        stderr
+    }
 }
 
 fn md5_fingerprint(path: &Path) -> u64 {
@@ -198,7 +280,7 @@ fn md5_fingerprint(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, thread, time::Duration};
     use tempfile::tempdir;
 
     #[test]
@@ -248,5 +330,31 @@ mod tests {
         let mut found = video_paths(root.path());
         found.sort();
         assert_eq!(found, vec![clip, movie]);
+    }
+
+    #[test]
+    fn failed_thumbnail_generation_is_cached_for_the_current_file() {
+        let root = tempdir().unwrap();
+        let video = root.path().join("not-a-video.mp4");
+        fs::write(&video, b"this is not a video").unwrap();
+        let failure = cache_path(&video).unwrap().with_extension("failed");
+
+        assert!(generate(&video).is_none());
+        let first_failure = fs::read(&failure).expect("failed thumbnail marker");
+        let first_modified = fs::metadata(&failure).unwrap().modified().unwrap();
+
+        thread::sleep(Duration::from_millis(25));
+        assert!(generate(&video).is_none());
+        assert_eq!(fs::read(&failure).unwrap(), first_failure);
+        assert_eq!(
+            fs::metadata(&failure).unwrap().modified().unwrap(),
+            first_modified
+        );
+
+        fs::write(&video, b"a different invalid video").unwrap();
+        let changed_failure = cache_path(&video).unwrap().with_extension("failed");
+        assert_ne!(changed_failure, failure);
+        assert!(generate(&video).is_none());
+        assert!(changed_failure.is_file());
     }
 }
