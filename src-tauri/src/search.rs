@@ -636,9 +636,8 @@ impl QueryParser {
 
 fn parse_query_term(token: &str) -> Result<QueryExpr, SearchError> {
     if let Some((raw_field, value)) = token.split_once(':') {
-        match raw_field.to_ascii_lowercase().as_str() {
-            "size" => return Ok(QueryExpr::Term(parse_size_term(value)?)),
-            _ => {}
+        if raw_field.eq_ignore_ascii_case("size") {
+            return Ok(QueryExpr::Term(parse_size_term(value)?));
         }
     }
     let (field, value) = token
