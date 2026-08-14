@@ -3448,6 +3448,10 @@ export default function App() {
   }, [managedIndex?.supported]);
 
   const managedIndexIsActive = indexIsActive(managedIndex);
+  const managedIndexActiveFolderCount =
+    managedIndex?.folders.filter(
+      (folder) => folder.status === "pending" || folder.status === "indexing",
+    ).length ?? 0;
 
   const chooseIndexFolder = async () => {
     setFolderError(undefined);
@@ -3770,7 +3774,9 @@ export default function App() {
                     {folder.status === "pending"
                       ? "Waiting to index"
                       : folder.status === "indexing"
-                        ? "Indexing…"
+                        ? folder.scannedFiles
+                          ? `Indexing… ${folder.scannedFiles} files`
+                          : "Indexing…"
                         : folder.status === "ready"
                           ? "Ready"
                           : folder.status === "offline"
@@ -3962,6 +3968,14 @@ export default function App() {
                 : "Search index idle"}
             </strong>
             <span>
+              {managedIndexIsActive
+                ? `${managedIndexActiveFolderCount} folder${
+                    managedIndexActiveFolderCount === 1 ? "" : "s"
+                  } in progress · `
+                : null}
+              {managedIndexIsActive && managedIndex?.indexingFiles
+                ? `Scanned ${managedIndex.indexingFiles} files · `
+                : null}
               Indexed: {managedIndex.indexedVideos ?? 0}{" "}
               {(managedIndex.indexedVideos ?? 0) === 1 ? "video" : "videos"}
               {" · "}

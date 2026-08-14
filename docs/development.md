@@ -60,6 +60,7 @@ to see its version, build age, Git SHA, and number of commits behind
 
 - No results: press `Ctrl+,` and check that the folder is configured and reports Ready. A disconnected drive reports Drive disconnected and keeps its existing database.
 - Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux` refreshes and restarts the user service.
+- Slow indexing: the status pane reports folders in progress and files scanned; if those numbers stop changing, inspect the indexer log at `~/.local/share/app.toka.desktop/logs/indexer.log`.
 - Optional Recoll provider: install `recoll`, run `recollindex`, and launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.

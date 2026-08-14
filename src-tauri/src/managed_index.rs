@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(not(feature = "e2e"))]
@@ -134,6 +135,8 @@ pub enum FolderStatus {
 struct PersistedFolderStatus {
     status: FolderStatus,
     message: Option<String>,
+    #[serde(default)]
+    scanned_files: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -158,6 +161,7 @@ pub struct IndexFolder {
     pub path: PathBuf,
     pub status: FolderStatus,
     pub message: Option<String>,
+    pub scanned_files: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,6 +171,7 @@ pub struct IndexState {
     pub revision: u64,
     pub indexed_videos: u64,
     pub indexed_images: u64,
+    pub indexing_files: u64,
     pub folders: Vec<IndexFolder>,
 }
 
@@ -193,9 +198,15 @@ impl IndexManager {
     pub fn state(&self) -> Result<IndexState, String> {
         let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
         let status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
+        let indexing_files = status
+            .folders
+            .values()
+            .filter(|entry| entry.status == FolderStatus::Indexing)
+            .map(|entry| entry.scanned_files)
+            .sum();
         let counts = status.counts.unwrap_or_else(|| {
             let mut cached = self.legacy_counts.lock().unwrap();
-            *cached.get_or_insert_with(|| count_indexed_media(&config.folders))
+            *cached.get_or_insert_with(|| indexed_media_counts(&self.paths, &config.folders))
         });
         let folders = config
             .folders
@@ -219,6 +230,9 @@ impl IndexManager {
                     path: folder.path,
                     status: folder_status,
                     message: persisted.and_then(|entry| entry.message.clone()),
+                    scanned_files: persisted
+                        .map(|entry| entry.scanned_files)
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -227,6 +241,7 @@ impl IndexManager {
             revision: status.revision,
             indexed_videos: counts.videos,
             indexed_images: counts.images,
+            indexing_files,
             folders,
         })
     }
@@ -280,7 +295,7 @@ impl IndexManager {
         }
         let mut status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
         status.folders.remove(id);
-        status.counts = Some(count_indexed_media(&config.folders));
+        status.counts = Some(indexed_media_counts(&self.paths, &config.folders));
         write_json(&self.paths.status, &status)?;
         if let Some(path) = removed_path {
             self.logger
@@ -441,6 +456,7 @@ fn updatedb_arguments(root: &Path, database: &Path) -> Vec<String> {
         root.to_string_lossy().into_owned(),
         "-o".into(),
         database.to_string_lossy().into_owned(),
+        "--verbose".into(),
         "--prunefs".into(),
         String::new(),
         "--prunenames".into(),
@@ -493,13 +509,23 @@ fn set_folder_status(
         PersistedFolderStatus {
             status: folder_status,
             message,
+            scanned_files: 0,
         },
     );
     if advance_revision {
         status.revision = status.revision.saturating_add(1);
         let config = load_json::<IndexConfig>(&paths.config)?.unwrap_or_default();
-        status.counts = Some(count_indexed_media(&config.folders));
+        status.counts = Some(indexed_media_counts(paths, &config.folders));
     }
+    write_json(&paths.status, &status)
+}
+
+fn set_folder_progress(paths: &IndexPaths, id: &str, scanned_files: u64) -> Result<(), String> {
+    let mut status = load_json::<PersistedStatus>(&paths.status)?.unwrap_or_default();
+    let folder = status.folders.entry(id.to_owned()).or_default();
+    folder.status = FolderStatus::Indexing;
+    folder.message = None;
+    folder.scanned_files = scanned_files;
     write_json(&paths.status, &status)
 }
 
@@ -533,6 +559,93 @@ fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
     }
 
     counts
+}
+
+fn indexed_media_counts(paths: &IndexPaths, folders: &[ConfiguredFolder]) -> MediaCounts {
+    let indexed = folders
+        .iter()
+        .filter(|folder| paths.database(&folder.id).is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    count_indexed_media(&indexed)
+}
+
+fn run_updatedb_with_progress(
+    paths: &IndexPaths,
+    folder: &ConfiguredFolder,
+    program: &Path,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let database = paths.database(&folder.id);
+    let mut child = Command::new(program)
+        .args(updatedb_arguments(&folder.path, &database))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Toka's indexer could not start: {error}"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Toka's indexer did not provide progress output.".to_owned());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Toka's indexer did not provide error output.".to_owned());
+        }
+    };
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = BufReader::new(stderr).read_to_end(&mut bytes);
+        (result, bytes)
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    let mut scanned_files: u64 = 0;
+    let mut last_report = Instant::now() - Duration::from_secs(1);
+    loop {
+        line.clear();
+        let bytes = match reader.read_until(b'\n', &mut line) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(format!("Toka's indexer could not report progress: {error}"));
+            }
+        };
+        if bytes == 0 {
+            break;
+        }
+        scanned_files = scanned_files.saturating_add(1);
+        if last_report.elapsed() >= Duration::from_millis(500) {
+            if let Err(error) = set_folder_progress(paths, &folder.id, scanned_files) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(error);
+            }
+            last_report = Instant::now();
+        }
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stderr_reader.join();
+            return Err(format!("Toka's indexer could not finish: {error}"));
+        }
+    };
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| "Toka's indexer error output could not be read.".to_owned())?;
+    stderr_result
+        .map_err(|error| format!("Toka's indexer error output could not be read: {error}"))?;
+    Ok((status, stderr))
 }
 
 struct ThumbnailWorker {
@@ -614,29 +727,25 @@ fn refresh_folder_with_optional_worker(
     logger.record(format!("indexing folder: {}", folder.path.display()));
     set_folder_status(paths, &folder.id, FolderStatus::Indexing, None, false)?;
     let database = paths.database(&folder.id);
-    let output = match Command::new(program)
-        .args(updatedb_arguments(&folder.path, &database))
-        .output()
-    {
+    let (status, stderr) = match run_updatedb_with_progress(paths, folder, program) {
         Ok(output) => output,
         Err(error) => {
-            let message = format!("Toka's indexer could not start: {error}");
             logger.record(format!(
-                "indexing failed for {}: {message}",
+                "indexing failed for {}: {error}",
                 folder.path.display()
             ));
             set_folder_status(
                 paths,
                 &folder.id,
                 FolderStatus::Error,
-                Some(message.clone()),
+                Some(error.clone()),
                 false,
             )?;
-            return Err(message);
+            return Err(error);
         }
     };
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
         let message = if detail.is_empty() {
             "Toka could not update this folder's index.".into()
         } else {
@@ -682,6 +791,13 @@ fn is_path_change(kind: &EventKind) -> bool {
             | EventKind::Remove(_)
             | EventKind::Modify(notify::event::ModifyKind::Name(_))
     )
+}
+
+fn is_configuration_change(paths: &IndexPaths, event_paths: &[PathBuf]) -> bool {
+    let temporary_config = paths.config.with_extension("json.new");
+    event_paths
+        .iter()
+        .any(|path| path == &paths.config || path == &temporary_config || path == &paths.wake)
 }
 
 pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
@@ -742,7 +858,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         let mut config_changed = false;
         match receiver.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(event)) => {
-                if event.paths.iter().any(|path| path.starts_with(&paths.root)) {
+                if is_configuration_change(&paths, &event.paths) {
                     config_changed = true;
                 } else if is_path_change(&event.kind) {
                     for folder in &config.folders {
@@ -756,7 +872,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
                     }
                 }
                 while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_secs(2)) {
-                    if event.paths.iter().any(|path| path.starts_with(&paths.root)) {
+                    if is_configuration_change(&paths, &event.paths) {
                         config_changed = true;
                     } else if is_path_change(&event.kind) {
                         for folder in &config.folders {
@@ -831,6 +947,8 @@ mod tests {
         assert_eq!(state.folders.len(), 1);
         assert_eq!(state.folders[0].path, media.canonicalize().unwrap());
         assert_eq!(state.folders[0].status, FolderStatus::Pending);
+        assert_eq!(state.indexed_videos, 0);
+        assert_eq!(state.indexed_images, 0);
         let database = paths.database(&state.folders[0].id);
         fs::write(&database, b"index").unwrap();
 
@@ -874,6 +992,7 @@ mod tests {
                 "/media/My Drive/Videos",
                 "-o",
                 "/data/toka/index.db",
+                "--verbose",
                 "--prunefs",
                 "",
                 "--prunenames",
@@ -884,6 +1003,39 @@ mod tests {
                 "no",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn records_files_seen_while_updatedb_reports_progress() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        let folder = ConfiguredFolder {
+            id: "folder".into(),
+            path: media,
+            mount: None,
+        };
+        let fake_updatedb = root.path().join("updatedb");
+        fs::write(&fake_updatedb, "#!/bin/sh\nprintf 'one\\none\\n'\n").unwrap();
+        fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (status, stderr) = run_updatedb_with_progress(&paths, &folder, &fake_updatedb).unwrap();
+
+        assert!(status.success());
+        assert!(stderr.is_empty());
+        assert_eq!(
+            load_json::<PersistedStatus>(&paths.status)
+                .unwrap()
+                .unwrap()
+                .folders["folder"]
+                .scanned_files,
+            1
+        );
+        assert_eq!(IndexManager::new(paths).state().unwrap().indexing_files, 1);
     }
 
     #[cfg(unix)]
@@ -1023,6 +1175,29 @@ mod tests {
                 "toka-indexer.service".to_owned(),
             ]]
         );
+    }
+
+    #[test]
+    fn only_configuration_and_wake_events_restart_an_index_pass() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+
+        assert!(is_configuration_change(
+            &paths,
+            std::slice::from_ref(&paths.config)
+        ));
+        assert!(is_configuration_change(
+            &paths,
+            std::slice::from_ref(&paths.wake)
+        ));
+        assert!(is_configuration_change(
+            &paths,
+            std::slice::from_ref(&paths.config.with_extension("json.new"))
+        ));
+        assert!(!is_configuration_change(
+            &paths,
+            std::slice::from_ref(&paths.root.join(".hidden-metadata"))
+        ));
     }
 
     #[cfg(unix)]
