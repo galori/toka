@@ -117,6 +117,7 @@ fn index_state() -> managed_index::IndexState {
         revision: 0,
         indexed_videos: 0,
         indexed_images: 0,
+        indexing_files: 0,
         folders: Vec::new(),
     }
 }
@@ -128,6 +129,7 @@ struct UnsupportedIndexState {
     revision: u64,
     indexed_videos: u64,
     indexed_images: u64,
+    indexing_files: u64,
     folders: Vec<String>,
 }
 
@@ -139,6 +141,7 @@ fn index_state() -> UnsupportedIndexState {
         revision: 0,
         indexed_videos: 0,
         indexed_images: 0,
+        indexing_files: 0,
         folders: Vec::new(),
     }
 }

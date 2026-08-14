@@ -47,6 +47,7 @@ export type IndexFolder = {
   path: string;
   status: "pending" | "indexing" | "ready" | "offline" | "error";
   message?: string;
+  scannedFiles?: number;
 };
 
 export type IndexState = {
@@ -54,6 +55,7 @@ export type IndexState = {
   revision: number;
   indexedVideos?: number;
   indexedImages?: number;
+  indexingFiles?: number;
   folders: IndexFolder[];
 };
 

@@ -422,6 +422,7 @@ test("shows indexing activity and managed media totals", async () => {
     revision: 1,
     indexedVideos: 12,
     indexedImages: 4,
+    indexingFiles: 384,
     folders: [{ id: "videos", path: "/Videos", status: "indexing" }],
   });
 
@@ -431,6 +432,8 @@ test("shows indexing activity and managed media totals", async () => {
     name: "Search index status",
   });
   expect(status).toHaveTextContent("Indexing search folders");
+  expect(status).toHaveTextContent("1 folder in progress");
+  expect(status).toHaveTextContent("Scanned 384 files");
   expect(status).toHaveTextContent("12 videos");
   expect(status).toHaveTextContent("4 images");
 });
