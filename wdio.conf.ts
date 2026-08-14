@@ -1,21 +1,32 @@
 import { delimiter, resolve } from "node:path";
 import type { Options } from "@wdio/types";
-import { startFixtureServer, stopFixtureServer } from "./test/integration/fixture-server";
+import {
+  startFixtureServer,
+  stopFixtureServer,
+} from "./test/integration/fixture-server";
 
-const fixturePaths = [1, 2, 3, 4, 5].map((number) =>
-  resolve("test/fixtures/sample" + number + ".mp4"),
-);
+const fixturePaths = [
+  ...[1, 2, 3, 4, 5].map((number) =>
+    resolve("test/fixtures/sample" + number + ".mp4"),
+  ),
+  ...["tall", "narrow", "wide", "short"].map((shape) =>
+    resolve("test/fixtures/image-fit-" + shape + ".png"),
+  ),
+];
 process.env.TOKA_E2E_VIDEOS = fixturePaths.join(delimiter);
 
-const binaryPath = process.env.TOKA_E2E_BINARY ?? resolve(
-  `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
-);
+const binaryPath =
+  process.env.TOKA_E2E_BINARY ??
+  resolve(
+    `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
+  );
 
 export const config: Options.Testrunner = {
   runner: "local",
   specs: [
     "./test/integration/happy-path.spec.ts",
     "./test/integration/player-controls.spec.ts",
+    "./test/integration/image-fit.spec.ts",
     "./test/integration/playlist-ui.spec.ts",
     "./test/integration/subtitles.spec.ts",
     "./test/integration/fullscreen.spec.ts",
@@ -23,7 +34,9 @@ export const config: Options.Testrunner = {
   maxInstances: 1,
   framework: "mocha",
   reporters: ["spec"],
-  services: [["tauri", { appBinaryPath: binaryPath, driverProvider: "embedded" }]],
+  services: [
+    ["tauri", { appBinaryPath: binaryPath, driverProvider: "embedded" }],
+  ],
   capabilities: [
     {
       browserName: "tauri",
