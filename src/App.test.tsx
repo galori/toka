@@ -353,6 +353,29 @@ test("a launch playlist bypasses first-launch folder setup", async () => {
   ).not.toBeInTheDocument();
 });
 
+test("starts launched playback in a focused player mode", async () => {
+  launchPlaylistMock.mockResolvedValue({
+    query: "summer.m3u8",
+    page: 1,
+    pageSize: 24,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
+
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing summer.mp4")).toBeVisible();
+  expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+  expect(document.activeElement).toHaveClass("player-shell");
+
+  fireEvent.keyDown(window, { key: "f" });
+  await waitFor(() =>
+    expect(windowApiMock.setFullscreen).toHaveBeenCalledWith(true),
+  );
+});
+
 test("offers to refresh search results when the managed index advances", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
@@ -2654,6 +2677,25 @@ test("selects the fullscreen information and scrubber mode without delay", async
   }
 });
 
+test("keeps the tag editor visible when opened in fullscreen information mode", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    await enterFullscreen(user);
+
+    fireEvent.keyDown(window, { key: "t" });
+    const field = await screen.findByRole("textbox", {
+      name: "Add tag to clip.mp4",
+    });
+    expect(field).toBeVisible();
+    expect(field).toHaveFocus();
+    expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
 test("keeps the fullscreen controls selected with F visible", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
@@ -4907,10 +4949,8 @@ test("says nothing about other players when this computer has none", async () =>
   ).not.toBeInTheDocument();
 });
 
-// `autoFocus` fires once per mount, and the search form stays mounted for the
-// whole session — the player renders beside it rather than replacing it. So the
-// field was focused at startup and never again, and coming back from a video
-// left the keyboard on a shell that had just been unmounted.
+// Search and playback are separate modes, so each transition mounts the
+// screen that owns the keyboard and its focus target.
 test("focuses the search field on startup and on every return from a video", async () => {
   invokeMock
     .mockResolvedValueOnce({
@@ -4936,10 +4976,11 @@ test("focuses the search field on startup and on every return from a video", asy
   expect(field).not.toHaveFocus();
 
   await user.click(screen.getByRole("button", { name: "Back to results" }));
-  await waitFor(() => expect(field).toHaveFocus());
+  const returnedField = await screen.findByRole("searchbox");
+  await waitFor(() => expect(returnedField).toHaveFocus());
   // Typing goes straight into the field, with nothing else to click first.
   await user.keyboard("second");
-  expect(field).toHaveValue("clipsecond");
+  expect(returnedField).toHaveValue("clipsecond");
 });
 
 // Aspect deliberately ignores rotation: some players apply an override
