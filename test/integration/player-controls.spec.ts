@@ -116,6 +116,11 @@ describe("Toka player controls", () => {
     await $(".playlist-drawer").waitForExist({ reverse: true });
   });
 
+  after(async () => {
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
+  });
+
   it("shows the scrub timeline across the overlay", async () => {
     // The scrubber is a range input, not a button: the design draws it as a
     // thin bar, so it is held to spanning the overlay rather than to the
@@ -249,7 +254,12 @@ describe("Toka player controls", () => {
     await browser.waitUntil(async () => (await pill()).label === "Play", {
       timeoutMsg: "The play/pause control did not come back to its first state",
     });
-    await expect($(".player-controls")).toBeDisplayed();
+    // WebKit can commit the button's new label before it has laid out the
+    // overlay after a native playback restart. Wait for the same layout frame
+    // that the rest of this spec measures rather than sampling that transition.
+    await browser.waitUntil(async () => (await $(".player-controls").isDisplayed()), {
+      timeoutMsg: "The player controls did not return after playback resumed",
+    });
   });
 
   // The overlay spans the shell, and the shell clips what overflows it, so a

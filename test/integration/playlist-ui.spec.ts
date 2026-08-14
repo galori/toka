@@ -97,7 +97,11 @@ describe("Toka playlist interface", () => {
     await $(".player-controls").waitForDisplayed();
   });
 
-  after(leaveFullscreen);
+  after(async () => {
+    await leaveFullscreen();
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
+  });
 
   it("opens the playlist drawer over the picture", async () => {
     // On Linux the mpv surface is composited above the WebView whatever the
@@ -461,13 +465,18 @@ describe("Toka permanent playlist mode", () => {
     // Not scoped to `.player-heading`: an engine that gave up on the media
     // leaves the player in its error state, which carries the same control
     // somewhere else.
-    await $('button[aria-label="Back to results"]').click();
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
     await browser.waitUntil(async () => (await $$(".video-tile")).length === 5, {
       timeoutMsg: "The results grid never came back",
     });
   });
 
-  after(leaveFullscreen);
+  after(async () => {
+    await leaveFullscreen();
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
+  });
 
   it("opens the whole page of results when one of them is chosen", async () => {
     // There is no such thing as playing one video on its own any more: a tile

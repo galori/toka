@@ -1102,6 +1102,7 @@ function Player({
   onLoadMore,
   onBack,
   onHelp,
+  onNewWindow,
   helpOpen,
   onTagsChange,
 }: {
@@ -1111,6 +1112,7 @@ function Player({
   onLoadMore?: () => Promise<VideoResult[]>;
   onBack: () => void;
   onHelp: () => void;
+  onNewWindow: () => void;
   helpOpen: boolean;
   onTagsChange: (
     videoId: string,
@@ -1182,6 +1184,12 @@ function Player({
   const [imageDurationSeconds, setImageDurationSeconds] = useState(
     DEFAULT_IMAGE_DURATION_SECONDS,
   );
+  useLayoutEffect(() => {
+    // Playback is its own mode. Claim the keyboard as soon as the player is
+    // mounted so a search field or result control cannot keep swallowing the
+    // player's shortcuts after a launch or a result click.
+    playerShell.current?.focus({ preventScroll: true });
+  }, []);
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
@@ -1490,6 +1498,13 @@ function Player({
 
   // Typing a tag needs the viewer's attention, so the picture waits for them.
   const openTagField = () => {
+    if (fullscreen && fullscreenModeRef.current !== "controls") {
+      // The tag editor lives in the controls row. Fullscreen information mode
+      // hides that row down to the scrubber, so opening the editor must reveal
+      // the controls at the same time or the focused field is invisible.
+      fullscreenModeRef.current = "controls";
+      setFullscreenMode("controls");
+    }
     if (playingBack) pause();
     setAddingTag(true);
   };
@@ -2318,6 +2333,14 @@ function Player({
           ) : null}
         </div>
         <HelpButton className="player-help-toggle" onClick={onHelp} />
+        <ControlButton
+          shortcut="Ctrl+N"
+          className="player-help-toggle"
+          aria-label="New window"
+          onClick={onNewWindow}
+        >
+          <Label>New window</Label>
+        </ControlButton>
         <ControlButton
           shortcut="P"
           className="playlist-toggle"
@@ -3796,6 +3819,28 @@ export default function App() {
     );
   }
 
+  if (playing && page) {
+    return (
+      <main className="app playback-mode">
+        {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
+        <Player
+          videos={playing.videos}
+          startIndex={playing.startIndex}
+          hasMore={page.results.length < page.totalResults}
+          onLoadMore={loadMorePlaylist}
+          onBack={() => {
+            restoreResultsScroll.current = true;
+            setPlaying(undefined);
+          }}
+          onHelp={() => setShowHelp(true)}
+          onNewWindow={() => void startNewWindow()}
+          helpOpen={showHelp}
+          onTagsChange={updateTags}
+        />
+      </main>
+    );
+  }
+
   return (
     <main className={hasSubmitted ? "app" : "app initial"}>
       <form role="search" onSubmit={submit} className="search-form">
@@ -3960,22 +4005,6 @@ export default function App() {
           </ControlButton>
         </aside>
       ) : null}
-      {playing && page ? (
-        <Player
-          videos={playing.videos}
-          startIndex={playing.startIndex}
-          hasMore={page.results.length < page.totalResults}
-          onLoadMore={loadMorePlaylist}
-          onBack={() => {
-            restoreResultsScroll.current = true;
-            setPlaying(undefined);
-          }}
-          onHelp={() => setShowHelp(true)}
-          helpOpen={showHelp}
-          onTagsChange={updateTags}
-        />
-      ) : null}
-
       {!loading && !playing && page ? (
         <section className="results" ref={setResultsList}>
           <div className="results-summary">
