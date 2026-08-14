@@ -508,9 +508,24 @@ enum QueryField {
     Any,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Comparison {
+    Equal,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryTerm {
+    Text { field: QueryField, value: String },
+    Size { comparison: Comparison, bytes: u64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryExpr {
-    Term { field: QueryField, value: String },
+    Term(QueryTerm),
     And(Box<QueryExpr>, Box<QueryExpr>),
     Or(Box<QueryExpr>, Box<QueryExpr>),
 }
@@ -614,12 +629,18 @@ impl QueryParser {
             {
                 Err(SearchError::InvalidQuery)
             }
-            Some(_) => Ok(parse_query_term(&self.consume().unwrap())),
+            Some(_) => parse_query_term(&self.consume().unwrap()),
         }
     }
 }
 
-fn parse_query_term(token: &str) -> QueryExpr {
+fn parse_query_term(token: &str) -> Result<QueryExpr, SearchError> {
+    if let Some((raw_field, value)) = token.split_once(':') {
+        match raw_field.to_ascii_lowercase().as_str() {
+            "size" => return Ok(QueryExpr::Term(parse_size_term(value)?)),
+            _ => {}
+        }
+    }
     let (field, value) = token
         .split_once(':')
         .map(|(field, value)| (field.to_ascii_lowercase(), value))
@@ -633,15 +654,69 @@ fn parse_query_term(token: &str) -> QueryExpr {
             (!value.is_empty()).then_some((field, value))
         })
         .unwrap_or((QueryField::Any, token));
-    QueryExpr::Term {
+    Ok(QueryExpr::Term(QueryTerm::Text {
         field,
         value: value.to_lowercase(),
+    }))
+}
+
+fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
+    let (comparison, number) = split_comparison(value);
+    let number = number.to_ascii_lowercase();
+    let units = [
+        ("tib", 1_099_511_627_776u64),
+        ("tb", 1_000_000_000_000u64),
+        ("gib", 1_073_741_824u64),
+        ("gb", 1_000_000_000u64),
+        ("mib", 1_048_576u64),
+        ("mb", 1_000_000u64),
+        ("kib", 1_024u64),
+        ("kb", 1_000u64),
+        ("b", 1u64),
+        ("", 1u64),
+    ];
+    let (number, multiplier) = units
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            number
+                .strip_suffix(suffix)
+                .map(|number| (number, *multiplier))
+        })
+        .ok_or(SearchError::InvalidQuery)?;
+    let number = number
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .ok_or(SearchError::InvalidQuery)?;
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err(SearchError::InvalidQuery);
     }
+    Ok(QueryTerm::Size {
+        comparison,
+        bytes: bytes.round() as u64,
+    })
+}
+
+fn split_comparison(value: &str) -> (Comparison, &str) {
+    for (prefix, comparison) in [
+        ("<=", Comparison::LessOrEqual),
+        (">=", Comparison::GreaterOrEqual),
+        ("<", Comparison::Less),
+        (">", Comparison::Greater),
+        ("=", Comparison::Equal),
+    ] {
+        if let Some(value) = value.strip_prefix(prefix) {
+            return (comparison, value);
+        }
+    }
+    (Comparison::Equal, value)
 }
 
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
-        QueryExpr::Term { field, .. } => *field == QueryField::Path,
+        QueryExpr::Term(QueryTerm::Text { field, .. }) => *field == QueryField::Path,
+        QueryExpr::Term(QueryTerm::Size { .. }) => false,
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
             query_needs_whole_path(left) || query_needs_whole_path(right)
         }
@@ -650,7 +725,7 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
 
 fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> bool {
     match expression {
-        QueryExpr::Term { field, value } => match field {
+        QueryExpr::Term(QueryTerm::Text { field, value }) => match field {
             QueryField::Any => haystacks(path, fields)
                 .iter()
                 .any(|hay| hay.contains(value)),
@@ -658,12 +733,25 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
             QueryField::FileName => file_name_haystack(path).contains(value),
             QueryField::Path => path_haystack(path).contains(value),
         },
+        QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
+            .map(|metadata| compare(metadata.len(), *comparison, *bytes))
+            .unwrap_or(false),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields) && matches_query(path, right, fields)
         }
         QueryExpr::Or(left, right) => {
             matches_query(path, left, fields) || matches_query(path, right, fields)
         }
+    }
+}
+
+fn compare<T: PartialOrd>(actual: T, comparison: Comparison, expected: T) -> bool {
+    match comparison {
+        Comparison::Equal => actual == expected,
+        Comparison::Less => actual < expected,
+        Comparison::LessOrEqual => actual <= expected,
+        Comparison::Greater => actual > expected,
+        Comparison::GreaterOrEqual => actual >= expected,
     }
 }
 
@@ -1230,6 +1318,33 @@ mod tests {
             engine.search(request("AND clip")),
             Err(SearchError::InvalidQuery)
         ));
+    }
+
+    #[test]
+    fn size_predicates_match_exact_sizes_and_ranges() {
+        let directory = tempdir().unwrap();
+        let small = directory.path().join("small.mp4");
+        let target = directory.path().join("target.mp4");
+        let huge = directory.path().join("huge.mp4");
+        for (path, size) in [
+            (&small, 100_000),
+            (&target, 36_300_000),
+            (&huge, 1_600_000_000),
+        ] {
+            fs::File::create(path).unwrap().set_len(size).unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![small, target, huge])));
+
+        assert_eq!(
+            names(&engine.search(request("size:36.3mb")).unwrap()),
+            ["target.mp4"]
+        );
+        let mut under = names(&engine.search(request("size:<1.5gb")).unwrap());
+        under.sort();
+        assert_eq!(under, ["small.mp4", "target.mp4"]);
+        let mut at_least = names(&engine.search(request("size:>=100kb")).unwrap());
+        at_least.sort();
+        assert_eq!(at_least, ["huge.mp4", "small.mp4", "target.mp4"]);
     }
 
     #[test]

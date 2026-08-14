@@ -148,7 +148,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent(
     "Combine terms and group them with parentheses",
   );
-  expect(help).toHaveTextContent("Limit a term to a specific search field");
+  expect(help).toHaveTextContent("Limit a term to a search field or file size");
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");

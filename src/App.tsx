@@ -796,8 +796,8 @@ const HELP_SECTIONS: HelpSection[] = [
         description: "Combine terms and group them with parentheses",
       },
       {
-        shortcut: "tags: filename: path:",
-        description: "Limit a term to a specific search field",
+        shortcut: "tags: filename: path: size:",
+        description: "Limit a term to a search field or file size",
       },
       {
         shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",
