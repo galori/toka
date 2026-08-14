@@ -127,6 +127,12 @@ describe("Toka image fitting", () => {
     await leaveFullscreen();
     const back = $('button[aria-label="Back to results"]');
     if (await back.isExisting()) await back.click();
+    const videos = $('button[aria-label="Videos"]');
+    if (
+      (await videos.isExisting()) &&
+      (await videos.getAttribute("aria-pressed")) !== "true"
+    )
+      await videos.click();
   });
 
   it("keeps every aspect ratio whole in every player mode", async () => {
