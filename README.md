@@ -36,6 +36,13 @@ File-size predicates can be added to a search without a separate control:
 `size:>=100kb` express ranges. `kb`, `mb`, `gb`, and `tb` use decimal units;
 the corresponding `kib`, `mib`, `gib`, and `tib` suffixes use binary units.
 
+Creation and modification dates can be searched with the same comparison
+operators: `created:10-5-2026`, `modified:>1-1-2026`, and
+`created:<=12-10-2025`. Dates accept `MM-DD-YYYY`, `MM-DD-YY`, and
+`YYYY-MM-DD`; one- or two-digit months and days are accepted, and two-digit
+years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Dates use the file's
+local calendar date rather than its time of day.
+
 ## Playlists
 
 Every page of results is a playlist: playing one video plays the rest after it,

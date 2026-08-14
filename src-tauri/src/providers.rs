@@ -740,9 +740,9 @@ mod tests {
 
         provider
             .candidates(
-                "size:>=100kb filename:clip",
+                "created:>1-1-2026 filename:clip",
                 false,
-                &context("size:>=100kb filename:clip"),
+                &context("created:>1-1-2026 filename:clip"),
             )
             .unwrap();
 

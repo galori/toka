@@ -517,10 +517,46 @@ enum Comparison {
     GreaterOrEqual,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateField {
+    Created,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CalendarDate {
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+impl CalendarDate {
+    fn new(year: i32, month: u32, day: u32) -> Option<Self> {
+        if year < 1
+            || !(1..=12).contains(&month)
+            || !(1..=days_in_month(year, month)).contains(&day)
+        {
+            return None;
+        }
+        Some(Self { year, month, day })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryTerm {
-    Text { field: QueryField, value: String },
-    Size { comparison: Comparison, bytes: u64 },
+    Text {
+        field: QueryField,
+        value: String,
+    },
+    Size {
+        comparison: Comparison,
+        bytes: u64,
+    },
+    Date {
+        field: DateField,
+        comparison: Comparison,
+        date: CalendarDate,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -639,6 +675,9 @@ fn parse_query_term(token: &str) -> Result<QueryExpr, SearchError> {
         if raw_field.eq_ignore_ascii_case("size") {
             return Ok(QueryExpr::Term(parse_size_term(value)?));
         }
+        if let Some(field) = parse_date_field(raw_field) {
+            return Ok(QueryExpr::Term(parse_date_term(field, value)?));
+        }
     }
     let (field, value) = token
         .split_once(':')
@@ -697,6 +736,109 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     })
 }
 
+fn parse_date_field(field: &str) -> Option<DateField> {
+    if field.eq_ignore_ascii_case("created") {
+        Some(DateField::Created)
+    } else if field.eq_ignore_ascii_case("modified") {
+        Some(DateField::Modified)
+    } else {
+        None
+    }
+}
+
+fn parse_date_term(field: DateField, value: &str) -> Result<QueryTerm, SearchError> {
+    let (comparison, value) = split_comparison(value);
+    Ok(QueryTerm::Date {
+        field,
+        comparison,
+        date: parse_calendar_date(value)?,
+    })
+}
+
+fn parse_calendar_date(value: &str) -> Result<CalendarDate, SearchError> {
+    let parts = value.split('-').collect::<Vec<_>>();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(SearchError::InvalidQuery);
+    }
+
+    let (year, month, day) = if parts[0].len() == 4 {
+        (
+            parse_year(parts[0], false)?,
+            parse_month_or_day(parts[1])?,
+            parse_month_or_day(parts[2])?,
+        )
+    } else {
+        (
+            parse_year(parts[2], parts[2].len() == 2)?,
+            parse_month_or_day(parts[0])?,
+            parse_month_or_day(parts[1])?,
+        )
+    };
+
+    CalendarDate::new(year, month, day).ok_or(SearchError::InvalidQuery)
+}
+
+fn parse_year(value: &str, allow_two_digits: bool) -> Result<i32, SearchError> {
+    let expected_length = if allow_two_digits { 2 } else { 4 };
+    if value.len() != expected_length || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SearchError::InvalidQuery);
+    }
+    let year = value
+        .parse::<i32>()
+        .map_err(|_| SearchError::InvalidQuery)?;
+    if allow_two_digits {
+        Ok(if year <= 68 { 2000 + year } else { 1900 + year })
+    } else {
+        Ok(year)
+    }
+}
+
+fn parse_month_or_day(value: &str) -> Result<u32, SearchError> {
+    if !(1..=2).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SearchError::InvalidQuery);
+    }
+    value.parse::<u32>().map_err(|_| SearchError::InvalidQuery)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+#[cfg(unix)]
+fn calendar_date(time: SystemTime) -> Option<CalendarDate> {
+    let seconds = match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs().try_into().ok()?,
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = duration
+                .as_secs()
+                .checked_add(u64::from(duration.subsec_nanos() != 0))?;
+            let seconds: libc::time_t = seconds.try_into().ok()?;
+            seconds.checked_neg()?
+        }
+    };
+    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
+    if unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
+        return None;
+    }
+    CalendarDate::new(
+        local.tm_year.checked_add(1900)?,
+        u32::try_from(local.tm_mon.checked_add(1)?).ok()?,
+        u32::try_from(local.tm_mday).ok()?,
+    )
+}
+
+#[cfg(not(unix))]
+fn calendar_date(_time: SystemTime) -> Option<CalendarDate> {
+    None
+}
+
 fn split_comparison(value: &str) -> (Comparison, &str) {
     for (prefix, comparison) in [
         ("<=", Comparison::LessOrEqual),
@@ -716,6 +858,7 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, .. }) => *field == QueryField::Path,
         QueryExpr::Term(QueryTerm::Size { .. }) => false,
+        QueryExpr::Term(QueryTerm::Date { .. }) => false,
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
             query_needs_whole_path(left) || query_needs_whole_path(right)
         }
@@ -735,6 +878,20 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
         QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
             .map(|metadata| compare(metadata.len(), *comparison, *bytes))
             .unwrap_or(false),
+        QueryExpr::Term(QueryTerm::Date {
+            field,
+            comparison,
+            date,
+        }) => fs::metadata(path)
+            .ok()
+            .and_then(|metadata| {
+                let time = match field {
+                    DateField::Created => metadata.created().ok()?,
+                    DateField::Modified => metadata.modified().ok()?,
+                };
+                calendar_date(time)
+            })
+            .is_some_and(|actual| compare(actual, *comparison, *date)),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields) && matches_query(path, right, fields)
         }
@@ -1344,6 +1501,79 @@ mod tests {
         let mut at_least = names(&engine.search(request("size:>=100kb")).unwrap());
         at_least.sort();
         assert_eq!(at_least, ["huge.mp4", "small.mp4", "target.mp4"]);
+    }
+
+    #[test]
+    fn date_predicates_match_created_and_modified_dates() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first.mp4");
+        let second = directory.path().join("second.mp4");
+        fs::write(&first, b"test").unwrap();
+        fs::write(&second, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![first, second])));
+
+        let mut modified = names(&engine.search(request("modified:>=01-01-1970")).unwrap());
+        modified.sort();
+        assert_eq!(modified, ["first.mp4", "second.mp4"]);
+
+        let date = calendar_date(
+            fs::metadata(directory.path().join("first.mp4"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+        .unwrap();
+        let exact_query = format!(
+            "modified:{:04}-{:02}-{:02}",
+            date.year, date.month, date.day
+        );
+        let mut exact = names(&engine.search(request(&exact_query)).unwrap());
+        exact.sort();
+        assert_eq!(exact, ["first.mp4", "second.mp4"]);
+
+        let mut created = names(&engine.search(request("created:>01-01-1970")).unwrap());
+        created.sort();
+        assert_eq!(created, ["first.mp4", "second.mp4"]);
+
+        assert!(matches!(
+            engine.search(request("modified:2026-02-30")),
+            Err(SearchError::InvalidQuery)
+        ));
+    }
+
+    #[test]
+    fn date_parser_accepts_the_supported_formats_and_validates_calendar_dates() {
+        assert_eq!(
+            parse_calendar_date("10-5-2026").unwrap(),
+            CalendarDate {
+                year: 2026,
+                month: 10,
+                day: 5,
+            }
+        );
+        assert_eq!(
+            parse_calendar_date("10-5-26").unwrap(),
+            CalendarDate {
+                year: 2026,
+                month: 10,
+                day: 5,
+            }
+        );
+        assert_eq!(
+            parse_calendar_date("2026-10-05").unwrap(),
+            CalendarDate {
+                year: 2026,
+                month: 10,
+                day: 5,
+            }
+        );
+        assert!(parse_calendar_date("02-29-2024").is_ok());
+        for invalid in ["02-29-2023", "04-31-2026", "13-1-2026", "2026-1-1-1"] {
+            assert!(
+                parse_calendar_date(invalid).is_err(),
+                "expected {invalid} to be rejected"
+            );
+        }
     }
 
     #[test]
