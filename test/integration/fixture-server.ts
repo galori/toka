@@ -1,15 +1,20 @@
 import { createReadStream, statSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import { basename } from "node:path";
+import { basename, extname } from "node:path";
 
 export const fixtureServerHost = "127.0.0.1";
-export const fixtureServerPort = Number(process.env.TOKA_E2E_FIXTURE_SERVER_PORT ?? "1421");
+export const fixtureServerPort = Number(
+  process.env.TOKA_E2E_FIXTURE_SERVER_PORT ?? "1421",
+);
 let fixtureServer: Server | undefined;
 
 export function startFixtureServer(filePaths: string[]): Promise<void> {
-  const fixtures = new Map(filePaths.map((filePath) => [basename(filePath), filePath]));
+  const fixtures = new Map(
+    filePaths.map((filePath) => [basename(filePath), filePath]),
+  );
   fixtureServer = createServer((request, response) => {
-    const pathName = new URL(request.url ?? "/", `http://${fixtureServerHost}`).pathname;
+    const pathName = new URL(request.url ?? "/", `http://${fixtureServerHost}`)
+      .pathname;
     const filePath = fixtures.get(decodeURIComponent(pathName.slice(1)));
     if (!filePath) {
       response.writeHead(404).end();
@@ -26,10 +31,23 @@ export function startFixtureServer(filePaths: string[]): Promise<void> {
     }
 
     const partial = Boolean(range);
+    const contentType =
+      {
+        ".avif": "image/avif",
+        ".bmp": "image/bmp",
+        ".gif": "image/gif",
+        ".heic": "image/heic",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".webp": "image/webp",
+      }[extname(filePath).toLowerCase()] ?? "video/mp4";
     const headers: Record<string, string | number> = {
       "Accept-Ranges": "bytes",
       "Content-Length": end - start + 1,
-      "Content-Type": "video/mp4",
+      "Content-Type": contentType,
     };
     if (partial) headers["Content-Range"] = `bytes ${start}-${end}/${size}`;
     response.writeHead(partial ? 206 : 200, headers);
@@ -44,6 +62,6 @@ export function startFixtureServer(filePaths: string[]): Promise<void> {
 
 export function stopFixtureServer(): Promise<void> {
   return new Promise((resolveServer, reject) => {
-    fixtureServer?.close((error) => error ? reject(error) : resolveServer());
+    fixtureServer?.close((error) => (error ? reject(error) : resolveServer()));
   });
 }
