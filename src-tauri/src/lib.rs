@@ -372,7 +372,7 @@ fn trash_outcome(
 /// controls a search's results do.
 ///
 /// `toka summer.m3u8` opens that playlist, `toka clip.mp4` plays that one
-/// video, and `toka /Videos` plays every supported video under that folder and
+/// video, and `toka /Videos` plays every supported video and image under that folder and
 /// its subfolders, shuffled like any other playlist.
 ///
 /// `None` is the ordinary case: Toka was started on its own and belongs on an
@@ -389,7 +389,7 @@ fn launch_playlist(
     };
     if path.is_dir() {
         let mut videos =
-            playlist::collect_directory_videos(path).map_err(|message| CommandError {
+            playlist::collect_directory_media(path).map_err(|message| CommandError {
                 kind: "Playlist",
                 message,
             })?;

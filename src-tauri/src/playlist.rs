@@ -82,9 +82,9 @@ pub fn videos(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(videos)
 }
 
-/// Every supported video under `directory` and its subfolders, recursively.
-/// The walk skips files Toka cannot play and any entry that cannot be read.
-pub fn collect_directory_videos(directory: &Path) -> Result<Vec<PathBuf>, String> {
+/// Every supported video and image under `directory` and its subfolders,
+/// recursively. The walk skips files Toka cannot play or show and any entry that cannot be read.
+pub fn collect_directory_media(directory: &Path) -> Result<Vec<PathBuf>, String> {
     if !directory.is_dir() {
         return Err(format!(
             "{} could not be read: not a directory",
@@ -96,7 +96,7 @@ pub fn collect_directory_videos(directory: &Path) -> Result<Vec<PathBuf>, String
         .map_err(|error| format!("{} could not be read: {error}", name(directory)))?;
     if videos.is_empty() {
         return Err(format!(
-            "{} contains no videos Toka can play.",
+            "{} contains no videos or images Toka can play.",
             name(directory)
         ));
     }
@@ -109,7 +109,7 @@ fn collect_recursive(directory: &Path, out: &mut Vec<PathBuf>) -> std::io::Resul
         let path = entry.path();
         if path.is_dir() {
             collect_recursive(&path, out)?;
-        } else if path.is_file() && is_supported_video(&path) {
+        } else if path.is_file() && is_supported_media(&path, MediaType::Both) {
             out.push(path);
         }
     }
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn collecting_a_folders_videos_finds_supported_videos_recursively() {
+    fn collecting_a_folders_videos_finds_supported_videos_and_images_recursively() {
         let root = tempdir().unwrap();
         let beach = root.path().join("beach.mp4");
         let notes = root.path().join("notes.txt");
@@ -365,10 +365,12 @@ mod tests {
         fs::create_dir(&deep).unwrap();
         let extra = deep.join("extra.webm");
         fs::write(&extra, b"test").unwrap();
+        let photo = deep.join("photo.JPG");
+        fs::write(&photo, b"test").unwrap();
 
-        let mut collected = collect_directory_videos(root.path()).unwrap();
+        let mut collected = collect_directory_media(root.path()).unwrap();
         collected.sort();
-        let mut expected = vec![beach, party, hidden, extra];
+        let mut expected = vec![beach, party, hidden, extra, photo];
         expected.sort();
         assert_eq!(collected, expected);
     }
@@ -378,23 +380,23 @@ mod tests {
         let directory = tempdir().unwrap();
         let upper = directory.path().join("CLIP.MP4");
         fs::write(&upper, b"test").unwrap();
-        let collected = collect_directory_videos(directory.path()).unwrap();
+        let collected = collect_directory_media(directory.path()).unwrap();
         assert_eq!(collected, vec![upper]);
     }
 
     #[test]
     fn an_empty_folder_reports_no_videos() {
         let directory = tempdir().unwrap();
-        let error = collect_directory_videos(directory.path()).unwrap_err();
-        assert!(error.contains("no videos"), "{error}");
+        let error = collect_directory_media(directory.path()).unwrap_err();
+        assert!(error.contains("no videos or images"), "{error}");
     }
 
     #[test]
     fn a_folder_with_only_unsupported_files_reports_no_videos() {
         let directory = tempdir().unwrap();
         fs::write(directory.path().join("notes.txt"), b"test").unwrap();
-        let error = collect_directory_videos(directory.path()).unwrap_err();
-        assert!(error.contains("no videos"), "{error}");
+        let error = collect_directory_media(directory.path()).unwrap_err();
+        assert!(error.contains("no videos or images"), "{error}");
     }
 
     #[test]
