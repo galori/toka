@@ -148,7 +148,9 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent(
     "Combine terms and group them with parentheses",
   );
-  expect(help).toHaveTextContent("Limit a term to a search field, size, or date");
+  expect(help).toHaveTextContent(
+    "Limit a term to a search field, size, or date",
+  );
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
@@ -5505,6 +5507,46 @@ test("hides the cursor when it rests on the video during playback", async () => 
   fireEvent.pause(video);
   await act(async () => {
     vi.advanceTimersByTime(3000);
+  });
+  expect(shell).not.toHaveClass("cursor-hidden");
+  vi.useRealTimers();
+});
+
+test("hides the cursor when it rests on an image and restores it on movement", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  invokeMock.mockImplementation((command: string) =>
+    command === "search_videos"
+      ? Promise.resolve({
+          query: "pic",
+          page: 1,
+          pageSize: 24,
+          totalResults: 1,
+          totalPages: 1,
+          results: [{ id: "image-1", fileName: "pic.jpg", extension: "jpg" }],
+        })
+      : Promise.resolve({
+          filePath: "/Photos/pic.jpg",
+          playbackBackend: "web",
+        }),
+  );
+  render(<App />);
+  await user.click(screen.getByRole("button", { name: "Images" }));
+  await user.type(screen.getByRole("searchbox"), "pic{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play pic.jpg" }));
+  const image = await screen.findByLabelText("Playing pic.jpg");
+  const shell = document.querySelector(".player-shell")!;
+  await act(async () => {
+    vi.advanceTimersByTime(10);
+  });
+  await user.hover(image);
+  await act(async () => {
+    vi.advanceTimersByTime(2100);
+  });
+  expect(shell).toHaveClass("cursor-hidden");
+  fireEvent.mouseMove(image);
+  await act(async () => {
+    vi.advanceTimersByTime(10);
   });
   expect(shell).not.toHaveClass("cursor-hidden");
   vi.useRealTimers();

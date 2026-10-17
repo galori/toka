@@ -1965,13 +1965,11 @@ function Player({
     };
     const isOverVideo = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
-      const videoEl = element.current;
-      const surfaceEl = nativeSurface.current;
+      // The picture is the video, the native surface or the image; the shell
+      // itself counts too, since a letterboxed picture leaves bare shell.
       return (
-        target === videoEl ||
-        target === surfaceEl ||
-        (videoEl?.contains(target) ?? false) ||
-        (surfaceEl?.contains(target) ?? false)
+        target === playerShell.current ||
+        target.closest("video, .native-video, .slideshow-image") !== null
       );
     };
     if (!playingBack) {
@@ -2000,7 +1998,7 @@ function Player({
     };
     window.addEventListener("mousemove", onPointerMove);
     window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("mouseout", (event) => {
+    const onMouseOut = (event: MouseEvent) => {
       // Leaving the video element fires mouseout with relatedTarget outside.
       if (
         isOverVideo(event.target) &&
@@ -2008,12 +2006,14 @@ function Player({
       ) {
         onLeaveVideo();
       }
-    });
+    };
+    window.addEventListener("mouseout", onMouseOut);
     window.addEventListener("keydown", onKeyDown);
     return () => {
       clearTimer();
       window.removeEventListener("mousemove", onPointerMove);
       window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("mouseout", onMouseOut);
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [playingBack]);
