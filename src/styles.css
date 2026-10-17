@@ -908,10 +908,6 @@ button:focus-visible {
 .player-shell.fullscreen.image-player .slideshow-image {
   max-height: calc(100% - var(--scrubber-sliver));
 }
-.player-shell:fullscreen.idle,
-.player-shell.fullscreen.idle {
-  cursor: none;
-}
 .player-shell.cursor-hidden {
   cursor: none;
 }
