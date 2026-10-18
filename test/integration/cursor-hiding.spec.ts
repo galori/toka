@@ -89,6 +89,12 @@ describe("Toka cursor hiding", () => {
       .catch(() => false);
     if (!entered) this.skip();
 
+    // The cursor only hides during playback, so wait for it to be under way
+    // (the transport button offers Pause) rather than racing the player's start.
+    await $('button[aria-label="Pause"]').waitForExist({
+      timeoutMsg: "The video never started playing in fullscreen",
+    });
+
     // A known spot well inside the picture, clear of the edge-triggered
     // playlist and of the controls along the bottom.
     const { x, y } = await browser.execute(() => ({
