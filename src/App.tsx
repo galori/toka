@@ -1147,6 +1147,11 @@ function Player({
   const [speed, setSpeed] = useState(1);
   const [volume, setVolume] = useState(100);
   const [playingBack, setPlayingBack] = useState(false);
+  // Whether the viewer has paused this video. The engine parks on the last
+  // frame when a file ends, and the native poll only learns of that a moment
+  // later, so a pause that lands in that gap would otherwise be answered by a
+  // restart or an advance that starts the video again underneath it.
+  const pausedByViewer = useRef(false);
   const [rotation, setRotation] = useState(0);
   const [aspectStep, setAspectStep] = useState(0);
   const [skipStepIndex, setSkipStepIndex] = useState(DEFAULT_SKIP_STEP);
@@ -1262,6 +1267,7 @@ function Player({
     setNativeStarted(false);
     setFullscreenError(undefined);
     setPlayingBack(false);
+    pausedByViewer.current = false;
     setRotation(0);
     setAspectStep(0);
     // Both the step and the rate it may be measured against belong to this
@@ -1432,7 +1438,7 @@ function Player({
           // with the polling rather than with the load.
           if (state.frameRate) setFrameRate(state.frameRate);
           if (!state.ended) advancing = false;
-          if (state.ended && !advancing) {
+          if (state.ended && !advancing && !pausedByViewer.current) {
             advancing = true;
             finishVideo.current(state.duration);
           }
@@ -1471,6 +1477,7 @@ function Player({
   ]);
 
   const play = () => {
+    pausedByViewer.current = false;
     if (native) {
       void setNativePaused(false)
         .then(() => setPlayingBack(true))
@@ -1486,6 +1493,7 @@ function Player({
   };
 
   const pause = () => {
+    pausedByViewer.current = true;
     if (native) {
       void setNativePaused(true)
         .then(() => setPlayingBack(false))
@@ -1512,8 +1520,12 @@ function Player({
   const restart = () => {
     if (native) {
       void seekNativeVideo(0)
-        .then(() => setNativePaused(false))
-        .then(() => setPlayingBack(true))
+        .then(() => {
+          if (!pausedByViewer.current) return setNativePaused(false);
+        })
+        .then(() => {
+          if (!pausedByViewer.current) setPlayingBack(true);
+        })
         .catch((reason: unknown) => setError(errorMessage(reason)));
     } else if (element.current) {
       element.current.currentTime = 0;

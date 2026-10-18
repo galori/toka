@@ -6034,3 +6034,57 @@ test("fits an image inside the player in windowed and fullscreen modes", async (
     userAgent.mockRestore();
   }
 });
+
+test("a pause that lands as a looped native video ends is not undone by the restart", async () => {
+  let ended = false;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "native-1", fileName: "native.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 2,
+        currentTime: 2,
+        paused: false,
+        ended,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mp4" }),
+  );
+  await user.click(await screen.findByRole("button", { name: "Pause" }));
+  fireEvent.keyDown(window, { key: "l" });
+  expect(loopControl()).toHaveAccessibleName("Loop: this video");
+  invokeMock.mockClear();
+
+  // The engine reports the end only after the viewer has paused: the poll
+  // must not take that for the video running out underneath a playing viewer.
+  ended = true;
+  await new Promise((resolve) => setTimeout(resolve, 800));
+
+  expect(invokeMock).not.toHaveBeenCalledWith("seek_native_video", {
+    seconds: 0,
+  });
+  expect(invokeMock).not.toHaveBeenCalledWith("set_native_paused", {
+    paused: false,
+  });
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+});
