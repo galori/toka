@@ -1944,6 +1944,12 @@ function Player({
   // again at once on movement and whenever it is not over the picture, so it
   // never gets lost on the controls or the rest of the page.
   useEffect(() => {
+    // [DEBUG-c7a1]
+    const dbg = (m: string) =>
+      ((window as unknown as { __cl: string[] }).__cl ??= []).push(
+        `${Math.round(performance.now())} ${m}`,
+      );
+    dbg(`effect playingBack=${playingBack}`);
     const clearTimer = () => {
       if (cursorTimer.current !== undefined) {
         window.clearTimeout(cursorTimer.current);
@@ -1956,12 +1962,17 @@ function Player({
         !playingBack ||
         !pointerOverVideo.current ||
         pointerOverControls.current
-      )
+      ) {
+        dbg(
+          `skip pb=${playingBack} v=${pointerOverVideo.current} c=${pointerOverControls.current}`,
+        );
         return;
-      cursorTimer.current = window.setTimeout(
-        () => setCursorHidden(true),
-        CURSOR_IDLE_DELAY,
-      );
+      }
+      dbg("armed");
+      cursorTimer.current = window.setTimeout(() => {
+        dbg("fired");
+        setCursorHidden(true);
+      }, CURSOR_IDLE_DELAY);
     };
     const isOverVideo = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
@@ -1980,6 +1991,7 @@ function Player({
     scheduleHide();
     const onPointerMove = (event: MouseEvent | PointerEvent) => {
       const over = isOverVideo(event.target);
+      dbg(`move ${event.type} over=${over}`);
       pointerOverVideo.current = over;
       // Enter and leave are not enough to know this: WebKitGTK can skip the
       // mouseleave when the controls collapse beneath a pointer that clicked
