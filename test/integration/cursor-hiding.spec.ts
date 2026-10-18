@@ -36,6 +36,17 @@ function cursorAt(x: number, y: number) {
 
 describe("Toka cursor hiding", () => {
   before(async () => {
+    // The app is shared with the specs before this one, which can leave a
+    // player (even a fullscreen one) open over the results.
+    await browser.execute(() => {
+      if (document.fullscreenElement) document.exitFullscreen?.();
+      else
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+    });
+    const back = $('button[aria-label="Back to results"]');
+    if (await back.isExisting()) await back.click();
     await $("#video-search").waitForExist();
     await browser.execute((value) => {
       const field = document.querySelector<HTMLInputElement>("#video-search");
