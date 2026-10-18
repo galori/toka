@@ -214,18 +214,27 @@ async fn search_videos(
         })?
         .map_err(Into::into)
         .and_then(|page| {
-            for result in &page.results {
-                if let Some(path) = &result.thumbnail_path {
-                    app.asset_protocol_scope()
-                        .allow_file(path)
-                        .map_err(|_| CommandError {
-                            kind: "Thumbnail",
-                            message: "The video thumbnail could not be exposed.".into(),
-                        })?;
-                }
-            }
+            expose_cached_thumbnails(&app, &page)?;
             Ok(page)
         })
+}
+
+/// Lets the webview load the thumbnails a page of results already carries.
+/// Every command that hands out results has to do this: a thumbnail the
+/// webview may not read stays blank, and because it has a path the frontend
+/// never asks for it again.
+fn expose_cached_thumbnails(app: &tauri::AppHandle, page: &SearchPage) -> Result<(), CommandError> {
+    for result in &page.results {
+        if let Some(path) = &result.thumbnail_path {
+            app.asset_protocol_scope()
+                .allow_file(path)
+                .map_err(|_| CommandError {
+                    kind: "Thumbnail",
+                    message: "The video thumbnail could not be exposed.".into(),
+                })?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -382,11 +391,18 @@ fn trash_outcome(
 #[tauri::command]
 fn launch_playlist(
     launched: State<'_, LaunchPlaylist>,
+    app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<Option<SearchPage>, CommandError> {
     let Some(path) = launched.0.as_deref() else {
         return Ok(None);
     };
+    let page = launch_page(path, &engine)?;
+    expose_cached_thumbnails(&app, &page)?;
+    Ok(Some(page))
+}
+
+fn launch_page(path: &std::path::Path, engine: &SearchEngine) -> Result<SearchPage, CommandError> {
     if path.is_dir() {
         let mut videos =
             playlist::collect_directory_media(path).map_err(|message| CommandError {
@@ -395,7 +411,7 @@ fn launch_playlist(
             })?;
         playlist::shuffle_paths(&mut videos);
         let name = playlist::name(path).into_owned();
-        return Ok(Some(engine.page_of_videos(name, videos)));
+        return Ok(engine.page_of_videos(name, videos));
     }
     if search::is_supported_video(path) {
         if !path.is_file() {
@@ -405,14 +421,14 @@ fn launch_playlist(
             });
         }
         let name = playlist::name(path).into_owned();
-        return Ok(Some(engine.page_of_videos(name, vec![path.to_path_buf()])));
+        return Ok(engine.page_of_videos(name, vec![path.to_path_buf()]));
     }
     let videos = playlist::videos(path).map_err(|message| CommandError {
         kind: "Playlist",
         message,
     })?;
     let name = playlist::name(path).into_owned();
-    Ok(Some(engine.page_of_videos(name, videos)))
+    Ok(engine.page_of_videos(name, videos))
 }
 
 /// The players installed on this computer that Toka can hand a playlist to.
