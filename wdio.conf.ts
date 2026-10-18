@@ -30,6 +30,7 @@ export const config: Options.Testrunner = {
     "./test/integration/playlist-ui.spec.ts",
     "./test/integration/subtitles.spec.ts",
     "./test/integration/fullscreen.spec.ts",
+    "./test/integration/cursor-hiding.spec.ts",
   ],
   maxInstances: 1,
   framework: "mocha",
