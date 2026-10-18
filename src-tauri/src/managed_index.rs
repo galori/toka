@@ -793,9 +793,15 @@ fn is_path_change(kind: &EventKind) -> bool {
     )
 }
 
-fn is_configuration_change(paths: &IndexPaths, event_paths: &[PathBuf]) -> bool {
+fn is_configuration_change(paths: &IndexPaths, event: &notify::Event) -> bool {
+    // Opening and reading a file is reported too, and the indexer reads its
+    // configuration at the start of every pass.
+    if matches!(event.kind, EventKind::Access(_)) {
+        return false;
+    }
     let temporary_config = paths.config.with_extension("json.new");
-    event_paths
+    event
+        .paths
         .iter()
         .any(|path| path == &paths.config || path == &temporary_config || path == &paths.wake)
 }
@@ -858,7 +864,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         let mut config_changed = false;
         match receiver.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(event)) => {
-                if is_configuration_change(&paths, &event.paths) {
+                if is_configuration_change(&paths, &event) {
                     config_changed = true;
                 } else if is_path_change(&event.kind) {
                     for folder in &config.folders {
@@ -872,7 +878,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
                     }
                 }
                 while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_secs(2)) {
-                    if is_configuration_change(&paths, &event.paths) {
+                    if is_configuration_change(&paths, &event) {
                         config_changed = true;
                     } else if is_path_change(&event.kind) {
                         for folder in &config.folders {
@@ -1177,27 +1183,59 @@ mod tests {
         );
     }
 
+    fn event(kind: EventKind, path: &Path) -> notify::Event {
+        notify::Event::new(kind).add_path(path.to_path_buf())
+    }
+
     #[test]
     fn only_configuration_and_wake_events_restart_an_index_pass() {
         let root = tempdir().unwrap();
         let paths = IndexPaths::under(root.path().join("state"));
+        let modified = EventKind::Modify(notify::event::ModifyKind::Any);
 
         assert!(is_configuration_change(
             &paths,
-            std::slice::from_ref(&paths.config)
+            &event(modified, &paths.config)
         ));
         assert!(is_configuration_change(
             &paths,
-            std::slice::from_ref(&paths.wake)
+            &event(modified, &paths.wake)
         ));
         assert!(is_configuration_change(
             &paths,
-            std::slice::from_ref(&paths.config.with_extension("json.new"))
+            &event(modified, &paths.config.with_extension("json.new"))
         ));
         assert!(!is_configuration_change(
             &paths,
-            std::slice::from_ref(&paths.root.join(".hidden-metadata"))
+            &event(modified, &paths.root.join(".hidden-metadata"))
         ));
+    }
+
+    #[test]
+    fn reading_the_configuration_does_not_restart_an_index_pass() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().to_path_buf());
+        fs::write(&paths.config, b"{}").unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .unwrap();
+        watcher
+            .watch(&paths.root, RecursiveMode::NonRecursive)
+            .unwrap();
+
+        // The indexer reads its own configuration on every pass; that read
+        // must not look like the configuration changing, or every pass starts
+        // the next one.
+        let _ = load_json::<IndexConfig>(&paths.config).unwrap();
+
+        while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_millis(500)) {
+            assert!(
+                !is_configuration_change(&paths, &event),
+                "a read was taken for a change: {event:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
