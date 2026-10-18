@@ -1182,6 +1182,10 @@ function Player({
   const [cursorHidden, setCursorHidden] = useState(false);
   const pointerOverVideo = useRef(false);
   const cursorTimer = useRef<number | undefined>(undefined);
+  // When the pointer or keyboard last woke the cursor. Playback flipping off
+  // and on (a short video ending, the next one starting) re-runs the effect
+  // below, and the countdown has to carry on from here rather than start over.
+  const cursorWoke = useRef(0);
   const imageElapsed = useRef(0);
   const video = playlist[index];
   const isImage = isImageResult(video);
@@ -1972,7 +1976,7 @@ function Player({
         return;
       cursorTimer.current = window.setTimeout(
         () => setCursorHidden(true),
-        CURSOR_IDLE_DELAY,
+        Math.max(0, CURSOR_IDLE_DELAY - (Date.now() - cursorWoke.current)),
       );
     };
     const isOverVideo = (target: EventTarget | null) => {
@@ -1993,6 +1997,7 @@ function Player({
     const onPointerMove = (event: MouseEvent | PointerEvent) => {
       const over = isOverVideo(event.target);
       pointerOverVideo.current = over;
+      cursorWoke.current = Date.now();
       // Moving anywhere brings the cursor back; if it is still over the
       // picture a new idle countdown begins.
       setCursorHidden(false);
@@ -2005,6 +2010,7 @@ function Player({
       clearTimer();
     };
     const onKeyDown = () => {
+      cursorWoke.current = Date.now();
       setCursorHidden(false);
       scheduleHide();
     };
