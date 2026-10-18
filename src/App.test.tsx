@@ -5456,7 +5456,7 @@ test("reports a launch playlist it cannot play and leaves the search ready", asy
   expect(screen.getByRole("searchbox")).toHaveFocus();
 });
 
-test("hides the cursor on the video even when the controls never saw the pointer leave", async () => {
+test("keeps counting the idle delay across a pause and resume of playback", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
   invokeMock
@@ -5477,15 +5477,20 @@ test("hides the cursor on the video even when the controls never saw the pointer
   const video = await screen.findByLabelText("Playing clip.mp4");
   const shell = document.querySelector(".player-shell")!;
   fireEvent.play(video);
-  // Clicking "Enter fullscreen" puts the pointer on the controls. WebKitGTK
-  // does not always deliver mouseleave when they then collapse beneath it.
-  fireEvent.mouseEnter(screen.getByLabelText("Video controls"));
+  await user.hover(video);
   await act(async () => {
-    vi.advanceTimersByTime(10);
+    vi.advanceTimersByTime(1500);
   });
-  fireEvent.mouseMove(video);
+  // A short video ends and the next (or the same, looped) one starts, which
+  // flips playback off and on again. That must not restart the countdown, or a
+  // video shorter than the delay would never let the cursor hide.
+  fireEvent.pause(video);
   await act(async () => {
-    vi.advanceTimersByTime(2100);
+    vi.advanceTimersByTime(20);
+  });
+  fireEvent.play(video);
+  await act(async () => {
+    vi.advanceTimersByTime(700);
   });
   expect(shell).toHaveClass("cursor-hidden");
 });

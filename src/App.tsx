@@ -1177,6 +1177,10 @@ function Player({
   const [cursorHidden, setCursorHidden] = useState(false);
   const pointerOverVideo = useRef(false);
   const cursorTimer = useRef<number | undefined>(undefined);
+  // When the pointer or keyboard last woke the cursor. Playback flipping off
+  // and on (a short video ending, the next one starting) re-runs the effect
+  // below, and the countdown has to carry on from here rather than start over.
+  const cursorWoke = useRef(0);
   const imageElapsed = useRef(0);
   const video = playlist[index];
   const isImage = isImageResult(video);
@@ -1944,12 +1948,6 @@ function Player({
   // again at once on movement and whenever it is not over the picture, so it
   // never gets lost on the controls or the rest of the page.
   useEffect(() => {
-    // [DEBUG-c7a1]
-    const dbg = (m: string) =>
-      ((window as unknown as { __cl: string[] }).__cl ??= []).push(
-        `${Math.round(performance.now())} ${m}`,
-      );
-    dbg(`effect playingBack=${playingBack}`);
     const clearTimer = () => {
       if (cursorTimer.current !== undefined) {
         window.clearTimeout(cursorTimer.current);
@@ -1962,17 +1960,12 @@ function Player({
         !playingBack ||
         !pointerOverVideo.current ||
         pointerOverControls.current
-      ) {
-        dbg(
-          `skip pb=${playingBack} v=${pointerOverVideo.current} c=${pointerOverControls.current}`,
-        );
+      )
         return;
-      }
-      dbg("armed");
-      cursorTimer.current = window.setTimeout(() => {
-        dbg("fired");
-        setCursorHidden(true);
-      }, CURSOR_IDLE_DELAY);
+      cursorTimer.current = window.setTimeout(
+        () => setCursorHidden(true),
+        Math.max(0, CURSOR_IDLE_DELAY - (Date.now() - cursorWoke.current)),
+      );
     };
     const isOverVideo = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
@@ -1991,14 +1984,8 @@ function Player({
     scheduleHide();
     const onPointerMove = (event: MouseEvent | PointerEvent) => {
       const over = isOverVideo(event.target);
-      dbg(`move ${event.type} over=${over}`);
       pointerOverVideo.current = over;
-      // Enter and leave are not enough to know this: WebKitGTK can skip the
-      // mouseleave when the controls collapse beneath a pointer that clicked
-      // them (entering fullscreen), which left the cursor stuck visible.
-      pointerOverControls.current =
-        event.target instanceof Node &&
-        (playerControls.current?.contains(event.target) ?? false);
+      cursorWoke.current = Date.now();
       // Moving anywhere brings the cursor back; if it is still over the
       // picture a new idle countdown begins.
       setCursorHidden(false);
@@ -2011,6 +1998,7 @@ function Player({
       clearTimer();
     };
     const onKeyDown = () => {
+      cursorWoke.current = Date.now();
       setCursorHidden(false);
       scheduleHide();
     };

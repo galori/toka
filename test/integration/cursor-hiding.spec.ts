@@ -115,15 +115,6 @@ describe("Toka cursor hiding", () => {
 
     await browser.pause(CURSOR_IDLE_DELAY_MS + 500);
 
-    // [DEBUG-c7a1]
-    console.log(
-      "[DEBUG-c7a1]",
-      JSON.stringify(
-        await browser.execute(
-          () => (window as unknown as { __cl: string[] }).__cl,
-        ),
-      ),
-    );
     expect(await cursorAt(x, y)).toEqual({ cursor: "none", hiddenClass: true });
 
     // Moving the pointer brings it straight back.
