@@ -1981,6 +1981,12 @@ function Player({
     const onPointerMove = (event: MouseEvent | PointerEvent) => {
       const over = isOverVideo(event.target);
       pointerOverVideo.current = over;
+      // Enter and leave are not enough to know this: WebKitGTK can skip the
+      // mouseleave when the controls collapse beneath a pointer that clicked
+      // them (entering fullscreen), which left the cursor stuck visible.
+      pointerOverControls.current =
+        event.target instanceof Node &&
+        (playerControls.current?.contains(event.target) ?? false);
       // Moving anywhere brings the cursor back; if it is still over the
       // picture a new idle countdown begins.
       setCursorHidden(false);

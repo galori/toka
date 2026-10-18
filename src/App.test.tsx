@@ -5456,6 +5456,40 @@ test("reports a launch playlist it cannot play and leaves the search ready", asy
   expect(screen.getByRole("searchbox")).toHaveFocus();
 });
 
+test("hides the cursor on the video even when the controls never saw the pointer leave", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  const shell = document.querySelector(".player-shell")!;
+  fireEvent.play(video);
+  // Clicking "Enter fullscreen" puts the pointer on the controls. WebKitGTK
+  // does not always deliver mouseleave when they then collapse beneath it.
+  fireEvent.mouseEnter(screen.getByLabelText("Video controls"));
+  await act(async () => {
+    vi.advanceTimersByTime(10);
+  });
+  fireEvent.mouseMove(video);
+  await act(async () => {
+    vi.advanceTimersByTime(2100);
+  });
+  expect(shell).toHaveClass("cursor-hidden");
+});
+
 test("hides the cursor when it rests on the video during playback", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });

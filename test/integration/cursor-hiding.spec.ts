@@ -101,19 +101,6 @@ describe("Toka cursor hiding", () => {
       x: Math.round(window.innerWidth / 2),
       y: Math.round(window.innerHeight / 3),
     }));
-    // [DEBUG-c7a1] record what the page sees of the pointer.
-    await browser.execute(() => {
-      const seen: string[] = [];
-      (window as unknown as { __seen: string[] }).__seen = seen;
-      for (const type of ["mousemove", "pointermove", "mouseout"]) {
-        window.addEventListener(type, (event) => {
-          const t = event.target as Element;
-          seen.push(
-            `${type}@${t.tagName}.${t.className}:${(event as MouseEvent).clientX},${(event as MouseEvent).clientY}`,
-          );
-        });
-      }
-    });
     // Move in two steps so the pointer really travels, then rests at (x, y).
     await browser
       .action("pointer")
@@ -128,20 +115,6 @@ describe("Toka cursor hiding", () => {
 
     await browser.pause(CURSOR_IDLE_DELAY_MS + 500);
 
-    // [DEBUG-c7a1]
-    const debug = await browser.execute(() => ({
-      seen: (window as unknown as { __seen: string[] }).__seen.slice(-12),
-      playing: document.querySelector('button[aria-label="Pause"]') !== null,
-      shell: document.querySelector(".player-shell")?.className,
-      under: (() => {
-        const t = document.elementFromPoint(
-          window.innerWidth / 2,
-          window.innerHeight / 3,
-        );
-        return `${t?.tagName}.${t?.className}`;
-      })(),
-    }));
-    console.log("[DEBUG-c7a1]", JSON.stringify(debug));
     expect(await cursorAt(x, y)).toEqual({ cursor: "none", hiddenClass: true });
 
     // Moving the pointer brings it straight back.
