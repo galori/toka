@@ -156,6 +156,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Space");
   expect(help).toHaveTextContent("Enter fullscreen, show controls, or exit");
   expect(help).toHaveTextContent("Change image display duration");
+  expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
@@ -5296,6 +5297,140 @@ test("cycles the skip step and applies it to both directions", async () => {
   }
   fireEvent.keyDown(window, { key: "ArrowLeft" });
   expect(video).toHaveProperty("currentTime", 1060);
+});
+
+// VLC's A-B loop: one key marks where the range starts, another where it
+// ends, and from then on only that stretch of the video plays.
+test("marks a range with B and E and plays only that range", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = (await screen.findByLabelText(
+    "Playing clip.mp4",
+  )) as HTMLVideoElement;
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 10,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+
+  const start = screen.getByRole("button", { name: "Mark range start" });
+  expect(start).toHaveAttribute("aria-keyshortcuts", "B");
+  expect(start.querySelector(".key-hint")).toHaveTextContent("B");
+  const end = screen.getByRole("button", { name: "Mark range end" });
+  expect(end).toHaveAttribute("aria-keyshortcuts", "E");
+  expect(end.querySelector(".key-hint")).toHaveTextContent("E");
+
+  fireEvent.keyDown(window, { key: "b" });
+  expect(
+    screen.getByRole("button", { name: "Range start: 0:10" }),
+  ).toHaveAttribute("aria-pressed", "true");
+
+  video.currentTime = 30;
+  fireEvent.timeUpdate(video);
+  fireEvent.keyDown(window, { key: "e" });
+  expect(
+    screen.getByRole("button", { name: "Range end: 0:30" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  // Closing the range goes straight back to its start.
+  expect(video).toHaveProperty("currentTime", 10);
+
+  // Reaching the end of the range plays it again from the start.
+  video.currentTime = 30.2;
+  fireEvent.timeUpdate(video);
+  expect(video).toHaveProperty("currentTime", 10);
+
+  // Inside the range, playback is left alone.
+  video.currentTime = 20;
+  fireEvent.timeUpdate(video);
+  expect(video).toHaveProperty("currentTime", 20);
+
+  // A range that runs to the end of the file loops rather than advancing.
+  vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+  fireEvent.ended(video);
+  expect(video).toHaveProperty("currentTime", 10);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+});
+
+test("clears the range when moving to another video", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `clip-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const first = (await screen.findByLabelText(
+    "Playing clip-1.mp4",
+  )) as HTMLVideoElement;
+  Object.defineProperty(first, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(first, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 10,
+  });
+  fireEvent.loadedMetadata(first);
+  fireEvent.timeUpdate(first);
+  fireEvent.keyDown(window, { key: "b" });
+  first.currentTime = 30;
+  fireEvent.timeUpdate(first);
+  fireEvent.keyDown(window, { key: "e" });
+  expect(screen.getByRole("button", { name: "Range end: 0:30" })).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "PageDown" });
+  const second = await screen.findByLabelText("Playing clip-2.mp4");
+  expect(
+    screen.getByRole("button", { name: "Mark range start" }),
+  ).toHaveAttribute("aria-pressed", "false");
+  expect(
+    screen.getByRole("button", { name: "Mark range end" }),
+  ).toHaveAttribute("aria-pressed", "false");
+
+  // The old range no longer pulls playback back.
+  Object.defineProperty(second, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(second, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 40,
+  });
+  fireEvent.timeUpdate(second);
+  expect(second).toHaveProperty("currentTime", 40);
+
+  // Going back clears it too.
+  fireEvent.keyDown(window, { key: "b" });
+  fireEvent.keyDown(window, { key: "PageUp" });
+  await screen.findByLabelText("Playing clip-1.mp4");
+  expect(
+    screen.getByRole("button", { name: "Mark range start" }),
+  ).toHaveAttribute("aria-pressed", "false");
 });
 
 // Ten seconds is a nudge through a feature and a third of a short clip, so the
