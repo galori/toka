@@ -1145,7 +1145,8 @@ function Player({
   const controlsIdle = fullscreen && fullscreenMode !== "controls";
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
-  const [volume, setVolume] = useState(100);
+  // A new window starts at half volume, so the first video is not full blast.
+  const [volume, setVolume] = useState(50);
   const [playingBack, setPlayingBack] = useState(false);
   // Whether the viewer has paused this video. The engine parks on the last
   // frame when a file ends, and the native poll only learns of that a moment

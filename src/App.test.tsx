@@ -3246,12 +3246,13 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   );
   await screen.findByLabelText("Playing clip.mp4");
 
+  // A new window starts at half volume rather than full blast.
   const volume = screen.getByRole("slider", { name: "Volume" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
   fireEvent.keyDown(window, { key: "ArrowDown" });
-  expect(volume).toHaveValue("95");
+  expect(volume).toHaveValue("45");
   fireEvent.keyDown(window, { key: "ArrowUp" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   const quieter = screen.getByRole("button", { name: "Decrease volume" });
   const louder = screen.getByRole("button", { name: "Increase volume" });
@@ -3264,7 +3265,7 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   // presets keep a digit, and the rest of the row does nothing.
   fireEvent.keyDown(window, { key: "9" });
   fireEvent.keyDown(window, { key: "3" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   // "Vol −" and "Vol +" as words sat oddly among a row of icons; a speaker
   // carrying more or fewer waves says the same thing at a glance.
@@ -3294,7 +3295,7 @@ test("jumps to preset volumes with the discoverable digit shortcuts", async () =
   const video = await screen.findByLabelText("Playing clip.mp4");
 
   const volume = screen.getByRole("slider", { name: "Volume" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   fireEvent.keyDown(window, { key: "0" });
   expect(volume).toHaveValue("0");
@@ -3365,6 +3366,14 @@ test("sends preset volumes to native playback", async () => {
     await screen.findByRole("button", { name: "Play native.mp4" }),
   );
   await screen.findByLabelText("Playing native.mp4");
+  // A new window starts at half volume, so mpv is told that on load; clear
+  // it so each preset below must send its own volume.
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_volume", {
+      volume: 50,
+    }),
+  );
+  invokeMock.mockClear();
 
   fireEvent.keyDown(window, { key: "0" });
   await waitFor(() =>
