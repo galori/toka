@@ -207,6 +207,10 @@ describe("Toka player controls", () => {
               : "none",
           width: box?.width ?? 0,
           left: box?.left ?? 0,
+          // The player swaps itself for an error page when playback fails, so a
+          // missing button is reported with whatever that page said.
+          alert:
+            document.querySelector('[role="alert"]')?.textContent?.trim() ?? "",
         };
       });
 
@@ -251,9 +255,13 @@ describe("Toka player controls", () => {
     expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
 
     await toggle.click();
-    await browser.waitUntil(async () => (await pill()).label === "Play", {
-      timeoutMsg: "The play/pause control did not come back to its first state",
-    });
+    await browser
+      .waitUntil(async () => (await pill()).label === "Play")
+      .catch(async () => {
+        throw new Error(
+          `The play/pause control did not come back to its first state: ${JSON.stringify(await pill())}`,
+        );
+      });
     // WebKit can commit the button's new label before it has laid out the
     // overlay after a native playback restart. Wait for the same layout frame
     // that the rest of this spec measures rather than sampling that transition.
