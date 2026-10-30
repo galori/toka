@@ -1346,9 +1346,11 @@ mod tests {
 
     // A `GtkEntry` stands in for the WebView: the reparenting under test is
     // plain GTK container work, and an entry takes the keyboard the same way
-    // without needing a web process or a GL context.
+    // without needing a web process or a GL context. GTK binds itself to the
+    // first thread that initialises it and the test harness runs each test on
+    // its own thread, so every GTK check has to live in this one test.
     #[test]
-    fn keeps_the_keyboard_on_the_web_view_it_moves_into_the_overlay() {
+    fn leaves_keyboard_and_pointer_to_the_web_view_under_the_video() {
         gtk::init().expect("GTK needs a display to run this test.");
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1359,20 +1361,15 @@ mod tests {
         web_view.grab_focus();
         assert!(web_view.is_focus(), "the web view starts with the keyboard");
 
-        mount_web_view_over_video(&vbox, web_view.upcast_ref(), &gtk::Overlay::new());
+        let overlay = gtk::Overlay::new();
+        mount_web_view_over_video(&vbox, web_view.upcast_ref(), &overlay);
 
         assert!(
             web_view.is_focus(),
             "the web view still holds the keyboard once it is inside the overlay"
         );
-    }
 
-    #[test]
-    fn lets_clicks_on_the_video_through_to_the_web_view() {
-        gtk::init().expect("GTK needs a display to run this test.");
-        let overlay = gtk::Overlay::new();
         let video_area = gtk::GLArea::new();
-
         mount_video_over_web_view(&overlay, &video_area);
 
         assert!(
