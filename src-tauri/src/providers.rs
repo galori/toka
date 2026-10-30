@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 use crate::managed_index::{self, IndexPaths};
-use crate::search::{SearchError, SearchProvider};
+use crate::search::{tokenize_query, SearchError, SearchProvider};
 use crate::search_log::{CommandOutcome, SearchLogContext, SearchLogger};
 #[cfg(all(target_os = "macos", not(test)))]
 use std::sync::Once;
@@ -120,7 +120,8 @@ impl SearchProvider for MdfindSearchProvider {
         } else {
             format!("({})", term_predicates.join(" || "))
         };
-        let predicate = format!("{matching} && kMDItemContentTypeTree == \"public.movie\"");
+        let media_predicate = "(kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")";
+        let predicate = format!("{matching} && {media_predicate}");
         let mut paths = run_mdfind(&*self.runner, vec![predicate], context)?;
         paths.extend(macos_download_candidates(query)?);
         Ok(paths)
@@ -182,14 +183,14 @@ fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
             };
             if file_type.is_dir() {
                 pending.push(path);
-            } else if terms.iter().any(|term| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains(term)
-            }) {
-                candidates.push(path);
+            } else {
+                let haystack = path.to_string_lossy().to_lowercase();
+                if terms
+                    .iter()
+                    .any(|term| term == "*" || haystack.contains(term))
+                {
+                    candidates.push(path);
+                }
             }
         }
     }
@@ -373,43 +374,29 @@ impl SearchProvider for ManagedPlocateSearchProvider {
 }
 
 fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for character in query.chars() {
-        if matches!(character, '(' | ')') {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-            tokens.push(character.to_string());
-        } else if character.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(character);
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
+    let tokens = tokenize_query(query)?;
     let mut terms = Vec::new();
-    let mut has_metadata_predicate = false;
+    let mut needs_all_candidates = false;
     for token in tokens {
-        if token == "("
-            || token == ")"
-            || token.eq_ignore_ascii_case("AND")
-            || token.eq_ignore_ascii_case("OR")
-        {
+        if token == "(" || token == ")" || token.eq_ignore_ascii_case("AND") {
+            continue;
+        }
+        if token.eq_ignore_ascii_case("NOT") {
+            needs_all_candidates = true;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("OR") {
             continue;
         }
         if let Some((field, value)) = token.split_once(':') {
             match field.to_ascii_lowercase().as_str() {
-                "size" | "created" | "modified" => {
-                    has_metadata_predicate = true;
+                "size" | "created" | "modified" | "type" | "extension" | "ext" => {
+                    needs_all_candidates = true;
                     continue;
                 }
-                "tags" | "tag" | "filename" | "file" | "name" | "path" if !value.is_empty() => {
+                "tags" | "tag" | "filename" | "file" | "name" | "path" | "folder"
+                    if !value.is_empty() =>
+                {
                     terms.push(value.to_owned());
                     continue;
                 }
@@ -418,10 +405,10 @@ fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
         }
         terms.push(token);
     }
-    if has_metadata_predicate {
-        // A metadata term can match a file regardless of its name. Ask each
-        // provider for its complete indexed set, then let SearchEngine apply
-        // the full expression and media filter locally.
+    if needs_all_candidates {
+        // A metadata or negative term can match a file regardless of its name.
+        // Ask each provider for its complete indexed set, then let SearchEngine
+        // apply the full expression and media filter locally.
         terms = vec!["*".into()];
     }
     if terms.is_empty() {
@@ -556,7 +543,7 @@ mod tests {
             Some(&(
                 "/usr/bin/mdfind".into(),
                 vec![
-                    "(kMDItemDisplayName == \"*summer*\"cd || kMDItemDisplayName == \"*vacation*\"cd) && kMDItemContentTypeTree == \"public.movie\""
+                    "(kMDItemDisplayName == \"*summer*\"cd || kMDItemDisplayName == \"*vacation*\"cd) && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
                         .into()
                 ]
             ))
@@ -609,6 +596,50 @@ mod tests {
         assert_eq!(
             download_folder_candidates(directory.path(), "untitled"),
             vec![matching]
+        );
+    }
+
+    #[test]
+    fn downloads_fallback_widens_folder_and_metadata_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("Family Archive");
+        std::fs::create_dir(&archive).unwrap();
+        let photo = archive.join("Trip.jpg");
+        let video = directory.path().join("Clip.mov");
+        std::fs::write(&photo, b"test").unwrap();
+        std::fs::write(&video, b"test").unwrap();
+
+        assert_eq!(
+            download_folder_candidates(directory.path(), "folder:archive"),
+            vec![photo.clone()]
+        );
+        let mut metadata = download_folder_candidates(directory.path(), "type:image");
+        metadata.sort();
+        let mut expected = vec![photo, video];
+        expected.sort();
+        assert_eq!(metadata, expected);
+    }
+
+    #[test]
+    fn mdfind_searches_images_and_videos_for_local_type_filtering() {
+        let runner = Arc::new(FakeRunner::new("/Pictures/Trip.jpg\n"));
+        let provider = MdfindSearchProvider {
+            runner: runner.clone(),
+        };
+
+        provider
+            .candidates("type:image", false, &context("type:image"))
+            .unwrap();
+
+        assert_eq!(
+            runner.invocations.lock().unwrap().first(),
+            Some(&(
+                "/usr/bin/mdfind".into(),
+                vec![
+                    "kMDItemDisplayName == \"*\"cd && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
+                        .into()
+                ]
+            ))
         );
     }
 
@@ -698,6 +729,26 @@ mod tests {
     }
 
     #[test]
+    fn providers_keep_quoted_values_together() {
+        assert_eq!(
+            query_terms("filename:\"family trip\" OR folder:archive").unwrap(),
+            ["family trip", "archive"]
+        );
+    }
+
+    #[test]
+    fn metadata_and_negative_terms_request_every_indexed_path() {
+        for query in [
+            "type:image",
+            "extension:jpg",
+            "NOT tags:hidden",
+            "filename:trip OR NOT folder:private",
+        ] {
+            assert_eq!(query_terms(query).unwrap(), ["*"], "query: {query}");
+        }
+    }
+
+    #[test]
     fn providers_search_the_value_of_a_qualified_term() {
         let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
         let provider = PlocateSearchProvider {
@@ -774,7 +825,7 @@ mod tests {
             Some(&(
                 "/usr/bin/mdfind".into(),
                 vec![
-                    "kMDItemPath == \"*holiday*\"cd && kMDItemContentTypeTree == \"public.movie\""
+                    "kMDItemPath == \"*holiday*\"cd && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
                         .into()
                 ]
             ))
