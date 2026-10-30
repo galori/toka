@@ -1,3 +1,4 @@
+import { copyFileSync, mkdirSync, rmSync } from "node:fs";
 import { delimiter, resolve } from "node:path";
 import type { Options } from "@wdio/types";
 import {
@@ -5,10 +6,32 @@ import {
   stopFixtureServer,
 } from "./test/integration/fixture-server";
 
+const generatedFixtureDirectory = resolve(
+  "src-tauri",
+  "target",
+  `e2e-addon-fixtures-${process.env.TOKA_E2E_FIXTURE_SERVER_PORT ?? process.pid}`,
+);
+mkdirSync(generatedFixtureDirectory, { recursive: true });
+const addonFixtureNames = [
+  "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+  "2026-10-11_@sometiktoker_18938383490812348344.mp4",
+  "2026-10-12_@sometiktoker2_18938383490812348345.mp4",
+  "unrelated-addon-fixture.mp4",
+];
+const addonFixturePaths = addonFixtureNames.map((name, index) => {
+  const destination = resolve(generatedFixtureDirectory, name);
+  copyFileSync(
+    resolve("test/fixtures", `sample${(index % 4) + 1}.mp4`),
+    destination,
+  );
+  return destination;
+});
+
 const fixturePaths = [
   ...[1, 2, 3, 4, 5].map((number) =>
     resolve("test/fixtures/sample" + number + ".mp4"),
   ),
+  ...addonFixturePaths,
   ...["tall", "narrow", "wide", "short"].map((shape) =>
     resolve("test/fixtures/image-fit-" + shape + ".png"),
   ),
@@ -26,6 +49,7 @@ export const config: Options.Testrunner = {
   specs: [
     "./test/integration/happy-path.spec.ts",
     "./test/integration/player-controls.spec.ts",
+    "./test/integration/addons.spec.ts",
     "./test/integration/image-fit.spec.ts",
     "./test/integration/playlist-ui.spec.ts",
     "./test/integration/subtitles.spec.ts",
@@ -49,5 +73,8 @@ export const config: Options.Testrunner = {
   connectionRetryTimeout: 30_000,
   mochaOpts: { timeout: 30_000 },
   onPrepare: () => startFixtureServer(fixturePaths),
-  onComplete: stopFixtureServer,
+  onComplete: async () => {
+    await stopFixtureServer();
+    rmSync(generatedFixtureDirectory, { recursive: true, force: true });
+  },
 };
