@@ -8,6 +8,8 @@ export type VideoResult = {
   extension: string;
   thumbnailPath?: string;
   tags?: string[];
+  // The tags of the folder the video sits in.
+  folderTags?: string[];
 };
 
 export type VideoTagUpdate = Pick<VideoResult, "fileName" | "tags">;
@@ -242,6 +244,24 @@ export function removeVideoTags(
   tags: string[],
 ): Promise<VideoTagUpdate> {
   return invoke("remove_video_tags", { resultId, tags });
+}
+
+// Tagging a video's folder renames the folder, which moves every video in it,
+// so the update names each result that now carries the new folder tags.
+export type FolderTagUpdate = { folderTags: string[]; resultIds: string[] };
+
+export function addFolderTags(
+  resultId: string,
+  tags: string[],
+): Promise<FolderTagUpdate> {
+  return invoke("add_folder_tags", { resultId, tags });
+}
+
+export function removeFolderTags(
+  resultId: string,
+  tags: string[],
+): Promise<FolderTagUpdate> {
+  return invoke("remove_folder_tags", { resultId, tags });
 }
 
 export function loadNativeVideo(filePath: string): Promise<void> {

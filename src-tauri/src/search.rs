@@ -78,6 +78,8 @@ pub struct VideoResult {
     pub extension: String,
     pub thumbnail_path: Option<String>,
     pub tags: Vec<String>,
+    /// The tags of the folder the file sits in, read from that folder's name.
+    pub folder_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -135,6 +137,9 @@ pub struct SearchEngine {
     /// gone, as `plocate --existing` does, stops listing it at all. Keeping the
     /// renames here lets a search see the file the way it is now.
     renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// Folders this session has renamed, the same way: under the name the index
+    /// knew them by. Tagging a folder renames it, which moves every file in it.
+    renamed_folders: Mutex<HashMap<PathBuf, PathBuf>>,
     /// The order the search on screen is being read in. Only the current one is
     /// kept: a new question replaces it, and there is never a second search to
     /// go back to — the frontend asks for page one and then walks forward.
@@ -163,6 +168,7 @@ impl SearchEngine {
             logger,
             result_paths: Mutex::new(HashMap::new()),
             renamed_paths: Mutex::new(HashMap::new()),
+            renamed_folders: Mutex::new(HashMap::new()),
             shuffle: Mutex::new(None),
         }
     }
@@ -332,18 +338,26 @@ impl SearchEngine {
     ) -> Result<Vec<PathBuf>, SearchError> {
         let mut paths = self.provider.candidates(query, whole_path, context)?;
         let renamed = self.renamed_paths.lock().unwrap();
-        if renamed.is_empty() {
+        let folders = self.renamed_folders.lock().unwrap();
+        if renamed.is_empty() && folders.is_empty() {
             return Ok(paths);
         }
         for path in &mut paths {
             if let Some(current) = renamed.get(path) {
                 *path = current.clone();
+            } else if let Some(current) = through_folders(folders.iter(), path) {
+                *path = current;
             }
         }
         // A renamed file that has since been deleted is not a search result,
         // and this is the only place a path Toka renamed itself can be checked
         // cheaply — provider candidates are deliberately left untouched.
         paths.extend(renamed.values().filter(|path| path.is_file()).cloned());
+        // An index that drops names whose file is gone drops a renamed
+        // folder's whole contents, so they are listed from the folder itself.
+        for folder in folders.values() {
+            files_under(folder, &mut paths);
+        }
         Ok(paths)
     }
 
@@ -410,16 +424,53 @@ impl SearchEngine {
     /// the index's own answer is enough again.
     fn record_rename(&self, previous: PathBuf, current: PathBuf) {
         let mut renamed = self.renamed_paths.lock().unwrap();
+        let folders = self.renamed_folders.lock().unwrap();
         let indexed = renamed
             .iter()
             .find(|(_, path)| **path == previous)
             .map(|(indexed, _)| indexed.clone())
+            .or_else(|| through_folders(folders.iter().map(|(i, c)| (c, i)), &previous))
             .unwrap_or(previous);
         if indexed == current {
             renamed.remove(&indexed);
         } else {
             renamed.insert(indexed, current);
         }
+    }
+
+    /// Follows a folder from `previous` to `current`: every result the engine
+    /// knows inside it now lives under the new name, and searches see it there
+    /// while the index still has the old one. Returns the ids that moved.
+    pub fn rename_folder(&self, previous: &Path, current: PathBuf) -> Vec<String> {
+        let mut known_paths = self.result_paths.lock().unwrap();
+        let mut renamed = self.renamed_paths.lock().unwrap();
+        let mut folders = self.renamed_folders.lock().unwrap();
+        let mut moved = Vec::new();
+        for (id, path) in known_paths.iter_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+                moved.push(id.clone());
+            }
+        }
+        if previous == current {
+            return moved;
+        }
+        for path in renamed.values_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+            }
+        }
+        renamed.retain(|indexed, path| indexed != path);
+        let indexed = through_folders(folders.iter().map(|(i, c)| (c, i)), previous)
+            .unwrap_or_else(|| previous.to_path_buf());
+        for path in folders.values_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+            }
+        }
+        folders.insert(indexed, current);
+        folders.retain(|indexed, path| indexed != path);
+        moved
     }
 
     pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
@@ -497,6 +548,48 @@ fn video_result(path: &Path) -> VideoResult {
             None
         },
         tags: tags::get(path),
+        folder_tags: path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| tags::Tags::parse_dir_name(&name.to_string_lossy()).into_values())
+            .unwrap_or_default(),
+    }
+}
+
+/// `path` moved from under `from` to the same place under `to`, if it was
+/// under `from` at all. Compared by component, so `/a/b` is not under `/a/bc`.
+fn moved_under(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
+}
+
+/// The deepest renamed folder `path` sits under, looked up from one side of a
+/// rename (the indexed name or the current one) and moved to the other side.
+fn through_folders<'a>(
+    folders: impl Iterator<Item = (&'a PathBuf, &'a PathBuf)>,
+    path: &Path,
+) -> Option<PathBuf> {
+    folders
+        .filter(|(from, _)| path.starts_with(from))
+        .max_by_key(|(from, _)| from.components().count())
+        .and_then(|(from, to)| moved_under(path, from, to))
+}
+
+/// Every file below `folder`, without following links to other folders.
+fn files_under(folder: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => files_under(&entry.path(), files),
+            Ok(kind) if kind.is_file() => files.push(entry.path()),
+            _ => {}
+        }
     }
 }
 
@@ -2055,6 +2148,182 @@ mod tests {
         let page = engine.search(request("sample")).unwrap();
 
         assert_eq!(page.total_results, 0);
+    }
+
+    /// A folder holding `names`, inside `parent`, with every file written.
+    fn folder_of(parent: &Path, folder: &str, names: &[&str]) -> Vec<PathBuf> {
+        let folder = parent.join(folder);
+        fs::create_dir_all(&folder).unwrap();
+        names
+            .iter()
+            .map(|name| {
+                let path = folder.join(name);
+                fs::write(&path, b"test").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn id_of(page: &SearchPage, file_name: &str) -> String {
+        page.results
+            .iter()
+            .find(|result| result.file_name == file_name)
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    fn file_names(page: &SearchPage) -> Vec<String> {
+        let mut names: Vec<String> = page
+            .results
+            .iter()
+            .map(|result| result.file_name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_result_carries_the_tags_of_its_folder() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip [beach]", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+
+        let page = engine.search(request("clip")).unwrap();
+
+        assert_eq!(page.results[0].folder_tags, ["beach"]);
+        assert!(page.results[0].tags.is_empty());
+    }
+
+    #[test]
+    fn a_renamed_folder_moves_every_video_the_engine_knows_in_it() {
+        let directory = tempdir().unwrap();
+        let mut videos = folder_of(directory.path(), "Trip", &["clip-a.mp4", "clip-b.mp4"]);
+        let outside = folder_of(directory.path(), "Other", &["clip-c.mp4"]);
+        videos.extend(outside);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        let page = engine.search(request("clip")).unwrap();
+        let (a, b, c) = (
+            id_of(&page, "clip-a.mp4"),
+            id_of(&page, "clip-b.mp4"),
+            id_of(&page, "clip-c.mp4"),
+        );
+
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(directory.path().join("Trip"), &tagged).unwrap();
+        let mut moved = engine.rename_folder(&directory.path().join("Trip"), tagged.clone());
+        moved.sort();
+
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort();
+        assert_eq!(moved, expected);
+        assert_eq!(engine.video_path(&a).unwrap(), tagged.join("clip-a.mp4"));
+        assert_eq!(engine.video_path(&b).unwrap(), tagged.join("clip-b.mp4"));
+        assert!(engine.video_path(&c).is_ok());
+    }
+
+    #[test]
+    fn videos_in_a_renamed_folder_are_found_while_the_index_is_stale() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip-a.mp4", "clip-b.mp4"]);
+        let provider = Arc::new(FakeProvider::new(videos));
+        let engine = SearchEngine::new(provider.clone());
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged).unwrap();
+        engine.rename_folder(&folder, tagged.clone());
+
+        // The index still lists the videos under the folder's old name.
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 2);
+        assert!(stale.results.iter().all(|r| r.folder_tags == ["beach"]));
+
+        // The index has dropped them, because nothing is at the old name now.
+        provider.paths.lock().unwrap().clear();
+        let dropped = engine.search(request("clip")).unwrap();
+        assert_eq!(file_names(&dropped), ["clip-a.mp4", "clip-b.mp4"]);
+
+        // Once it catches up, each video is listed once.
+        *provider.paths.lock().unwrap() =
+            vec![tagged.join("clip-a.mp4"), tagged.join("clip-b.mp4")];
+        let refreshed = engine.search(request("clip")).unwrap();
+        assert_eq!(refreshed.total_results, 2);
+
+        // And a folder tag is something a search can find.
+        let by_tag = engine.search(request("beach")).unwrap();
+        assert_eq!(by_tag.total_results, 2);
+    }
+
+    #[test]
+    fn a_video_tagged_before_its_folder_follows_the_folder() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let provider = Arc::new(FakeProvider::new(videos.clone()));
+        let engine = SearchEngine::new(provider);
+        let page = engine.search(request("clip")).unwrap();
+        let id = page.results[0].id.clone();
+        let folder = directory.path().join("Trip");
+
+        let tagged_video = folder.join("clip [home].mp4");
+        fs::rename(&videos[0], &tagged_video).unwrap();
+        engine.update_video_path(&id, tagged_video).unwrap();
+        let tagged_folder = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged_folder).unwrap();
+        engine.rename_folder(&folder, tagged_folder.clone());
+
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 1);
+        assert_eq!(stale.results[0].file_name, "clip [home].mp4");
+        assert_eq!(stale.results[0].folder_tags, ["beach"]);
+        assert_eq!(
+            engine.video_path(&id).unwrap(),
+            tagged_folder.join("clip [home].mp4")
+        );
+    }
+
+    #[test]
+    fn a_video_tagged_after_its_folder_is_found_under_both_names() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged_folder = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged_folder).unwrap();
+        engine.rename_folder(&folder, tagged_folder.clone());
+        let page = engine.search(request("clip")).unwrap();
+
+        let tagged_video = tagged_folder.join("clip [home].mp4");
+        fs::rename(tagged_folder.join("clip.mp4"), &tagged_video).unwrap();
+        engine
+            .update_video_path(&page.results[0].id, tagged_video)
+            .unwrap();
+
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 1);
+        assert_eq!(stale.results[0].file_name, "clip [home].mp4");
+        assert_eq!(stale.results[0].tags, ["home"]);
+        assert_eq!(stale.results[0].folder_tags, ["beach"]);
+    }
+
+    #[test]
+    fn a_folder_renamed_back_to_its_indexed_name_lists_each_video_once() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged).unwrap();
+        engine.rename_folder(&folder, tagged.clone());
+        fs::rename(&tagged, &folder).unwrap();
+        engine.rename_folder(&tagged, folder.clone());
+
+        let page = engine.search(request("clip")).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert!(page.results[0].folder_tags.is_empty());
     }
 
     #[test]
