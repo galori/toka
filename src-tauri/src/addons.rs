@@ -91,6 +91,11 @@ enum ActionStep {
     },
 }
 
+enum PreparedActionStep {
+    OpenRelatedSearch(AddonSearchLaunch),
+    OpenUrl(Url),
+}
+
 struct CompiledAddon {
     manifest: AddonManifest,
     file_name_regex: Regex,
@@ -251,8 +256,10 @@ impl AddonRegistry {
             .iter()
             .find(|action| action.id == action_id)
             .ok_or_else(|| "That add-on action is not loaded.".to_owned())?;
-        for step in &action.steps {
-            match step {
+        let steps = action
+            .steps
+            .iter()
+            .map(|step| match step {
                 ActionStep::OpenRelatedSearch {
                     capture,
                     query,
@@ -260,20 +267,30 @@ impl AddonRegistry {
                     media_type,
                 } => {
                     let value = capture_value(&captures, capture)?;
-                    host.open_related_search(AddonSearchLaunch {
-                        query: render_template(query, &captures, str::to_owned)?,
+                    Ok(PreparedActionStep::OpenRelatedSearch(AddonSearchLaunch {
+                        query: render_template(query, &captures, encode_search_capture)?,
                         fields: search_fields(fields),
                         media_type: *media_type,
                         addon_id: addon.manifest.id.clone(),
                         capture: capture.clone(),
                         value: value.to_owned(),
-                    })?;
+                    }))
                 }
                 ActionStep::OpenUrl { url } => {
                     let rendered = render_template(url, &captures, encode_url_capture)?;
                     let parsed = Url::parse(&rendered)
                         .map_err(|error| format!("The add-on URL could not be built: {error}"))?;
-                    host.open_url(&parsed)?;
+                    Ok(PreparedActionStep::OpenUrl(parsed))
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for step in steps {
+            match step {
+                PreparedActionStep::OpenRelatedSearch(search) => {
+                    host.open_related_search(search)?;
+                }
+                PreparedActionStep::OpenUrl(url) => {
+                    host.open_url(&url)?;
                 }
             }
         }
@@ -327,7 +344,7 @@ fn capture_value<'a>(captures: &'a regex::Captures<'_>, name: &str) -> Result<&'
 fn render_template(
     template: &str,
     captures: &regex::Captures<'_>,
-    encode: fn(&str) -> String,
+    encode: fn(&str) -> Result<String, String>,
 ) -> Result<String, String> {
     let mut rendered = String::with_capacity(template.len());
     let mut rest = template;
@@ -338,14 +355,30 @@ fn render_template(
             .find('}')
             .ok_or_else(|| "The add-on template is invalid.".to_owned())?;
         let name = &after_open[..close];
-        rendered.push_str(&encode(capture_value(captures, name)?));
+        rendered.push_str(&encode(capture_value(captures, name)?)?);
         rest = &after_open[close + 1..];
     }
     rendered.push_str(rest);
     Ok(rendered)
 }
 
-fn encode_url_capture(value: &str) -> String {
+fn encode_search_capture(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("and")
+        || value.eq_ignore_ascii_case("or")
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || matches!(character, '(' | ')' | ':'))
+    {
+        return Err("An add-on search capture must be one plain search term.".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn encode_url_capture(value: &str) -> Result<String, String> {
+    if matches!(value, "." | "..") {
+        return Err("An add-on URL capture must not be a dot segment.".into());
+    }
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'@') {
@@ -355,7 +388,7 @@ fn encode_url_capture(value: &str) -> String {
             let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    encoded
+    Ok(encoded)
 }
 
 fn search_fields(fields: &[SearchField]) -> SearchFields {
@@ -634,6 +667,69 @@ mod tests {
         assert_eq!(menu.errors.len(), 1);
         assert!(menu.errors[0].contains("broken.json"), "{:?}", menu.errors);
         assert!(menu.errors[0].contains("invalid JSON"), "{:?}", menu.errors);
+    }
+
+    #[test]
+    fn related_search_captures_cannot_change_query_syntax() {
+        let manifest = r#"{
+          "schemaVersion": 1,
+          "id": "search-safety",
+          "name": "Search safety",
+          "match": { "fileNameRegex": "^(?P<value>.+)\\.mp4$" },
+          "actions": [{
+            "id": "related",
+            "label": "Open related",
+            "steps": [
+              {
+                "type": "openUrl",
+                "url": "https://example.com/creator"
+              },
+              {
+                "type": "openRelatedSearch",
+                "capture": "value",
+                "query": "{value}",
+                "fields": ["fileName"],
+                "mediaType": "videos"
+              }
+            ]
+          }]
+        }"#;
+        let registry = AddonRegistry::from_json_sources([("safe.json", manifest)]);
+        let mut host = FakeHost::default();
+
+        let error = registry
+            .run_action("sam OR sammy.mp4", "search-safety", "related", &mut host)
+            .unwrap_err();
+
+        assert!(error.contains("search term"), "{error}");
+        assert!(host.0.is_empty());
+    }
+
+    #[test]
+    fn url_captures_cannot_become_dot_segments() {
+        let manifest = r#"{
+          "schemaVersion": 1,
+          "id": "url-safety",
+          "name": "URL safety",
+          "match": { "fileNameRegex": "^(?P<value>\\.{2})\\.mp4$" },
+          "actions": [{
+            "id": "open",
+            "label": "Open page",
+            "steps": [{
+              "type": "openUrl",
+              "url": "https://example.com/a/{value}/b"
+            }]
+          }]
+        }"#;
+        let registry = AddonRegistry::from_json_sources([("safe.json", manifest)]);
+        let mut host = FakeHost::default();
+
+        let error = registry
+            .run_action("...mp4", "url-safety", "open", &mut host)
+            .unwrap_err();
+
+        assert!(error.contains("dot segment"), "{error}");
+        assert!(host.0.is_empty());
     }
 
     #[test]

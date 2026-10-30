@@ -476,29 +476,41 @@ fn trash_outcome(
 
 /// What Toka was launched with, ready for the normal player or search flow.
 #[tauri::command]
-fn launch_intent(
+async fn launch_intent(
     launched: State<'_, LaunchRequest>,
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
     registry: State<'_, Arc<addons::AddonRegistry>>,
 ) -> Result<Option<LaunchResponse>, CommandError> {
-    let intent = launched.0.as_ref().map_err(|message| CommandError {
+    let intent = launched.0.clone().map_err(|message| CommandError {
         kind: "Launch",
-        message: message.clone(),
+        message,
     })?;
-    let response = match intent {
-        launch::LaunchIntent::Empty => return Ok(None),
-        launch::LaunchIntent::Media(path) => LaunchResponse {
-            page: launch_page(path, &engine)?,
-            addon_search: None,
-        },
-        launch::LaunchIntent::AddonSearch(addon_search) => LaunchResponse {
-            page: addon_search_page(addon_search.clone(), &engine, &registry)?,
-            addon_search: Some(addon_search.clone()),
-        },
-    };
-    expose_cached_thumbnails(&app, &response.page)?;
-    Ok(Some(response))
+    let engine = Arc::clone(engine.inner());
+    let registry = Arc::clone(registry.inner());
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        let response = match intent {
+            launch::LaunchIntent::Empty => return Ok(None),
+            launch::LaunchIntent::Media(path) => LaunchResponse {
+                page: launch_page(&path, &engine)?,
+                addon_search: None,
+            },
+            launch::LaunchIntent::AddonSearch(addon_search) => LaunchResponse {
+                page: addon_search_page(addon_search.clone(), &engine, &registry)?,
+                addon_search: Some(addon_search),
+            },
+        };
+        Ok::<_, CommandError>(Some(response))
+    })
+    .await
+    .map_err(|error| CommandError {
+        kind: "Launch",
+        message: format!("The launch worker stopped unexpectedly: {error}"),
+    })??;
+    if let Some(response) = &response {
+        expose_cached_thumbnails(&app, &response.page)?;
+    }
+    Ok(response)
 }
 
 fn launch_page(path: &std::path::Path, engine: &SearchEngine) -> Result<SearchPage, CommandError> {
@@ -594,11 +606,12 @@ impl addons::ActionHost for SystemActionHost {
     fn open_related_search(&mut self, search: addons::AddonSearchLaunch) -> Result<(), String> {
         let encoded = serde_json::to_string(&search)
             .map_err(|error| format!("The related search could not be prepared: {error}"))?;
-        std::process::Command::new(&self.executable)
+        let child = std::process::Command::new(&self.executable)
             .arg(launch::ADDON_SEARCH_FLAG)
             .arg(encoded)
             .spawn()
             .map_err(|error| format!("Another Toka could not be started: {error}"))?;
+        reap_child(child);
         Ok(())
     }
 
@@ -670,6 +683,12 @@ fn folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
         })
 }
 
+fn reap_child(mut child: std::process::Child) {
+    drop(std::thread::spawn(move || {
+        let _ = child.wait();
+    }));
+}
+
 fn start_toka(folder: Option<&std::path::Path>) -> Result<(), CommandError> {
     let executable = std::env::current_exe().map_err(|error| CommandError {
         kind: "NewWindow",
@@ -679,10 +698,11 @@ fn start_toka(folder: Option<&std::path::Path>) -> Result<(), CommandError> {
     if let Some(folder) = folder {
         command.arg(folder);
     }
-    command.spawn().map_err(|error| CommandError {
+    let child = command.spawn().map_err(|error| CommandError {
         kind: "NewWindow",
         message: format!("Another Toka could not be started: {error}"),
     })?;
+    reap_child(child);
     Ok(())
 }
 
@@ -1146,6 +1166,18 @@ impl SearchProvider for InvalidProvider {
     }
 }
 
+fn addon_directory(
+    config_directory: Option<PathBuf>,
+    e2e_directory: Option<std::ffi::OsString>,
+    e2e: bool,
+) -> Option<PathBuf> {
+    if e2e {
+        e2e_directory.map(PathBuf::from)
+    } else {
+        config_directory.map(|directory| directory.join("app.toka.desktop").join("addons"))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "linux")]
@@ -1173,8 +1205,11 @@ pub fn run() {
     // Read before the window exists, because the command line Toka was started
     // with is the whole of what it was asked to open.
     let launched = LaunchRequest(launch::from_arguments(std::env::args_os()));
-    let user_addons =
-        dirs::config_dir().map(|directory| directory.join("app.toka.desktop").join("addons"));
+    let user_addons = addon_directory(
+        dirs::config_dir(),
+        std::env::var_os("TOKA_E2E_ADDONS_DIR"),
+        cfg!(feature = "e2e"),
+    );
     let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
     let engine = Arc::new(SearchEngine::new_with_logger(
@@ -1340,6 +1375,25 @@ mod tests {
         assert_eq!(
             page.results[0].file_name,
             "2026-10-10_@sam_18938383490812348343.mp4"
+        );
+    }
+
+    #[test]
+    fn e2e_addons_ignore_the_real_user_config_directory() {
+        let real_config = Some(PathBuf::from("/real/config"));
+
+        assert_eq!(
+            addon_directory(real_config.clone(), None, false),
+            Some(PathBuf::from("/real/config/app.toka.desktop/addons"))
+        );
+        assert_eq!(addon_directory(real_config.clone(), None, true), None);
+        assert_eq!(
+            addon_directory(
+                real_config,
+                Some(std::ffi::OsString::from("/test/addons")),
+                true
+            ),
+            Some(PathBuf::from("/test/addons"))
         );
     }
 

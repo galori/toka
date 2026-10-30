@@ -84,7 +84,8 @@ an action. Version 1 supports these ordered steps:
 
 - `openRelatedSearch` starts another Toka process. It searches the selected
   fields, then applies the same named capture as an exact filter before
-  shuffling and paging.
+  shuffling and paging. Inserted captures must be one plain search term; they
+  cannot add operators, fields, parentheses, or more terms.
 - `openUrl` opens the system browser after a user chooses the action. Its URL
   must use HTTPS, its host must be fixed text, and capture values are escaped
   before insertion outside the host.
@@ -109,7 +110,7 @@ network.
 
 `docs/thumbnails.md` records the decided approach for result thumbnails.
 
-The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it.
+The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it. E2E builds ignore the real user add-on folder; set `TOKA_E2E_ADDONS_DIR` when a test needs its own manifests.
 
 Release builds write `/usr/share/toka/build-info.json` into the Debian package.
 After installing Toka on Linux, run `bin/toka-freshness.mjs` from the repository
