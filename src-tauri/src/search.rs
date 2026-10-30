@@ -505,6 +505,7 @@ enum QueryField {
     Tags,
     FileName,
     Path,
+    Folder,
     Any,
 }
 
@@ -542,12 +543,20 @@ impl CalendarDate {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMediaType {
+    Video,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryTerm {
     Text {
         field: QueryField,
         value: String,
     },
+    MediaType(QueryMediaType),
+    Extension(String),
     Size {
         comparison: Comparison,
         bytes: u64,
@@ -562,41 +571,63 @@ enum QueryTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryExpr {
     Term(QueryTerm),
+    Not(Box<QueryExpr>),
     And(Box<QueryExpr>, Box<QueryExpr>),
     Or(Box<QueryExpr>, Box<QueryExpr>),
 }
 
-fn tokenize_query(query: &str) -> Vec<String> {
+pub(crate) fn tokenize_query(query: &str) -> Result<Vec<String>, SearchError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    for character in query.chars() {
-        if matches!(character, '(' | ')') {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+    let mut characters = query.chars().peekable();
+    let mut quoted = false;
+
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '\\' if quoted => match characters.peek().copied() {
+                Some('"' | '\\') => current.push(characters.next().unwrap()),
+                Some(_) => current.push(character),
+                None => return Err(SearchError::InvalidQuery),
+            },
+            '(' | ')' if !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(character.to_string());
             }
-            tokens.push(character.to_string());
-        } else if character.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+            character if character.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
             }
-        } else {
-            current.push(character);
+            _ => current.push(character),
         }
+    }
+
+    if quoted {
+        return Err(SearchError::InvalidQuery);
     }
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
-    let tokens = tokenize_query(query);
+    let today = calendar_date(SystemTime::now()).ok_or(SearchError::InvalidQuery)?;
+    parse_query_at(query, today)
+}
+
+fn parse_query_at(query: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
+    let tokens = tokenize_query(query)?;
     if tokens.is_empty() {
         return Err(SearchError::InvalidQuery);
     }
     let mut parser = QueryParser {
         tokens,
         position: 0,
+        today,
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
@@ -608,6 +639,7 @@ fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
 struct QueryParser {
     tokens: Vec<String>,
     position: usize,
+    today: CalendarDate,
 }
 
 impl QueryParser {
@@ -634,7 +666,7 @@ impl QueryParser {
     }
 
     fn parse_and(&mut self) -> Result<QueryExpr, SearchError> {
-        let mut expression = self.parse_primary()?;
+        let mut expression = self.parse_not()?;
         loop {
             match self.peek() {
                 None | Some(")") => break,
@@ -644,9 +676,20 @@ impl QueryParser {
                 }
                 Some(_) => {}
             }
-            expression = QueryExpr::And(Box::new(expression), Box::new(self.parse_primary()?));
+            expression = QueryExpr::And(Box::new(expression), Box::new(self.parse_not()?));
         }
         Ok(expression)
+    }
+
+    fn parse_not(&mut self) -> Result<QueryExpr, SearchError> {
+        if self
+            .peek()
+            .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+        {
+            self.consume();
+            return Ok(QueryExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<QueryExpr, SearchError> {
@@ -661,41 +704,70 @@ impl QueryParser {
             }
             Some(")") | None => Err(SearchError::InvalidQuery),
             Some(token)
-                if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") =>
+                if token.eq_ignore_ascii_case("AND")
+                    || token.eq_ignore_ascii_case("OR")
+                    || token.eq_ignore_ascii_case("NOT") =>
             {
                 Err(SearchError::InvalidQuery)
             }
-            Some(_) => parse_query_term(&self.consume().unwrap()),
+            Some(_) => parse_query_term(&self.consume().unwrap(), self.today),
         }
     }
 }
 
-fn parse_query_term(token: &str) -> Result<QueryExpr, SearchError> {
+fn parse_query_term(token: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
     if let Some((raw_field, value)) = token.split_once(':') {
-        if raw_field.eq_ignore_ascii_case("size") {
-            return Ok(QueryExpr::Term(parse_size_term(value)?));
-        }
-        if let Some(field) = parse_date_field(raw_field) {
-            return Ok(QueryExpr::Term(parse_date_term(field, value)?));
-        }
+        let field = raw_field.to_ascii_lowercase();
+        let term = match field.as_str() {
+            "size" => parse_size_term(value)?,
+            "created" => parse_date_term(DateField::Created, value, today)?,
+            "modified" => parse_date_term(DateField::Modified, value, today)?,
+            "type" => QueryTerm::MediaType(parse_media_type(value)?),
+            "extension" | "ext" => QueryTerm::Extension(parse_extension(value)?),
+            "tags" | "tag" | "filename" | "file" | "name" | "path" | "folder" => {
+                if value.is_empty() {
+                    return Err(SearchError::InvalidQuery);
+                }
+                let field = match field.as_str() {
+                    "tags" | "tag" => QueryField::Tags,
+                    "filename" | "file" | "name" => QueryField::FileName,
+                    "path" => QueryField::Path,
+                    "folder" => QueryField::Folder,
+                    _ => unreachable!(),
+                };
+                QueryTerm::Text {
+                    field,
+                    value: value.to_lowercase(),
+                }
+            }
+            _ => QueryTerm::Text {
+                field: QueryField::Any,
+                value: token.to_lowercase(),
+            },
+        };
+        return Ok(QueryExpr::Term(term));
     }
-    let (field, value) = token
-        .split_once(':')
-        .map(|(field, value)| (field.to_ascii_lowercase(), value))
-        .and_then(|(field, value)| {
-            let field = match field.as_str() {
-                "tags" | "tag" => QueryField::Tags,
-                "filename" | "file" | "name" => QueryField::FileName,
-                "path" => QueryField::Path,
-                _ => return None,
-            };
-            (!value.is_empty()).then_some((field, value))
-        })
-        .unwrap_or((QueryField::Any, token));
+
     Ok(QueryExpr::Term(QueryTerm::Text {
-        field,
-        value: value.to_lowercase(),
+        field: QueryField::Any,
+        value: token.to_lowercase(),
     }))
+}
+
+fn parse_media_type(value: &str) -> Result<QueryMediaType, SearchError> {
+    match value.to_ascii_lowercase().as_str() {
+        "video" | "videos" => Ok(QueryMediaType::Video),
+        "image" | "images" => Ok(QueryMediaType::Image),
+        _ => Err(SearchError::InvalidQuery),
+    }
+}
+
+fn parse_extension(value: &str) -> Result<String, SearchError> {
+    let value = value.strip_prefix('.').unwrap_or(value);
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(SearchError::InvalidQuery);
+    }
+    Ok(value.to_lowercase())
 }
 
 fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
@@ -736,23 +808,61 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     })
 }
 
-fn parse_date_field(field: &str) -> Option<DateField> {
-    if field.eq_ignore_ascii_case("created") {
-        Some(DateField::Created)
-    } else if field.eq_ignore_ascii_case("modified") {
-        Some(DateField::Modified)
-    } else {
-        None
-    }
-}
-
-fn parse_date_term(field: DateField, value: &str) -> Result<QueryTerm, SearchError> {
+fn parse_date_term(
+    field: DateField,
+    value: &str,
+    today: CalendarDate,
+) -> Result<QueryTerm, SearchError> {
     let (comparison, value) = split_comparison(value);
+    let date = parse_calendar_date(value).or_else(|_| parse_relative_date(value, today))?;
     Ok(QueryTerm::Date {
         field,
         comparison,
-        date: parse_calendar_date(value)?,
+        date,
     })
+}
+
+fn parse_relative_date(value: &str, today: CalendarDate) -> Result<CalendarDate, SearchError> {
+    let lower = value.to_ascii_lowercase();
+    let parts = lower.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[2] != "ago" {
+        return Err(SearchError::InvalidQuery);
+    }
+    let amount = parts[0]
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or(SearchError::InvalidQuery)?;
+    let multiplier = match parts[1] {
+        "day" | "days" => 1,
+        "week" | "weeks" => 7,
+        _ => return Err(SearchError::InvalidQuery),
+    };
+    let days = amount
+        .checked_mul(multiplier)
+        .ok_or(SearchError::InvalidQuery)?;
+    subtract_calendar_days(today, days)
+}
+
+fn subtract_calendar_days(
+    mut date: CalendarDate,
+    mut days: u64,
+) -> Result<CalendarDate, SearchError> {
+    while days >= u64::from(date.day) {
+        days -= u64::from(date.day);
+        if date.month == 1 {
+            date.year = date.year.checked_sub(1).ok_or(SearchError::InvalidQuery)?;
+            if date.year < 1 {
+                return Err(SearchError::InvalidQuery);
+            }
+            date.month = 12;
+        } else {
+            date.month -= 1;
+        }
+        date.day = days_in_month(date.year, date.month);
+    }
+    date.day -= days as u32;
+    CalendarDate::new(date.year, date.month, date.day).ok_or(SearchError::InvalidQuery)
 }
 
 fn parse_calendar_date(value: &str) -> Result<CalendarDate, SearchError> {
@@ -856,9 +966,16 @@ fn split_comparison(value: &str) -> (Comparison, &str) {
 
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
-        QueryExpr::Term(QueryTerm::Text { field, .. }) => *field == QueryField::Path,
-        QueryExpr::Term(QueryTerm::Size { .. }) => false,
-        QueryExpr::Term(QueryTerm::Date { .. }) => false,
+        QueryExpr::Term(QueryTerm::Text { field, .. }) => {
+            matches!(field, QueryField::Path | QueryField::Folder)
+        }
+        QueryExpr::Term(
+            QueryTerm::MediaType(_)
+            | QueryTerm::Extension(_)
+            | QueryTerm::Size { .. }
+            | QueryTerm::Date { .. },
+        ) => false,
+        QueryExpr::Not(expression) => query_needs_whole_path(expression),
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
             query_needs_whole_path(left) || query_needs_whole_path(right)
         }
@@ -873,8 +990,15 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 .any(|hay| hay.contains(value)),
             QueryField::Tags => tags_haystack(path).contains(value),
             QueryField::FileName => file_name_haystack(path).contains(value),
-            QueryField::Path => path_haystack(path).contains(value),
+            QueryField::Path | QueryField::Folder => path_haystack(path).contains(value),
         },
+        QueryExpr::Term(QueryTerm::MediaType(media_type)) => match media_type {
+            QueryMediaType::Video => is_supported_video(path),
+            QueryMediaType::Image => is_supported_image(path),
+        },
+        QueryExpr::Term(QueryTerm::Extension(extension)) => path
+            .extension()
+            .is_some_and(|actual| actual.to_string_lossy().eq_ignore_ascii_case(extension)),
         QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
             .map(|metadata| compare(metadata.len(), *comparison, *bytes))
             .unwrap_or(false),
@@ -892,6 +1016,7 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 calendar_date(time)
             })
             .is_some_and(|actual| compare(actual, *comparison, *date)),
+        QueryExpr::Not(expression) => !matches_query(path, expression, fields),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields) && matches_query(path, right, fields)
         }
@@ -1546,6 +1671,152 @@ mod tests {
 
         let filename_only = engine.search(request("filename:home")).unwrap();
         assert_eq!(names(&filename_only), ["home clip.mp4"]);
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and_and_or() {
+        let directory = tempdir().unwrap();
+        let summer_draft = directory.path().join("summer draft.mp4");
+        let winter_final = directory.path().join("winter final.mp4");
+        let winter_draft = directory.path().join("winter draft.mp4");
+        for path in [&summer_draft, &winter_final, &winter_draft] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            summer_draft,
+            winter_final,
+            winter_draft,
+        ])));
+
+        let mut found = names(
+            &engine
+                .search(request(
+                    "filename:summer OR filename:winter AND NOT filename:draft",
+                ))
+                .unwrap(),
+        );
+        found.sort();
+        assert_eq!(found, ["summer draft.mp4", "winter final.mp4"]);
+    }
+
+    #[test]
+    fn type_extension_and_folder_qualifiers_match_exact_metadata() {
+        let directory = tempdir().unwrap();
+        let archive = directory.path().join("Family Archive");
+        fs::create_dir(&archive).unwrap();
+        let photo = archive.join("Trip.JPEG");
+        let video = archive.join("Trip.mp4");
+        for path in [&photo, &video] {
+            fs::write(path, b"test").unwrap();
+        }
+        let provider = Arc::new(FakeProvider::new(vec![photo, video]));
+        let engine = SearchEngine::new(provider.clone());
+        let both = |query: &str| SearchRequest {
+            media_type: MediaType::Both,
+            ..request(query)
+        };
+
+        assert_eq!(
+            names(
+                &engine
+                    .search(both("type:image extension:jpeg folder:\"Family Archive\"",))
+                    .unwrap(),
+            ),
+            ["Trip.JPEG"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(both("type:video extension:mp4 folder:archive"))
+                    .unwrap(),
+            ),
+            ["Trip.mp4"]
+        );
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [true, true]);
+    }
+
+    #[test]
+    fn quoted_values_keep_spaces_and_escaped_quotes() {
+        let directory = tempdir().unwrap();
+        let phrase = directory.path().join("Family Trip.mp4");
+        let quote = directory.path().join("Family \"Trip\".mp4");
+        for path in [&phrase, &quote] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![phrase, quote])));
+
+        assert_eq!(
+            names(&engine.search(request("filename:\"family trip\"")).unwrap(),),
+            ["Family Trip.mp4"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("filename:\"family \\\"trip\\\"\""))
+                    .unwrap(),
+            ),
+            ["Family \"Trip\".mp4"]
+        );
+    }
+
+    #[test]
+    fn relative_dates_resolve_once_from_the_search_date() {
+        let today = CalendarDate::new(2026, 3, 1).unwrap();
+
+        assert_eq!(
+            parse_query_at("modified:>\"3 days ago\"", today).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::Greater,
+                date: CalendarDate::new(2026, 2, 26).unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_query_at("created:>=\"1 week ago\"", today).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Created,
+                comparison: Comparison::GreaterOrEqual,
+                date: CalendarDate::new(2026, 2, 22).unwrap(),
+            })
+        );
+        assert_eq!(
+            subtract_calendar_days(CalendarDate::new(2024, 3, 1).unwrap(), 1).unwrap(),
+            CalendarDate::new(2024, 2, 29).unwrap()
+        );
+        assert_eq!(
+            subtract_calendar_days(CalendarDate::new(2026, 1, 1).unwrap(), 1).unwrap(),
+            CalendarDate::new(2025, 12, 31).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_field_names_remain_plain_text() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("camera:model.mp4");
+        fs::write(&matching, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![matching])));
+
+        assert_eq!(
+            names(&engine.search(request("camera:model")).unwrap()),
+            ["camera:model.mp4"]
+        );
+    }
+
+    #[test]
+    fn new_operators_reject_missing_or_unknown_values() {
+        for invalid in [
+            "NOT",
+            "type:document",
+            "extension:",
+            "folder:",
+            "modified:\"soon\"",
+            "filename:\"unfinished",
+        ] {
+            assert!(
+                parse_query(invalid).is_err(),
+                "expected {invalid} to be rejected"
+            );
+        }
     }
 
     #[test]
