@@ -803,6 +803,53 @@ button:focus-visible {
   margin-left: 0;
   padding: 9px 16px;
 }
+.addon-menu-wrap {
+  position: relative;
+  flex: none;
+}
+.addon-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 8px);
+  right: 0;
+  display: grid;
+  gap: 6px;
+  width: max-content;
+  min-width: 240px;
+  max-width: min(360px, calc(100vw - 40px));
+  border: 1px solid oklch(0.3 0.02 40);
+  border-radius: 10px;
+  padding: 8px;
+  background: oklch(0.17 0.02 40);
+  color: inherit;
+  box-shadow: 0 16px 42px rgb(0 0 0 / 38%);
+}
+.addon-menu button {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+.addon-menu button:hover,
+.addon-menu button:focus-visible {
+  border-color: oklch(0.68 0.19 38);
+  background: oklch(0.22 0.02 40);
+}
+.addon-menu button span {
+  color: oklch(0.68 0.02 60);
+  font-size: 11px;
+}
+.addon-error {
+  margin: 4px 6px;
+  color: #ff9f9f;
+  font-size: 12px;
+  line-height: 1.4;
+}
 .playlist-toggle .playlist-count {
   display: inline-flex;
   align-items: center;

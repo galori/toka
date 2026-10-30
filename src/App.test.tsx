@@ -12,7 +12,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   externalPlayers,
   indexState,
-  launchPlaylist,
+  launchIntent,
+  matchingAddonActions,
   searchLogSettings,
 } from "./api";
 import App, {
@@ -55,7 +56,10 @@ vi.mock("./api", async (importOriginal) => ({
   indexState: vi.fn(() =>
     Promise.resolve({ supported: false, revision: 0, folders: [] }),
   ),
-  launchPlaylist: vi.fn(() => Promise.resolve(null)),
+  launchIntent: vi.fn(() => Promise.resolve(null)),
+  matchingAddonActions: vi.fn(() =>
+    Promise.resolve({ actions: [], errors: [] }),
+  ),
   searchLogSettings: vi.fn(() =>
     Promise.resolve({ verbose: false, path: undefined }),
   ),
@@ -64,7 +68,8 @@ vi.mock("./api", async (importOriginal) => ({
 const invokeMock = vi.mocked(invoke);
 const externalPlayersMock = vi.mocked(externalPlayers);
 const indexStateMock = vi.mocked(indexState);
-const launchPlaylistMock = vi.mocked(launchPlaylist);
+const launchIntentMock = vi.mocked(launchIntent);
+const matchingAddonActionsMock = vi.mocked(matchingAddonActions);
 const searchLogSettingsMock = vi.mocked(searchLogSettings);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
 const openMock = vi.mocked(open);
@@ -105,7 +110,10 @@ beforeEach(() => {
   indexStateMock
     .mockReset()
     .mockResolvedValue({ supported: false, revision: 0, folders: [] });
-  launchPlaylistMock.mockReset().mockResolvedValue(null);
+  launchIntentMock.mockReset().mockResolvedValue(null);
+  matchingAddonActionsMock
+    .mockReset()
+    .mockResolvedValue({ actions: [], errors: [] });
   searchLogSettingsMock
     .mockReset()
     .mockResolvedValue({ verbose: false, path: undefined });
@@ -158,6 +166,8 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
+  expect(help).toHaveTextContent("Ctrl+Shift+A");
+  expect(help).toHaveTextContent("Open actions from add-ons");
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
   ).toHaveAttribute("aria-keyshortcuts", "Escape");
@@ -218,13 +228,15 @@ test("opens and saves verbose search logging from its discoverable shortcuts", a
 });
 
 test("opens help over the player without letting Escape leave playback", async () => {
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -332,19 +344,70 @@ test("leaves configured search folder setup with Escape", async () => {
   ).not.toBeInTheDocument();
 });
 
+test("opens an add-on launch as an exact search result list", async () => {
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "@sometiktoker",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+          extension: "mp4",
+        },
+        {
+          id: "video-2",
+          fileName: "2026-10-11_@sometiktoker_18938383490812348344.mp4",
+          extension: "mp4",
+        },
+      ],
+    },
+    addonSearch: {
+      query: "@sometiktoker",
+      fields: { tags: false, fileName: true, path: false },
+      mediaType: "videos",
+      addonId: "tiktok",
+      capture: "handle",
+      value: "@sometiktoker",
+    },
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("searchbox")).toHaveValue("@sometiktoker");
+  expect(
+    screen.getByRole("button", {
+      name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
+    }),
+  ).toBeVisible();
+  expect(screen.queryByLabelText(/^Playing /)).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Search filename" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  expect(screen.getByRole("button", { name: "Search tags" })).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+});
+
 test("a launch playlist bypasses first-launch folder setup", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
     revision: 0,
     folders: [],
   });
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -357,13 +420,15 @@ test("a launch playlist bypasses first-launch folder setup", async () => {
 });
 
 test("starts launched playback in a focused player mode", async () => {
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -5208,6 +5273,117 @@ test("says why the playing video's folder could not be opened", async () => {
   );
 });
 
+test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "tiktok",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+            extension: "mp4",
+          },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/2026-10-10_@sometiktoker_18938383490812348343.mp4",
+        playbackBackend: "web",
+      });
+    }
+    return Promise.resolve();
+  });
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [
+      {
+        addonId: "tiktok",
+        actionId: "creator",
+        label: "Open TikTok creator",
+        effects: ["New Toka window", "tiktok.com"],
+      },
+    ],
+    errors: [],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tiktok{Enter}");
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
+    }),
+  );
+
+  const addons = await screen.findByRole("button", { name: "Add-ons" });
+  expect(addons).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+A");
+  expect(addons.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+A");
+  fireEvent.keyDown(window, { key: "a", ctrlKey: true, shiftKey: true });
+
+  expect(
+    await screen.findByRole("menu", { name: "Add-ons" }),
+  ).toHaveTextContent("New Toka window · tiktok.com");
+  await user.click(
+    screen.getByRole("menuitem", { name: /Open TikTok creator/ }),
+  );
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
+      resultId: "video-1",
+      addonId: "tiktok",
+      actionId: "creator",
+    }),
+  );
+});
+
+test("keeps unmatched add-ons disabled and shows load failures in their menu", async () => {
+  const result = {
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      { id: "video-1", fileName: "clip.mp4", extension: "mp4" },
+      { id: "video-2", fileName: "other.mp4", extension: "mp4" },
+    ],
+  };
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(result);
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/clip.mp4",
+        playbackBackend: "web",
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+
+  const unmatched = await screen.findByRole("button", { name: "Add-ons" });
+  await waitFor(() => expect(unmatched).toBeDisabled());
+  expect(matchingAddonActionsMock).toHaveBeenCalledWith("video-1");
+
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [],
+    errors: ["broken.json: invalid JSON"],
+  });
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  await waitFor(() => expect(unmatched).toBeEnabled());
+  await user.click(unmatched);
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "broken.json: invalid JSON",
+  );
+});
+
 test("says why a second Toka could not be started", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "open_new_window")
@@ -5845,13 +6021,15 @@ test("plays the playlist Toka was launched with and leaves it to come back to", 
     fileName: `launched-${number}.mp4`,
     extension: "mp4",
   }));
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 2,
-    totalPages: 1,
-    results,
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/launched-1.mp4" });
   const user = userEvent.setup();
@@ -5875,7 +6053,7 @@ test("plays the playlist Toka was launched with and leaves it to come back to", 
 });
 
 test("reports a launch playlist it cannot play and leaves the search ready", async () => {
-  launchPlaylistMock.mockRejectedValue({
+  launchIntentMock.mockRejectedValue({
     kind: "Playlist",
     message: "summer.m3u8 lists no videos Toka can play.",
   });

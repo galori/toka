@@ -14,7 +14,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   addIndexFolder,
-  launchPlaylist,
+  launchIntent,
   loadNativeVideo,
   nativePlaybackState,
   nativeSubtitleTracks,
@@ -37,6 +37,8 @@ import {
   indexState,
   removeIndexFolder,
   openInExternalPlayer,
+  matchingAddonActions,
+  runAddonAction,
   openNewWindow,
   openFolderInNewWindow,
   searchMatchCount,
@@ -50,6 +52,8 @@ import {
   videoPreview,
   DEFAULT_SEARCH_FIELDS,
   DEFAULT_MEDIA_TYPE,
+  type AddonMenu,
+  type AddonSearch,
   type BulkTagUpdate,
   type ExternalPlayer,
   type FolderTagUpdate,
@@ -992,6 +996,7 @@ const HELP_SECTIONS: HelpSection[] = [
       },
       { shortcut: "T", description: "Edit tags" },
       { shortcut: "Shift+T", description: "Tag the video's folder" },
+      { shortcut: "Ctrl+Shift+A", description: "Open actions from add-ons" },
       {
         shortcut: "F",
         description: "Enter fullscreen, show controls, or exit",
@@ -1316,6 +1321,50 @@ function Player({
   const cursorWoke = useRef(0);
   const imageElapsed = useRef(0);
   const video = playlist[index];
+  const [addonMenu, setAddonMenu] = useState<AddonMenu>({
+    actions: [],
+    errors: [],
+  });
+  const [addonLoading, setAddonLoading] = useState(true);
+  const [addonOpen, setAddonOpen] = useState(false);
+  const [addonBusy, setAddonBusy] = useState(false);
+  const [addonError, setAddonError] = useState<string>();
+  useEffect(() => {
+    let active = true;
+    setAddonMenu({ actions: [], errors: [] });
+    setAddonLoading(true);
+    setAddonOpen(false);
+    setAddonError(undefined);
+    void matchingAddonActions(video.id)
+      .then((menu) => {
+        if (active) setAddonMenu(menu);
+      })
+      .catch((reason: unknown) => {
+        if (active)
+          setAddonMenu({ actions: [], errors: [errorMessage(reason)] });
+      })
+      .finally(() => {
+        if (active) setAddonLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [video.id]);
+  const addonAvailable =
+    addonMenu.actions.length > 0 || addonMenu.errors.length > 0;
+  const runSelectedAddon = async (addonId: string, actionId: string) => {
+    setAddonBusy(true);
+    setAddonError(undefined);
+    try {
+      await runAddonAction(video.id, addonId, actionId);
+      setAddonOpen(false);
+      focusPlayerShell();
+    } catch (reason) {
+      setAddonError(errorMessage(reason));
+    } finally {
+      setAddonBusy(false);
+    }
+  };
   const isImage = isImageResult(video);
   const [slideshowPlaying, setSlideshowPlaying] = useState(true);
   const [imageDurationSeconds, setImageDurationSeconds] = useState(
@@ -2346,9 +2395,13 @@ function Player({
     const onKeyDown = (event: KeyboardEvent) => {
       if (helpOpen) return;
       const target = event.target;
+      const addonShortcut =
+        event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
       if (
         event.defaultPrevented ||
-        (event.ctrlKey && !(event.shiftKey && event.key === "Delete")) ||
+        (event.ctrlKey &&
+          !(event.shiftKey && event.key === "Delete") &&
+          !addonShortcut) ||
         event.metaKey ||
         event.altKey ||
         acceptsTypedText(target)
@@ -2377,6 +2430,15 @@ function Player({
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
       // focus itself, which the check above already returns on.
+      if (addonShortcut) {
+        if (!addonLoading && addonAvailable)
+          run(() => setAddonOpen((open) => !open));
+        return;
+      }
+      if (addonOpen && event.key === "Escape") {
+        run(() => setAddonOpen(false));
+        return;
+      }
       if (addingTag || addingFolderTag) {
         if (event.key === "Escape")
           run(() => {
@@ -2450,6 +2512,9 @@ function Player({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    addonAvailable,
+    addonLoading,
+    addonOpen,
     currentTime,
     duration,
     fullscreen,
@@ -2583,6 +2648,46 @@ function Player({
         >
           <Label>New window</Label>
         </ControlButton>
+        <div className="addon-menu-wrap">
+          <ControlButton
+            shortcut="Ctrl+Shift+A"
+            className="player-help-toggle"
+            aria-label="Add-ons"
+            aria-expanded={addonOpen}
+            disabled={addonLoading || !addonAvailable}
+            onClick={() => setAddonOpen((open) => !open)}
+          >
+            <Label>Add-ons</Label>
+          </ControlButton>
+          {addonOpen ? (
+            <div className="addon-menu" role="menu" aria-label="Add-ons">
+              {addonMenu.actions.map((action) => (
+                <button
+                  type="button"
+                  role="menuitem"
+                  key={`${action.addonId}:${action.actionId}`}
+                  disabled={addonBusy}
+                  onClick={() =>
+                    void runSelectedAddon(action.addonId, action.actionId)
+                  }
+                >
+                  <strong>{action.label}</strong>
+                  <span>{action.effects.join(" · ")}</span>
+                </button>
+              ))}
+              {addonMenu.errors.map((message) => (
+                <p role="alert" className="addon-error" key={message}>
+                  {message}
+                </p>
+              ))}
+              {addonError ? (
+                <p role="alert" className="addon-error">
+                  {addonError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
         <ControlButton
           shortcut="Ctrl+Shift+N"
           className="player-help-toggle"
@@ -3159,6 +3264,7 @@ async function loadResultPages(
   lastPage: number,
   fields: SearchFields,
   mediaType: MediaType,
+  addonSearch?: AddonSearch,
 ): Promise<VideoResult[][]> {
   const pages = Array.from(
     { length: Math.max(0, lastPage - firstPage + 1) },
@@ -3173,6 +3279,7 @@ async function loadResultPages(
         firstPage + pageIndex,
         fields,
         mediaType,
+        addonSearch,
       );
       pages[pageIndex] = response.results;
     }
@@ -3202,6 +3309,7 @@ export default function App() {
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [page, setPage] = useState<SearchPage>();
+  const [addonSearch, setAddonSearch] = useState<AddonSearch>();
   // Playback is always a playlist: choosing one result starts the whole page of
   // them, positioned at the one that was chosen.
   const [playing, setPlaying] = useState<{
@@ -3285,10 +3393,15 @@ export default function App() {
   // than for whatever has been typed since.
   const searchedQuery = useRef<string | undefined>(undefined);
 
-  const runSearch = async (submittedQuery: string, requestedPage: number) => {
+  const runSearch = async (
+    submittedQuery: string,
+    requestedPage: number,
+    nextAddonSearch?: AddonSearch,
+  ) => {
     const trimmed = submittedQuery.trim();
     if (!trimmed) return;
     searchedQuery.current = trimmed;
+    setAddonSearch(nextAddonSearch);
     const currentRequest = ++requestNumber.current;
     if (page) indexRefreshCheckRevision.current = managedIndex?.revision;
     setIndexRefreshAvailable(false);
@@ -3301,6 +3414,7 @@ export default function App() {
         requestedPage,
         fields,
         mediaType,
+        nextAddonSearch,
       );
       if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
@@ -3325,6 +3439,7 @@ export default function App() {
         loadedPages + 1,
         fields,
         mediaType,
+        addonSearch,
       );
       setPage((current) =>
         current && current.query === next.query
@@ -3347,6 +3462,7 @@ export default function App() {
       loadedPage + 1,
       fields,
       mediaType,
+      addonSearch,
     );
     setPage((current) =>
       current && current.query === next.query && current.page === loadedPage
@@ -3637,6 +3753,7 @@ export default function App() {
           totalPages,
           fields,
           mediaType,
+          addonSearch,
         )
       : [];
     return [page.results, ...pages].flat();
@@ -3691,28 +3808,25 @@ export default function App() {
     }
   };
 
-  // A playlist — or single video, or folder — Toka was launched with plays
-  // as soon as the window is up. Its entries arrive as a page of results, so
-  // everything a search's results reach — the player, its drawer, prev and
-  // next, coming back to the list — works without a second way through any
-  // of it. The launch clears any existing playlist and search term, and a
-  // folder's videos arrive shuffled like any other playlist.
+  // Media launch intents play at once. Add-on search intents open their exact
+  // result list, ready to browse, without inventing a second search path.
   useEffect(() => {
     let cancelled = false;
     void Promise.allSettled([
-      launchPlaylist(),
+      launchIntent(),
       indexState(),
       loadSearchLogSettings(),
-    ]).then(([playlistResult, indexResult, logResult]) => {
+    ]).then(([launchResult, indexResult, logResult]) => {
       if (cancelled) return;
       const launched =
-        playlistResult.status === "fulfilled" ? playlistResult.value : null;
-      if (playlistResult.status === "rejected")
-        setError(errorMessage(playlistResult.reason));
+        launchResult.status === "fulfilled" ? launchResult.value : null;
+      const launchedPage = launched?.page;
+      if (launchResult.status === "rejected")
+        setError(errorMessage(launchResult.reason));
       if (indexResult.status === "fulfilled") {
         setManagedIndex(indexResult.value);
         if (
-          !launched?.results.length &&
+          !launchedPage?.results.length &&
           indexResult.value.supported &&
           indexResult.value.folders.length === 0
         )
@@ -3725,10 +3839,22 @@ export default function App() {
       }
       // A viewer who got a search in first has asked for something newer than
       // the command line did, and keeps it.
-      if (!launched?.results.length || requestNumber.current) return;
-      setQuery("");
-      setPage(launched);
-      setPlaying({ videos: launched.results, startIndex: 0 });
+      if (!launchedPage?.results.length || requestNumber.current) return;
+      setPage(launchedPage);
+      if (launched?.addonSearch) {
+        searchedQuery.current = launched.addonSearch.query;
+        searchedFields.current = launched.addonSearch.fields;
+        searchedMediaType.current = launched.addonSearch.mediaType;
+        setQuery(launched.addonSearch.query);
+        setFields(launched.addonSearch.fields);
+        setMediaType(launched.addonSearch.mediaType);
+        setAddonSearch(launched.addonSearch);
+        setPlaying(undefined);
+      } else {
+        setQuery("");
+        setAddonSearch(undefined);
+        setPlaying({ videos: launchedPage.results, startIndex: 0 });
+      }
     });
     return () => {
       cancelled = true;
@@ -3896,7 +4022,7 @@ export default function App() {
     if (indexRefreshCheckRevision.current === revision) return;
     indexRefreshCheckRevision.current = revision;
     let cancelled = false;
-    void searchMatchCount(page.query, fields, mediaType)
+    void searchMatchCount(page.query, fields, mediaType, addonSearch)
       .then((totalResults) => {
         if (!cancelled)
           setIndexRefreshAvailable(totalResults > page.totalResults);
@@ -3908,6 +4034,7 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    addonSearch,
     fields,
     managedIndex?.revision,
     managedIndex?.supported,
@@ -3950,7 +4077,7 @@ export default function App() {
       )
         return;
       event.preventDefault();
-      if (page) void runSearch(page.query, 1);
+      if (page) void runSearch(page.query, 1, addonSearch);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -4308,7 +4435,7 @@ export default function App() {
             shortcut="Ctrl+Shift+R"
             className="scope-toggle"
             aria-label="Refresh search results"
-            onClick={() => void runSearch(page.query, 1)}
+            onClick={() => void runSearch(page.query, 1, addonSearch)}
           >
             <Label>Refresh</Label>
           </ControlButton>
