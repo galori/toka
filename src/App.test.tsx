@@ -1694,6 +1694,44 @@ test("uses one control for playing and pausing", async () => {
   );
 });
 
+// A play() that a pause, a seek or the next video interrupts rejects with an
+// AbortError. That is the engine saying it was overruled, not that it cannot
+// play the file, so the player must stay put. WebKitGTK does this whenever a
+// pause lands while a looping video is restarting.
+test("an interrupted play request does not replace the player with an error", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockRejectedValue(
+    new DOMException("The play() request was interrupted.", "AbortError"),
+  );
+  await user.click(screen.getByRole("button", { name: "Play" }));
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.getByLabelText("Playing clip.mp4")).toBeInTheDocument();
+  expect(
+    screen.queryByText(
+      "This video could not be played by the system media engine.",
+    ),
+  ).not.toBeInTheDocument();
+});
+
 test("clicking the picture plays and pauses the video", async () => {
   invokeMock
     .mockResolvedValueOnce({
@@ -5001,10 +5039,90 @@ test("opens a new window from Ctrl+N while a video is playing", async () => {
     expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
   );
 
-  // Ctrl+Shift+N is not the shortcut: it must not open a new window.
+  // Ctrl+Shift+N opens the video's folder instead, never a blank window.
   invokeMock.mockClear();
   fireEvent.keyDown(window, { key: "n", ctrlKey: true, shiftKey: true });
-  expect(invokeMock).not.toHaveBeenCalled();
+  expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
+});
+
+// Watching one video is often the way into the rest of its folder: a second
+// Toka launched on that folder plays them all, leaving this one where it was.
+test("opens the playing video's folder in a new Toka from the control and from Ctrl+Shift+N", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Video controls");
+
+  const control = screen.getByRole("button", {
+    name: "Open folder in new window",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+N");
+  expect(control.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+N");
+  expect(control.querySelector("svg")).not.toBeNull();
+
+  invokeMock.mockClear();
+  await user.click(control);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "N", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+  expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
+});
+
+test("says why the playing video's folder could not be opened", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_folder_in_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open folder in new window" }),
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
 });
 
 test("says why a second Toka could not be started", async () => {

@@ -38,6 +38,7 @@ import {
   removeIndexFolder,
   openInExternalPlayer,
   openNewWindow,
+  openFolderInNewWindow,
   searchMatchCount,
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
@@ -591,6 +592,16 @@ function BackArrowIcon() {
   );
 }
 
+// A folder with an arrow leaving it: the folder opens somewhere else.
+function FolderWindowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M11 19H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v3" />
+      <path d="M15 19l6-6M16 13h5v5" />
+    </svg>
+  );
+}
+
 function CopyIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
@@ -875,6 +886,10 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "D", description: "Change image display duration" },
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
+      {
+        shortcut: "Ctrl+Shift+N",
+        description: "Open this file's folder in a new Toka window",
+      },
       { shortcut: "T", description: "Edit tags" },
       {
         shortcut: "F",
@@ -1215,6 +1230,31 @@ function Player({
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
+  // The rest of a video's folder is often what a viewer wants next. A second
+  // Toka launched on that folder plays it, leaving this playlist where it was.
+  const [folderError, setFolderError] = useState<string>();
+  const openFolder = async () => {
+    setFolderError(undefined);
+    try {
+      await openFolderInNewWindow(video.id);
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    }
+  };
+  // Ctrl is held, so the player's single-key handler below ignores it, and
+  // Shift is what keeps it apart from the Ctrl+N that opens a blank window.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (helpOpen || event.defaultPrevented) return;
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "n") return;
+      event.preventDefault();
+      void openFolder();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   const copyPath = async () => {
     const text = prepared?.filePath ?? video.fileName;
     try {
@@ -1506,9 +1546,13 @@ function Player({
     void element.current
       ?.play()
       .then(() => setPlayingBack(true))
-      .catch(() =>
-        setError("This video could not be played by the system media engine."),
-      );
+      .catch((reason: unknown) => {
+        // An AbortError means a pause, seek or new source overruled this
+        // request, which says nothing about whether the file can play.
+        if (reason instanceof DOMException && reason.name === "AbortError")
+          return;
+        setError("This video could not be played by the system media engine.");
+      });
   };
 
   const pause = () => {
@@ -2421,6 +2465,15 @@ function Player({
           <Label>New window</Label>
         </ControlButton>
         <ControlButton
+          shortcut="Ctrl+Shift+N"
+          className="player-help-toggle"
+          aria-label="Open folder in new window"
+          title="Open this file's folder in a new Toka window"
+          onClick={() => void openFolder()}
+        >
+          <FolderWindowIcon />
+        </ControlButton>
+        <ControlButton
           shortcut="P"
           className="playlist-toggle"
           aria-expanded={drawerOpen}
@@ -2437,6 +2490,11 @@ function Player({
       {fullscreenError ? (
         <p role="alert" className="message error">
           {fullscreenError}
+        </p>
+      ) : null}
+      {folderError ? (
+        <p role="alert" className="message error">
+          {folderError}
         </p>
       ) : null}
       {/* The shell outlives each video: it is the element the browser promotes
