@@ -499,16 +499,43 @@ fn open_in_external_player(
 /// rather than opening a second, so the running one has to be able to ask.
 #[tauri::command]
 fn open_new_window() -> Result<(), CommandError> {
+    start_toka(None)
+}
+
+/// Starts another Toka on the folder the video `result_id` names sits in, the
+/// way `toka /that/folder` would, so it plays the rest of that folder while
+/// this one carries on with its own playlist.
+#[tauri::command]
+fn open_folder_in_new_window(
+    result_id: String,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<(), CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    start_toka(Some(folder_of(&path)?))
+}
+
+fn folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
+    path.parent()
+        .filter(|folder| !folder.as_os_str().is_empty())
+        .ok_or_else(|| CommandError {
+            kind: "NewWindow",
+            message: format!("{} is not inside a folder Toka can open.", path.display()),
+        })
+}
+
+fn start_toka(folder: Option<&std::path::Path>) -> Result<(), CommandError> {
     let executable = std::env::current_exe().map_err(|error| CommandError {
         kind: "NewWindow",
         message: format!("Toka could not find its own program to start again: {error}"),
     })?;
-    std::process::Command::new(&executable)
-        .spawn()
-        .map_err(|error| CommandError {
-            kind: "NewWindow",
-            message: format!("Another Toka could not be started: {error}"),
-        })?;
+    let mut command = std::process::Command::new(&executable);
+    if let Some(folder) = folder {
+        command.arg(folder);
+    }
+    command.spawn().map_err(|error| CommandError {
+        kind: "NewWindow",
+        message: format!("Another Toka could not be started: {error}"),
+    })?;
     Ok(())
 }
 
@@ -1030,6 +1057,7 @@ pub fn run() {
             external_players,
             open_in_external_player,
             open_new_window,
+            open_folder_in_new_window,
             set_video_tags,
             add_video_tags,
             remove_video_tags,
@@ -1061,6 +1089,7 @@ pub fn run() {
                 external_players,
                 open_in_external_player,
                 open_new_window,
+                open_folder_in_new_window,
                 set_video_tags,
                 add_video_tags,
                 remove_video_tags,
@@ -1099,6 +1128,7 @@ pub fn run() {
         external_players,
         open_in_external_player,
         open_new_window,
+        open_folder_in_new_window,
         set_video_tags,
         add_video_tags,
         remove_video_tags,
@@ -1145,6 +1175,21 @@ mod tests {
 
         assert_eq!(error.kind, "Delete");
         assert!(error.message.contains("still on disk"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_videos_folder_is_the_folder_it_sits_in() {
+        assert_eq!(
+            folder_of(Path::new("/root/path/to/my/video.mp4")).unwrap(),
+            Path::new("/root/path/to/my")
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_folder_says_so() {
+        let error = folder_of(Path::new("video.mp4")).unwrap_err();
+
+        assert_eq!(error.kind, "NewWindow");
     }
 
     #[test]

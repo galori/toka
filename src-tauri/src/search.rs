@@ -1311,6 +1311,33 @@ mod tests {
         assert_eq!(every_name, every_clip_name(25));
     }
 
+    #[test]
+    fn search_keeps_the_page_size_and_rejects_invalid_page_requests() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), PAGE_SIZE + 1);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        let first = engine.search(request("clip")).unwrap();
+        assert_eq!(first.page, 1);
+        assert_eq!(first.page_size, 24);
+        assert_eq!(first.total_results, 25);
+        assert_eq!(first.total_pages, 2);
+
+        let mut zero_page = request("clip");
+        zero_page.page = 0;
+        assert!(matches!(
+            engine.search(zero_page),
+            Err(SearchError::InvalidPage)
+        ));
+
+        let mut wrong_size = request("clip");
+        wrong_size.page_size = 12;
+        assert!(matches!(
+            engine.search(wrong_size),
+            Err(SearchError::InvalidPage)
+        ));
+    }
+
     /// An alphabetical list buries everything past the first screenful, which
     /// is the wrong answer to "find me something to watch".
     #[test]
@@ -1356,6 +1383,21 @@ mod tests {
         let second = names(&engine.search(request("clip")).unwrap());
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn result_ids_are_opaque_and_do_not_reveal_paths() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("private-name.mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video.clone()])));
+
+        let page = engine.search(request("private-name")).unwrap();
+        let result = &page.results[0];
+
+        assert!(!result.id.contains("private-name"));
+        assert!(!result.id.contains(&video.to_string_lossy().into_owned()));
+        assert_eq!(engine.video_path(&result.id).unwrap(), video);
     }
 
     #[test]
@@ -1440,6 +1482,37 @@ mod tests {
     }
 
     #[test]
+    fn path_search_covers_every_ancestor_folder() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("Family Archive");
+        let grandchild = parent.join("2026").join("October");
+        fs::create_dir_all(&grandchild).unwrap();
+        let video = grandchild.join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+        let path_only = |query: &str| SearchRequest {
+            fields: SearchFields {
+                tags: false,
+                file_name: false,
+                path: true,
+            },
+            ..request(query)
+        };
+
+        assert_eq!(
+            engine
+                .search(path_only("family october"))
+                .unwrap()
+                .total_results,
+            1
+        );
+        assert_eq!(
+            engine.search(path_only("missing")).unwrap().total_results,
+            0
+        );
+    }
+
+    #[test]
     fn every_term_may_match_a_different_selected_field() {
         let directory = tempdir().unwrap();
         let folder = directory.path().join("Holiday");
@@ -1492,6 +1565,23 @@ mod tests {
         let mut found = names(&page);
         found.sort();
         assert_eq!(found, ["summer.mp4", "winter.mp4"]);
+    }
+
+    #[test]
+    fn explicit_and_matches_implicit_and() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("summer holiday.mp4");
+        let partial = directory.path().join("summer work.mp4");
+        for path in [&matching, &partial] {
+            fs::write(path, b"test").unwrap();
+        }
+        let paths = vec![matching, partial];
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        assert_eq!(
+            names(&engine.search(request("summer AND holiday")).unwrap()),
+            names(&engine.search(request("summer holiday")).unwrap())
+        );
     }
 
     #[test]

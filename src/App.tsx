@@ -38,6 +38,7 @@ import {
   removeIndexFolder,
   openInExternalPlayer,
   openNewWindow,
+  openFolderInNewWindow,
   searchMatchCount,
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
@@ -691,6 +692,16 @@ function BackArrowIcon() {
   );
 }
 
+// A folder with an arrow leaving it: the folder opens somewhere else.
+function FolderWindowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M11 19H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v3" />
+      <path d="M15 19l6-6M16 13h5v5" />
+    </svg>
+  );
+}
+
 function CopyIcon() {
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
@@ -946,13 +957,21 @@ const HELP_SECTIONS: HelpSection[] = [
   {
     title: "Player",
     entries: [
-      { shortcut: "Space", description: "Play or pause video / slideshow" },
+      {
+        shortcut: "Space",
+        description: "Play or pause video / slideshow (or click the video)",
+      },
       {
         shortcut: "ArrowLeft ArrowRight",
         description: "Seek, or move between images",
       },
       { shortcut: "PageUp PageDown", description: "Previous or next item" },
       { shortcut: "J", description: "Change the skip step" },
+      {
+        shortcut: "B E",
+        description:
+          "Mark the start and end of a range to play; cleared on the next video",
+      },
       { shortcut: "- =", description: "Decrease or increase playback speed" },
       {
         shortcut: "ArrowDown ArrowUp",
@@ -967,6 +986,10 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "D", description: "Change image display duration" },
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
+      {
+        shortcut: "Ctrl+Shift+N",
+        description: "Open this file's folder in a new Toka window",
+      },
       { shortcut: "T", description: "Edit tags" },
       { shortcut: "Shift+T", description: "Tag the video's folder" },
       {
@@ -1253,6 +1276,11 @@ function Player({
   const [rotation, setRotation] = useState(0);
   const [aspectStep, setAspectStep] = useState(0);
   const [skipStepIndex, setSkipStepIndex] = useState(DEFAULT_SKIP_STEP);
+  // The stretch of this video the viewer has marked to play on its own, the
+  // way VLC's A-B loop works. It belongs to the file on screen and is dropped
+  // with it, so nothing about it outlives a move to another video.
+  const [rangeStart, setRangeStart] = useState<number>();
+  const [rangeEnd, setRangeEnd] = useState<number>();
   // Whatever the backend has been able to say about the open file, so an
   // undefined rate means "nobody knows yet" rather than "no frames".
   const [frameRate, setFrameRate] = useState<number>();
@@ -1301,6 +1329,31 @@ function Player({
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
+  // The rest of a video's folder is often what a viewer wants next. A second
+  // Toka launched on that folder plays it, leaving this playlist where it was.
+  const [folderError, setFolderError] = useState<string>();
+  const openFolder = async () => {
+    setFolderError(undefined);
+    try {
+      await openFolderInNewWindow(video.id);
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    }
+  };
+  // Ctrl is held, so the player's single-key handler below ignores it, and
+  // Shift is what keeps it apart from the Ctrl+N that opens a blank window.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (helpOpen || event.defaultPrevented) return;
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "n") return;
+      event.preventDefault();
+      void openFolder();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   const copyPath = async () => {
     const text = prepared?.filePath ?? video.fileName;
     try {
@@ -1387,6 +1440,8 @@ function Player({
     // file: the next one is read from its own length once that is known.
     setSkipStepIndex(DEFAULT_SKIP_STEP);
     chosenSkipStep.current = false;
+    setRangeStart(undefined);
+    setRangeEnd(undefined);
     setFrameRate(undefined);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
@@ -1600,9 +1655,13 @@ function Player({
     void element.current
       ?.play()
       .then(() => setPlayingBack(true))
-      .catch(() =>
-        setError("This video could not be played by the system media engine."),
-      );
+      .catch((reason: unknown) => {
+        // An AbortError means a pause, seek or new source overruled this
+        // request, which says nothing about whether the file can play.
+        if (reason instanceof DOMException && reason.name === "AbortError")
+          return;
+        setError("This video could not be played by the system media engine.");
+      });
   };
 
   const pause = () => {
@@ -1616,6 +1675,9 @@ function Player({
       setPlayingBack(false);
     }
   };
+
+  // A click on the picture does what the play button does, as in most players.
+  const togglePlayback = () => (playingBack ? pause() : play());
 
   // Typing a tag needs the viewer's attention, so the picture waits for them.
   const openTagField = (folder = false) => {
@@ -1632,9 +1694,9 @@ function Player({
     setAddingFolderTag(folder);
   };
 
-  const restart = () => {
+  const restart = (from = 0) => {
     if (native) {
-      void seekNativeVideo(0)
+      void seekNativeVideo(from)
         .then(() => {
           if (!pausedByViewer.current) return setNativePaused(false);
         })
@@ -1643,10 +1705,10 @@ function Player({
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
     } else if (element.current) {
-      element.current.currentTime = 0;
+      element.current.currentTime = from;
       play();
     }
-    setCurrentTime(0);
+    setCurrentTime(from);
   };
 
   // Search playlists start with the results already on screen. Fetching the
@@ -1679,6 +1741,13 @@ function Player({
     // the scrubber stopped five to ten percent short and made every video look
     // as though its ending had been skipped.
     if (endTime > 0) setCurrentTime(endTime);
+    // A marked range that runs to the end of the file can reach it before the
+    // range's own end is seen, and it still has to start over rather than
+    // hand playback to the next entry.
+    if (rangeStart !== undefined && rangeEnd !== undefined) {
+      restart(rangeStart);
+      return;
+    }
     if (loop === "one") {
       restart();
       return;
@@ -1772,6 +1841,10 @@ function Player({
       0,
       Math.min(duration || Number.POSITIVE_INFINITY, currentTime + amount),
     );
+    seekTo(next);
+  };
+
+  const seekTo = (next: number) => {
     if (native)
       void seekNativeVideo(next).catch((reason: unknown) =>
         setError(errorMessage(reason)),
@@ -1779,6 +1852,32 @@ function Player({
     else if (element.current) element.current.currentTime = next;
     setCurrentTime(next);
   };
+
+  // A new start past the end would leave a range that runs backwards, so it
+  // drops the end and waits for a new one.
+  const markRangeStart = () => {
+    setRangeStart(currentTime);
+    if (rangeEnd !== undefined && rangeEnd <= currentTime)
+      setRangeEnd(undefined);
+  };
+
+  // With no start marked the range runs from the beginning of the file. An end
+  // at or before the start is not a range, so that press is ignored.
+  const markRangeEnd = () => {
+    const from = rangeStart ?? 0;
+    if (currentTime <= from) return;
+    if (rangeStart === undefined) setRangeStart(from);
+    setRangeEnd(currentTime);
+    seekTo(from);
+  };
+
+  // Only the end is enforced. Holding playback above the start as well would
+  // fight an engine whose seek lands on a keyframe just before it, and a
+  // viewer who scrubs back before the start is still carried into the range.
+  useEffect(() => {
+    if (rangeStart === undefined || rangeEnd === undefined) return;
+    if (currentTime >= rangeEnd) seekTo(rangeStart);
+  }, [currentTime, rangeEnd, rangeStart]);
 
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < playlist.length) setIndex(nextIndex);
@@ -2298,6 +2397,10 @@ function Player({
       } else if (event.key.toLowerCase() === "j") {
         if (!isImage) run(cycleSkipStep);
         else return;
+      } else if (event.key.toLowerCase() === "b") {
+        if (!isImage) run(markRangeStart);
+      } else if (event.key.toLowerCase() === "e") {
+        if (!isImage) run(markRangeEnd);
       } else if (event.key === "PageUp") {
         run(() => moveVideo(-1));
       } else if (event.key === "PageDown") {
@@ -2360,6 +2463,8 @@ function Player({
     addingFolderTag,
     playingBack,
     playlist.length,
+    rangeEnd,
+    rangeStart,
     skipSeconds,
     slideshowPlaying,
     speed,
@@ -2478,6 +2583,15 @@ function Player({
           <Label>New window</Label>
         </ControlButton>
         <ControlButton
+          shortcut="Ctrl+Shift+N"
+          className="player-help-toggle"
+          aria-label="Open folder in new window"
+          title="Open this file's folder in a new Toka window"
+          onClick={() => void openFolder()}
+        >
+          <FolderWindowIcon />
+        </ControlButton>
+        <ControlButton
           shortcut="P"
           className="playlist-toggle"
           aria-expanded={drawerOpen}
@@ -2494,6 +2608,11 @@ function Player({
       {fullscreenError ? (
         <p role="alert" className="message error">
           {fullscreenError}
+        </p>
+      ) : null}
+      {folderError ? (
+        <p role="alert" className="message error">
+          {folderError}
         </p>
       ) : null}
       {/* The shell outlives each video: it is the element the browser promotes
@@ -2533,6 +2652,7 @@ function Player({
             ref={nativeSurface}
             className="native-video"
             aria-label={`Playing ${video.fileName}`}
+            onClick={togglePlayback}
           />
         ) : (
           <video
@@ -2561,6 +2681,7 @@ function Player({
               event.currentTarget.volume = volume / 100;
               play();
             }}
+            onClick={togglePlayback}
             onPlay={() => setPlayingBack(true)}
             onPause={() => setPlayingBack(false)}
             onTimeUpdate={(event) =>
@@ -2774,6 +2895,38 @@ function Player({
                     aria-label={`Skip step: ${skipStepName}`}
                   >
                     <Label>{skipStep.label}</Label>
+                  </ControlButton>
+                  <ControlButton
+                    shortcut="B"
+                    onClick={markRangeStart}
+                    aria-label={
+                      rangeStart === undefined
+                        ? "Mark range start"
+                        : `Range start: ${formatTime(rangeStart)}`
+                    }
+                    aria-pressed={rangeStart !== undefined}
+                  >
+                    <Label>
+                      {rangeStart === undefined
+                        ? "From"
+                        : `From ${formatTime(rangeStart)}`}
+                    </Label>
+                  </ControlButton>
+                  <ControlButton
+                    shortcut="E"
+                    onClick={markRangeEnd}
+                    aria-label={
+                      rangeEnd === undefined
+                        ? "Mark range end"
+                        : `Range end: ${formatTime(rangeEnd)}`
+                    }
+                    aria-pressed={rangeEnd !== undefined}
+                  >
+                    <Label>
+                      {rangeEnd === undefined
+                        ? "To"
+                        : `To ${formatTime(rangeEnd)}`}
+                    </Label>
                   </ControlButton>
                   <span className="labelled-control">
                     <select
