@@ -1368,9 +1368,11 @@ function Player({
     event: ReactKeyboardEvent<HTMLDivElement>,
   ) => {
     event.stopPropagation();
-    if (event.key === "Escape") {
-      event.preventDefault();
-      closeAddonMenu(true);
+    const toggleShortcut =
+      event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
+    if (event.key === "Escape" || event.key === "Tab" || toggleShortcut) {
+      if (event.key !== "Tab") event.preventDefault();
+      closeAddonMenu(event.key !== "Tab");
       return;
     }
     const actions = Array.from(

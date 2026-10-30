@@ -5344,6 +5344,28 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
   expect(menu).toHaveTextContent("New Toka window · tiktok.com");
   const action = screen.getByRole("menuitem", { name: /Open TikTok creator/ });
   await waitFor(() => expect(action).toHaveFocus());
+
+  fireEvent.keyDown(action, { key: "a", ctrlKey: true, shiftKey: true });
+  expect(
+    screen.queryByRole("menu", { name: "Add-ons" }),
+  ).not.toBeInTheDocument();
+  expect(addons).toHaveFocus();
+
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const tabAction = await screen.findByRole("menuitem", {
+    name: /Open TikTok creator/,
+  });
+  await waitFor(() => expect(tabAction).toHaveFocus());
+  await user.keyboard("{Tab}");
+  expect(
+    screen.queryByRole("menu", { name: "Add-ons" }),
+  ).not.toBeInTheDocument();
+
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const selectedAction = await screen.findByRole("menuitem", {
+    name: /Open TikTok creator/,
+  });
+  await waitFor(() => expect(selectedAction).toHaveFocus());
   await user.keyboard("{Enter}");
   await waitFor(() =>
     expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
