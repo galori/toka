@@ -1534,9 +1534,13 @@ function Player({
     void element.current
       ?.play()
       .then(() => setPlayingBack(true))
-      .catch(() =>
-        setError("This video could not be played by the system media engine."),
-      );
+      .catch((reason: unknown) => {
+        // An AbortError means a pause, seek or new source overruled this
+        // request, which says nothing about whether the file can play.
+        if (reason instanceof DOMException && reason.name === "AbortError")
+          return;
+        setError("This video could not be played by the system media engine.");
+      });
   };
 
   const pause = () => {

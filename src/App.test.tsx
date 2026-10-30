@@ -1693,6 +1693,44 @@ test("uses one control for playing and pausing", async () => {
   );
 });
 
+// A play() that a pause, a seek or the next video interrupts rejects with an
+// AbortError. That is the engine saying it was overruled, not that it cannot
+// play the file, so the player must stay put. WebKitGTK does this whenever a
+// pause lands while a looping video is restarting.
+test("an interrupted play request does not replace the player with an error", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockRejectedValue(
+    new DOMException("The play() request was interrupted.", "AbortError"),
+  );
+  await user.click(screen.getByRole("button", { name: "Play" }));
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.getByLabelText("Playing clip.mp4")).toBeInTheDocument();
+  expect(
+    screen.queryByText(
+      "This video could not be played by the system media engine.",
+    ),
+  ).not.toBeInTheDocument();
+});
+
 test("clicking the picture plays and pauses the video", async () => {
   invokeMock
     .mockResolvedValueOnce({
