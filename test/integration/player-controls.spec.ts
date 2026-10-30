@@ -251,15 +251,30 @@ describe("Toka player controls", () => {
     expect(Math.abs(after.left - before.left)).toBeLessThanOrEqual(1);
 
     await toggle.click();
-    await browser.waitUntil(async () => (await pill()).label === "Play", {
-      timeoutMsg: "The play/pause control did not come back to its first state",
-    });
+    await browser
+      .waitUntil(async () => (await pill()).label === "Play", {
+        timeoutMsg:
+          "The play/pause control did not come back to its first state",
+      })
+      .catch(async (reason: unknown) => {
+        // The player swaps itself for an error view when the engine refuses a
+        // command, which leaves no button to read. Say what it reported.
+        const shown = await browser.execute(
+          () =>
+            document.querySelector(".player-error-state")?.textContent ??
+            `label: ${document.querySelector(".player-transport button.play-button")?.getAttribute("aria-label") ?? "none"}`,
+        );
+        throw new Error(`${String(reason)} — player shows: ${shown}`);
+      });
     // WebKit can commit the button's new label before it has laid out the
     // overlay after a native playback restart. Wait for the same layout frame
     // that the rest of this spec measures rather than sampling that transition.
-    await browser.waitUntil(async () => (await $(".player-controls").isDisplayed()), {
-      timeoutMsg: "The player controls did not return after playback resumed",
-    });
+    await browser.waitUntil(
+      async () => await $(".player-controls").isDisplayed(),
+      {
+        timeoutMsg: "The player controls did not return after playback resumed",
+      },
+    );
   });
 
   // The overlay spans the shell, and the shell clips what overflows it, so a
