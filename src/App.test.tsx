@@ -1693,6 +1693,101 @@ test("uses one control for playing and pausing", async () => {
   );
 });
 
+test("clicking the picture plays and pauses the video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  fireEvent.play(video);
+
+  const paused = vi
+    .spyOn(HTMLMediaElement.prototype, "pause")
+    .mockImplementation(() => {});
+  await user.click(video);
+  expect(paused).toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+
+  const played = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
+  await user.click(video);
+  expect(played).toHaveBeenCalled();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Pause" })).toBeVisible(),
+  );
+});
+
+test("clicking the native picture plays and pauses the video", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "native-1", fileName: "native-1.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native-1.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 30,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native-1.mp4" }),
+  );
+  const surface = await screen.findByLabelText("Playing native-1.mp4");
+  await screen.findByRole("button", { name: "Pause" });
+  invokeMock.mockClear();
+
+  await user.click(surface);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: true,
+    }),
+  );
+  await screen.findByRole("button", { name: "Play" });
+
+  await user.click(surface);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: false,
+    }),
+  );
+});
+
 test("starts the whole result page as a playlist positioned at the chosen video", async () => {
   const results = [1, 2, 3].map((number) => ({
     id: `video-${number}`,

@@ -870,6 +870,13 @@ fn mount_web_view_over_video(vbox: &gtk::Box, web_view: &gtk::Widget, overlay: &
     web_view.grab_focus();
 }
 
+/// Draws the video above the WebView while leaving the pointer to the WebView,
+/// so a click on the picture reaches the page beneath it.
+fn mount_video_over_web_view(overlay: &gtk::Overlay, video_area: &gtk::GLArea) {
+    overlay.add_overlay(video_area);
+    overlay.set_overlay_pass_through(video_area, true);
+}
+
 pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
         .get_webview_window("main")
@@ -893,7 +900,7 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     // WebKitGTK paints an opaque backing surface, including CSS-transparent
     // regions. Keep the GL area above it or a healthy mpv framebuffer is still
     // hidden behind the WebView's black player background.
-    overlay.add_overlay(&video_area);
+    mount_video_over_web_view(&overlay, &video_area);
 
     let realize_player = player.clone();
     video_area.connect_realize(move |area| {
@@ -1262,8 +1269,8 @@ fn rgb_from_rgba(color: [u8; 4]) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_speed, load, mount_web_view_over_video, rgb_from_rgba, state, subtitle_label,
-        NativePlayer,
+        checked_speed, load, mount_video_over_web_view, mount_web_view_over_video, rgb_from_rgba,
+        state, subtitle_label, NativePlayer,
     };
     use gtk::prelude::*;
     use std::sync::Arc;
@@ -1339,9 +1346,11 @@ mod tests {
 
     // A `GtkEntry` stands in for the WebView: the reparenting under test is
     // plain GTK container work, and an entry takes the keyboard the same way
-    // without needing a web process or a GL context.
+    // without needing a web process or a GL context. GTK binds itself to the
+    // first thread that initialises it and the test harness runs each test on
+    // its own thread, so every GTK check has to live in this one test.
     #[test]
-    fn keeps_the_keyboard_on_the_web_view_it_moves_into_the_overlay() {
+    fn leaves_keyboard_and_pointer_to_the_web_view_under_the_video() {
         gtk::init().expect("GTK needs a display to run this test.");
         let window = gtk::Window::new(gtk::WindowType::Toplevel);
         let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1352,11 +1361,20 @@ mod tests {
         web_view.grab_focus();
         assert!(web_view.is_focus(), "the web view starts with the keyboard");
 
-        mount_web_view_over_video(&vbox, web_view.upcast_ref(), &gtk::Overlay::new());
+        let overlay = gtk::Overlay::new();
+        mount_web_view_over_video(&vbox, web_view.upcast_ref(), &overlay);
 
         assert!(
             web_view.is_focus(),
             "the web view still holds the keyboard once it is inside the overlay"
+        );
+
+        let video_area = gtk::GLArea::new();
+        mount_video_over_web_view(&overlay, &video_area);
+
+        assert!(
+            overlay.is_overlay_pass_through(&video_area),
+            "the page under the video handles clicks on it, such as play and pause"
         );
     }
 
