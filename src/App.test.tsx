@@ -380,7 +380,7 @@ test("opens an add-on launch as an exact search result list", async () => {
 
   render(<App />);
 
-  expect(await screen.findByRole("searchbox")).toHaveValue("@sometiktoker");
+  expect(await screen.findByDisplayValue("@sometiktoker")).toBeVisible();
   expect(
     screen.getByRole("button", {
       name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
@@ -492,7 +492,7 @@ test("offers to refresh search results when the managed index advances", async (
   expect(refresh).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+R");
   expect(screen.getByText("New files are ready to search.")).toBeVisible();
   invokeMock.mockClear();
-  fireEvent.keyDown(window, { key: "r", ctrlKey: true, shiftKey: true });
+  await user.keyboard("{Control>}{Shift>}r{/Shift}{/Control}");
   await waitFor(() =>
     expect(invokeMock).toHaveBeenCalledWith("search_videos", {
       request: expect.objectContaining({ query: "clip", page: 1 }),
