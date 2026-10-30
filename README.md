@@ -53,6 +53,15 @@ years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Quoted relative v
 such as `modified:>"3 days ago"` and `created:>="1 week ago"` resolve once when
 the search starts. Dates use the file's local calendar date, not its time.
 
+## Add-ons
+
+While a video plays, press `Ctrl+Shift+A` to open actions supplied by add-ons.
+The bundled TikTok add-on recognizes names such as
+`2026-10-10_@sometiktoker_18938383490812348343.mp4`. Its creator action opens
+a new Toka window containing only that exact creator's videos, then opens the
+creator page in the default browser. The Add-ons control stays disabled when
+the current filename matches no action.
+
 ## Playlists
 
 Every page of results is a playlist: playing one video plays the rest after it,

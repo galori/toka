@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "tiktok",
+  "name": "TikTok",
+  "match": {
+    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?i:\\.mp4)$"
+  },
+  "actions": [
+    {
+      "id": "creator",
+      "label": "Open TikTok creator",
+      "steps": [
+        {
+          "type": "openRelatedSearch",
+          "capture": "handle",
+          "query": "{handle}",
+          "fields": ["fileName"],
+          "mediaType": "videos"
+        },
+        {
+          "type": "openUrl",
+          "url": "https://tiktok.com/{handle}"
+        }
+      ]
+    }
+  ]
+}
