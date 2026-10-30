@@ -345,35 +345,38 @@ test("leaves configured search folder setup with Escape", async () => {
 });
 
 test("opens an add-on launch as an exact search result list", async () => {
-  launchIntentMock.mockResolvedValue({
-    page: {
-      query: "@sometiktoker",
-      page: 1,
-      pageSize: 24,
-      totalResults: 2,
-      totalPages: 1,
-      results: [
-        {
-          id: "video-1",
-          fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
-          extension: "mp4",
-        },
-        {
-          id: "video-2",
-          fileName: "2026-10-11_@sometiktoker_18938383490812348344.mp4",
-          extension: "mp4",
-        },
-      ],
-    },
-    addonSearch: {
-      query: "@sometiktoker",
-      fields: { tags: false, fileName: true, path: false },
-      mediaType: "videos",
-      addonId: "tiktok",
-      capture: "handle",
-      value: "@sometiktoker",
-    },
-  });
+  const addonSearch = {
+    query: "@sometiktoker",
+    fields: { tags: false, fileName: true, path: false },
+    mediaType: "videos" as const,
+    addonId: "tiktok",
+    capture: "handle",
+    value: "@sometiktoker",
+  };
+  const page = {
+    query: "@sometiktoker",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      {
+        id: "video-1",
+        fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+        extension: "mp4",
+      },
+      {
+        id: "video-2",
+        fileName: "2026-10-11_@sometiktoker_18938383490812348344.mp4",
+        extension: "mp4",
+      },
+    ],
+  };
+  launchIntentMock.mockResolvedValue({ page, addonSearch });
+  invokeMock.mockImplementation((command: string) =>
+    command === "search_videos" ? Promise.resolve(page) : Promise.resolve(),
+  );
+  const user = userEvent.setup();
 
   render(<App />);
 
@@ -387,9 +390,22 @@ test("opens an add-on launch as an exact search result list", async () => {
   expect(
     screen.getByRole("button", { name: "Search filename" }),
   ).toHaveAttribute("aria-pressed", "true");
-  expect(screen.getByRole("button", { name: "Search tags" })).toHaveAttribute(
-    "aria-pressed",
-    "false",
+  const tags = screen.getByRole("button", { name: "Search tags" });
+  expect(tags).toHaveAttribute("aria-pressed", "false");
+
+  await user.click(tags);
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
+      request: {
+        query: "@sometiktoker",
+        page: 1,
+        pageSize: 24,
+        fields: { tags: true, fileName: true, path: false },
+        mediaType: "videos",
+      },
+      addonSearch,
+    }),
   );
 });
 
@@ -5324,12 +5340,11 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
   expect(addons.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+A");
   fireEvent.keyDown(window, { key: "a", ctrlKey: true, shiftKey: true });
 
-  expect(
-    await screen.findByRole("menu", { name: "Add-ons" }),
-  ).toHaveTextContent("New Toka window · tiktok.com");
-  await user.click(
-    screen.getByRole("menuitem", { name: /Open TikTok creator/ }),
-  );
+  const menu = await screen.findByRole("menu", { name: "Add-ons" });
+  expect(menu).toHaveTextContent("New Toka window · tiktok.com");
+  const action = screen.getByRole("menuitem", { name: /Open TikTok creator/ });
+  await waitFor(() => expect(action).toHaveFocus());
+  await user.keyboard("{Enter}");
   await waitFor(() =>
     expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
       resultId: "video-1",

@@ -2,6 +2,7 @@ import {
   ButtonHTMLAttributes,
   CSSProperties,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -1329,11 +1330,74 @@ function Player({
   const [addonOpen, setAddonOpen] = useState(false);
   const [addonBusy, setAddonBusy] = useState(false);
   const [addonError, setAddonError] = useState<string>();
+  const addonMenuWrap = useRef<HTMLDivElement>(null);
+  const addonMenuElement = useRef<HTMLDivElement>(null);
+  const addonVideoGeneration = useRef(0);
+  useLayoutEffect(() => {
+    addonVideoGeneration.current += 1;
+  }, [video.id]);
+  const focusAddonButton = useCallback(() => {
+    const button = addonMenuWrap.current?.firstElementChild;
+    if (button instanceof HTMLButtonElement) button.focus();
+  }, []);
+  const closeAddonMenu = useCallback(
+    (restoreFocus: boolean) => {
+      if (restoreFocus) focusAddonButton();
+      setAddonOpen(false);
+    },
+    [focusAddonButton],
+  );
+  useEffect(() => {
+    if (!addonOpen) return;
+    const menu = addonMenuElement.current;
+    const firstAction = menu?.querySelector<HTMLButtonElement>(
+      '[role="menuitem"]:not(:disabled)',
+    );
+    (firstAction ?? menu)?.focus();
+    const closeOutside = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !addonMenuWrap.current?.contains(event.target)
+      )
+        setAddonOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOutside);
+    return () => window.removeEventListener("pointerdown", closeOutside);
+  }, [addonOpen]);
+  const handleAddonMenuKeyDown = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeAddonMenu(true);
+      return;
+    }
+    const actions = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled)',
+      ),
+    );
+    if (!actions.length) return;
+    const current = actions.indexOf(
+      document.activeElement as HTMLButtonElement,
+    );
+    let next: number | undefined;
+    if (event.key === "ArrowDown") next = (current + 1) % actions.length;
+    else if (event.key === "ArrowUp")
+      next = (current - 1 + actions.length) % actions.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = actions.length - 1;
+    if (next === undefined) return;
+    event.preventDefault();
+    actions[next].focus();
+  };
   useEffect(() => {
     let active = true;
     setAddonMenu({ actions: [], errors: [] });
     setAddonLoading(true);
     setAddonOpen(false);
+    setAddonBusy(false);
     setAddonError(undefined);
     void matchingAddonActions(video.id)
       .then((menu) => {
@@ -1353,16 +1417,20 @@ function Player({
   const addonAvailable =
     addonMenu.actions.length > 0 || addonMenu.errors.length > 0;
   const runSelectedAddon = async (addonId: string, actionId: string) => {
+    const resultId = video.id;
+    const generation = addonVideoGeneration.current;
     setAddonBusy(true);
     setAddonError(undefined);
     try {
-      await runAddonAction(video.id, addonId, actionId);
+      await runAddonAction(resultId, addonId, actionId);
+      if (addonVideoGeneration.current !== generation) return;
       setAddonOpen(false);
       focusPlayerShell();
     } catch (reason) {
-      setAddonError(errorMessage(reason));
+      if (addonVideoGeneration.current === generation)
+        setAddonError(errorMessage(reason));
     } finally {
-      setAddonBusy(false);
+      if (addonVideoGeneration.current === generation) setAddonBusy(false);
     }
   };
   const isImage = isImageResult(video);
@@ -2432,11 +2500,11 @@ function Player({
       // focus itself, which the check above already returns on.
       if (addonShortcut) {
         if (!addonLoading && addonAvailable)
-          run(() => setAddonOpen((open) => !open));
+          run(() => (addonOpen ? closeAddonMenu(true) : setAddonOpen(true)));
         return;
       }
-      if (addonOpen && event.key === "Escape") {
-        run(() => setAddonOpen(false));
+      if (addonOpen) {
+        if (event.key === "Escape") run(() => closeAddonMenu(true));
         return;
       }
       if (addingTag || addingFolderTag) {
@@ -2515,6 +2583,7 @@ function Player({
     addonAvailable,
     addonLoading,
     addonOpen,
+    closeAddonMenu,
     currentTime,
     duration,
     fullscreen,
@@ -2648,19 +2717,28 @@ function Player({
         >
           <Label>New window</Label>
         </ControlButton>
-        <div className="addon-menu-wrap">
+        <div className="addon-menu-wrap" ref={addonMenuWrap}>
           <ControlButton
             shortcut="Ctrl+Shift+A"
             className="player-help-toggle"
             aria-label="Add-ons"
             aria-expanded={addonOpen}
             disabled={addonLoading || !addonAvailable}
-            onClick={() => setAddonOpen((open) => !open)}
+            onClick={() =>
+              addonOpen ? closeAddonMenu(false) : setAddonOpen(true)
+            }
           >
             <Label>Add-ons</Label>
           </ControlButton>
           {addonOpen ? (
-            <div className="addon-menu" role="menu" aria-label="Add-ons">
+            <div
+              className="addon-menu"
+              role="menu"
+              aria-label="Add-ons"
+              ref={addonMenuElement}
+              tabIndex={-1}
+              onKeyDown={handleAddonMenuKeyDown}
+            >
               {addonMenu.actions.map((action) => (
                 <button
                   type="button"
@@ -3590,13 +3668,15 @@ export default function App() {
   useEffect(() => {
     if (searchedFields.current === fields) return;
     searchedFields.current = fields;
-    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+    if (searchedQuery.current)
+      void runSearch(searchedQuery.current, 1, addonSearch);
   });
   const searchedMediaType = useRef(mediaType);
   useEffect(() => {
     if (searchedMediaType.current === mediaType) return;
     searchedMediaType.current = mediaType;
-    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+    if (searchedQuery.current)
+      void runSearch(searchedQuery.current, 1, addonSearch);
   });
 
   // Focus starts in the search field and is put back there on the way out of a
