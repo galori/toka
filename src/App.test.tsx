@@ -1343,6 +1343,80 @@ test("draws the tag's remove control as its own icon beside the name", async () 
   expect(pill.querySelector(".tag-remove-glyph")).toBeInTheDocument();
 });
 
+test("tags the playing video's folder from its control and Shift+T", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results: [
+        { id: "video-1", fileName: "clip-a.mp4", extension: "mp4" },
+        { id: "video-2", fileName: "clip-b.mp4", extension: "mp4" },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/Trip/clip-a.mp4" })
+    .mockResolvedValueOnce({
+      folderTags: ["beach"],
+      resultIds: ["video-1", "video-2"],
+    })
+    .mockResolvedValueOnce({ folderTags: [], resultIds: ["video-1"] });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-a.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip-a.mp4");
+
+  const control = screen.getByRole("button", {
+    name: "Tag folder of clip-a.mp4",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Shift+T");
+  expect(control.querySelector(".key-hint")).toBeInTheDocument();
+
+  // Shift+T opens the folder's field, not the video's own tag field.
+  fireEvent.keyDown(window, { key: "T", shiftKey: true });
+  const field = screen.getByRole("textbox", {
+    name: "Tag folder of clip-a.mp4",
+  });
+  expect(field).toHaveFocus();
+  expect(
+    screen.queryByRole("textbox", { name: "Add tag to clip-a.mp4" }),
+  ).toBeNull();
+  await user.keyboard("beach{Enter}");
+
+  expect(invokeMock).toHaveBeenCalledWith("add_folder_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+  const pill = await screen.findByRole("button", {
+    name: "Remove folder tag beach",
+  });
+  await user.click(pill);
+  expect(invokeMock).toHaveBeenCalledWith("remove_folder_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Remove folder tag beach" }),
+    ).toBeNull(),
+  );
+});
+
+test("lists folder tagging in the help pane", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(within(help).getByText("Tag the video's folder")).toBeVisible();
+  await user.keyboard("{Escape}");
+});
+
 test("gives the open tag field the keyboard and pauses for it", async () => {
   invokeMock
     .mockResolvedValueOnce({

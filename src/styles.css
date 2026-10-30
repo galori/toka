@@ -1130,6 +1130,13 @@ button:focus-visible {
   gap: 6px;
   padding-right: 6px;
 }
+/* The folder glyph marks a folder's tags apart from the video's own, at the
+   size of the text beside it rather than a transport button's icon. */
+.folder-tags .control-icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+}
 .player-controls .video-tags input {
   min-width: 80px;
   max-width: 120px;

@@ -44,11 +44,14 @@ import {
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
+  addFolderTags,
+  removeFolderTags,
   videoPreview,
   DEFAULT_SEARCH_FIELDS,
   DEFAULT_MEDIA_TYPE,
   type BulkTagUpdate,
   type ExternalPlayer,
+  type FolderTagUpdate,
   type MediaType,
   type PreparedVideo,
   type SearchFields,
@@ -435,6 +438,103 @@ function VideoTags({
         >
           <Label>+</Label>
         </button>
+      )}
+      {error ? (
+        <p className="tag-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+// What a retag changed about one result: its own name and tags, or the tags
+// of the folder it sits in.
+type TagChange = Partial<Pick<VideoResult, "fileName" | "tags" | "folderTags">>;
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 8.7v9.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" />
+    </svg>
+  );
+}
+
+// The folder's tags beside the video's own, marked with the folder glyph so the
+// two sets read apart. Tagging the folder renames it, which moves every video
+// inside, so the update names each result that changed rather than just this.
+function FolderTags({
+  video,
+  onChange,
+  adding,
+  onAddingChange,
+}: {
+  video: VideoResult;
+  onChange: (update: FolderTagUpdate) => void;
+  adding: boolean;
+  onAddingChange: (adding: boolean) => void;
+}) {
+  const field = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string>();
+  const tags = video.folderTags ?? [];
+  const label = `Tag folder of ${video.fileName}`;
+  useEffect(() => {
+    if (adding) field.current?.focus();
+  }, [adding]);
+  const save = async (update: Promise<FolderTagUpdate>) => {
+    try {
+      onChange(await update);
+      setError(undefined);
+    } catch (reason) {
+      setError(`Could not update folder tags: ${errorMessage(reason)}`);
+    }
+  };
+  const add = () => {
+    const tag = draft.trim();
+    setDraft("");
+    onAddingChange(false);
+    if (!tag || tags.includes(tag)) return;
+    void save(addFolderTags(video.id, [tag]));
+  };
+  return (
+    <div
+      className="video-tags folder-tags"
+      aria-label={`Folder tags for ${video.fileName}`}
+    >
+      {tags.map((tag) => (
+        <button
+          key={tag}
+          type="button"
+          className="tag-pill folder-tag-pill"
+          aria-label={`Remove folder tag ${tag}`}
+          onClick={() => void save(removeFolderTags(video.id, [tag]))}
+        >
+          <FolderIcon />
+          <span className="tag-name">{tag}</span>
+          <TagRemoveIcon />
+        </button>
+      ))}
+      {adding ? (
+        <input
+          ref={field}
+          aria-label={label}
+          value={draft}
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") add();
+            if (event.key === "Escape") onAddingChange(false);
+          }}
+        />
+      ) : (
+        <ControlButton
+          shortcut="Shift+T"
+          className="tag-add"
+          aria-label={label}
+          onClick={() => onAddingChange(true)}
+        >
+          <FolderIcon />
+        </ControlButton>
       )}
       {error ? (
         <p className="tag-error" role="alert">
@@ -868,6 +968,7 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
       { shortcut: "T", description: "Edit tags" },
+      { shortcut: "Shift+T", description: "Tag the video's folder" },
       {
         shortcut: "F",
         description: "Enter fullscreen, show controls, or exit",
@@ -1114,10 +1215,7 @@ function Player({
   onHelp: () => void;
   onNewWindow: () => void;
   helpOpen: boolean;
-  onTagsChange: (
-    videoId: string,
-    update: Pick<VideoResult, "fileName" | "tags">,
-  ) => void;
+  onTagsChange: (videoId: string, update: TagChange) => void;
 }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
@@ -1177,6 +1275,7 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
+  const [addingFolderTag, setAddingFolderTag] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
   const [cursorHidden, setCursorHidden] = useState(false);
@@ -1239,6 +1338,16 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
+  };
+  // Every video in the renamed folder carries its new tags, not just this one.
+  const updateFolderTags = ({ folderTags, resultIds }: FolderTagUpdate) => {
+    const moved = new Set(resultIds);
+    setPlaylist((current) =>
+      current.map((item) =>
+        moved.has(item.id) ? { ...item, folderTags } : item,
+      ),
+    );
+    for (const id of resultIds) onTagsChange(id, { folderTags });
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1509,7 +1618,7 @@ function Player({
   };
 
   // Typing a tag needs the viewer's attention, so the picture waits for them.
-  const openTagField = () => {
+  const openTagField = (folder = false) => {
     if (fullscreen && fullscreenModeRef.current !== "controls") {
       // The tag editor lives in the controls row. Fullscreen information mode
       // hides that row down to the scrubber, so opening the editor must reveal
@@ -1518,7 +1627,9 @@ function Player({
       setFullscreenMode("controls");
     }
     if (playingBack) pause();
-    setAddingTag(true);
+    // One field at a time: both claim every keystroke while open.
+    setAddingTag(!folder);
+    setAddingFolderTag(folder);
   };
 
   const restart = () => {
@@ -2166,8 +2277,12 @@ function Player({
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
       // focus itself, which the check above already returns on.
-      if (addingTag) {
-        if (event.key === "Escape") run(() => setAddingTag(false));
+      if (addingTag || addingFolderTag) {
+        if (event.key === "Escape")
+          run(() => {
+            setAddingTag(false);
+            setAddingFolderTag(false);
+          });
         return;
       }
       if (event.key === " " || event.key === "Spacebar") {
@@ -2207,6 +2322,8 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "c") {
         run(() => void copyPathRef.current());
+      } else if (event.key.toLowerCase() === "t" && event.shiftKey) {
+        run(() => openTagField(true));
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
       } else if (event.key.toLowerCase() === "s") {
@@ -2240,6 +2357,7 @@ function Player({
     nativeBaseRotation,
     onBack,
     addingTag,
+    addingFolderTag,
     playingBack,
     playlist.length,
     skipSeconds,
@@ -2585,6 +2703,14 @@ function Player({
                 adding={addingTag}
                 onAddingChange={(adding) =>
                   adding ? openTagField() : setAddingTag(false)
+                }
+              />
+              <FolderTags
+                video={video}
+                onChange={updateFolderTags}
+                adding={addingFolderTag}
+                onAddingChange={(adding) =>
+                  adding ? openTagField(true) : setAddingFolderTag(false)
                 }
               />
               {isImage ? (
@@ -3642,10 +3768,7 @@ export default function App() {
     void runSearch(query, 1);
   };
 
-  const updateTags = (
-    videoId: string,
-    update: Pick<VideoResult, "fileName" | "tags">,
-  ) => {
+  const updateTags = (videoId: string, update: TagChange) => {
     setPage((current) =>
       current
         ? {
