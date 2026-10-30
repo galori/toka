@@ -1,6 +1,8 @@
 mod external_players;
 #[cfg(target_os = "linux")]
 mod managed_index;
+#[allow(dead_code)]
+mod owned_index;
 #[cfg(target_os = "linux")]
 mod player_linux;
 mod playlist;
