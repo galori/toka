@@ -846,7 +846,10 @@ const HELP_SECTIONS: HelpSection[] = [
   {
     title: "Player",
     entries: [
-      { shortcut: "Space", description: "Play or pause video / slideshow" },
+      {
+        shortcut: "Space",
+        description: "Play or pause video / slideshow (or click the video)",
+      },
       {
         shortcut: "ArrowLeft ArrowRight",
         description: "Seek, or move between images",
@@ -1507,6 +1510,9 @@ function Player({
       setPlayingBack(false);
     }
   };
+
+  // A click on the picture does what the play button does, as in most players.
+  const togglePlayback = () => (playingBack ? pause() : play());
 
   // Typing a tag needs the viewer's attention, so the picture waits for them.
   const openTagField = () => {
@@ -2415,6 +2421,7 @@ function Player({
             ref={nativeSurface}
             className="native-video"
             aria-label={`Playing ${video.fileName}`}
+            onClick={togglePlayback}
           />
         ) : (
           <video
@@ -2443,6 +2450,7 @@ function Player({
               event.currentTarget.volume = volume / 100;
               play();
             }}
+            onClick={togglePlayback}
             onPlay={() => setPlayingBack(true)}
             onPause={() => setPlayingBack(false)}
             onTimeUpdate={(event) =>
