@@ -1,4 +1,6 @@
+mod addons;
 mod external_players;
+mod launch;
 #[cfg(target_os = "linux")]
 mod managed_index;
 #[allow(dead_code)]
@@ -18,11 +20,12 @@ use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
-use search_log::{SearchLogContext, SearchLogSettings, SearchLogger};
+use search_log::{SearchLogSettings, SearchLogger};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,9 +56,15 @@ struct DeletedVideo {
     trash_name: String,
 }
 
-/// The playlist file Toka was launched with, kept from the command line until
-/// the frontend is up to ask for it.
-struct LaunchPlaylist(Option<PathBuf>);
+/// What Toka was asked to open, kept until the frontend is ready for it.
+struct LaunchRequest(Result<launch::LaunchIntent, String>);
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LaunchResponse {
+    page: SearchPage,
+    addon_search: Option<addons::AddonSearchLaunch>,
+}
 
 #[derive(Serialize)]
 struct TagsError {
@@ -191,6 +200,76 @@ impl From<SearchError> for CommandError {
     }
 }
 
+fn addon_error(message: String) -> CommandError {
+    CommandError {
+        kind: "Addon",
+        message,
+    }
+}
+
+fn search_with_addon(
+    request: SearchRequest,
+    addon_search: &addons::AddonSearchLaunch,
+    engine: &SearchEngine,
+    registry: &addons::AddonRegistry,
+) -> Result<SearchPage, CommandError> {
+    registry
+        .validate_related_search(addon_search)
+        .map_err(addon_error)?;
+    engine
+        .search_filtered_for_addon(
+            request,
+            &addon_search.addon_id,
+            &addon_search.capture,
+            |path| {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                registry
+                    .matches_related_search(addon_search, &file_name)
+                    .unwrap_or(false)
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn match_count_with_addon(
+    request: SearchRequest,
+    addon_search: &addons::AddonSearchLaunch,
+    engine: &SearchEngine,
+    registry: &addons::AddonRegistry,
+) -> Result<usize, CommandError> {
+    registry
+        .validate_related_search(addon_search)
+        .map_err(addon_error)?;
+    engine
+        .match_count_filtered_for_addon(
+            request,
+            &addon_search.addon_id,
+            &addon_search.capture,
+            |path| {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                registry
+                    .matches_related_search(addon_search, &file_name)
+                    .unwrap_or(false)
+            },
+        )
+        .map_err(Into::into)
+}
+
+fn addon_search_page(
+    addon_search: addons::AddonSearchLaunch,
+    engine: &SearchEngine,
+    registry: &addons::AddonRegistry,
+) -> Result<SearchPage, CommandError> {
+    let request = SearchRequest {
+        query: addon_search.query.clone(),
+        page: 1,
+        page_size: search::PAGE_SIZE,
+        fields: addon_search.fields,
+        media_type: addon_search.media_type,
+    };
+    search_with_addon(request, &addon_search, engine, registry)
+}
+
 #[tauri::command]
 fn search_log_settings(logger: State<'_, Arc<SearchLogger>>) -> SearchLogSettings {
     logger.settings()
@@ -213,21 +292,24 @@ fn set_search_log_settings(
 #[tauri::command]
 async fn search_videos(
     request: SearchRequest,
+    addon_search: Option<addons::AddonSearchLaunch>,
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
+    registry: State<'_, Arc<addons::AddonRegistry>>,
 ) -> Result<SearchPage, CommandError> {
     let engine = Arc::clone(engine.inner());
-    tauri::async_runtime::spawn_blocking(move || engine.search(request))
-        .await
-        .map_err(|error| CommandError {
-            kind: "Provider",
-            message: format!("The search worker stopped unexpectedly: {error}"),
-        })?
-        .map_err(Into::into)
-        .and_then(|page| {
-            expose_cached_thumbnails(&app, &page)?;
-            Ok(page)
-        })
+    let registry = Arc::clone(registry.inner());
+    let page = tauri::async_runtime::spawn_blocking(move || match addon_search {
+        Some(addon_search) => search_with_addon(request, &addon_search, &engine, &registry),
+        None => engine.search(request).map_err(Into::into),
+    })
+    .await
+    .map_err(|error| CommandError {
+        kind: "Provider",
+        message: format!("The search worker stopped unexpectedly: {error}"),
+    })??;
+    expose_cached_thumbnails(&app, &page)?;
+    Ok(page)
 }
 
 /// Lets the webview load the thumbnails a page of results already carries.
@@ -251,16 +333,21 @@ fn expose_cached_thumbnails(app: &tauri::AppHandle, page: &SearchPage) -> Result
 #[tauri::command]
 async fn search_match_count(
     request: SearchRequest,
+    addon_search: Option<addons::AddonSearchLaunch>,
     engine: State<'_, Arc<SearchEngine>>,
+    registry: State<'_, Arc<addons::AddonRegistry>>,
 ) -> Result<usize, CommandError> {
     let engine = Arc::clone(engine.inner());
-    tauri::async_runtime::spawn_blocking(move || engine.match_count(request))
-        .await
-        .map_err(|error| CommandError {
-            kind: "Provider",
-            message: format!("The search worker stopped unexpectedly: {error}"),
-        })?
-        .map_err(Into::into)
+    let registry = Arc::clone(registry.inner());
+    tauri::async_runtime::spawn_blocking(move || match addon_search {
+        Some(addon_search) => match_count_with_addon(request, &addon_search, &engine, &registry),
+        None => engine.match_count(request).map_err(Into::into),
+    })
+    .await
+    .map_err(|error| CommandError {
+        kind: "Provider",
+        message: format!("The search worker stopped unexpectedly: {error}"),
+    })?
 }
 
 #[tauri::command]
@@ -387,30 +474,31 @@ fn trash_outcome(
     Ok(name)
 }
 
-/// The playlist — or single video, or folder — Toka was launched with, as a
-/// page of results to play, so it goes through the same player, drawer and
-/// controls a search's results do.
-///
-/// `toka summer.m3u8` opens that playlist, `toka clip.mp4` plays that one
-/// video, and `toka /Videos` plays every supported video and image under that folder and
-/// its subfolders, shuffled like any other playlist.
-///
-/// `None` is the ordinary case: Toka was started on its own and belongs on an
-/// empty search. A playlist, video or folder that cannot be read, and one with
-/// nothing left in it to play, come back as errors for the viewer to see
-/// instead.
+/// What Toka was launched with, ready for the normal player or search flow.
 #[tauri::command]
-fn launch_playlist(
-    launched: State<'_, LaunchPlaylist>,
+fn launch_intent(
+    launched: State<'_, LaunchRequest>,
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
-) -> Result<Option<SearchPage>, CommandError> {
-    let Some(path) = launched.0.as_deref() else {
-        return Ok(None);
+    registry: State<'_, Arc<addons::AddonRegistry>>,
+) -> Result<Option<LaunchResponse>, CommandError> {
+    let intent = launched.0.as_ref().map_err(|message| CommandError {
+        kind: "Launch",
+        message: message.clone(),
+    })?;
+    let response = match intent {
+        launch::LaunchIntent::Empty => return Ok(None),
+        launch::LaunchIntent::Media(path) => LaunchResponse {
+            page: launch_page(path, &engine)?,
+            addon_search: None,
+        },
+        launch::LaunchIntent::AddonSearch(addon_search) => LaunchResponse {
+            page: addon_search_page(addon_search.clone(), &engine, &registry)?,
+            addon_search: Some(addon_search.clone()),
+        },
     };
-    let page = launch_page(path, &engine)?;
-    expose_cached_thumbnails(&app, &page)?;
-    Ok(Some(page))
+    expose_cached_thumbnails(&app, &response.page)?;
+    Ok(Some(response))
 }
 
 fn launch_page(path: &std::path::Path, engine: &SearchEngine) -> Result<SearchPage, CommandError> {
@@ -495,6 +583,63 @@ fn open_in_external_player(
             message: format!("{player} could not be started: {error}"),
         })?;
     Ok(entries)
+}
+
+struct SystemActionHost {
+    app: tauri::AppHandle,
+    executable: PathBuf,
+}
+
+impl addons::ActionHost for SystemActionHost {
+    fn open_related_search(&mut self, search: addons::AddonSearchLaunch) -> Result<(), String> {
+        let encoded = serde_json::to_string(&search)
+            .map_err(|error| format!("The related search could not be prepared: {error}"))?;
+        std::process::Command::new(&self.executable)
+            .arg(launch::ADDON_SEARCH_FLAG)
+            .arg(encoded)
+            .spawn()
+            .map_err(|error| format!("Another Toka could not be started: {error}"))?;
+        Ok(())
+    }
+
+    fn open_url(&mut self, url: &url::Url) -> Result<(), String> {
+        self.app
+            .opener()
+            .open_url(url.as_str(), None::<&str>)
+            .map_err(|error| format!("{} could not be opened: {error}", url.as_str()))
+    }
+}
+
+#[tauri::command]
+fn matching_addon_actions(
+    result_id: String,
+    engine: State<'_, Arc<SearchEngine>>,
+    registry: State<'_, Arc<addons::AddonRegistry>>,
+) -> Result<addons::AddonMenu, CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    Ok(registry.matching_actions(&file_name))
+}
+
+#[tauri::command]
+fn run_addon_action(
+    result_id: String,
+    addon_id: String,
+    action_id: String,
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<SearchEngine>>,
+    registry: State<'_, Arc<addons::AddonRegistry>>,
+) -> Result<(), CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let executable = std::env::current_exe().map_err(|error| CommandError {
+        kind: "Addon",
+        message: format!("Toka could not find its own program: {error}"),
+    })?;
+    let mut host = SystemActionHost { app, executable };
+    registry
+        .run_action(&file_name, &addon_id, &action_id, &mut host)
+        .map_err(addon_error)
 }
 
 /// Starts another Toka. The desktop launcher raises the one already running
@@ -936,7 +1081,7 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
                 &self,
                 _query: &str,
                 _whole_path: bool,
-                _context: &SearchLogContext,
+                _context: &search_log::SearchLogContext,
             ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 let paths = std::env::var_os("TOKA_E2E_VIDEOS").ok_or_else(|| {
                     SearchError::Provider("The integration-test videos were not configured.".into())
@@ -975,7 +1120,7 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
                 &self,
                 _query: &str,
                 _whole_path: bool,
-                _context: &SearchLogContext,
+                _context: &search_log::SearchLogContext,
             ) -> Result<Vec<std::path::PathBuf>, SearchError> {
                 Err(SearchError::Provider(
                     "Toka currently supports video search on macOS and Linux.".into(),
@@ -995,7 +1140,7 @@ impl SearchProvider for InvalidProvider {
         &self,
         _query: &str,
         _whole_path: bool,
-        _context: &SearchLogContext,
+        _context: &search_log::SearchLogContext,
     ) -> Result<Vec<std::path::PathBuf>, SearchError> {
         Err(SearchError::Provider(self.0.clone()))
     }
@@ -1017,7 +1162,9 @@ pub fn run() {
     }
     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
     managed_index::ensure_indexer();
-    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init());
     #[cfg(feature = "e2e")]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
@@ -1025,7 +1172,10 @@ pub fn run() {
 
     // Read before the window exists, because the command line Toka was started
     // with is the whole of what it was asked to open.
-    let launched = LaunchPlaylist(playlist::from_arguments(std::env::args_os()));
+    let launched = LaunchRequest(launch::from_arguments(std::env::args_os()));
+    let user_addons =
+        dirs::config_dir().map(|directory| directory.join("app.toka.desktop").join("addons"));
+    let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
     let engine = Arc::new(SearchEngine::new_with_logger(
         platform_provider(logger.clone()),
@@ -1034,6 +1184,7 @@ pub fn run() {
     let builder = builder
         .manage(logger.clone())
         .manage(engine)
+        .manage(registry)
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
     #[cfg(target_os = "linux")]
@@ -1051,7 +1202,7 @@ pub fn run() {
             index_state,
             add_index_folder,
             remove_index_folder,
-            launch_playlist,
+            launch_intent,
             video_thumbnail,
             video_preview,
             delete_video,
@@ -1060,6 +1211,8 @@ pub fn run() {
             open_in_external_player,
             open_new_window,
             open_folder_in_new_window,
+            matching_addon_actions,
+            run_addon_action,
             set_video_tags,
             add_video_tags,
             remove_video_tags,
@@ -1083,7 +1236,7 @@ pub fn run() {
                 index_state,
                 add_index_folder,
                 remove_index_folder,
-                launch_playlist,
+                launch_intent,
                 video_thumbnail,
                 video_preview,
                 delete_video,
@@ -1092,6 +1245,8 @@ pub fn run() {
                 open_in_external_player,
                 open_new_window,
                 open_folder_in_new_window,
+                matching_addon_actions,
+                run_addon_action,
                 set_video_tags,
                 add_video_tags,
                 remove_video_tags,
@@ -1122,7 +1277,7 @@ pub fn run() {
         search_log_settings,
         set_search_log_settings,
         index_state,
-        launch_playlist,
+        launch_intent,
         video_thumbnail,
         video_preview,
         delete_video,
@@ -1131,6 +1286,8 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        matching_addon_actions,
+        run_addon_action,
         set_video_tags,
         add_video_tags,
         remove_video_tags,
@@ -1150,6 +1307,41 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn addon_launch_page_keeps_only_the_exact_creator() {
+        let directory = tempfile::tempdir().unwrap();
+        let exact = directory
+            .path()
+            .join("2026-10-10_@sam_18938383490812348343.mp4");
+        let similar = directory
+            .path()
+            .join("2026-10-10_@sammy_18938383490812348344.mp4");
+        std::fs::write(&exact, b"test").unwrap();
+        std::fs::write(&similar, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(vec![exact, similar])));
+        let registry = addons::AddonRegistry::system(None);
+        let search = addons::AddonSearchLaunch {
+            query: "@sam".into(),
+            fields: search::SearchFields {
+                tags: false,
+                file_name: true,
+                path: false,
+            },
+            media_type: search::MediaType::Videos,
+            addon_id: "tiktok".into(),
+            capture: "handle".into(),
+            value: "@sam".into(),
+        };
+
+        let page = addon_search_page(search, &engine, &registry).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(
+            page.results[0].file_name,
+            "2026-10-10_@sam_18938383490812348343.mp4"
+        );
+    }
 
     #[cfg(all(target_os = "linux", feature = "e2e"))]
     #[test]
@@ -1215,7 +1407,7 @@ mod tests {
             &self,
             _query: &str,
             _whole_path: bool,
-            _context: &SearchLogContext,
+            _context: &search_log::SearchLogContext,
         ) -> Result<Vec<PathBuf>, SearchError> {
             Ok(self.0.clone())
         }

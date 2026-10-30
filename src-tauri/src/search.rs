@@ -174,8 +174,38 @@ impl SearchEngine {
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
+        self.search_filtered(request, |_| true)
+    }
+
+    pub fn search_filtered(
+        &self,
+        request: SearchRequest,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
         let context = self.logger.context(&request, true);
-        let result = self.search_page(request, &context);
+        self.search_filtered_with_context(request, context, filter)
+    }
+
+    pub fn search_filtered_for_addon(
+        &self,
+        request: SearchRequest,
+        addon_id: &str,
+        addon_capture: &str,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
+        let context = self
+            .logger
+            .context_for_addon(&request, true, addon_id, addon_capture);
+        self.search_filtered_with_context(request, context, filter)
+    }
+
+    fn search_filtered_with_context(
+        &self,
+        request: SearchRequest,
+        context: SearchLogContext,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
+        let result = self.search_page(request, &context, &filter);
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
         }
@@ -186,8 +216,9 @@ impl SearchEngine {
         &self,
         request: SearchRequest,
         context: &SearchLogContext,
+        filter: &dyn Fn(&Path) -> bool,
     ) -> Result<SearchPage, SearchError> {
-        let (query, mut paths) = self.matching_paths(&request, context)?;
+        let (query, mut paths) = self.matching_paths(&request, context, filter)?;
         let fields = request.fields;
         let media_type = request.media_type;
 
@@ -241,9 +272,39 @@ impl SearchEngine {
     /// Answers whether a query's match count changed without creating result
     /// ids or replacing the shuffle used by the visible result pages.
     pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
+        self.match_count_filtered(request, |_| true)
+    }
+
+    pub fn match_count_filtered(
+        &self,
+        request: SearchRequest,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
         let context = self.logger.context(&request, false);
+        self.match_count_filtered_with_context(request, context, filter)
+    }
+
+    pub fn match_count_filtered_for_addon(
+        &self,
+        request: SearchRequest,
+        addon_id: &str,
+        addon_capture: &str,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
+        let context = self
+            .logger
+            .context_for_addon(&request, false, addon_id, addon_capture);
+        self.match_count_filtered_with_context(request, context, filter)
+    }
+
+    fn match_count_filtered_with_context(
+        &self,
+        request: SearchRequest,
+        context: SearchLogContext,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
         let result = self
-            .matching_paths(&request, &context)
+            .matching_paths(&request, &context, &filter)
             .map(|(_, paths)| paths.len());
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
@@ -255,6 +316,7 @@ impl SearchEngine {
         &self,
         request: &SearchRequest,
         context: &SearchLogContext,
+        filter: &dyn Fn(&Path) -> bool,
     ) -> Result<(String, Vec<PathBuf>), SearchError> {
         let query = request.query.trim();
         let expression = parse_query(query)?;
@@ -281,6 +343,11 @@ impl SearchEngine {
             if !matches_query(&path, &expression, request.fields) {
                 self.logger
                     .record_filtered(context, &path, "query did not match");
+                continue;
+            }
+            if !filter(&path) {
+                self.logger
+                    .record_filtered(context, &path, "add-on filter did not match");
                 continue;
             }
             if !seen.insert(path.clone()) {
@@ -1297,6 +1364,23 @@ mod tests {
     }
 
     #[test]
+    fn records_addon_identity_with_filtered_search_errors() {
+        let directory = tempdir().unwrap();
+        let log_path = directory.path().join("search.log");
+        let logger = Arc::new(SearchLogger::new(log_path.clone()));
+        let engine = SearchEngine::new_with_logger(Arc::new(ErrorProvider), logger);
+
+        engine
+            .search_filtered_for_addon(request("@sam"), "tiktok", "handle", |_| true)
+            .unwrap_err();
+
+        let line = fs::read_to_string(log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["addonId"], "tiktok");
+        assert_eq!(entry["addonCapture"], "handle");
+    }
+
+    #[test]
     fn search_returns_only_supported_files_containing_every_term() {
         let directory = tempdir().unwrap();
         let matching = directory.path().join("Summer Family Vacation.MP4");
@@ -1319,6 +1403,44 @@ mod tests {
         assert_eq!(page.results[0].file_name, "Summer Family Vacation.MP4");
         assert_eq!(page.results[0].extension, "mp4");
         assert!(!page.results[0].id.is_empty());
+    }
+
+    #[test]
+    fn an_addon_filter_runs_before_shuffle_and_paging() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for number in 0..30 {
+            for handle in ["@sam", "@sammy"] {
+                let path = directory
+                    .path()
+                    .join(format!("2026-10-10_{handle}_{number:020}.mp4"));
+                fs::write(&path, b"test").unwrap();
+                paths.push(path);
+            }
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let mut search = request("@sam");
+        search.fields = SearchFields {
+            tags: false,
+            file_name: true,
+            path: false,
+        };
+
+        let page = engine
+            .search_filtered(search, |path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("_@sam_"))
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 30);
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.results.len(), PAGE_SIZE);
+        assert!(page
+            .results
+            .iter()
+            .all(|result| result.file_name.contains("_@sam_")));
     }
 
     #[test]
