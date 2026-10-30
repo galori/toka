@@ -68,6 +68,15 @@ struct VideoTagUpdate {
     tags: Vec<String>,
 }
 
+/// What tagging a video's folder did: the folder's tags now, and every result
+/// the engine knows in that folder, since renaming it moved all of them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderTagUpdate {
+    folder_tags: Vec<String>,
+    result_ids: Vec<String>,
+}
+
 /// One video out of a page that was tagged in a single go, under the id the
 /// frontend knows it by — tagging renames the file, so the caller cannot match
 /// these up by name afterwards.
@@ -655,6 +664,56 @@ fn update_video_tags(
 }
 
 #[tauri::command]
+fn add_folder_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<FolderTagUpdate, TagsError> {
+    update_folder_tags(&result_id, &tags, &engine, tags::add)
+}
+
+#[tauri::command]
+fn remove_folder_tags(
+    result_id: String,
+    tags: Vec<String>,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<FolderTagUpdate, TagsError> {
+    update_folder_tags(&result_id, &tags, &engine, tags::remove)
+}
+
+/// Retags the folder the video behind `result_id` sits in. That renames the
+/// folder, so the engine follows every result it knows inside it.
+fn update_folder_tags(
+    result_id: &str,
+    tags: &[String],
+    engine: &SearchEngine,
+    operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
+) -> Result<FolderTagUpdate, TagsError> {
+    let path = engine.video_path(result_id).map_err(|error| TagsError {
+        kind: "VideoUnavailable",
+        message: error.to_string(),
+    })?;
+    // A video at the top of the filesystem has no folder a name can carry.
+    let folder = path
+        .parent()
+        .filter(|folder| folder.parent().is_some())
+        .ok_or_else(|| TagsError {
+            kind: "Tags",
+            message: "That video's folder cannot be tagged.".into(),
+        })?;
+    let update = operation(folder, tags).map_err(|message| TagsError {
+        kind: "Tags",
+        message,
+    })?;
+    let mut result_ids = engine.rename_folder(folder, update.path);
+    result_ids.sort();
+    Ok(FolderTagUpdate {
+        folder_tags: update.tags,
+        result_ids,
+    })
+}
+
+#[tauri::command]
 fn prepare_video(
     result_id: String,
     app: tauri::AppHandle,
@@ -975,6 +1034,8 @@ pub fn run() {
             add_video_tags,
             remove_video_tags,
             add_tags_to_videos,
+            add_folder_tags,
+            remove_folder_tags,
             prepare_video,
             subtitle_cues
         ])
@@ -1004,6 +1065,8 @@ pub fn run() {
                 add_video_tags,
                 remove_video_tags,
                 add_tags_to_videos,
+                add_folder_tags,
+                remove_folder_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -1040,6 +1103,8 @@ pub fn run() {
         add_video_tags,
         remove_video_tags,
         add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
         prepare_video,
         subtitle_cues
     ]);
