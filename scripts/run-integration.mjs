@@ -29,6 +29,7 @@ const environment = {
   CARGO_TARGET_DIR: cargoTargetDirectory,
   TOKA_E2E_FIXTURE_SERVER_PORT: fixturePort,
   TOKA_E2E_BINARY: resolve(cargoTargetDirectory, "debug", "toka"),
+  TOKA_E2E_FIXTURE_RUN_ID: fixturePort,
   VITE_E2E_FIXTURE_SERVER_PORT: fixturePort,
 };
 const wdio = resolve("node_modules/.bin/wdio");

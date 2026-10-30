@@ -6,10 +6,15 @@ import {
   stopFixtureServer,
 } from "./test/integration/fixture-server";
 
+const fixtureRunId =
+  process.env.TOKA_E2E_FIXTURE_RUN_ID ??
+  process.env.TOKA_E2E_FIXTURE_SERVER_PORT ??
+  String(process.pid);
+process.env.TOKA_E2E_FIXTURE_RUN_ID = fixtureRunId;
 const generatedFixtureDirectory = resolve(
   "src-tauri",
   "target",
-  `e2e-addon-fixtures-${process.env.TOKA_E2E_FIXTURE_SERVER_PORT ?? process.pid}`,
+  `e2e-addon-fixtures-${fixtureRunId}`,
 );
 mkdirSync(generatedFixtureDirectory, { recursive: true });
 const addonFixtureNames = [
