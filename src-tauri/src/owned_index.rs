@@ -1,5 +1,16 @@
-use rusqlite::Connection;
-use std::{fs, path::Path, time::Duration};
+use crate::{
+    search::{is_supported_image, is_supported_video},
+    tags,
+};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::Serialize;
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -139,10 +150,152 @@ pub(crate) enum OwnedIndexError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Toka could not fully scan {path}: {failures} path read failed.")]
+    IncompleteScan { path: String, failures: u64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ScanPhase {
+    Scanning,
+    Ready,
+    Error,
+}
+
+impl ScanPhase {
+    fn from_database(value: &str) -> Result<Self, rusqlite::Error> {
+        match value {
+            "scanning" => Ok(Self::Scanning),
+            "ready" => Ok(Self::Ready),
+            "error" => Ok(Self::Error),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
+
+    fn as_database(self) -> &'static str {
+        match self {
+            Self::Scanning => "scanning",
+            Self::Ready => "ready",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScanProgress {
+    pub root_id: String,
+    pub phase: ScanPhase,
+    pub folders_discovered: u64,
+    pub folders_scanned: u64,
+    pub files_discovered: u64,
+    pub files_indexed: u64,
+    pub videos_indexed: u64,
+    pub images_indexed: u64,
+    pub skipped_paths: u64,
+    pub read_failures: u64,
+    pub current_folder: Option<PathBuf>,
+    pub current_file: Option<PathBuf>,
+    pub started_at_ns: i64,
+    pub updated_at_ns: i64,
+    pub scan_rate: f64,
+    pub error: Option<String>,
+}
+
+impl ScanProgress {
+    fn new(root_id: &str) -> Self {
+        let now = now_ns();
+        Self {
+            root_id: root_id.to_owned(),
+            phase: ScanPhase::Scanning,
+            folders_discovered: 1,
+            folders_scanned: 0,
+            files_discovered: 0,
+            files_indexed: 0,
+            videos_indexed: 0,
+            images_indexed: 0,
+            skipped_paths: 0,
+            read_failures: 0,
+            current_folder: None,
+            current_file: None,
+            started_at_ns: now,
+            updated_at_ns: now,
+            scan_rate: 0.0,
+            error: None,
+        }
+    }
+
+    fn touch(&mut self) {
+        self.updated_at_ns = now_ns();
+        let elapsed_ns = self.updated_at_ns.saturating_sub(self.started_at_ns).max(1);
+        self.scan_rate = self.files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64;
+    }
+}
+
+struct IndexedFile {
+    path: PathBuf,
+    path_bytes: Vec<u8>,
+    file_name_bytes: Vec<u8>,
+    extension: String,
+    media_type: &'static str,
+    size_bytes: i64,
+    created_at_ns: Option<i64>,
+    modified_at_ns: i64,
+    file_name_search: String,
+    tags_search: String,
+    folders_search: String,
+}
+
+impl IndexedFile {
+    fn read(path: PathBuf, metadata: fs::Metadata) -> Option<Self> {
+        let media_type = if is_supported_video(&path) {
+            "video"
+        } else if is_supported_image(&path) {
+            "image"
+        } else {
+            return None;
+        };
+        let size_bytes = i64::try_from(metadata.len()).ok()?;
+        if size_bytes == 0 {
+            return None;
+        }
+        let modified_at_ns = metadata.modified().ok().and_then(time_ns)?;
+        let file_name = path.file_name()?.to_os_string();
+        let display_name = file_name.to_string_lossy();
+        let parsed_tags = tags::Tags::parse_file_name(&display_name);
+        let file_name_search = tags::Tags::default()
+            .apply_to_file(&display_name)
+            .to_lowercase();
+        let tags_search = parsed_tags.into_values().join(" ").to_lowercase();
+        let folders_search = path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_string_lossy()
+            .to_lowercase();
+
+        Some(Self {
+            path_bytes: path_bytes(&path),
+            file_name_bytes: os_string_bytes(file_name),
+            extension: path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase(),
+            media_type,
+            size_bytes,
+            created_at_ns: metadata.created().ok().and_then(time_ns),
+            modified_at_ns,
+            file_name_search,
+            tags_search,
+            folders_search,
+            path,
+        })
+    }
 }
 
 pub(crate) struct OwnedIndex {
     connection: Connection,
+    path: PathBuf,
 }
 
 impl OwnedIndex {
@@ -176,8 +329,497 @@ impl OwnedIndex {
             other => return Err(OwnedIndexError::UnsupportedSchema(other)),
         }
 
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+        })
     }
+
+    pub(crate) fn scan_root<F>(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        on_progress: F,
+    ) -> Result<ScanProgress, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress),
+    {
+        self.scan_root_in_batches(root_id, root, 128, on_progress)
+    }
+
+    #[cfg(test)]
+    fn scan_root_with_batch_size<F>(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        batch_size: usize,
+        on_progress: F,
+    ) -> Result<ScanProgress, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress),
+    {
+        self.scan_root_in_batches(root_id, root, batch_size.max(1), on_progress)
+    }
+
+    fn scan_root_in_batches<F>(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        batch_size: usize,
+        mut on_progress: F,
+    ) -> Result<ScanProgress, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress),
+    {
+        let (generation, mut progress) = self.begin_scan(root_id, root)?;
+        on_progress(&progress);
+        let mut pending = VecDeque::from([root.to_path_buf()]);
+        let mut batch = Vec::with_capacity(batch_size);
+
+        while let Some(directory) = pending.pop_front() {
+            progress.current_folder = Some(directory.clone());
+            progress.current_file = None;
+            progress.touch();
+            on_progress(&progress);
+
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    progress.read_failures = progress.read_failures.saturating_add(1);
+                    progress.touch();
+                    on_progress(&progress);
+                    continue;
+                }
+            };
+            progress.folders_scanned = progress.folders_scanned.saturating_add(1);
+
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        progress.read_failures = progress.read_failures.saturating_add(1);
+                        progress.touch();
+                        on_progress(&progress);
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => {
+                        progress.read_failures = progress.read_failures.saturating_add(1);
+                        progress.current_file = Some(path);
+                        progress.touch();
+                        on_progress(&progress);
+                        continue;
+                    }
+                };
+                if file_type.is_dir() {
+                    progress.folders_discovered = progress.folders_discovered.saturating_add(1);
+                    pending.push_back(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    progress.skipped_paths = progress.skipped_paths.saturating_add(1);
+                    progress.current_file = Some(path);
+                    progress.touch();
+                    on_progress(&progress);
+                    continue;
+                }
+
+                progress.files_discovered = progress.files_discovered.saturating_add(1);
+                progress.current_file = Some(path.clone());
+                progress.touch();
+                on_progress(&progress);
+                if self.is_own_index_path(&path)
+                    || (!is_supported_video(&path) && !is_supported_image(&path))
+                {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        progress.read_failures = progress.read_failures.saturating_add(1);
+                        progress.touch();
+                        on_progress(&progress);
+                        continue;
+                    }
+                };
+                if metadata.len() == 0 {
+                    progress.skipped_paths = progress.skipped_paths.saturating_add(1);
+                    progress.touch();
+                    on_progress(&progress);
+                    continue;
+                }
+                let Some(file) = IndexedFile::read(path, metadata) else {
+                    progress.read_failures = progress.read_failures.saturating_add(1);
+                    progress.touch();
+                    on_progress(&progress);
+                    continue;
+                };
+                batch.push(file);
+                if batch.len() >= batch_size {
+                    self.commit_batch(root_id, generation, &mut batch, &mut progress)?;
+                    on_progress(&progress);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            self.commit_batch(root_id, generation, &mut batch, &mut progress)?;
+            on_progress(&progress);
+        }
+
+        if progress.read_failures > 0 {
+            let error = OwnedIndexError::IncompleteScan {
+                path: root.display().to_string(),
+                failures: progress.read_failures,
+            };
+            self.finish_failed_scan(&mut progress, &error.to_string())?;
+            on_progress(&progress);
+            return Err(error);
+        }
+
+        self.finish_successful_scan(generation, &mut progress)?;
+        on_progress(&progress);
+        Ok(progress)
+    }
+
+    fn begin_scan(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+    ) -> Result<(i64, ScanProgress), OwnedIndexError> {
+        let progress = ScanProgress::new(root_id);
+        let root_bytes = path_bytes(root);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO roots (
+                id, path, display_path, state, scan_generation,
+                created_at_ns, updated_at_ns
+             ) VALUES (?1, ?2, ?3, 'scanning', 1, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                display_path = excluded.display_path,
+                state = 'scanning',
+                scan_generation = roots.scan_generation + 1,
+                updated_at_ns = excluded.updated_at_ns",
+            params![
+                root_id,
+                root_bytes,
+                root.to_string_lossy(),
+                progress.started_at_ns
+            ],
+        )?;
+        let generation = transaction.query_row(
+            "SELECT scan_generation FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO scan_runs (
+                root_id, generation, state, folders_discovered,
+                started_at_ns, updated_at_ns
+             ) VALUES (?1, ?2, 'scanning', 1, ?3, ?3)",
+            params![root_id, generation, progress.started_at_ns],
+        )?;
+        transaction.commit()?;
+        Ok((generation, progress))
+    }
+
+    fn commit_batch(
+        &mut self,
+        root_id: &str,
+        generation: i64,
+        batch: &mut Vec<IndexedFile>,
+        progress: &mut ScanProgress,
+    ) -> Result<(), OwnedIndexError> {
+        let transaction = self.connection.transaction()?;
+        let mut videos = 0u64;
+        let mut images = 0u64;
+        for file in batch.drain(..) {
+            transaction.execute(
+                "INSERT INTO files (
+                    path, display_path, file_name, extension, media_type,
+                    size_bytes, created_at_ns, modified_at_ns,
+                    file_name_search, tags_search, folders_search
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(path) DO UPDATE SET
+                    display_path = excluded.display_path,
+                    file_name = excluded.file_name,
+                    extension = excluded.extension,
+                    media_type = excluded.media_type,
+                    size_bytes = excluded.size_bytes,
+                    created_at_ns = excluded.created_at_ns,
+                    modified_at_ns = excluded.modified_at_ns,
+                    file_name_search = excluded.file_name_search,
+                    tags_search = excluded.tags_search,
+                    folders_search = excluded.folders_search",
+                params![
+                    file.path_bytes,
+                    file.path.to_string_lossy(),
+                    file.file_name_bytes,
+                    file.extension,
+                    file.media_type,
+                    file.size_bytes,
+                    file.created_at_ns,
+                    file.modified_at_ns,
+                    file.file_name_search,
+                    file.tags_search,
+                    file.folders_search,
+                ],
+            )?;
+            let file_id: i64 = transaction.query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                [file.path_bytes],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO root_files (root_id, file_id, scan_generation)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(root_id, file_id) DO UPDATE SET
+                    scan_generation = excluded.scan_generation",
+                params![root_id, file_id, generation],
+            )?;
+            if file.media_type == "video" {
+                videos = videos.saturating_add(1);
+            } else {
+                images = images.saturating_add(1);
+            }
+        }
+        progress.files_indexed = progress
+            .files_indexed
+            .saturating_add(videos.saturating_add(images));
+        progress.videos_indexed = progress.videos_indexed.saturating_add(videos);
+        progress.images_indexed = progress.images_indexed.saturating_add(images);
+        progress.touch();
+        persist_progress(&transaction, progress)?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finish_failed_scan(
+        &mut self,
+        progress: &mut ScanProgress,
+        message: &str,
+    ) -> Result<(), OwnedIndexError> {
+        progress.phase = ScanPhase::Error;
+        progress.current_folder = None;
+        progress.current_file = None;
+        progress.error = Some(message.to_owned());
+        progress.touch();
+        let transaction = self.connection.transaction()?;
+        persist_progress(&transaction, progress)?;
+        transaction.execute(
+            "UPDATE roots SET state = 'error', updated_at_ns = ?2 WHERE id = ?1",
+            params![progress.root_id, progress.updated_at_ns],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn finish_successful_scan(
+        &mut self,
+        generation: i64,
+        progress: &mut ScanProgress,
+    ) -> Result<(), OwnedIndexError> {
+        progress.phase = ScanPhase::Ready;
+        progress.current_folder = None;
+        progress.current_file = None;
+        progress.error = None;
+        progress.touch();
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM root_files
+             WHERE root_id = ?1 AND scan_generation != ?2",
+            params![progress.root_id, generation],
+        )?;
+        transaction.execute(
+            "DELETE FROM files
+             WHERE NOT EXISTS (
+                SELECT 1 FROM root_files WHERE root_files.file_id = files.id
+             )",
+            [],
+        )?;
+        persist_progress(&transaction, progress)?;
+        transaction.execute(
+            "UPDATE roots SET state = 'ready', updated_at_ns = ?2 WHERE id = ?1",
+            params![progress.root_id, progress.updated_at_ns],
+        )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn scan_progress(
+        &self,
+        root_id: &str,
+    ) -> Result<Option<ScanProgress>, OwnedIndexError> {
+        self.connection
+            .query_row(
+                "SELECT root_id, state,
+                    folders_discovered, folders_scanned,
+                    files_discovered, files_indexed,
+                    videos_indexed, images_indexed,
+                    skipped_paths, read_failures,
+                    current_folder, current_file,
+                    started_at_ns, updated_at_ns, error
+                 FROM scan_runs
+                 WHERE root_id = ?1
+                 ORDER BY generation DESC
+                 LIMIT 1",
+                [root_id],
+                |row| {
+                    let phase = ScanPhase::from_database(&row.get::<_, String>(1)?)?;
+                    let started_at_ns: i64 = row.get(12)?;
+                    let updated_at_ns: i64 = row.get(13)?;
+                    let files_indexed = row.get::<_, i64>(5)? as u64;
+                    let elapsed_ns = updated_at_ns.saturating_sub(started_at_ns).max(1);
+                    Ok(ScanProgress {
+                        root_id: row.get(0)?,
+                        phase,
+                        folders_discovered: row.get::<_, i64>(2)? as u64,
+                        folders_scanned: row.get::<_, i64>(3)? as u64,
+                        files_discovered: row.get::<_, i64>(4)? as u64,
+                        files_indexed,
+                        videos_indexed: row.get::<_, i64>(6)? as u64,
+                        images_indexed: row.get::<_, i64>(7)? as u64,
+                        skipped_paths: row.get::<_, i64>(8)? as u64,
+                        read_failures: row.get::<_, i64>(9)? as u64,
+                        current_folder: row.get::<_, Option<Vec<u8>>>(10)?.map(path_from_bytes),
+                        current_file: row.get::<_, Option<Vec<u8>>>(11)?.map(path_from_bytes),
+                        started_at_ns,
+                        updated_at_ns,
+                        scan_rate: files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+                        error: row.get(14)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(OwnedIndexError::from)
+    }
+
+    fn is_own_index_path(&self, path: &Path) -> bool {
+        if path == self.path {
+            return true;
+        }
+        ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| {
+                let mut value = self.path.as_os_str().to_os_string();
+                value.push(suffix);
+                PathBuf::from(value)
+            })
+            .any(|owned| path == owned)
+    }
+}
+
+fn persist_progress(
+    transaction: &Transaction<'_>,
+    progress: &ScanProgress,
+) -> Result<(), rusqlite::Error> {
+    let current_folder = progress.current_folder.as_deref().map(path_bytes);
+    let current_file = progress.current_file.as_deref().map(path_bytes);
+    let finished_at_ns = (progress.phase != ScanPhase::Scanning).then_some(progress.updated_at_ns);
+    transaction.execute(
+        "UPDATE scan_runs SET
+            state = ?2,
+            folders_discovered = ?3,
+            folders_scanned = ?4,
+            files_discovered = ?5,
+            files_indexed = ?6,
+            videos_indexed = ?7,
+            images_indexed = ?8,
+            skipped_paths = ?9,
+            read_failures = ?10,
+            current_folder = ?11,
+            current_file = ?12,
+            updated_at_ns = ?13,
+            finished_at_ns = ?14,
+            error = ?15
+         WHERE root_id = ?1
+           AND generation = (
+                SELECT scan_generation FROM roots WHERE id = ?1
+           )",
+        params![
+            progress.root_id,
+            progress.phase.as_database(),
+            database_count(progress.folders_discovered),
+            database_count(progress.folders_scanned),
+            database_count(progress.files_discovered),
+            database_count(progress.files_indexed),
+            database_count(progress.videos_indexed),
+            database_count(progress.images_indexed),
+            database_count(progress.skipped_paths),
+            database_count(progress.read_failures),
+            current_folder,
+            current_file,
+            progress.updated_at_ns,
+            finished_at_ns,
+            progress.error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn database_count(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn now_ns() -> i64 {
+    time_ns(SystemTime::now()).unwrap_or_default()
+}
+
+fn time_ns(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
+        Err(error) => i64::try_from(error.duration().as_nanos())
+            .ok()
+            .and_then(i64::checked_neg),
+    }
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    use std::os::unix::ffi::OsStringExt;
+
+    value.into_vec()
+}
+
+#[cfg(not(unix))]
+fn os_string_bytes(value: OsString) -> Vec<u8> {
+    value.to_string_lossy().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn path_from_bytes(value: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(value))
+}
+
+#[cfg(not(unix))]
+fn path_from_bytes(value: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&value).into_owned())
 }
 
 #[cfg(unix)]
@@ -432,6 +1074,210 @@ mod tests {
                 .unwrap();
             assert_eq!(matches, 1, "query: {query}");
         }
+    }
+
+    #[test]
+    fn an_initial_scan_indexes_media_and_reports_detailed_progress() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("Family Archive");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Trip [home holiday].JPG"), b"photo").unwrap();
+        std::fs::write(nested.join("Clip.mp4"), b"video").unwrap();
+        std::fs::write(nested.join("notes.txt"), b"text").unwrap();
+        std::fs::File::create(nested.join("empty.mov")).unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        let mut updates = Vec::new();
+
+        let finished = index
+            .scan_root("root", &root, |progress| updates.push(progress.clone()))
+            .unwrap();
+
+        assert_eq!(finished.phase, ScanPhase::Ready);
+        assert_eq!(finished.folders_discovered, 2);
+        assert_eq!(finished.folders_scanned, 2);
+        assert_eq!(finished.files_discovered, 4);
+        assert_eq!(finished.files_indexed, 2);
+        assert_eq!(finished.videos_indexed, 1);
+        assert_eq!(finished.images_indexed, 1);
+        assert_eq!(finished.skipped_paths, 1);
+        assert_eq!(finished.read_failures, 0);
+        assert!(finished.scan_rate > 0.0);
+        assert!(finished.current_folder.is_none());
+        assert!(finished.current_file.is_none());
+        assert!(updates.iter().any(|progress| {
+            progress.phase == ScanPhase::Scanning
+                && progress.current_folder.as_deref() == Some(nested.as_path())
+        }));
+        assert!(updates.iter().any(|progress| {
+            progress.phase == ScanPhase::Scanning
+                && progress.current_file.as_deref() == Some(nested.join("Clip.mp4").as_path())
+        }));
+
+        let stored = index.scan_progress("root").unwrap().unwrap();
+        assert_eq!(stored.phase, ScanPhase::Ready);
+        assert_eq!(stored.files_indexed, 2);
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([
+                nested.join("Clip.mp4").to_string_lossy().into_owned(),
+                nested
+                    .join("Trip [home holiday].JPG")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+        );
+        let tags: String = index
+            .connection
+            .query_row(
+                "SELECT tags_search FROM files WHERE extension = 'jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, "holiday home");
+    }
+
+    #[test]
+    fn scan_batches_are_searchable_before_the_scan_finishes() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("first.mp4"), b"one").unwrap();
+        std::fs::write(root.join("second.mp4"), b"two").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut scanner = OwnedIndex::open(&database).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let mut partial_count = None;
+
+        scanner
+            .scan_root_with_batch_size("root", &root, 1, |progress| {
+                if progress.phase == ScanPhase::Scanning && progress.files_indexed == 1 {
+                    partial_count = Some(search_match_count(&observer, "mp4"));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(partial_count, Some(1));
+        assert_eq!(search_match_count(&observer, "mp4"), 2);
+    }
+
+    #[test]
+    fn a_successful_rescan_removes_files_unseen_in_its_generation() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let kept = root.join("kept.mp4");
+        let removed = root.join("removed.mp4");
+        std::fs::write(&kept, b"keep").unwrap();
+        std::fs::write(&removed, b"remove").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        std::fs::remove_file(removed).unwrap();
+
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([kept.to_string_lossy().into_owned()])
+        );
+        let generation: i64 = index
+            .connection
+            .query_row(
+                "SELECT scan_generation FROM roots WHERE id = 'root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 2);
+    }
+
+    #[test]
+    fn a_failed_rescan_keeps_the_last_complete_memberships() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"clip").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert!(index.scan_root("root", &root, |_| {}).is_err());
+
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([clip.to_string_lossy().into_owned()])
+        );
+        let failed = index.scan_progress("root").unwrap().unwrap();
+        assert_eq!(failed.phase, ScanPhase::Error);
+        assert_eq!(failed.read_failures, 1);
+    }
+
+    #[test]
+    fn overlapping_root_scans_share_files_but_keep_both_memberships() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("media");
+        let child = parent.join("photos");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("trip.jpg"), b"photo").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+
+        index.scan_root("parent", &parent, |_| {}).unwrap();
+        index.scan_root("child", &child, |_| {}).unwrap();
+
+        assert_eq!(indexed_file_count(&index), 1);
+        let memberships: i64 = index
+            .connection
+            .query_row("SELECT count(*) FROM root_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(memberships, 2);
+    }
+
+    #[test]
+    fn a_scan_never_indexes_its_own_database_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"clip").unwrap();
+        let database = root.join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([root.join("clip.mp4").to_string_lossy().into_owned()])
+        );
+    }
+
+    fn indexed_file_count(index: &OwnedIndex) -> i64 {
+        index
+            .connection
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn search_match_count(index: &OwnedIndex, query: &str) -> i64 {
+        index
+            .connection
+            .query_row(
+                "SELECT count(*) FROM search_docs WHERE search_docs MATCH ?1",
+                [query],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn indexed_display_paths(index: &OwnedIndex) -> BTreeSet<String> {
+        index
+            .connection
+            .prepare("SELECT display_path FROM files")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     #[cfg(unix)]
