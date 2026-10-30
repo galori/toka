@@ -83,6 +83,11 @@ export function isImageResult(result: VideoResult): boolean {
   return isImageExtension(result.extension);
 }
 
+function matchesMediaType(result: VideoResult, mediaType: MediaType): boolean {
+  if (mediaType === "both") return true;
+  return isImageResult(result) === (mediaType === "images");
+}
+
 export const SLIDESHOW_INTERVAL = 3_000;
 const DEFAULT_IMAGE_DURATION_SECONDS = SLIDESHOW_INTERVAL / 1_000;
 const IMAGE_DURATION_OPTIONS = [1, 3, 5, 10] as const;
@@ -3004,11 +3009,15 @@ export default function App() {
   // field holds: changing what is searched has to search for that again rather
   // than for whatever has been typed since.
   const searchedQuery = useRef<string | undefined>(undefined);
+  // Everything Toka was launched with, while the list on screen is still that
+  // launch rather than a search.
+  const launchedResults = useRef<VideoResult[] | undefined>(undefined);
 
   const runSearch = async (submittedQuery: string, requestedPage: number) => {
     const trimmed = submittedQuery.trim();
     if (!trimmed) return;
     searchedQuery.current = trimmed;
+    launchedResults.current = undefined;
     const currentRequest = ++requestNumber.current;
     if (page) indexRefreshCheckRevision.current = managedIndex?.revision;
     setIndexRefreshAvailable(false);
@@ -3199,8 +3208,33 @@ export default function App() {
   const searchedMediaType = useRef(mediaType);
   useEffect(() => {
     if (searchedMediaType.current === mediaType) return;
+    const previous = searchedMediaType.current;
     searchedMediaType.current = mediaType;
-    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+    if (searchedQuery.current) {
+      void runSearch(searchedQuery.current, 1);
+      return;
+    }
+    // A launched folder was never searched for, so there is nothing to ask
+    // again: the toggle filters the whole folder it came with instead.
+    const launched = launchedResults.current;
+    if (!launched || !page) return;
+    const current = new Map(page.results.map((video) => [video.id, video]));
+    // Entries the old filter showed carry whatever was changed on screen —
+    // tags, renames — and the rest come back as they were launched.
+    const merged = launched.map((video) =>
+      matchesMediaType(video, previous)
+        ? (current.get(video.id) ?? video)
+        : video,
+    );
+    launchedResults.current = merged;
+    const results = merged.filter((video) =>
+      matchesMediaType(video, mediaType),
+    );
+    setPage({
+      ...page,
+      results,
+      totalResults: results.length,
+    });
   });
 
   // Focus starts in the search field and is put back there on the way out of a
@@ -3447,6 +3481,15 @@ export default function App() {
       // the command line did, and keeps it.
       if (!launched?.results.length || requestNumber.current) return;
       setQuery("");
+      launchedResults.current = launched.results;
+      // The toggle starts on whatever the launch holds, so nothing in it is
+      // hidden until the viewer asks for that.
+      const images = launched.results.some(isImageResult);
+      const videos = launched.results.some((video) => !isImageResult(video));
+      const launchedType: MediaType =
+        images && videos ? "both" : images ? "images" : "videos";
+      searchedMediaType.current = launchedType;
+      setMediaType(launchedType);
       setPage(launched);
       setPlaying({ videos: launched.results, startIndex: 0 });
     });

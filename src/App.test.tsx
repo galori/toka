@@ -5443,6 +5443,53 @@ test("plays the playlist Toka was launched with and leaves it to come back to", 
   ).toBeVisible();
 });
 
+test("filters a launched folder of videos and images with the media toggle", async () => {
+  launchPlaylistMock.mockResolvedValue({
+    query: "Holiday",
+    page: 1,
+    pageSize: 24,
+    totalResults: 3,
+    totalPages: 1,
+    results: [
+      { id: "video-1", fileName: "beach.mp4", extension: "mp4" },
+      { id: "image-1", fileName: "sunset.jpg", extension: "jpg" },
+      { id: "video-2", fileName: "pier.mkv", extension: "mkv" },
+    ],
+  });
+  invokeMock.mockResolvedValue({ filePath: "/Holiday/beach.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  // A mixed folder starts as it always has, playing everything in it.
+  expect(await screen.findByLabelText("Playing beach.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(screen.getByRole("button", { name: "Both" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  expect(screen.getByRole("button", { name: "Play sunset.jpg" })).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "Videos" }));
+  expect(
+    screen.queryByRole("button", { name: "Play sunset.jpg" }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Play beach.mp4" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Play pier.mkv" })).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "2", ctrlKey: true });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Play beach.mp4" }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByRole("button", { name: "Play sunset.jpg" })).toBeVisible();
+
+  // Nothing is searched for: the folder is the list being filtered.
+  expect(invokeMock.mock.calls.map(([command]) => command)).not.toContain(
+    "search_videos",
+  );
+});
+
 test("reports a launch playlist it cannot play and leaves the search ready", async () => {
   launchPlaylistMock.mockRejectedValue({
     kind: "Playlist",
