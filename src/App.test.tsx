@@ -285,6 +285,9 @@ test("adds a search folder and makes the setup completable", async () => {
   render(<App />);
 
   await screen.findByRole("button", { name: "Add folder" });
+  await act(async () => {
+    await Promise.resolve();
+  });
   fireEvent.keyDown(window, { key: "o", ctrlKey: true });
 
   await waitFor(() =>
