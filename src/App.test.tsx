@@ -5324,9 +5324,15 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
     actions: [
       {
         addonId: "tiktok",
-        actionId: "creator",
-        label: "Open TikTok creator",
-        effects: ["New Toka window", "tiktok.com"],
+        actionId: "creator-search",
+        label: "Show this creator in Toka",
+        effects: ["New Toka window"],
+      },
+      {
+        addonId: "tiktok",
+        actionId: "creator-profile",
+        label: "Open this creator on TikTok",
+        effects: ["tiktok.com"],
       },
     ],
     errors: [],
@@ -5346,8 +5352,13 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
   fireEvent.keyDown(window, { key: "a", ctrlKey: true, shiftKey: true });
 
   const menu = await screen.findByRole("menu", { name: "Add-ons" });
-  expect(menu).toHaveTextContent("New Toka window · tiktok.com");
-  const action = screen.getByRole("menuitem", { name: /Open TikTok creator/ });
+  expect(menu).toHaveTextContent("Show this creator in Toka");
+  expect(menu).toHaveTextContent("New Toka window");
+  expect(menu).toHaveTextContent("Open this creator on TikTok");
+  expect(menu).toHaveTextContent("tiktok.com");
+  const action = screen.getByRole("menuitem", {
+    name: /Show this creator in Toka/,
+  });
   await waitFor(() => expect(action).toHaveFocus());
 
   fireEvent.keyDown(action, { key: "a", ctrlKey: true, shiftKey: true });
@@ -5358,7 +5369,7 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
 
   fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
   const tabAction = await screen.findByRole("menuitem", {
-    name: /Open TikTok creator/,
+    name: /Show this creator in Toka/,
   });
   await waitFor(() => expect(tabAction).toHaveFocus());
   await user.keyboard("{Tab}");
@@ -5368,7 +5379,7 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
 
   fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
   const selectedAction = await screen.findByRole("menuitem", {
-    name: /Open TikTok creator/,
+    name: /Show this creator in Toka/,
   });
   await waitFor(() => expect(selectedAction).toHaveFocus());
   await user.keyboard("{Enter}");
@@ -5376,7 +5387,27 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
     expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
       resultId: "video-1",
       addonId: "tiktok",
-      actionId: "creator",
+      actionId: "creator-search",
+    }),
+  );
+
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const profileAction = await screen.findByRole("menuitem", {
+    name: /Open this creator on TikTok/,
+  });
+  await waitFor(() =>
+    expect(
+      screen.getByRole("menuitem", { name: /Show this creator in Toka/ }),
+    ).toHaveFocus(),
+  );
+  await user.keyboard("{ArrowDown}");
+  await waitFor(() => expect(profileAction).toHaveFocus());
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
+      resultId: "video-1",
+      addonId: "tiktok",
+      actionId: "creator-profile",
     }),
   );
 });

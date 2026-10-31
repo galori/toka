@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn creator_action_runs_the_new_window_before_the_browser() {
+    fn creator_search_action_opens_only_the_exact_creator_window() {
         let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
         let mut host = FakeHost::default();
 
@@ -603,28 +603,45 @@ mod tests {
             .run_action(
                 "2026-10-10_@sometiktoker_18938383490812348343.mp4",
                 "tiktok",
-                "creator",
+                "creator-search",
                 &mut host,
             )
             .unwrap();
 
         assert_eq!(
             host.0,
-            [
-                HostedAction::Search(AddonSearchLaunch {
-                    query: "@sometiktoker".into(),
-                    fields: SearchFields {
-                        tags: false,
-                        file_name: true,
-                        path: false,
-                    },
-                    media_type: MediaType::Videos,
-                    addon_id: "tiktok".into(),
-                    capture: "handle".into(),
-                    value: "@sometiktoker".into(),
-                }),
-                HostedAction::Url("https://tiktok.com/@sometiktoker".into()),
-            ]
+            [HostedAction::Search(AddonSearchLaunch {
+                query: "@sometiktoker".into(),
+                fields: SearchFields {
+                    tags: false,
+                    file_name: true,
+                    path: false,
+                },
+                media_type: MediaType::Videos,
+                addon_id: "tiktok".into(),
+                capture: "handle".into(),
+                value: "@sometiktoker".into(),
+            })]
+        );
+    }
+
+    #[test]
+    fn creator_profile_action_opens_only_the_browser() {
+        let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
+        let mut host = FakeHost::default();
+
+        registry
+            .run_action(
+                "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+                "tiktok",
+                "creator-profile",
+                &mut host,
+            )
+            .unwrap();
+
+        assert_eq!(
+            host.0,
+            [HostedAction::Url("https://tiktok.com/@sometiktoker".into())]
         );
     }
 
@@ -663,7 +680,7 @@ mod tests {
         );
         let menu = registry.matching_actions("2026-10-10_@sometiktoker_18938383490812348343.mp4");
 
-        assert_eq!(menu.actions.len(), 1);
+        assert_eq!(menu.actions.len(), 2);
         assert_eq!(menu.errors.len(), 1);
         assert!(menu.errors[0].contains("broken.json"), "{:?}", menu.errors);
         assert!(menu.errors[0].contains("invalid JSON"), "{:?}", menu.errors);
@@ -733,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn sample_tiktok_filename_exposes_the_creator_action() {
+    fn sample_tiktok_filename_exposes_separate_creator_actions() {
         let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
 
         let menu = registry.matching_actions("2026-10-10_@sometiktoker_18938383490812348343.mp4");
@@ -741,12 +758,20 @@ mod tests {
         assert_eq!(menu.errors, Vec::<String>::new());
         assert_eq!(
             menu.actions,
-            [AddonActionSummary {
-                addon_id: "tiktok".into(),
-                action_id: "creator".into(),
-                label: "Open TikTok creator".into(),
-                effects: vec!["New Toka window".into(), "tiktok.com".into()],
-            }]
+            [
+                AddonActionSummary {
+                    addon_id: "tiktok".into(),
+                    action_id: "creator-search".into(),
+                    label: "Show this creator in Toka".into(),
+                    effects: vec!["New Toka window".into()],
+                },
+                AddonActionSummary {
+                    addon_id: "tiktok".into(),
+                    action_id: "creator-profile".into(),
+                    label: "Open this creator on TikTok".into(),
+                    effects: vec!["tiktok.com".into()],
+                },
+            ]
         );
     }
 }

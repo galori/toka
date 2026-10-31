@@ -59,8 +59,8 @@ The bundled TikTok reference lives at `src-tauri/addons/tiktok.json`:
   },
   "actions": [
     {
-      "id": "creator",
-      "label": "Open TikTok creator",
+      "id": "creator-search",
+      "label": "Show this creator in Toka",
       "steps": [
         {
           "type": "openRelatedSearch",
@@ -68,7 +68,13 @@ The bundled TikTok reference lives at `src-tauri/addons/tiktok.json`:
           "query": "{handle}",
           "fields": ["fileName"],
           "mediaType": "videos"
-        },
+        }
+      ]
+    },
+    {
+      "id": "creator-profile",
+      "label": "Open this creator on TikTok",
+      "steps": [
         {
           "type": "openUrl",
           "url": "https://tiktok.com/{handle}"
