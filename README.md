@@ -1,6 +1,6 @@
 # Toka
 
-Toka is a small desktop app for finding and playing videos on macOS and Linux. On Linux it maintains a private search index for the folders you choose; on macOS it uses Spotlight. It never changes the contents of your files except when you edit a video's tags, which live in its filename.
+Toka is a small desktop app for finding and playing videos on macOS and Linux. On Linux it maintains a private search index for the folders you choose; on macOS it limits Spotlight to the folders you choose. It never changes the contents of your files except when you edit a video's tags, which live in its filename.
 
 ## Quick start
 
@@ -100,7 +100,7 @@ taken.
 
 - Supported search results: MP4, MOV, MKV, AVI, WebM, M4V, MPEG, MPG, and MPE.
 - Linux playback uses the embedded libmpv/FFmpeg media engine; other platforms use the system WebKit media engine. Toka does not transcode files.
-- On Linux, `Ctrl+,` opens the search-folder screen. Toka updates those private indexes after files are created, removed, moved, or renamed, even while its window is closed.
+- On both platforms, `Ctrl+,` opens the search-folder screen. Linux searches a private index for those folders; macOS limits Spotlight to them and keeps its own index of the same folders up to date. On Linux, Toka updates the private index after files are created, removed, moved, or renamed, even while its window is closed.
 - A disconnected external folder is shown as offline. Its index is retained and incrementally refreshed when the same drive returns at the same mount path.
 
 See [Development](docs/development.md) for tests, project structure, troubleshooting, and implementation details. The official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) cover other Linux distributions.

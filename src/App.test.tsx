@@ -252,7 +252,7 @@ test("opens help over the player without letting Escape leave playback", async (
   expect(screen.getByLabelText("Playing summer.mp4")).toBeVisible();
 });
 
-test("opens folder setup on an unconfigured Linux first launch", async () => {
+test("opens folder setup on first launch when search folders are supported", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
     revision: 0,
@@ -285,6 +285,9 @@ test("adds a search folder and makes the setup completable", async () => {
   render(<App />);
 
   await screen.findByRole("button", { name: "Add folder" });
+  await act(async () => {
+    await Promise.resolve();
+  });
   fireEvent.keyDown(window, { key: "o", ctrlKey: true });
 
   await waitFor(() =>
@@ -309,9 +312,11 @@ test("reopens configured search folders from Ctrl+,", async () => {
     folders: [{ id: "videos", path: "/Videos", status: "ready" }],
   });
   render(<App />);
-  expect(
-    await screen.findByRole("button", { name: "Search folders" }),
-  ).toHaveAttribute("aria-keyshortcuts", "Ctrl+,");
+  const searchFolders = await screen.findByRole("button", {
+    name: "Search folders",
+  });
+  expect(searchFolders).toHaveAttribute("aria-keyshortcuts", "Ctrl+,");
+  expect(searchFolders.querySelector(".key-hint")).toHaveTextContent("Ctrl+,");
 
   fireEvent.keyDown(window, { key: ",", ctrlKey: true });
 

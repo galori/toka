@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(any(target_os = "macos", test))]
+use std::sync::Mutex;
+
 const SCHEMA_VERSION: i64 = 1;
 const REPAIR_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
@@ -148,6 +151,8 @@ pub(crate) enum OwnedIndexError {
     Database(#[from] rusqlite::Error),
     #[error("Toka cannot read search index schema version {0}.")]
     UnsupportedSchema(i64),
+    #[error("That search folder is no longer configured.")]
+    FolderNotConfigured,
     #[error("Toka could not secure {path}: {source}")]
     Permissions {
         path: String,
@@ -341,7 +346,7 @@ impl OwnedIndexUpdates {
 
     pub(crate) fn system() -> Self {
         Self {
-            database: dirs::data_local_dir().map(|directory| directory.join("toka/index.sqlite3")),
+            database: database_path().ok(),
         }
     }
 
@@ -382,6 +387,285 @@ impl IndexUpdates for OwnedIndexUpdates {
     fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError> {
         OwnedIndexUpdates::synchronize_rename(self, from, to)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OwnedFolderStatus {
+    Pending,
+    Indexing,
+    Ready,
+    Offline,
+    Error,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OwnedIndexFolder {
+    pub id: String,
+    pub path: PathBuf,
+    pub status: OwnedFolderStatus,
+    pub message: Option<String>,
+    pub scanned_files: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OwnedIndexState {
+    pub supported: bool,
+    pub revision: u64,
+    pub indexed_videos: u64,
+    pub indexed_images: u64,
+    pub indexing_files: u64,
+    pub folders: Vec<OwnedIndexFolder>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) struct OwnedIndexManager {
+    database: PathBuf,
+    watch: bool,
+    watchers: Mutex<HashMap<String, ManagedRootWatcher>>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct ManagedRootWatcher {
+    path: PathBuf,
+    watcher: OwnedIndexWatcher,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl OwnedIndexManager {
+    pub(crate) fn system() -> Result<Self, String> {
+        let manager = Self::new(database_path()?, true);
+        manager.restore_watchers();
+        Ok(manager)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn under(database: PathBuf) -> Self {
+        Self::new(database, false)
+    }
+
+    fn new(database: PathBuf, watch: bool) -> Self {
+        Self {
+            database,
+            watch,
+            watchers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn restore_watchers(&self) {
+        if let Err(error) = self.ensure_watchers() {
+            eprintln!("Toka could not restore search folder watchers: {error}");
+        }
+    }
+
+    pub(crate) fn state(&self) -> Result<OwnedIndexState, String> {
+        self.ensure_watchers()?;
+        let index = self.open().map_err(|error| error.to_string())?;
+        let (indexed_videos, indexed_images) =
+            index.media_counts().map_err(|error| error.to_string())?;
+        let revision = index.revision().map_err(|error| error.to_string())?;
+        let roots = index.roots().map_err(|error| error.to_string())?;
+        let mut folders = Vec::new();
+        let mut indexing_files = 0;
+
+        for (id, path) in roots {
+            let progress = index
+                .scan_progress(&id)
+                .map_err(|error| error.to_string())?;
+            let status = if !path.is_dir() {
+                OwnedFolderStatus::Offline
+            } else {
+                match progress.as_ref().map(|progress| progress.phase) {
+                    Some(ScanPhase::Scanning) => OwnedFolderStatus::Indexing,
+                    Some(ScanPhase::Ready) => OwnedFolderStatus::Ready,
+                    Some(ScanPhase::Error) => OwnedFolderStatus::Error,
+                    None => OwnedFolderStatus::Pending,
+                }
+            };
+            let scanned_files = progress
+                .as_ref()
+                .map(|progress| progress.files_discovered)
+                .unwrap_or(0);
+            if status == OwnedFolderStatus::Indexing {
+                indexing_files += scanned_files;
+            }
+            folders.push(OwnedIndexFolder {
+                id,
+                path,
+                status,
+                message: progress.and_then(|progress| progress.error),
+                scanned_files,
+            });
+        }
+
+        Ok(OwnedIndexState {
+            supported: true,
+            revision,
+            indexed_videos,
+            indexed_images,
+            indexing_files,
+            folders,
+        })
+    }
+
+    pub(crate) fn add_folder(&self, requested: &Path) -> Result<OwnedIndexState, String> {
+        let root = requested
+            .canonicalize()
+            .map_err(|error| format!("Toka could not open that folder: {error}"))?;
+        if !root.is_dir() {
+            return Err("Choose a folder to search.".into());
+        }
+
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
+        let id = {
+            let index = self.open().map_err(|error| error.to_string())?;
+            let existing = index.roots().map_err(|error| error.to_string())?;
+            if existing
+                .iter()
+                .any(|(_, path)| root.starts_with(path) || path.starts_with(&root))
+            {
+                return Err("That folder is already covered by a Toka search folder.".into());
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut index = index;
+            index
+                .insert_root(&id, &root)
+                .map_err(|error| error.to_string())?;
+            id
+        };
+
+        if self.watch {
+            match OwnedIndexWatcher::start(&self.database, id.clone(), root.clone()) {
+                Ok(watcher) => {
+                    watchers.insert(
+                        id,
+                        ManagedRootWatcher {
+                            path: root,
+                            watcher,
+                        },
+                    );
+                }
+                Err(error) => {
+                    if let Ok(mut index) = self.open() {
+                        let _ = index.remove_root(&id);
+                    }
+                    return Err(error.to_string());
+                }
+            }
+        }
+
+        drop(watchers);
+        self.state()
+    }
+
+    pub(crate) fn remove_folder(&self, id: &str) -> Result<OwnedIndexState, String> {
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
+        let watcher = watchers.remove(id);
+        if let Some(watcher) = watcher {
+            if let Err(error) = watcher.watcher.stop() {
+                eprintln!("Toka could not stop a search folder watcher: {error}");
+            }
+        }
+        {
+            let mut index = self.open().map_err(|error| error.to_string())?;
+            index.remove_root(id).map_err(|error| error.to_string())?;
+        }
+        drop(watchers);
+        self.state()
+    }
+
+    fn open(&self) -> Result<OwnedIndex, OwnedIndexError> {
+        OwnedIndex::open(&self.database)
+    }
+
+    fn ensure_watchers(&self) -> Result<(), String> {
+        if !self.watch {
+            return Ok(());
+        }
+        let mut watchers = self
+            .watchers
+            .lock()
+            .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
+        let index = self.open().map_err(|error| error.to_string())?;
+        let roots = index.roots().map_err(|error| error.to_string())?;
+        drop(index);
+        let online_roots = roots
+            .iter()
+            .filter(|(_, root)| root.is_dir())
+            .map(|(id, _)| id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let stale_watchers = watchers
+            .keys()
+            .filter(|id| !online_roots.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in stale_watchers {
+            if let Some(watcher) = watchers.remove(&id) {
+                if let Err(error) = watcher.watcher.stop() {
+                    eprintln!("Toka could not stop a search folder watcher: {error}");
+                }
+            }
+        }
+        for (id, root) in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            if watchers
+                .get(&id)
+                .is_some_and(|watcher| watcher.path == root)
+            {
+                continue;
+            }
+            if let Some(watcher) = watchers.remove(&id) {
+                if let Err(error) = watcher.watcher.stop() {
+                    eprintln!("Toka could not stop a search folder watcher: {error}");
+                }
+            }
+            match OwnedIndexWatcher::start(&self.database, id.clone(), root.clone()) {
+                Ok(watcher) => {
+                    watchers.insert(
+                        id,
+                        ManagedRootWatcher {
+                            path: root,
+                            watcher,
+                        },
+                    );
+                }
+                Err(error) => eprintln!("Toka could not watch a search folder: {error}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn database_path() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|directory| directory.join("toka").join("index.sqlite3"))
+        .ok_or_else(|| "Toka could not find a place for its search index.".into())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn root_paths(database: &Path) -> Result<Vec<PathBuf>, OwnedIndexError> {
+    OwnedIndex::open(database)?
+        .roots()
+        .map(|roots| roots.into_iter().map(|(_, path)| path).collect())
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn index_revision(database: &Path) -> Result<u64, OwnedIndexError> {
+    OwnedIndex::open(database)?.revision()
 }
 
 pub(crate) struct OwnedIndexWatcher {
@@ -627,6 +911,67 @@ impl OwnedIndex {
         })?;
         rows.collect::<Result<_, _>>()
             .map_err(OwnedIndexError::from)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO roots (
+                id, path, display_path, state, created_at_ns, updated_at_ns
+             ) VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
+            params![id, path_bytes(root), root.to_string_lossy(), now_ns()],
+        )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn remove_root(&mut self, id: &str) -> Result<(), OwnedIndexError> {
+        let transaction = self.connection.transaction()?;
+        let removed = transaction.execute("DELETE FROM roots WHERE id = ?1", [id])?;
+        if removed == 0 {
+            return Err(OwnedIndexError::FolderNotConfigured);
+        }
+        transaction.execute(
+            "DELETE FROM files WHERE NOT EXISTS (
+                SELECT 1 FROM root_files WHERE root_files.file_id = files.id
+             )",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn revision(&self) -> Result<u64, OwnedIndexError> {
+        let revision: i64 = self.connection.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'index_revision'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(revision.max(0) as u64)
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn media_counts(&self) -> Result<(u64, u64), OwnedIndexError> {
+        let (videos, images): (i64, i64) = self.connection.query_row(
+            "SELECT
+                COALESCE(SUM(media_type = 'video'), 0),
+                COALESCE(SUM(media_type = 'image'), 0)
+             FROM files",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((videos as u64, images as u64))
     }
 
     pub(crate) fn scan_root<F>(
@@ -2057,6 +2402,39 @@ mod tests {
     }
 
     #[test]
+    fn manager_state_restores_folder_watchers_after_restart() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+        let restored_manager = OwnedIndexManager::new(database, true);
+        restored_manager.restore_watchers();
+
+        wait_for(|| {
+            restored_manager
+                .state()
+                .is_ok_and(|state| state.folders[0].status == OwnedFolderStatus::Ready)
+        });
+        assert_eq!(restored_manager.state().unwrap().indexed_videos, 1);
+        restored_manager.remove_folder("root").unwrap();
+    }
+
+    #[test]
+    fn removing_a_missing_root_is_reported_as_an_error() {
+        let (_directory, mut index) = open_index();
+
+        assert!(matches!(
+            index.remove_root("missing"),
+            Err(OwnedIndexError::FolderNotConfigured)
+        ));
+    }
+
+    #[test]
     fn recursive_watcher_applies_create_modify_rename_and_remove_promptly() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
@@ -2429,6 +2807,98 @@ mod tests {
         std::fs::remove_file(&clip).unwrap();
         index.synchronize_path("root", &root, &clip).unwrap();
         assert!(indexed_display_paths(&index).is_empty());
+    }
+
+    #[test]
+    fn a_managed_root_reports_scanned_media_and_folder_state() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        std::fs::write(root.join("photo.jpg"), b"image").unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+
+        let added = manager.add_folder(&root).unwrap();
+        assert_eq!(added.folders.len(), 1);
+        assert_eq!(added.folders[0].status, OwnedFolderStatus::Pending);
+
+        let id = added.folders[0].id.clone();
+        OwnedIndex::open(&manager.database)
+            .unwrap()
+            .scan_root(&id, &root, |_| {})
+            .unwrap();
+
+        let state = manager.state().unwrap();
+        assert!(state.supported);
+        assert_eq!(state.indexed_videos, 1);
+        assert_eq!(state.indexed_images, 1);
+        assert_eq!(state.folders[0].status, OwnedFolderStatus::Ready);
+        assert_eq!(state.folders[0].scanned_files, 2);
+    }
+
+    #[test]
+    fn adding_and_removing_a_search_folder_advances_the_index_revision() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let before = manager.state().unwrap().revision;
+
+        let added = manager.add_folder(&root).unwrap();
+        let removed = manager.remove_folder(&added.folders[0].id).unwrap();
+
+        assert!(added.revision > before);
+        assert!(removed.revision > added.revision);
+    }
+
+    #[test]
+    fn a_missing_managed_root_is_reported_offline() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        let state = manager.state().unwrap();
+        assert_eq!(state.folders[0].status, OwnedFolderStatus::Offline);
+    }
+
+    #[test]
+    fn removing_a_managed_root_removes_its_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let id = manager.add_folder(&root).unwrap().folders[0].id.clone();
+        OwnedIndex::open(&manager.database)
+            .unwrap()
+            .scan_root(&id, &root, |_| {})
+            .unwrap();
+
+        let state = manager.remove_folder(&id).unwrap();
+
+        assert!(state.folders.is_empty());
+        assert_eq!(state.indexed_videos, 0);
+    }
+
+    #[test]
+    fn overlapping_managed_roots_are_rejected() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+
+        let error = manager.add_folder(&child).unwrap_err();
+
+        assert_eq!(
+            error,
+            "That folder is already covered by a Toka search folder."
+        );
+        assert_eq!(manager.state().unwrap().folders.len(), 1);
     }
 
     #[cfg(unix)]
