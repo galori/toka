@@ -903,6 +903,46 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn search_candidates(
+        &self,
+        terms: &[String],
+    ) -> Result<Vec<PathBuf>, OwnedIndexError> {
+        if terms.is_empty()
+            || terms
+                .iter()
+                .any(|term| term == "*" || !is_fts_candidate_term(term))
+        {
+            let mut statement = self.connection.prepare(
+                "SELECT DISTINCT files.path
+                 FROM files
+                 JOIN root_files ON root_files.file_id = files.id
+                 ORDER BY files.path",
+            )?;
+            let rows = statement.query_map([], |row| Ok(path_from_bytes(row.get(0)?)))?;
+            return rows
+                .collect::<Result<_, _>>()
+                .map_err(OwnedIndexError::from);
+        }
+
+        let match_query = terms
+            .iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT files.path
+             FROM search_docs
+             JOIN files ON files.id = search_docs.rowid
+             JOIN root_files ON root_files.file_id = files.id
+             WHERE search_docs MATCH ?1
+             ORDER BY files.path",
+        )?;
+        let rows = statement.query_map([match_query], |row| Ok(path_from_bytes(row.get(0)?)))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
+    }
+
     fn roots_with_generations(&self) -> Result<Vec<(String, PathBuf, i64)>, OwnedIndexError> {
         let mut statement = self
             .connection
@@ -1903,6 +1943,11 @@ fn path_from_bytes(value: Vec<u8>) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&value).into_owned())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_fts_candidate_term(term: &str) -> bool {
+    term.len() >= 3 && term.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 #[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<(), OwnedIndexError> {
     use std::os::unix::fs::PermissionsExt;
@@ -2312,6 +2357,44 @@ mod tests {
         assert_eq!(progress.files_indexed, 0);
         assert_eq!(progress.folders_scanned, 0);
         assert_eq!(progress.skipped_paths, 1);
+    }
+
+    #[test]
+    fn search_candidates_use_the_full_text_index_and_widen_when_needed() {
+        let (directory, mut index) = open_index();
+        let root = directory.path().join("media");
+        let nested = root.join("Sample Set");
+        std::fs::create_dir_all(&nested).unwrap();
+        let sample = root.join("sample.mp4");
+        let clip = nested.join("clip.mov");
+        let other = root.join("other.mp4");
+        for path in [&sample, &clip, &other] {
+            std::fs::write(path, b"media").unwrap();
+        }
+        index.insert_root("media", &root).unwrap();
+        index.scan_root("media", &root, |_| {}).unwrap();
+
+        let mut sample_candidates = index.search_candidates(&["sample".into()]).unwrap();
+        sample_candidates.sort();
+        let mut sample_matches = vec![sample.clone(), clip.clone()];
+        sample_matches.sort();
+        assert_eq!(sample_candidates, sample_matches);
+
+        let mut all_candidates = vec![sample.clone(), clip.clone(), other.clone()];
+        all_candidates.sort();
+        let mut multi_term_candidates = index
+            .search_candidates(&["sample".into(), "other".into()])
+            .unwrap();
+        multi_term_candidates.sort();
+        assert_eq!(multi_term_candidates, all_candidates);
+
+        let mut short_term_candidates = index.search_candidates(&["sa".into()]).unwrap();
+        short_term_candidates.sort();
+        assert_eq!(short_term_candidates, all_candidates);
+        assert_eq!(
+            index.search_candidates(&["*".into()]).unwrap(),
+            all_candidates
+        );
     }
 
     #[test]

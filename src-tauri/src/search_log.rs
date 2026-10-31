@@ -39,6 +39,7 @@ impl From<&SearchRequest> for SearchLogContext {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) struct CommandOutcome<'a> {
     pub(crate) success: bool,
     pub(crate) exit_code: Option<i32>,
@@ -179,6 +180,7 @@ impl SearchLogger {
         context
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn record_command(
         &self,
         context: &SearchLogContext,
@@ -397,6 +399,7 @@ fn write_verbose_header(file: &mut fs::File, context: &SearchLogContext) -> std:
 }
 
 impl VerboseSearchLog {
+    #[cfg(any(target_os = "linux", test))]
     fn record_command(
         &self,
         program: &str,
@@ -410,7 +413,7 @@ impl VerboseSearchLog {
         let _ = writeln!(file, "COMMAND: {}", display_command(program, args));
         let _ = writeln!(file, "Succeeded: {success}");
         let _ = writeln!(file, "Exit code: {exit_code:?}");
-        write_verbose_block(&mut file, "PLOCATE RESULTS", stdout);
+        write_verbose_block(&mut file, "SEARCH PROVIDER RESULTS", stdout);
         if !stderr.trim().is_empty() {
             write_verbose_block(&mut file, "COMMAND STDERR", stderr);
         }
@@ -441,6 +444,7 @@ impl VerboseSearchLog {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn write_verbose_block(file: &mut fs::File, title: &str, value: &str) {
     let _ = writeln!(file, "{title}:");
     if value.is_empty() {
@@ -549,6 +553,7 @@ fn process_is_alive(pid: u32) -> bool {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn display_command(program: &str, args: &[String]) -> String {
     std::iter::once(program)
         .chain(args.iter().map(String::as_str))
@@ -557,6 +562,7 @@ fn display_command(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -681,6 +687,7 @@ mod tests {
         assert_eq!(logs.len(), 1);
         let body = fs::read_to_string(&logs[0]).unwrap();
         assert!(body.contains("COMMAND: plocate -- summer"));
+        assert!(body.contains("SEARCH PROVIDER RESULTS:"));
         assert!(body.contains("/Videos/summer.mp4"));
         assert!(body.contains("FILTERED OUT: /Videos/empty.mp4 (empty file)"));
         assert!(body.contains("RESULTS RETURNED TO APP:"));
