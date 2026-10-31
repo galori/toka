@@ -34,6 +34,67 @@ logs include the provider command, filtered candidates, returned paths, and
 errors. Zero-byte media is ignored by indexing, search results, and thumbnail
 discovery.
 
+## Add-ons
+
+Add-ons are declarative JSON files. They can match a filename, extract named
+values, and run only the action types Toka defines. They cannot load code or
+run shell commands.
+
+Toka loads bundled add-ons and user add-ons once, during startup. Put user
+`.json` files directly in one of these folders, then restart Toka:
+
+- macOS: `~/Library/Application Support/app.toka.desktop/addons`
+- Linux: `$XDG_CONFIG_HOME/app.toka.desktop/addons`, or
+  `~/.config/app.toka.desktop/addons` when `XDG_CONFIG_HOME` is unset
+
+The bundled TikTok reference lives at `src-tauri/addons/tiktok.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "tiktok",
+  "name": "TikTok",
+  "match": {
+    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?i:\\.mp4)$"
+  },
+  "actions": [
+    {
+      "id": "creator",
+      "label": "Open TikTok creator",
+      "steps": [
+        {
+          "type": "openRelatedSearch",
+          "capture": "handle",
+          "query": "{handle}",
+          "fields": ["fileName"],
+          "mediaType": "videos"
+        },
+        {
+          "type": "openUrl",
+          "url": "https://tiktok.com/{handle}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`fileNameRegex` uses Rust regex syntax and must name each value referenced by
+an action. Version 1 supports these ordered steps:
+
+- `openRelatedSearch` starts another Toka process. It searches the selected
+  fields, then applies the same named capture as an exact filter before
+  shuffling and paging. Inserted captures must be one plain search term; they
+  cannot add operators, fields, parentheses, or more terms.
+- `openUrl` opens the system browser after a user chooses the action. Its URL
+  must use HTTPS, its host must be fixed text, and capture values are escaped
+  before insertion outside the host.
+
+Unknown fields, action types, schema versions, duplicate IDs, unsafe URLs, and
+invalid expressions are rejected. A bad user add-on does not stop Toka. Its
+error appears in the Add-ons menu. Toka never downloads add-ons from the
+network.
+
 ## How it works
 
 - `src/` contains the React interface and Tauri command client.
@@ -49,7 +110,7 @@ discovery.
 
 `docs/thumbnails.md` records the decided approach for result thumbnails.
 
-The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it.
+The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it. E2E builds ignore the real user add-on folder; set `TOKA_E2E_ADDONS_DIR` when a test needs its own manifests.
 
 Release builds write `/usr/share/toka/build-info.json` into the Debian package.
 After installing Toka on Linux, run `bin/toka-freshness.mjs` from the repository

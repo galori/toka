@@ -31,6 +31,15 @@ again straight away. The last part left on cannot be switched off, because a
 search with nothing to look at could only ever answer "no videos". The choice
 lasts as long as Toka is open, like every other setting here.
 
+Searches accept implicit `AND`, explicit `AND`, `OR`, and `NOT`. `AND` binds
+more tightly than `OR`, while `NOT` binds most tightly. Parentheses change the
+order. Quoted values keep spaces, such as `filename:"family trip"`.
+
+Text can target `tags:`, `filename:`, `path:`, or `folder:`. `path:` and
+`folder:` search every parent path component. `type:image` and `type:video`
+match media kinds. `extension:jpg` matches an exact extension without regard to
+case.
+
 File-size predicates can be added to a search without a separate control:
 `size:36.3mb` matches that exact size, while `size:<1.5gb` and
 `size:>=100kb` express ranges. `kb`, `mb`, `gb`, and `tb` use decimal units;
@@ -40,8 +49,18 @@ Creation and modification dates can be searched with the same comparison
 operators: `created:10-5-2026`, `modified:>1-1-2026`, and
 `created:<=12-10-2025`. Dates accept `MM-DD-YYYY`, `MM-DD-YY`, and
 `YYYY-MM-DD`; one- or two-digit months and days are accepted, and two-digit
-years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Dates use the file's
-local calendar date rather than its time of day.
+years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Quoted relative values
+such as `modified:>"3 days ago"` and `created:>="1 week ago"` resolve once when
+the search starts. Dates use the file's local calendar date, not its time.
+
+## Add-ons
+
+While a video plays, press `Ctrl+Shift+A` to open actions supplied by add-ons.
+The bundled TikTok add-on recognizes names such as
+`2026-10-10_@sometiktoker_18938383490812348343.mp4`. Its creator action opens
+a new Toka window containing only that exact creator's videos, then opens the
+creator page in the default browser. The Add-ons control stays disabled when
+the current filename matches no action.
 
 ## Playlists
 

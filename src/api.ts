@@ -8,6 +8,8 @@ export type VideoResult = {
   extension: string;
   thumbnailPath?: string;
   tags?: string[];
+  // The tags of the folder the video sits in.
+  folderTags?: string[];
 };
 
 export type VideoTagUpdate = Pick<VideoResult, "fileName" | "tags">;
@@ -20,6 +22,32 @@ export type SearchPage = {
   totalPages: number;
   indexRevision?: number;
   results: VideoResult[];
+};
+
+export type AddonAction = {
+  addonId: string;
+  actionId: string;
+  label: string;
+  effects: string[];
+};
+
+export type AddonMenu = {
+  actions: AddonAction[];
+  errors: string[];
+};
+
+export type AddonSearch = {
+  query: string;
+  fields: SearchFields;
+  mediaType: MediaType;
+  addonId: string;
+  capture: string;
+  value: string;
+};
+
+export type LaunchIntent = {
+  page: SearchPage;
+  addonSearch?: AddonSearch | null;
 };
 
 // Which part of a video a query is matched against. The three are separate
@@ -95,28 +123,32 @@ export function searchVideos(
   page: number,
   fields: SearchFields = DEFAULT_SEARCH_FIELDS,
   mediaType: MediaType = DEFAULT_MEDIA_TYPE,
+  addonSearch?: AddonSearch,
 ): Promise<SearchPage> {
-  return invoke<SearchPage>("search_videos", {
-    request: { query, page, pageSize: PAGE_SIZE, fields, mediaType },
-  });
+  const request = { query, page, pageSize: PAGE_SIZE, fields, mediaType };
+  return invoke<SearchPage>(
+    "search_videos",
+    addonSearch ? { request, addonSearch } : { request },
+  );
 }
 
 export function searchMatchCount(
   query: string,
   fields: SearchFields = DEFAULT_SEARCH_FIELDS,
   mediaType: MediaType = DEFAULT_MEDIA_TYPE,
+  addonSearch?: AddonSearch,
 ): Promise<number> {
-  return invoke<number>("search_match_count", {
-    request: { query, page: 1, pageSize: PAGE_SIZE, fields, mediaType },
-  });
+  const request = { query, page: 1, pageSize: PAGE_SIZE, fields, mediaType };
+  return invoke<number>(
+    "search_match_count",
+    addonSearch ? { request, addonSearch } : { request },
+  );
 }
 
-// The playlist file Toka was launched with — `toka summer.m3u8`, or a playlist
-// opened from a file manager — as a page of results to play. `null` is the
-// ordinary case: Toka was started on its own. A playlist that cannot be read,
-// or that has nothing left in it to play, rejects with the reason.
-export function launchPlaylist(): Promise<SearchPage | null> {
-  return invoke<SearchPage | null>("launch_playlist");
+// What this Toka process was started with. Add-on searches carry their exact
+// capture filter beside the first page so every later page uses the same rule.
+export function launchIntent(): Promise<LaunchIntent | null> {
+  return invoke<LaunchIntent | null>("launch_intent");
 }
 
 export function videoThumbnail(resultId: string): Promise<string> {
@@ -244,6 +276,24 @@ export function removeVideoTags(
   return invoke("remove_video_tags", { resultId, tags });
 }
 
+// Tagging a video's folder renames the folder, which moves every video in it,
+// so the update names each result that now carries the new folder tags.
+export type FolderTagUpdate = { folderTags: string[]; resultIds: string[] };
+
+export function addFolderTags(
+  resultId: string,
+  tags: string[],
+): Promise<FolderTagUpdate> {
+  return invoke("add_folder_tags", { resultId, tags });
+}
+
+export function removeFolderTags(
+  resultId: string,
+  tags: string[],
+): Promise<FolderTagUpdate> {
+  return invoke("remove_folder_tags", { resultId, tags });
+}
+
 export function loadNativeVideo(filePath: string): Promise<void> {
   return invoke("load_native_video", { filePath });
 }
@@ -294,6 +344,22 @@ export function setNativeVideoBounds(bounds: {
   return invoke("set_native_video_bounds", bounds);
 }
 
+export function matchingAddonActions(resultId: string): Promise<AddonMenu> {
+  return invoke<AddonMenu>("matching_addon_actions", { resultId });
+}
+
+export function runAddonAction(
+  resultId: string,
+  addonId: string,
+  actionId: string,
+): Promise<void> {
+  return invoke("run_addon_action", { resultId, addonId, actionId });
+}
+
 export function openNewWindow(): Promise<void> {
   return invoke("open_new_window");
+}
+
+export function openFolderInNewWindow(resultId: string): Promise<void> {
+  return invoke("open_folder_in_new_window", { resultId });
 }

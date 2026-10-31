@@ -2,6 +2,7 @@ import {
   ButtonHTMLAttributes,
   CSSProperties,
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -14,7 +15,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   addIndexFolder,
-  launchPlaylist,
+  launchIntent,
   loadNativeVideo,
   nativePlaybackState,
   nativeSubtitleTracks,
@@ -37,18 +38,26 @@ import {
   indexState,
   removeIndexFolder,
   openInExternalPlayer,
+  matchingAddonActions,
+  runAddonAction,
   openNewWindow,
+  openFolderInNewWindow,
   searchMatchCount,
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
   addVideoTags,
   addTagsToVideos,
   removeVideoTags,
+  addFolderTags,
+  removeFolderTags,
   videoPreview,
   DEFAULT_SEARCH_FIELDS,
   DEFAULT_MEDIA_TYPE,
+  type AddonMenu,
+  type AddonSearch,
   type BulkTagUpdate,
   type ExternalPlayer,
+  type FolderTagUpdate,
   type MediaType,
   type PreparedVideo,
   type SearchFields,
@@ -450,6 +459,103 @@ function VideoTags({
   );
 }
 
+// What a retag changed about one result: its own name and tags, or the tags
+// of the folder it sits in.
+type TagChange = Partial<Pick<VideoResult, "fileName" | "tags" | "folderTags">>;
+
+function FolderIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M3 6.5A1.5 1.5 0 0 1 4.5 5h4.6l2 2.2h8.4A1.5 1.5 0 0 1 21 8.7v9.8a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z" />
+    </svg>
+  );
+}
+
+// The folder's tags beside the video's own, marked with the folder glyph so the
+// two sets read apart. Tagging the folder renames it, which moves every video
+// inside, so the update names each result that changed rather than just this.
+function FolderTags({
+  video,
+  onChange,
+  adding,
+  onAddingChange,
+}: {
+  video: VideoResult;
+  onChange: (update: FolderTagUpdate) => void;
+  adding: boolean;
+  onAddingChange: (adding: boolean) => void;
+}) {
+  const field = useRef<HTMLInputElement>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string>();
+  const tags = video.folderTags ?? [];
+  const label = `Tag folder of ${video.fileName}`;
+  useEffect(() => {
+    if (adding) field.current?.focus();
+  }, [adding]);
+  const save = async (update: Promise<FolderTagUpdate>) => {
+    try {
+      onChange(await update);
+      setError(undefined);
+    } catch (reason) {
+      setError(`Could not update folder tags: ${errorMessage(reason)}`);
+    }
+  };
+  const add = () => {
+    const tag = draft.trim();
+    setDraft("");
+    onAddingChange(false);
+    if (!tag || tags.includes(tag)) return;
+    void save(addFolderTags(video.id, [tag]));
+  };
+  return (
+    <div
+      className="video-tags folder-tags"
+      aria-label={`Folder tags for ${video.fileName}`}
+    >
+      {tags.map((tag) => (
+        <button
+          key={tag}
+          type="button"
+          className="tag-pill folder-tag-pill"
+          aria-label={`Remove folder tag ${tag}`}
+          onClick={() => void save(removeFolderTags(video.id, [tag]))}
+        >
+          <FolderIcon />
+          <span className="tag-name">{tag}</span>
+          <TagRemoveIcon />
+        </button>
+      ))}
+      {adding ? (
+        <input
+          ref={field}
+          aria-label={label}
+          value={draft}
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") add();
+            if (event.key === "Escape") onAddingChange(false);
+          }}
+        />
+      ) : (
+        <ControlButton
+          shortcut="Shift+T"
+          className="tag-add"
+          aria-label={label}
+          onClick={() => onAddingChange(true)}
+        >
+          <FolderIcon />
+        </ControlButton>
+      )}
+      {error ? (
+        <p className="tag-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function SearchIcon() {
   return (
     <svg viewBox="0 0 24 24" className="search-glyph" aria-hidden="true">
@@ -592,6 +698,16 @@ function BackArrowIcon() {
     <svg viewBox="0 0 24 24" aria-hidden="true" className="back-arrow">
       <path d="M10.5 5 3.5 12l7 7" />
       <path d="M3.5 12h17" />
+    </svg>
+  );
+}
+
+// A folder with an arrow leaving it: the folder opens somewhere else.
+function FolderWindowIcon() {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className="control-icon">
+      <path d="M11 19H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v3" />
+      <path d="M15 19l6-6M16 13h5v5" />
     </svg>
   );
 }
@@ -851,13 +967,21 @@ const HELP_SECTIONS: HelpSection[] = [
   {
     title: "Player",
     entries: [
-      { shortcut: "Space", description: "Play or pause video / slideshow" },
+      {
+        shortcut: "Space",
+        description: "Play or pause video / slideshow (or click the video)",
+      },
       {
         shortcut: "ArrowLeft ArrowRight",
         description: "Seek, or move between images",
       },
       { shortcut: "PageUp PageDown", description: "Previous or next item" },
       { shortcut: "J", description: "Change the skip step" },
+      {
+        shortcut: "B E",
+        description:
+          "Mark the start and end of a range to play; cleared on the next video",
+      },
       { shortcut: "- =", description: "Decrease or increase playback speed" },
       {
         shortcut: "ArrowDown ArrowUp",
@@ -872,7 +996,13 @@ const HELP_SECTIONS: HelpSection[] = [
       { shortcut: "D", description: "Change image display duration" },
       { shortcut: "S", description: "Toggle subtitles or slideshow" },
       { shortcut: "C", description: "Copy the file path" },
+      {
+        shortcut: "Ctrl+Shift+N",
+        description: "Open this file's folder in a new Toka window",
+      },
       { shortcut: "T", description: "Edit tags" },
+      { shortcut: "Shift+T", description: "Tag the video's folder" },
+      { shortcut: "Ctrl+Shift+A", description: "Open actions from add-ons" },
       {
         shortcut: "F",
         description: "Enter fullscreen, show controls, or exit",
@@ -1119,10 +1249,7 @@ function Player({
   onHelp: () => void;
   onNewWindow: () => void;
   helpOpen: boolean;
-  onTagsChange: (
-    videoId: string,
-    update: Pick<VideoResult, "fileName" | "tags">,
-  ) => void;
+  onTagsChange: (videoId: string, update: TagChange) => void;
 }) {
   const element = useRef<HTMLVideoElement>(null);
   const playerShell = useRef<HTMLDivElement>(null);
@@ -1150,7 +1277,8 @@ function Player({
   const controlsIdle = fullscreen && fullscreenMode !== "controls";
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
-  const [volume, setVolume] = useState(100);
+  // A new window starts at half volume, so the first video is not full blast.
+  const [volume, setVolume] = useState(50);
   const [playingBack, setPlayingBack] = useState(false);
   // Whether the viewer has paused this video. The engine parks on the last
   // frame when a file ends, and the native poll only learns of that a moment
@@ -1160,6 +1288,11 @@ function Player({
   const [rotation, setRotation] = useState(0);
   const [aspectStep, setAspectStep] = useState(0);
   const [skipStepIndex, setSkipStepIndex] = useState(DEFAULT_SKIP_STEP);
+  // The stretch of this video the viewer has marked to play on its own, the
+  // way VLC's A-B loop works. It belongs to the file on screen and is dropped
+  // with it, so nothing about it outlives a move to another video.
+  const [rangeStart, setRangeStart] = useState<number>();
+  const [rangeEnd, setRangeEnd] = useState<number>();
   // Whatever the backend has been able to say about the open file, so an
   // undefined rate means "nobody knows yet" rather than "no frames".
   const [frameRate, setFrameRate] = useState<number>();
@@ -1182,6 +1315,7 @@ function Player({
     index: number;
   }>();
   const [addingTag, setAddingTag] = useState(false);
+  const [addingFolderTag, setAddingFolderTag] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
   const [cursorHidden, setCursorHidden] = useState(false);
@@ -1193,6 +1327,119 @@ function Player({
   const cursorWoke = useRef(0);
   const imageElapsed = useRef(0);
   const video = playlist[index];
+  const [addonMenu, setAddonMenu] = useState<AddonMenu>({
+    actions: [],
+    errors: [],
+  });
+  const [addonLoading, setAddonLoading] = useState(true);
+  const [addonOpen, setAddonOpen] = useState(false);
+  const [addonBusy, setAddonBusy] = useState(false);
+  const [addonError, setAddonError] = useState<string>();
+  const addonMenuWrap = useRef<HTMLDivElement>(null);
+  const addonMenuElement = useRef<HTMLDivElement>(null);
+  const addonVideoGeneration = useRef(0);
+  useLayoutEffect(() => {
+    addonVideoGeneration.current += 1;
+  }, [video.id]);
+  const focusAddonButton = useCallback(() => {
+    const button = addonMenuWrap.current?.firstElementChild;
+    if (button instanceof HTMLButtonElement) button.focus();
+  }, []);
+  const closeAddonMenu = useCallback(
+    (restoreFocus: boolean) => {
+      if (restoreFocus) focusAddonButton();
+      setAddonOpen(false);
+    },
+    [focusAddonButton],
+  );
+  useEffect(() => {
+    if (!addonOpen) return;
+    const menu = addonMenuElement.current;
+    const firstAction = menu?.querySelector<HTMLButtonElement>(
+      '[role="menuitem"]:not(:disabled)',
+    );
+    (firstAction ?? menu)?.focus();
+    const closeOutside = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !addonMenuWrap.current?.contains(event.target)
+      )
+        setAddonOpen(false);
+    };
+    window.addEventListener("pointerdown", closeOutside);
+    return () => window.removeEventListener("pointerdown", closeOutside);
+  }, [addonOpen]);
+  const handleAddonMenuKeyDown = (
+    event: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    event.stopPropagation();
+    const toggleShortcut =
+      event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
+    if (event.key === "Escape" || event.key === "Tab" || toggleShortcut) {
+      if (event.key !== "Tab") event.preventDefault();
+      closeAddonMenu(event.key !== "Tab");
+      return;
+    }
+    const actions = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>(
+        '[role="menuitem"]:not(:disabled)',
+      ),
+    );
+    if (!actions.length) return;
+    const current = actions.indexOf(
+      document.activeElement as HTMLButtonElement,
+    );
+    let next: number | undefined;
+    if (event.key === "ArrowDown") next = (current + 1) % actions.length;
+    else if (event.key === "ArrowUp")
+      next = (current - 1 + actions.length) % actions.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = actions.length - 1;
+    if (next === undefined) return;
+    event.preventDefault();
+    actions[next].focus();
+  };
+  useEffect(() => {
+    let active = true;
+    setAddonMenu({ actions: [], errors: [] });
+    setAddonLoading(true);
+    setAddonOpen(false);
+    setAddonBusy(false);
+    setAddonError(undefined);
+    void matchingAddonActions(video.id)
+      .then((menu) => {
+        if (active) setAddonMenu(menu);
+      })
+      .catch((reason: unknown) => {
+        if (active)
+          setAddonMenu({ actions: [], errors: [errorMessage(reason)] });
+      })
+      .finally(() => {
+        if (active) setAddonLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [video.id]);
+  const addonAvailable =
+    addonMenu.actions.length > 0 || addonMenu.errors.length > 0;
+  const runSelectedAddon = async (addonId: string, actionId: string) => {
+    const resultId = video.id;
+    const generation = addonVideoGeneration.current;
+    setAddonBusy(true);
+    setAddonError(undefined);
+    try {
+      await runAddonAction(resultId, addonId, actionId);
+      if (addonVideoGeneration.current !== generation) return;
+      setAddonOpen(false);
+      focusPlayerShell();
+    } catch (reason) {
+      if (addonVideoGeneration.current === generation)
+        setAddonError(errorMessage(reason));
+    } finally {
+      if (addonVideoGeneration.current === generation) setAddonBusy(false);
+    }
+  };
   const isImage = isImageResult(video);
   const [slideshowPlaying, setSlideshowPlaying] = useState(true);
   const [imageDurationSeconds, setImageDurationSeconds] = useState(
@@ -1207,6 +1454,31 @@ function Player({
   useEffect(() => {
     if (isImage) setSlideshowPlaying(true);
   }, [video.id, isImage]);
+  // The rest of a video's folder is often what a viewer wants next. A second
+  // Toka launched on that folder plays it, leaving this playlist where it was.
+  const [folderError, setFolderError] = useState<string>();
+  const openFolder = async () => {
+    setFolderError(undefined);
+    try {
+      await openFolderInNewWindow(video.id);
+    } catch (reason) {
+      setFolderError(errorMessage(reason));
+    }
+  };
+  // Ctrl is held, so the player's single-key handler below ignores it, and
+  // Shift is what keeps it apart from the Ctrl+N that opens a blank window.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (helpOpen || event.defaultPrevented) return;
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "n") return;
+      event.preventDefault();
+      void openFolder();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
   const copyPath = async () => {
     const text = prepared?.filePath ?? video.fileName;
     try {
@@ -1244,6 +1516,16 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
+  };
+  // Every video in the renamed folder carries its new tags, not just this one.
+  const updateFolderTags = ({ folderTags, resultIds }: FolderTagUpdate) => {
+    const moved = new Set(resultIds);
+    setPlaylist((current) =>
+      current.map((item) =>
+        moved.has(item.id) ? { ...item, folderTags } : item,
+      ),
+    );
+    for (const id of resultIds) onTagsChange(id, { folderTags });
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1283,6 +1565,8 @@ function Player({
     // file: the next one is read from its own length once that is known.
     setSkipStepIndex(DEFAULT_SKIP_STEP);
     chosenSkipStep.current = false;
+    setRangeStart(undefined);
+    setRangeEnd(undefined);
     setFrameRate(undefined);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
@@ -1496,9 +1780,13 @@ function Player({
     void element.current
       ?.play()
       .then(() => setPlayingBack(true))
-      .catch(() =>
-        setError("This video could not be played by the system media engine."),
-      );
+      .catch((reason: unknown) => {
+        // An AbortError means a pause, seek or new source overruled this
+        // request, which says nothing about whether the file can play.
+        if (reason instanceof DOMException && reason.name === "AbortError")
+          return;
+        setError("This video could not be played by the system media engine.");
+      });
   };
 
   const pause = () => {
@@ -1513,8 +1801,11 @@ function Player({
     }
   };
 
+  // A click on the picture does what the play button does, as in most players.
+  const togglePlayback = () => (playingBack ? pause() : play());
+
   // Typing a tag needs the viewer's attention, so the picture waits for them.
-  const openTagField = () => {
+  const openTagField = (folder = false) => {
     if (fullscreen && fullscreenModeRef.current !== "controls") {
       // The tag editor lives in the controls row. Fullscreen information mode
       // hides that row down to the scrubber, so opening the editor must reveal
@@ -1523,12 +1814,14 @@ function Player({
       setFullscreenMode("controls");
     }
     if (playingBack) pause();
-    setAddingTag(true);
+    // One field at a time: both claim every keystroke while open.
+    setAddingTag(!folder);
+    setAddingFolderTag(folder);
   };
 
-  const restart = () => {
+  const restart = (from = 0) => {
     if (native) {
-      void seekNativeVideo(0)
+      void seekNativeVideo(from)
         .then(() => {
           if (!pausedByViewer.current) return setNativePaused(false);
         })
@@ -1537,10 +1830,10 @@ function Player({
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
     } else if (element.current) {
-      element.current.currentTime = 0;
+      element.current.currentTime = from;
       play();
     }
-    setCurrentTime(0);
+    setCurrentTime(from);
   };
 
   // Search playlists start with the results already on screen. Fetching the
@@ -1573,6 +1866,13 @@ function Player({
     // the scrubber stopped five to ten percent short and made every video look
     // as though its ending had been skipped.
     if (endTime > 0) setCurrentTime(endTime);
+    // A marked range that runs to the end of the file can reach it before the
+    // range's own end is seen, and it still has to start over rather than
+    // hand playback to the next entry.
+    if (rangeStart !== undefined && rangeEnd !== undefined) {
+      restart(rangeStart);
+      return;
+    }
     if (loop === "one") {
       restart();
       return;
@@ -1666,6 +1966,10 @@ function Player({
       0,
       Math.min(duration || Number.POSITIVE_INFINITY, currentTime + amount),
     );
+    seekTo(next);
+  };
+
+  const seekTo = (next: number) => {
     if (native)
       void seekNativeVideo(next).catch((reason: unknown) =>
         setError(errorMessage(reason)),
@@ -1673,6 +1977,32 @@ function Player({
     else if (element.current) element.current.currentTime = next;
     setCurrentTime(next);
   };
+
+  // A new start past the end would leave a range that runs backwards, so it
+  // drops the end and waits for a new one.
+  const markRangeStart = () => {
+    setRangeStart(currentTime);
+    if (rangeEnd !== undefined && rangeEnd <= currentTime)
+      setRangeEnd(undefined);
+  };
+
+  // With no start marked the range runs from the beginning of the file. An end
+  // at or before the start is not a range, so that press is ignored.
+  const markRangeEnd = () => {
+    const from = rangeStart ?? 0;
+    if (currentTime <= from) return;
+    if (rangeStart === undefined) setRangeStart(from);
+    setRangeEnd(currentTime);
+    seekTo(from);
+  };
+
+  // Only the end is enforced. Holding playback above the start as well would
+  // fight an engine whose seek lands on a keyframe just before it, and a
+  // viewer who scrubs back before the start is still carried into the range.
+  useEffect(() => {
+    if (rangeStart === undefined || rangeEnd === undefined) return;
+    if (currentTime >= rangeEnd) seekTo(rangeStart);
+  }, [currentTime, rangeEnd, rangeStart]);
 
   const selectVideo = (nextIndex: number) => {
     if (nextIndex >= 0 && nextIndex < playlist.length) setIndex(nextIndex);
@@ -2140,9 +2470,13 @@ function Player({
     const onKeyDown = (event: KeyboardEvent) => {
       if (helpOpen) return;
       const target = event.target;
+      const addonShortcut =
+        event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
       if (
         event.defaultPrevented ||
-        (event.ctrlKey && !(event.shiftKey && event.key === "Delete")) ||
+        (event.ctrlKey &&
+          !(event.shiftKey && event.key === "Delete") &&
+          !addonShortcut) ||
         event.metaKey ||
         event.altKey ||
         acceptsTypedText(target)
@@ -2171,8 +2505,21 @@ function Player({
       // hijack the letters being typed, and Escape has to close the field
       // rather than leave fullscreen. Reached only when the field does not hold
       // focus itself, which the check above already returns on.
-      if (addingTag) {
-        if (event.key === "Escape") run(() => setAddingTag(false));
+      if (addonShortcut) {
+        if (!addonLoading && addonAvailable)
+          run(() => (addonOpen ? closeAddonMenu(true) : setAddonOpen(true)));
+        return;
+      }
+      if (addonOpen) {
+        if (event.key === "Escape") run(() => closeAddonMenu(true));
+        return;
+      }
+      if (addingTag || addingFolderTag) {
+        if (event.key === "Escape")
+          run(() => {
+            setAddingTag(false);
+            setAddingFolderTag(false);
+          });
         return;
       }
       if (event.key === " " || event.key === "Spacebar") {
@@ -2188,6 +2535,10 @@ function Player({
       } else if (event.key.toLowerCase() === "j") {
         if (!isImage) run(cycleSkipStep);
         else return;
+      } else if (event.key.toLowerCase() === "b") {
+        if (!isImage) run(markRangeStart);
+      } else if (event.key.toLowerCase() === "e") {
+        if (!isImage) run(markRangeEnd);
       } else if (event.key === "PageUp") {
         run(() => moveVideo(-1));
       } else if (event.key === "PageDown") {
@@ -2212,6 +2563,8 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "c") {
         run(() => void copyPathRef.current());
+      } else if (event.key.toLowerCase() === "t" && event.shiftKey) {
+        run(() => openTagField(true));
       } else if (event.key.toLowerCase() === "t") {
         run(openTagField);
       } else if (event.key.toLowerCase() === "s") {
@@ -2234,6 +2587,10 @@ function Player({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
+    addonAvailable,
+    addonLoading,
+    addonOpen,
+    closeAddonMenu,
     currentTime,
     duration,
     fullscreen,
@@ -2245,8 +2602,11 @@ function Player({
     nativeBaseRotation,
     onBack,
     addingTag,
+    addingFolderTag,
     playingBack,
     playlist.length,
+    rangeEnd,
+    rangeStart,
     skipSeconds,
     slideshowPlaying,
     speed,
@@ -2364,6 +2724,64 @@ function Player({
         >
           <Label>New window</Label>
         </ControlButton>
+        <div className="addon-menu-wrap" ref={addonMenuWrap}>
+          <ControlButton
+            shortcut="Ctrl+Shift+A"
+            className="player-help-toggle"
+            aria-label="Add-ons"
+            aria-expanded={addonOpen}
+            disabled={addonLoading || !addonAvailable}
+            onClick={() =>
+              addonOpen ? closeAddonMenu(false) : setAddonOpen(true)
+            }
+          >
+            <Label>Add-ons</Label>
+          </ControlButton>
+          {addonOpen ? (
+            <div
+              className="addon-menu"
+              role="menu"
+              aria-label="Add-ons"
+              ref={addonMenuElement}
+              tabIndex={-1}
+              onKeyDown={handleAddonMenuKeyDown}
+            >
+              {addonMenu.actions.map((action) => (
+                <button
+                  type="button"
+                  role="menuitem"
+                  key={`${action.addonId}:${action.actionId}`}
+                  disabled={addonBusy}
+                  onClick={() =>
+                    void runSelectedAddon(action.addonId, action.actionId)
+                  }
+                >
+                  <strong>{action.label}</strong>
+                  <span>{action.effects.join(" · ")}</span>
+                </button>
+              ))}
+              {addonMenu.errors.map((message) => (
+                <p role="alert" className="addon-error" key={message}>
+                  {message}
+                </p>
+              ))}
+              {addonError ? (
+                <p role="alert" className="addon-error">
+                  {addonError}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+        <ControlButton
+          shortcut="Ctrl+Shift+N"
+          className="player-help-toggle"
+          aria-label="Open folder in new window"
+          title="Open this file's folder in a new Toka window"
+          onClick={() => void openFolder()}
+        >
+          <FolderWindowIcon />
+        </ControlButton>
         <ControlButton
           shortcut="P"
           className="playlist-toggle"
@@ -2381,6 +2799,11 @@ function Player({
       {fullscreenError ? (
         <p role="alert" className="message error">
           {fullscreenError}
+        </p>
+      ) : null}
+      {folderError ? (
+        <p role="alert" className="message error">
+          {folderError}
         </p>
       ) : null}
       {/* The shell outlives each video: it is the element the browser promotes
@@ -2420,6 +2843,7 @@ function Player({
             ref={nativeSurface}
             className="native-video"
             aria-label={`Playing ${video.fileName}`}
+            onClick={togglePlayback}
           />
         ) : (
           <video
@@ -2448,6 +2872,7 @@ function Player({
               event.currentTarget.volume = volume / 100;
               play();
             }}
+            onClick={togglePlayback}
             onPlay={() => setPlayingBack(true)}
             onPause={() => setPlayingBack(false)}
             onTimeUpdate={(event) =>
@@ -2592,6 +3017,14 @@ function Player({
                   adding ? openTagField() : setAddingTag(false)
                 }
               />
+              <FolderTags
+                video={video}
+                onChange={updateFolderTags}
+                adding={addingFolderTag}
+                onAddingChange={(adding) =>
+                  adding ? openTagField(true) : setAddingFolderTag(false)
+                }
+              />
               {isImage ? (
                 <>
                   <ControlButton
@@ -2653,6 +3086,38 @@ function Player({
                     aria-label={`Skip step: ${skipStepName}`}
                   >
                     <Label>{skipStep.label}</Label>
+                  </ControlButton>
+                  <ControlButton
+                    shortcut="B"
+                    onClick={markRangeStart}
+                    aria-label={
+                      rangeStart === undefined
+                        ? "Mark range start"
+                        : `Range start: ${formatTime(rangeStart)}`
+                    }
+                    aria-pressed={rangeStart !== undefined}
+                  >
+                    <Label>
+                      {rangeStart === undefined
+                        ? "From"
+                        : `From ${formatTime(rangeStart)}`}
+                    </Label>
+                  </ControlButton>
+                  <ControlButton
+                    shortcut="E"
+                    onClick={markRangeEnd}
+                    aria-label={
+                      rangeEnd === undefined
+                        ? "Mark range end"
+                        : `Range end: ${formatTime(rangeEnd)}`
+                    }
+                    aria-pressed={rangeEnd !== undefined}
+                  >
+                    <Label>
+                      {rangeEnd === undefined
+                        ? "To"
+                        : `To ${formatTime(rangeEnd)}`}
+                    </Label>
                   </ControlButton>
                   <span className="labelled-control">
                     <select
@@ -2884,6 +3349,7 @@ async function loadResultPages(
   lastPage: number,
   fields: SearchFields,
   mediaType: MediaType,
+  addonSearch?: AddonSearch,
 ): Promise<VideoResult[][]> {
   const pages = Array.from(
     { length: Math.max(0, lastPage - firstPage + 1) },
@@ -2898,6 +3364,7 @@ async function loadResultPages(
         firstPage + pageIndex,
         fields,
         mediaType,
+        addonSearch,
       );
       pages[pageIndex] = response.results;
     }
@@ -2927,6 +3394,7 @@ export default function App() {
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [page, setPage] = useState<SearchPage>();
+  const [addonSearch, setAddonSearch] = useState<AddonSearch>();
   // Playback is always a playlist: choosing one result starts the whole page of
   // them, positioned at the one that was chosen.
   const [playing, setPlaying] = useState<{
@@ -3013,11 +3481,16 @@ export default function App() {
   // launch rather than a search.
   const launchedResults = useRef<VideoResult[] | undefined>(undefined);
 
-  const runSearch = async (submittedQuery: string, requestedPage: number) => {
+  const runSearch = async (
+    submittedQuery: string,
+    requestedPage: number,
+    nextAddonSearch?: AddonSearch,
+  ) => {
     const trimmed = submittedQuery.trim();
     if (!trimmed) return;
     searchedQuery.current = trimmed;
     launchedResults.current = undefined;
+    setAddonSearch(nextAddonSearch);
     const currentRequest = ++requestNumber.current;
     if (page) indexRefreshCheckRevision.current = managedIndex?.revision;
     setIndexRefreshAvailable(false);
@@ -3030,6 +3503,7 @@ export default function App() {
         requestedPage,
         fields,
         mediaType,
+        nextAddonSearch,
       );
       if (currentRequest === requestNumber.current) setPage(response);
     } catch (reason) {
@@ -3054,6 +3528,7 @@ export default function App() {
         loadedPages + 1,
         fields,
         mediaType,
+        addonSearch,
       );
       setPage((current) =>
         current && current.query === next.query
@@ -3076,6 +3551,7 @@ export default function App() {
       loadedPage + 1,
       fields,
       mediaType,
+      addonSearch,
     );
     setPage((current) =>
       current && current.query === next.query && current.page === loadedPage
@@ -3203,7 +3679,8 @@ export default function App() {
   useEffect(() => {
     if (searchedFields.current === fields) return;
     searchedFields.current = fields;
-    if (searchedQuery.current) void runSearch(searchedQuery.current, 1);
+    if (searchedQuery.current)
+      void runSearch(searchedQuery.current, 1, addonSearch);
   });
   const searchedMediaType = useRef(mediaType);
   useEffect(() => {
@@ -3211,7 +3688,7 @@ export default function App() {
     const previous = searchedMediaType.current;
     searchedMediaType.current = mediaType;
     if (searchedQuery.current) {
-      void runSearch(searchedQuery.current, 1);
+      void runSearch(searchedQuery.current, 1, addonSearch);
       return;
     }
     // A launched folder was never searched for, so there is nothing to ask
@@ -3391,6 +3868,7 @@ export default function App() {
           totalPages,
           fields,
           mediaType,
+          addonSearch,
         )
       : [];
     return [page.results, ...pages].flat();
@@ -3445,28 +3923,25 @@ export default function App() {
     }
   };
 
-  // A playlist — or single video, or folder — Toka was launched with plays
-  // as soon as the window is up. Its entries arrive as a page of results, so
-  // everything a search's results reach — the player, its drawer, prev and
-  // next, coming back to the list — works without a second way through any
-  // of it. The launch clears any existing playlist and search term, and a
-  // folder's videos arrive shuffled like any other playlist.
+  // Media launch intents play at once. Add-on search intents open their exact
+  // result list, ready to browse, without inventing a second search path.
   useEffect(() => {
     let cancelled = false;
     void Promise.allSettled([
-      launchPlaylist(),
+      launchIntent(),
       indexState(),
       loadSearchLogSettings(),
-    ]).then(([playlistResult, indexResult, logResult]) => {
+    ]).then(([launchResult, indexResult, logResult]) => {
       if (cancelled) return;
       const launched =
-        playlistResult.status === "fulfilled" ? playlistResult.value : null;
-      if (playlistResult.status === "rejected")
-        setError(errorMessage(playlistResult.reason));
+        launchResult.status === "fulfilled" ? launchResult.value : null;
+      const launchedPage = launched?.page;
+      if (launchResult.status === "rejected")
+        setError(errorMessage(launchResult.reason));
       if (indexResult.status === "fulfilled") {
         setManagedIndex(indexResult.value);
         if (
-          !launched?.results.length &&
+          !launchedPage?.results.length &&
           indexResult.value.supported &&
           indexResult.value.folders.length === 0
         )
@@ -3479,19 +3954,33 @@ export default function App() {
       }
       // A viewer who got a search in first has asked for something newer than
       // the command line did, and keeps it.
-      if (!launched?.results.length || requestNumber.current) return;
-      setQuery("");
-      launchedResults.current = launched.results;
-      // The toggle starts on whatever the launch holds, so nothing in it is
-      // hidden until the viewer asks for that.
-      const images = launched.results.some(isImageResult);
-      const videos = launched.results.some((video) => !isImageResult(video));
-      const launchedType: MediaType =
-        images && videos ? "both" : images ? "images" : "videos";
-      searchedMediaType.current = launchedType;
-      setMediaType(launchedType);
-      setPage(launched);
-      setPlaying({ videos: launched.results, startIndex: 0 });
+      if (!launchedPage?.results.length || requestNumber.current) return;
+      setPage(launchedPage);
+      if (launched?.addonSearch) {
+        searchedQuery.current = launched.addonSearch.query;
+        searchedFields.current = launched.addonSearch.fields;
+        searchedMediaType.current = launched.addonSearch.mediaType;
+        setQuery(launched.addonSearch.query);
+        setFields(launched.addonSearch.fields);
+        setMediaType(launched.addonSearch.mediaType);
+        setAddonSearch(launched.addonSearch);
+        setPlaying(undefined);
+      } else {
+        setQuery("");
+        setAddonSearch(undefined);
+        launchedResults.current = launchedPage.results;
+        // The toggle starts on whatever the launch holds, so nothing in it is
+        // hidden until the viewer asks for that.
+        const images = launchedPage.results.some(isImageResult);
+        const videos = launchedPage.results.some(
+          (video) => !isImageResult(video),
+        );
+        const launchedType: MediaType =
+          images && videos ? "both" : images ? "images" : "videos";
+        searchedMediaType.current = launchedType;
+        setMediaType(launchedType);
+        setPlaying({ videos: launchedPage.results, startIndex: 0 });
+      }
     });
     return () => {
       cancelled = true;
@@ -3659,7 +4148,7 @@ export default function App() {
     if (indexRefreshCheckRevision.current === revision) return;
     indexRefreshCheckRevision.current = revision;
     let cancelled = false;
-    void searchMatchCount(page.query, fields, mediaType)
+    void searchMatchCount(page.query, fields, mediaType, addonSearch)
       .then((totalResults) => {
         if (!cancelled)
           setIndexRefreshAvailable(totalResults > page.totalResults);
@@ -3671,6 +4160,7 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    addonSearch,
     fields,
     managedIndex?.revision,
     managedIndex?.supported,
@@ -3685,10 +4175,7 @@ export default function App() {
     void runSearch(query, 1);
   };
 
-  const updateTags = (
-    videoId: string,
-    update: Pick<VideoResult, "fileName" | "tags">,
-  ) => {
+  const updateTags = (videoId: string, update: TagChange) => {
     setPage((current) =>
       current
         ? {
@@ -3716,7 +4203,7 @@ export default function App() {
       )
         return;
       event.preventDefault();
-      if (page) void runSearch(page.query, 1);
+      if (page) void runSearch(page.query, 1, addonSearch);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -4074,7 +4561,7 @@ export default function App() {
             shortcut="Ctrl+Shift+R"
             className="scope-toggle"
             aria-label="Refresh search results"
-            onClick={() => void runSearch(page.query, 1)}
+            onClick={() => void runSearch(page.query, 1, addonSearch)}
           >
             <Label>Refresh</Label>
           </ControlButton>

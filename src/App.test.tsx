@@ -12,7 +12,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   externalPlayers,
   indexState,
-  launchPlaylist,
+  launchIntent,
+  matchingAddonActions,
   searchLogSettings,
 } from "./api";
 import App, {
@@ -55,7 +56,10 @@ vi.mock("./api", async (importOriginal) => ({
   indexState: vi.fn(() =>
     Promise.resolve({ supported: false, revision: 0, folders: [] }),
   ),
-  launchPlaylist: vi.fn(() => Promise.resolve(null)),
+  launchIntent: vi.fn(() => Promise.resolve(null)),
+  matchingAddonActions: vi.fn(() =>
+    Promise.resolve({ actions: [], errors: [] }),
+  ),
   searchLogSettings: vi.fn(() =>
     Promise.resolve({ verbose: false, path: undefined }),
   ),
@@ -64,7 +68,8 @@ vi.mock("./api", async (importOriginal) => ({
 const invokeMock = vi.mocked(invoke);
 const externalPlayersMock = vi.mocked(externalPlayers);
 const indexStateMock = vi.mocked(indexState);
-const launchPlaylistMock = vi.mocked(launchPlaylist);
+const launchIntentMock = vi.mocked(launchIntent);
+const matchingAddonActionsMock = vi.mocked(matchingAddonActions);
 const searchLogSettingsMock = vi.mocked(searchLogSettings);
 const convertFileSrcMock = vi.mocked(convertFileSrc);
 const openMock = vi.mocked(open);
@@ -105,7 +110,10 @@ beforeEach(() => {
   indexStateMock
     .mockReset()
     .mockResolvedValue({ supported: false, revision: 0, folders: [] });
-  launchPlaylistMock.mockReset().mockResolvedValue(null);
+  launchIntentMock.mockReset().mockResolvedValue(null);
+  matchingAddonActionsMock
+    .mockReset()
+    .mockResolvedValue({ actions: [], errors: [] });
   searchLogSettingsMock
     .mockReset()
     .mockResolvedValue({ verbose: false, path: undefined });
@@ -156,7 +164,10 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Space");
   expect(help).toHaveTextContent("Enter fullscreen, show controls, or exit");
   expect(help).toHaveTextContent("Change image display duration");
+  expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
+  expect(help).toHaveTextContent("Ctrl+Shift+A");
+  expect(help).toHaveTextContent("Open actions from add-ons");
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
   ).toHaveAttribute("aria-keyshortcuts", "Escape");
@@ -217,13 +228,15 @@ test("opens and saves verbose search logging from its discoverable shortcuts", a
 });
 
 test("opens help over the player without letting Escape leave playback", async () => {
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -331,19 +344,86 @@ test("leaves configured search folder setup with Escape", async () => {
   ).not.toBeInTheDocument();
 });
 
+test("opens an add-on launch as an exact search result list", async () => {
+  const addonSearch = {
+    query: "@sometiktoker",
+    fields: { tags: false, fileName: true, path: false },
+    mediaType: "videos" as const,
+    addonId: "tiktok",
+    capture: "handle",
+    value: "@sometiktoker",
+  };
+  const page = {
+    query: "@sometiktoker",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      {
+        id: "video-1",
+        fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+        extension: "mp4",
+      },
+      {
+        id: "video-2",
+        fileName: "2026-10-11_@sometiktoker_18938383490812348344.mp4",
+        extension: "mp4",
+      },
+    ],
+  };
+  launchIntentMock.mockResolvedValue({ page, addonSearch });
+  invokeMock.mockImplementation((command: string) =>
+    command === "search_videos" ? Promise.resolve(page) : Promise.resolve(),
+  );
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  expect(await screen.findByDisplayValue("@sometiktoker")).toBeVisible();
+  expect(
+    screen.getByRole("button", {
+      name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
+    }),
+  ).toBeVisible();
+  expect(screen.queryByLabelText(/^Playing /)).not.toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Search filename" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  const tags = screen.getByRole("button", { name: "Search tags" });
+  expect(tags).toHaveAttribute("aria-pressed", "false");
+
+  await user.click(tags);
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
+      request: {
+        query: "@sometiktoker",
+        page: 1,
+        pageSize: 24,
+        fields: { tags: true, fileName: true, path: false },
+        mediaType: "videos",
+      },
+      addonSearch,
+    }),
+  );
+});
+
 test("a launch playlist bypasses first-launch folder setup", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
     revision: 0,
     folders: [],
   });
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -356,13 +436,15 @@ test("a launch playlist bypasses first-launch folder setup", async () => {
 });
 
 test("starts launched playback in a focused player mode", async () => {
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 1,
-    totalPages: 1,
-    results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
 
@@ -410,7 +492,7 @@ test("offers to refresh search results when the managed index advances", async (
   expect(refresh).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+R");
   expect(screen.getByText("New files are ready to search.")).toBeVisible();
   invokeMock.mockClear();
-  fireEvent.keyDown(window, { key: "r", ctrlKey: true, shiftKey: true });
+  await user.keyboard("{Control>}{Shift>}r{/Shift}{/Control}");
   await waitFor(() =>
     expect(invokeMock).toHaveBeenCalledWith("search_videos", {
       request: expect.objectContaining({ query: "clip", page: 1 }),
@@ -1343,6 +1425,80 @@ test("draws the tag's remove control as its own icon beside the name", async () 
   expect(pill.querySelector(".tag-remove-glyph")).toBeInTheDocument();
 });
 
+test("tags the playing video's folder from its control and Shift+T", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results: [
+        { id: "video-1", fileName: "clip-a.mp4", extension: "mp4" },
+        { id: "video-2", fileName: "clip-b.mp4", extension: "mp4" },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/Trip/clip-a.mp4" })
+    .mockResolvedValueOnce({
+      folderTags: ["beach"],
+      resultIds: ["video-1", "video-2"],
+    })
+    .mockResolvedValueOnce({ folderTags: [], resultIds: ["video-1"] });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-a.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip-a.mp4");
+
+  const control = screen.getByRole("button", {
+    name: "Tag folder of clip-a.mp4",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Shift+T");
+  expect(control.querySelector(".key-hint")).toBeInTheDocument();
+
+  // Shift+T opens the folder's field, not the video's own tag field.
+  fireEvent.keyDown(window, { key: "T", shiftKey: true });
+  const field = screen.getByRole("textbox", {
+    name: "Tag folder of clip-a.mp4",
+  });
+  expect(field).toHaveFocus();
+  expect(
+    screen.queryByRole("textbox", { name: "Add tag to clip-a.mp4" }),
+  ).toBeNull();
+  await user.keyboard("beach{Enter}");
+
+  expect(invokeMock).toHaveBeenCalledWith("add_folder_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+  const pill = await screen.findByRole("button", {
+    name: "Remove folder tag beach",
+  });
+  await user.click(pill);
+  expect(invokeMock).toHaveBeenCalledWith("remove_folder_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("button", { name: "Remove folder tag beach" }),
+    ).toBeNull(),
+  );
+});
+
+test("lists folder tagging in the help pane", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(within(help).getByText("Tag the video's folder")).toBeVisible();
+  await user.keyboard("{Escape}");
+});
+
 test("gives the open tag field the keyboard and pauses for it", async () => {
   invokeMock
     .mockResolvedValueOnce({
@@ -1690,6 +1846,139 @@ test("uses one control for playing and pausing", async () => {
   expect(played).toHaveBeenCalled();
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Pause" })).toBeVisible(),
+  );
+});
+
+// A play() that a pause, a seek or the next video interrupts rejects with an
+// AbortError. That is the engine saying it was overruled, not that it cannot
+// play the file, so the player must stay put. WebKitGTK does this whenever a
+// pause lands while a looping video is restarting.
+test("an interrupted play request does not replace the player with an error", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+
+  vi.spyOn(HTMLMediaElement.prototype, "play").mockRejectedValue(
+    new DOMException("The play() request was interrupted.", "AbortError"),
+  );
+  await user.click(screen.getByRole("button", { name: "Play" }));
+
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(screen.getByLabelText("Playing clip.mp4")).toBeInTheDocument();
+  expect(
+    screen.queryByText(
+      "This video could not be played by the system media engine.",
+    ),
+  ).not.toBeInTheDocument();
+});
+
+test("clicking the picture plays and pauses the video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  fireEvent.play(video);
+
+  const paused = vi
+    .spyOn(HTMLMediaElement.prototype, "pause")
+    .mockImplementation(() => {});
+  await user.click(video);
+  expect(paused).toHaveBeenCalled();
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+
+  const played = vi
+    .spyOn(HTMLMediaElement.prototype, "play")
+    .mockResolvedValue(undefined);
+  await user.click(video);
+  expect(played).toHaveBeenCalled();
+  await waitFor(() =>
+    expect(screen.getByRole("button", { name: "Pause" })).toBeVisible(),
+  );
+});
+
+test("clicking the native picture plays and pauses the video", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "native-1", fileName: "native-1.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native-1.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 30,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native-1.mp4" }),
+  );
+  const surface = await screen.findByLabelText("Playing native-1.mp4");
+  await screen.findByRole("button", { name: "Pause" });
+  invokeMock.mockClear();
+
+  await user.click(surface);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: true,
+    }),
+  );
+  await screen.findByRole("button", { name: "Play" });
+
+  await user.click(surface);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: false,
+    }),
   );
 });
 
@@ -3246,12 +3535,13 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   );
   await screen.findByLabelText("Playing clip.mp4");
 
+  // A new window starts at half volume rather than full blast.
   const volume = screen.getByRole("slider", { name: "Volume" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
   fireEvent.keyDown(window, { key: "ArrowDown" });
-  expect(volume).toHaveValue("95");
+  expect(volume).toHaveValue("45");
   fireEvent.keyDown(window, { key: "ArrowUp" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   const quieter = screen.getByRole("button", { name: "Decrease volume" });
   const louder = screen.getByRole("button", { name: "Increase volume" });
@@ -3264,7 +3554,7 @@ test("changes volume with the discoverable keyboard shortcuts", async () => {
   // presets keep a digit, and the rest of the row does nothing.
   fireEvent.keyDown(window, { key: "9" });
   fireEvent.keyDown(window, { key: "3" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   // "Vol −" and "Vol +" as words sat oddly among a row of icons; a speaker
   // carrying more or fewer waves says the same thing at a glance.
@@ -3294,7 +3584,7 @@ test("jumps to preset volumes with the discoverable digit shortcuts", async () =
   const video = await screen.findByLabelText("Playing clip.mp4");
 
   const volume = screen.getByRole("slider", { name: "Volume" });
-  expect(volume).toHaveValue("100");
+  expect(volume).toHaveValue("50");
 
   fireEvent.keyDown(window, { key: "0" });
   expect(volume).toHaveValue("0");
@@ -3365,6 +3655,14 @@ test("sends preset volumes to native playback", async () => {
     await screen.findByRole("button", { name: "Play native.mp4" }),
   );
   await screen.findByLabelText("Playing native.mp4");
+  // A new window starts at half volume, so mpv is told that on load; clear
+  // it so each preset below must send its own volume.
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_volume", {
+      volume: 50,
+    }),
+  );
+  invokeMock.mockClear();
 
   fireEvent.keyDown(window, { key: "0" });
   await waitFor(() =>
@@ -4905,10 +5203,222 @@ test("opens a new window from Ctrl+N while a video is playing", async () => {
     expect(invokeMock).toHaveBeenCalledWith("open_new_window"),
   );
 
-  // Ctrl+Shift+N is not the shortcut: it must not open a new window.
+  // Ctrl+Shift+N opens the video's folder instead, never a blank window.
   invokeMock.mockClear();
   fireEvent.keyDown(window, { key: "n", ctrlKey: true, shiftKey: true });
-  expect(invokeMock).not.toHaveBeenCalled();
+  expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
+});
+
+// Watching one video is often the way into the rest of its folder: a second
+// Toka launched on that folder plays them all, leaving this one where it was.
+test("opens the playing video's folder in a new Toka from the control and from Ctrl+Shift+N", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Video controls");
+
+  const control = screen.getByRole("button", {
+    name: "Open folder in new window",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+N");
+  expect(control.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+N");
+  expect(control.querySelector("svg")).not.toBeNull();
+
+  invokeMock.mockClear();
+  await user.click(control);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "N", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+  expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
+});
+
+test("says why the playing video's folder could not be opened", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_folder_in_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open folder in new window" }),
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
+});
+
+test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "tiktok",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+            extension: "mp4",
+          },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/2026-10-10_@sometiktoker_18938383490812348343.mp4",
+        playbackBackend: "web",
+      });
+    }
+    return Promise.resolve();
+  });
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [
+      {
+        addonId: "tiktok",
+        actionId: "creator",
+        label: "Open TikTok creator",
+        effects: ["New Toka window", "tiktok.com"],
+      },
+    ],
+    errors: [],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tiktok{Enter}");
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
+    }),
+  );
+
+  const addons = await screen.findByRole("button", { name: "Add-ons" });
+  expect(addons).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+A");
+  expect(addons.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+A");
+  fireEvent.keyDown(window, { key: "a", ctrlKey: true, shiftKey: true });
+
+  const menu = await screen.findByRole("menu", { name: "Add-ons" });
+  expect(menu).toHaveTextContent("New Toka window · tiktok.com");
+  const action = screen.getByRole("menuitem", { name: /Open TikTok creator/ });
+  await waitFor(() => expect(action).toHaveFocus());
+
+  fireEvent.keyDown(action, { key: "a", ctrlKey: true, shiftKey: true });
+  expect(
+    screen.queryByRole("menu", { name: "Add-ons" }),
+  ).not.toBeInTheDocument();
+  expect(addons).toHaveFocus();
+
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const tabAction = await screen.findByRole("menuitem", {
+    name: /Open TikTok creator/,
+  });
+  await waitFor(() => expect(tabAction).toHaveFocus());
+  await user.keyboard("{Tab}");
+  expect(
+    screen.queryByRole("menu", { name: "Add-ons" }),
+  ).not.toBeInTheDocument();
+
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const selectedAction = await screen.findByRole("menuitem", {
+    name: /Open TikTok creator/,
+  });
+  await waitFor(() => expect(selectedAction).toHaveFocus());
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("run_addon_action", {
+      resultId: "video-1",
+      addonId: "tiktok",
+      actionId: "creator",
+    }),
+  );
+});
+
+test("keeps unmatched add-ons disabled and shows load failures in their menu", async () => {
+  const result = {
+    query: "clip",
+    page: 1,
+    pageSize: 24,
+    totalResults: 2,
+    totalPages: 1,
+    results: [
+      { id: "video-1", fileName: "clip.mp4", extension: "mp4" },
+      { id: "video-2", fileName: "other.mp4", extension: "mp4" },
+    ],
+  };
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(result);
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/clip.mp4",
+        playbackBackend: "web",
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+
+  const unmatched = await screen.findByRole("button", { name: "Add-ons" });
+  await waitFor(() => expect(unmatched).toBeDisabled());
+  expect(matchingAddonActionsMock).toHaveBeenCalledWith("video-1");
+
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [],
+    errors: ["broken.json: invalid JSON"],
+  });
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  await waitFor(() => expect(unmatched).toBeEnabled());
+  await user.click(unmatched);
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "broken.json: invalid JSON",
+  );
 });
 
 test("says why a second Toka could not be started", async () => {
@@ -5203,6 +5713,140 @@ test("cycles the skip step and applies it to both directions", async () => {
   expect(video).toHaveProperty("currentTime", 1060);
 });
 
+// VLC's A-B loop: one key marks where the range starts, another where it
+// ends, and from then on only that stretch of the video plays.
+test("marks a range with B and E and plays only that range", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = (await screen.findByLabelText(
+    "Playing clip.mp4",
+  )) as HTMLVideoElement;
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 10,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+
+  const start = screen.getByRole("button", { name: "Mark range start" });
+  expect(start).toHaveAttribute("aria-keyshortcuts", "B");
+  expect(start.querySelector(".key-hint")).toHaveTextContent("B");
+  const end = screen.getByRole("button", { name: "Mark range end" });
+  expect(end).toHaveAttribute("aria-keyshortcuts", "E");
+  expect(end.querySelector(".key-hint")).toHaveTextContent("E");
+
+  fireEvent.keyDown(window, { key: "b" });
+  expect(
+    screen.getByRole("button", { name: "Range start: 0:10" }),
+  ).toHaveAttribute("aria-pressed", "true");
+
+  video.currentTime = 30;
+  fireEvent.timeUpdate(video);
+  fireEvent.keyDown(window, { key: "e" });
+  expect(
+    screen.getByRole("button", { name: "Range end: 0:30" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  // Closing the range goes straight back to its start.
+  expect(video).toHaveProperty("currentTime", 10);
+
+  // Reaching the end of the range plays it again from the start.
+  video.currentTime = 30.2;
+  fireEvent.timeUpdate(video);
+  expect(video).toHaveProperty("currentTime", 10);
+
+  // Inside the range, playback is left alone.
+  video.currentTime = 20;
+  fireEvent.timeUpdate(video);
+  expect(video).toHaveProperty("currentTime", 20);
+
+  // A range that runs to the end of the file loops rather than advancing.
+  vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+  fireEvent.ended(video);
+  expect(video).toHaveProperty("currentTime", 10);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+});
+
+test("clears the range when moving to another video", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `video-${number}`,
+    fileName: `clip-${number}.mp4`,
+    extension: "mp4",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  const first = (await screen.findByLabelText(
+    "Playing clip-1.mp4",
+  )) as HTMLVideoElement;
+  Object.defineProperty(first, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(first, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 10,
+  });
+  fireEvent.loadedMetadata(first);
+  fireEvent.timeUpdate(first);
+  fireEvent.keyDown(window, { key: "b" });
+  first.currentTime = 30;
+  fireEvent.timeUpdate(first);
+  fireEvent.keyDown(window, { key: "e" });
+  expect(screen.getByRole("button", { name: "Range end: 0:30" })).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "PageDown" });
+  const second = await screen.findByLabelText("Playing clip-2.mp4");
+  expect(
+    screen.getByRole("button", { name: "Mark range start" }),
+  ).toHaveAttribute("aria-pressed", "false");
+  expect(
+    screen.getByRole("button", { name: "Mark range end" }),
+  ).toHaveAttribute("aria-pressed", "false");
+
+  // The old range no longer pulls playback back.
+  Object.defineProperty(second, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(second, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 40,
+  });
+  fireEvent.timeUpdate(second);
+  expect(second).toHaveProperty("currentTime", 40);
+
+  // Going back clears it too.
+  fireEvent.keyDown(window, { key: "b" });
+  fireEvent.keyDown(window, { key: "PageUp" });
+  await screen.findByLabelText("Playing clip-1.mp4");
+  expect(
+    screen.getByRole("button", { name: "Mark range start" }),
+  ).toHaveAttribute("aria-pressed", "false");
+});
+
 // Ten seconds is a nudge through a feature and a third of a short clip, so the
 // step each video starts on is read from that video's own length.
 test("starts each video on the skip step closest to a tenth of its length", async () => {
@@ -5414,13 +6058,15 @@ test("plays the playlist Toka was launched with and leaves it to come back to", 
     fileName: `launched-${number}.mp4`,
     extension: "mp4",
   }));
-  launchPlaylistMock.mockResolvedValue({
-    query: "summer.m3u8",
-    page: 1,
-    pageSize: 24,
-    totalResults: 2,
-    totalPages: 1,
-    results,
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 2,
+      totalPages: 1,
+      results,
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Videos/launched-1.mp4" });
   const user = userEvent.setup();
@@ -5444,17 +6090,19 @@ test("plays the playlist Toka was launched with and leaves it to come back to", 
 });
 
 test("filters a launched folder of videos and images with the media toggle", async () => {
-  launchPlaylistMock.mockResolvedValue({
-    query: "Holiday",
-    page: 1,
-    pageSize: 24,
-    totalResults: 3,
-    totalPages: 1,
-    results: [
-      { id: "video-1", fileName: "beach.mp4", extension: "mp4" },
-      { id: "image-1", fileName: "sunset.jpg", extension: "jpg" },
-      { id: "video-2", fileName: "pier.mkv", extension: "mkv" },
-    ],
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "Holiday",
+      page: 1,
+      pageSize: 24,
+      totalResults: 3,
+      totalPages: 1,
+      results: [
+        { id: "video-1", fileName: "beach.mp4", extension: "mp4" },
+        { id: "image-1", fileName: "sunset.jpg", extension: "jpg" },
+        { id: "video-2", fileName: "pier.mkv", extension: "mkv" },
+      ],
+    },
   });
   invokeMock.mockResolvedValue({ filePath: "/Holiday/beach.mp4" });
   const user = userEvent.setup();
@@ -5491,7 +6139,7 @@ test("filters a launched folder of videos and images with the media toggle", asy
 });
 
 test("reports a launch playlist it cannot play and leaves the search ready", async () => {
-  launchPlaylistMock.mockRejectedValue({
+  launchIntentMock.mockRejectedValue({
     kind: "Playlist",
     message: "summer.m3u8 lists no videos Toka can play.",
   });

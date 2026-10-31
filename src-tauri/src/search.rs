@@ -78,6 +78,8 @@ pub struct VideoResult {
     pub extension: String,
     pub thumbnail_path: Option<String>,
     pub tags: Vec<String>,
+    /// The tags of the folder the file sits in, read from that folder's name.
+    pub folder_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -135,6 +137,9 @@ pub struct SearchEngine {
     /// gone, as `plocate --existing` does, stops listing it at all. Keeping the
     /// renames here lets a search see the file the way it is now.
     renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// Folders this session has renamed, the same way: under the name the index
+    /// knew them by. Tagging a folder renames it, which moves every file in it.
+    renamed_folders: Mutex<HashMap<PathBuf, PathBuf>>,
     /// The order the search on screen is being read in. Only the current one is
     /// kept: a new question replaces it, and there is never a second search to
     /// go back to — the frontend asks for page one and then walks forward.
@@ -163,13 +168,44 @@ impl SearchEngine {
             logger,
             result_paths: Mutex::new(HashMap::new()),
             renamed_paths: Mutex::new(HashMap::new()),
+            renamed_folders: Mutex::new(HashMap::new()),
             shuffle: Mutex::new(None),
         }
     }
 
     pub fn search(&self, request: SearchRequest) -> Result<SearchPage, SearchError> {
+        self.search_filtered(request, |_| true)
+    }
+
+    pub fn search_filtered(
+        &self,
+        request: SearchRequest,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
         let context = self.logger.context(&request, true);
-        let result = self.search_page(request, &context);
+        self.search_filtered_with_context(request, context, filter)
+    }
+
+    pub fn search_filtered_for_addon(
+        &self,
+        request: SearchRequest,
+        addon_id: &str,
+        addon_capture: &str,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
+        let context = self
+            .logger
+            .context_for_addon(&request, true, addon_id, addon_capture);
+        self.search_filtered_with_context(request, context, filter)
+    }
+
+    fn search_filtered_with_context(
+        &self,
+        request: SearchRequest,
+        context: SearchLogContext,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<SearchPage, SearchError> {
+        let result = self.search_page(request, &context, &filter);
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
         }
@@ -180,8 +216,9 @@ impl SearchEngine {
         &self,
         request: SearchRequest,
         context: &SearchLogContext,
+        filter: &dyn Fn(&Path) -> bool,
     ) -> Result<SearchPage, SearchError> {
-        let (query, mut paths) = self.matching_paths(&request, context)?;
+        let (query, mut paths) = self.matching_paths(&request, context, filter)?;
         let fields = request.fields;
         let media_type = request.media_type;
 
@@ -235,9 +272,39 @@ impl SearchEngine {
     /// Answers whether a query's match count changed without creating result
     /// ids or replacing the shuffle used by the visible result pages.
     pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
+        self.match_count_filtered(request, |_| true)
+    }
+
+    pub fn match_count_filtered(
+        &self,
+        request: SearchRequest,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
         let context = self.logger.context(&request, false);
+        self.match_count_filtered_with_context(request, context, filter)
+    }
+
+    pub fn match_count_filtered_for_addon(
+        &self,
+        request: SearchRequest,
+        addon_id: &str,
+        addon_capture: &str,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
+        let context = self
+            .logger
+            .context_for_addon(&request, false, addon_id, addon_capture);
+        self.match_count_filtered_with_context(request, context, filter)
+    }
+
+    fn match_count_filtered_with_context(
+        &self,
+        request: SearchRequest,
+        context: SearchLogContext,
+        filter: impl Fn(&Path) -> bool,
+    ) -> Result<usize, SearchError> {
         let result = self
-            .matching_paths(&request, &context)
+            .matching_paths(&request, &context, &filter)
             .map(|(_, paths)| paths.len());
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
@@ -249,6 +316,7 @@ impl SearchEngine {
         &self,
         request: &SearchRequest,
         context: &SearchLogContext,
+        filter: &dyn Fn(&Path) -> bool,
     ) -> Result<(String, Vec<PathBuf>), SearchError> {
         let query = request.query.trim();
         let expression = parse_query(query)?;
@@ -275,6 +343,11 @@ impl SearchEngine {
             if !matches_query(&path, &expression, request.fields) {
                 self.logger
                     .record_filtered(context, &path, "query did not match");
+                continue;
+            }
+            if !filter(&path) {
+                self.logger
+                    .record_filtered(context, &path, "add-on filter did not match");
                 continue;
             }
             if !seen.insert(path.clone()) {
@@ -332,18 +405,26 @@ impl SearchEngine {
     ) -> Result<Vec<PathBuf>, SearchError> {
         let mut paths = self.provider.candidates(query, whole_path, context)?;
         let renamed = self.renamed_paths.lock().unwrap();
-        if renamed.is_empty() {
+        let folders = self.renamed_folders.lock().unwrap();
+        if renamed.is_empty() && folders.is_empty() {
             return Ok(paths);
         }
         for path in &mut paths {
             if let Some(current) = renamed.get(path) {
                 *path = current.clone();
+            } else if let Some(current) = through_folders(folders.iter(), path) {
+                *path = current;
             }
         }
         // A renamed file that has since been deleted is not a search result,
         // and this is the only place a path Toka renamed itself can be checked
         // cheaply — provider candidates are deliberately left untouched.
         paths.extend(renamed.values().filter(|path| path.is_file()).cloned());
+        // An index that drops names whose file is gone drops a renamed
+        // folder's whole contents, so they are listed from the folder itself.
+        for folder in folders.values() {
+            files_under(folder, &mut paths);
+        }
         Ok(paths)
     }
 
@@ -410,16 +491,53 @@ impl SearchEngine {
     /// the index's own answer is enough again.
     fn record_rename(&self, previous: PathBuf, current: PathBuf) {
         let mut renamed = self.renamed_paths.lock().unwrap();
+        let folders = self.renamed_folders.lock().unwrap();
         let indexed = renamed
             .iter()
             .find(|(_, path)| **path == previous)
             .map(|(indexed, _)| indexed.clone())
+            .or_else(|| through_folders(folders.iter().map(|(i, c)| (c, i)), &previous))
             .unwrap_or(previous);
         if indexed == current {
             renamed.remove(&indexed);
         } else {
             renamed.insert(indexed, current);
         }
+    }
+
+    /// Follows a folder from `previous` to `current`: every result the engine
+    /// knows inside it now lives under the new name, and searches see it there
+    /// while the index still has the old one. Returns the ids that moved.
+    pub fn rename_folder(&self, previous: &Path, current: PathBuf) -> Vec<String> {
+        let mut known_paths = self.result_paths.lock().unwrap();
+        let mut renamed = self.renamed_paths.lock().unwrap();
+        let mut folders = self.renamed_folders.lock().unwrap();
+        let mut moved = Vec::new();
+        for (id, path) in known_paths.iter_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+                moved.push(id.clone());
+            }
+        }
+        if previous == current {
+            return moved;
+        }
+        for path in renamed.values_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+            }
+        }
+        renamed.retain(|indexed, path| indexed != path);
+        let indexed = through_folders(folders.iter().map(|(i, c)| (c, i)), previous)
+            .unwrap_or_else(|| previous.to_path_buf());
+        for path in folders.values_mut() {
+            if let Some(next) = moved_under(path, previous, &current) {
+                *path = next;
+            }
+        }
+        folders.insert(indexed, current);
+        folders.retain(|indexed, path| indexed != path);
+        moved
     }
 
     pub fn thumbnail_path(&self, result_id: &str) -> Result<PathBuf, SearchError> {
@@ -497,6 +615,48 @@ fn video_result(path: &Path) -> VideoResult {
             None
         },
         tags: tags::get(path),
+        folder_tags: path
+            .parent()
+            .and_then(Path::file_name)
+            .map(|name| tags::Tags::parse_dir_name(&name.to_string_lossy()).into_values())
+            .unwrap_or_default(),
+    }
+}
+
+/// `path` moved from under `from` to the same place under `to`, if it was
+/// under `from` at all. Compared by component, so `/a/b` is not under `/a/bc`.
+fn moved_under(path: &Path, from: &Path, to: &Path) -> Option<PathBuf> {
+    let rest = path.strip_prefix(from).ok()?;
+    Some(if rest.as_os_str().is_empty() {
+        to.to_path_buf()
+    } else {
+        to.join(rest)
+    })
+}
+
+/// The deepest renamed folder `path` sits under, looked up from one side of a
+/// rename (the indexed name or the current one) and moved to the other side.
+fn through_folders<'a>(
+    folders: impl Iterator<Item = (&'a PathBuf, &'a PathBuf)>,
+    path: &Path,
+) -> Option<PathBuf> {
+    folders
+        .filter(|(from, _)| path.starts_with(from))
+        .max_by_key(|(from, _)| from.components().count())
+        .and_then(|(from, to)| moved_under(path, from, to))
+}
+
+/// Every file below `folder`, without following links to other folders.
+fn files_under(folder: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => files_under(&entry.path(), files),
+            Ok(kind) if kind.is_file() => files.push(entry.path()),
+            _ => {}
+        }
     }
 }
 
@@ -505,6 +665,7 @@ enum QueryField {
     Tags,
     FileName,
     Path,
+    Folder,
     Any,
 }
 
@@ -542,12 +703,20 @@ impl CalendarDate {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMediaType {
+    Video,
+    Image,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryTerm {
     Text {
         field: QueryField,
         value: String,
     },
+    MediaType(QueryMediaType),
+    Extension(String),
     Size {
         comparison: Comparison,
         bytes: u64,
@@ -562,41 +731,63 @@ enum QueryTerm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryExpr {
     Term(QueryTerm),
+    Not(Box<QueryExpr>),
     And(Box<QueryExpr>, Box<QueryExpr>),
     Or(Box<QueryExpr>, Box<QueryExpr>),
 }
 
-fn tokenize_query(query: &str) -> Vec<String> {
+pub(crate) fn tokenize_query(query: &str) -> Result<Vec<String>, SearchError> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    for character in query.chars() {
-        if matches!(character, '(' | ')') {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+    let mut characters = query.chars().peekable();
+    let mut quoted = false;
+
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '\\' if quoted => match characters.peek().copied() {
+                Some('"' | '\\') => current.push(characters.next().unwrap()),
+                Some(_) => current.push(character),
+                None => return Err(SearchError::InvalidQuery),
+            },
+            '(' | ')' if !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(character.to_string());
             }
-            tokens.push(character.to_string());
-        } else if character.is_whitespace() {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+            character if character.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
             }
-        } else {
-            current.push(character);
+            _ => current.push(character),
         }
+    }
+
+    if quoted {
+        return Err(SearchError::InvalidQuery);
     }
     if !current.is_empty() {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
-    let tokens = tokenize_query(query);
+    let today = calendar_date(SystemTime::now()).ok_or(SearchError::InvalidQuery)?;
+    parse_query_at(query, today)
+}
+
+fn parse_query_at(query: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
+    let tokens = tokenize_query(query)?;
     if tokens.is_empty() {
         return Err(SearchError::InvalidQuery);
     }
     let mut parser = QueryParser {
         tokens,
         position: 0,
+        today,
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
@@ -608,6 +799,7 @@ fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
 struct QueryParser {
     tokens: Vec<String>,
     position: usize,
+    today: CalendarDate,
 }
 
 impl QueryParser {
@@ -634,7 +826,7 @@ impl QueryParser {
     }
 
     fn parse_and(&mut self) -> Result<QueryExpr, SearchError> {
-        let mut expression = self.parse_primary()?;
+        let mut expression = self.parse_not()?;
         loop {
             match self.peek() {
                 None | Some(")") => break,
@@ -644,9 +836,20 @@ impl QueryParser {
                 }
                 Some(_) => {}
             }
-            expression = QueryExpr::And(Box::new(expression), Box::new(self.parse_primary()?));
+            expression = QueryExpr::And(Box::new(expression), Box::new(self.parse_not()?));
         }
         Ok(expression)
+    }
+
+    fn parse_not(&mut self) -> Result<QueryExpr, SearchError> {
+        if self
+            .peek()
+            .is_some_and(|token| token.eq_ignore_ascii_case("NOT"))
+        {
+            self.consume();
+            return Ok(QueryExpr::Not(Box::new(self.parse_not()?)));
+        }
+        self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<QueryExpr, SearchError> {
@@ -661,41 +864,70 @@ impl QueryParser {
             }
             Some(")") | None => Err(SearchError::InvalidQuery),
             Some(token)
-                if token.eq_ignore_ascii_case("AND") || token.eq_ignore_ascii_case("OR") =>
+                if token.eq_ignore_ascii_case("AND")
+                    || token.eq_ignore_ascii_case("OR")
+                    || token.eq_ignore_ascii_case("NOT") =>
             {
                 Err(SearchError::InvalidQuery)
             }
-            Some(_) => parse_query_term(&self.consume().unwrap()),
+            Some(_) => parse_query_term(&self.consume().unwrap(), self.today),
         }
     }
 }
 
-fn parse_query_term(token: &str) -> Result<QueryExpr, SearchError> {
+fn parse_query_term(token: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
     if let Some((raw_field, value)) = token.split_once(':') {
-        if raw_field.eq_ignore_ascii_case("size") {
-            return Ok(QueryExpr::Term(parse_size_term(value)?));
-        }
-        if let Some(field) = parse_date_field(raw_field) {
-            return Ok(QueryExpr::Term(parse_date_term(field, value)?));
-        }
+        let field = raw_field.to_ascii_lowercase();
+        let term = match field.as_str() {
+            "size" => parse_size_term(value)?,
+            "created" => parse_date_term(DateField::Created, value, today)?,
+            "modified" => parse_date_term(DateField::Modified, value, today)?,
+            "type" => QueryTerm::MediaType(parse_media_type(value)?),
+            "extension" | "ext" => QueryTerm::Extension(parse_extension(value)?),
+            "tags" | "tag" | "filename" | "file" | "name" | "path" | "folder" => {
+                if value.is_empty() {
+                    return Err(SearchError::InvalidQuery);
+                }
+                let field = match field.as_str() {
+                    "tags" | "tag" => QueryField::Tags,
+                    "filename" | "file" | "name" => QueryField::FileName,
+                    "path" => QueryField::Path,
+                    "folder" => QueryField::Folder,
+                    _ => unreachable!(),
+                };
+                QueryTerm::Text {
+                    field,
+                    value: value.to_lowercase(),
+                }
+            }
+            _ => QueryTerm::Text {
+                field: QueryField::Any,
+                value: token.to_lowercase(),
+            },
+        };
+        return Ok(QueryExpr::Term(term));
     }
-    let (field, value) = token
-        .split_once(':')
-        .map(|(field, value)| (field.to_ascii_lowercase(), value))
-        .and_then(|(field, value)| {
-            let field = match field.as_str() {
-                "tags" | "tag" => QueryField::Tags,
-                "filename" | "file" | "name" => QueryField::FileName,
-                "path" => QueryField::Path,
-                _ => return None,
-            };
-            (!value.is_empty()).then_some((field, value))
-        })
-        .unwrap_or((QueryField::Any, token));
+
     Ok(QueryExpr::Term(QueryTerm::Text {
-        field,
-        value: value.to_lowercase(),
+        field: QueryField::Any,
+        value: token.to_lowercase(),
     }))
+}
+
+fn parse_media_type(value: &str) -> Result<QueryMediaType, SearchError> {
+    match value.to_ascii_lowercase().as_str() {
+        "video" | "videos" => Ok(QueryMediaType::Video),
+        "image" | "images" => Ok(QueryMediaType::Image),
+        _ => Err(SearchError::InvalidQuery),
+    }
+}
+
+fn parse_extension(value: &str) -> Result<String, SearchError> {
+    let value = value.strip_prefix('.').unwrap_or(value);
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(SearchError::InvalidQuery);
+    }
+    Ok(value.to_lowercase())
 }
 
 fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
@@ -736,23 +968,61 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     })
 }
 
-fn parse_date_field(field: &str) -> Option<DateField> {
-    if field.eq_ignore_ascii_case("created") {
-        Some(DateField::Created)
-    } else if field.eq_ignore_ascii_case("modified") {
-        Some(DateField::Modified)
-    } else {
-        None
-    }
-}
-
-fn parse_date_term(field: DateField, value: &str) -> Result<QueryTerm, SearchError> {
+fn parse_date_term(
+    field: DateField,
+    value: &str,
+    today: CalendarDate,
+) -> Result<QueryTerm, SearchError> {
     let (comparison, value) = split_comparison(value);
+    let date = parse_calendar_date(value).or_else(|_| parse_relative_date(value, today))?;
     Ok(QueryTerm::Date {
         field,
         comparison,
-        date: parse_calendar_date(value)?,
+        date,
     })
+}
+
+fn parse_relative_date(value: &str, today: CalendarDate) -> Result<CalendarDate, SearchError> {
+    let lower = value.to_ascii_lowercase();
+    let parts = lower.split_whitespace().collect::<Vec<_>>();
+    if parts.len() != 3 || parts[2] != "ago" {
+        return Err(SearchError::InvalidQuery);
+    }
+    let amount = parts[0]
+        .parse::<u64>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .ok_or(SearchError::InvalidQuery)?;
+    let multiplier = match parts[1] {
+        "day" | "days" => 1,
+        "week" | "weeks" => 7,
+        _ => return Err(SearchError::InvalidQuery),
+    };
+    let days = amount
+        .checked_mul(multiplier)
+        .ok_or(SearchError::InvalidQuery)?;
+    subtract_calendar_days(today, days)
+}
+
+fn subtract_calendar_days(
+    mut date: CalendarDate,
+    mut days: u64,
+) -> Result<CalendarDate, SearchError> {
+    while days >= u64::from(date.day) {
+        days -= u64::from(date.day);
+        if date.month == 1 {
+            date.year = date.year.checked_sub(1).ok_or(SearchError::InvalidQuery)?;
+            if date.year < 1 {
+                return Err(SearchError::InvalidQuery);
+            }
+            date.month = 12;
+        } else {
+            date.month -= 1;
+        }
+        date.day = days_in_month(date.year, date.month);
+    }
+    date.day -= days as u32;
+    CalendarDate::new(date.year, date.month, date.day).ok_or(SearchError::InvalidQuery)
 }
 
 fn parse_calendar_date(value: &str) -> Result<CalendarDate, SearchError> {
@@ -856,9 +1126,16 @@ fn split_comparison(value: &str) -> (Comparison, &str) {
 
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
-        QueryExpr::Term(QueryTerm::Text { field, .. }) => *field == QueryField::Path,
-        QueryExpr::Term(QueryTerm::Size { .. }) => false,
-        QueryExpr::Term(QueryTerm::Date { .. }) => false,
+        QueryExpr::Term(QueryTerm::Text { field, .. }) => {
+            matches!(field, QueryField::Path | QueryField::Folder)
+        }
+        QueryExpr::Term(
+            QueryTerm::MediaType(_)
+            | QueryTerm::Extension(_)
+            | QueryTerm::Size { .. }
+            | QueryTerm::Date { .. },
+        ) => false,
+        QueryExpr::Not(expression) => query_needs_whole_path(expression),
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
             query_needs_whole_path(left) || query_needs_whole_path(right)
         }
@@ -873,8 +1150,15 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 .any(|hay| hay.contains(value)),
             QueryField::Tags => tags_haystack(path).contains(value),
             QueryField::FileName => file_name_haystack(path).contains(value),
-            QueryField::Path => path_haystack(path).contains(value),
+            QueryField::Path | QueryField::Folder => path_haystack(path).contains(value),
         },
+        QueryExpr::Term(QueryTerm::MediaType(media_type)) => match media_type {
+            QueryMediaType::Video => is_supported_video(path),
+            QueryMediaType::Image => is_supported_image(path),
+        },
+        QueryExpr::Term(QueryTerm::Extension(extension)) => path
+            .extension()
+            .is_some_and(|actual| actual.to_string_lossy().eq_ignore_ascii_case(extension)),
         QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
             .map(|metadata| compare(metadata.len(), *comparison, *bytes))
             .unwrap_or(false),
@@ -892,6 +1176,7 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 calendar_date(time)
             })
             .is_some_and(|actual| compare(actual, *comparison, *date)),
+        QueryExpr::Not(expression) => !matches_query(path, expression, fields),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields) && matches_query(path, right, fields)
         }
@@ -1079,6 +1364,23 @@ mod tests {
     }
 
     #[test]
+    fn records_addon_identity_with_filtered_search_errors() {
+        let directory = tempdir().unwrap();
+        let log_path = directory.path().join("search.log");
+        let logger = Arc::new(SearchLogger::new(log_path.clone()));
+        let engine = SearchEngine::new_with_logger(Arc::new(ErrorProvider), logger);
+
+        engine
+            .search_filtered_for_addon(request("@sam"), "tiktok", "handle", |_| true)
+            .unwrap_err();
+
+        let line = fs::read_to_string(log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["addonId"], "tiktok");
+        assert_eq!(entry["addonCapture"], "handle");
+    }
+
+    #[test]
     fn search_returns_only_supported_files_containing_every_term() {
         let directory = tempdir().unwrap();
         let matching = directory.path().join("Summer Family Vacation.MP4");
@@ -1101,6 +1403,44 @@ mod tests {
         assert_eq!(page.results[0].file_name, "Summer Family Vacation.MP4");
         assert_eq!(page.results[0].extension, "mp4");
         assert!(!page.results[0].id.is_empty());
+    }
+
+    #[test]
+    fn an_addon_filter_runs_before_shuffle_and_paging() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        for number in 0..30 {
+            for handle in ["@sam", "@sammy"] {
+                let path = directory
+                    .path()
+                    .join(format!("2026-10-10_{handle}_{number:020}.mp4"));
+                fs::write(&path, b"test").unwrap();
+                paths.push(path);
+            }
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let mut search = request("@sam");
+        search.fields = SearchFields {
+            tags: false,
+            file_name: true,
+            path: false,
+        };
+
+        let page = engine
+            .search_filtered(search, |path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("_@sam_"))
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 30);
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.results.len(), PAGE_SIZE);
+        assert!(page
+            .results
+            .iter()
+            .all(|result| result.file_name.contains("_@sam_")));
     }
 
     #[test]
@@ -1218,6 +1558,33 @@ mod tests {
         assert_eq!(every_name, every_clip_name(25));
     }
 
+    #[test]
+    fn search_keeps_the_page_size_and_rejects_invalid_page_requests() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), PAGE_SIZE + 1);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        let first = engine.search(request("clip")).unwrap();
+        assert_eq!(first.page, 1);
+        assert_eq!(first.page_size, 24);
+        assert_eq!(first.total_results, 25);
+        assert_eq!(first.total_pages, 2);
+
+        let mut zero_page = request("clip");
+        zero_page.page = 0;
+        assert!(matches!(
+            engine.search(zero_page),
+            Err(SearchError::InvalidPage)
+        ));
+
+        let mut wrong_size = request("clip");
+        wrong_size.page_size = 12;
+        assert!(matches!(
+            engine.search(wrong_size),
+            Err(SearchError::InvalidPage)
+        ));
+    }
+
     /// An alphabetical list buries everything past the first screenful, which
     /// is the wrong answer to "find me something to watch".
     #[test]
@@ -1263,6 +1630,21 @@ mod tests {
         let second = names(&engine.search(request("clip")).unwrap());
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn result_ids_are_opaque_and_do_not_reveal_paths() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("private-name.mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video.clone()])));
+
+        let page = engine.search(request("private-name")).unwrap();
+        let result = &page.results[0];
+
+        assert!(!result.id.contains("private-name"));
+        assert!(!result.id.contains(&video.to_string_lossy().into_owned()));
+        assert_eq!(engine.video_path(&result.id).unwrap(), video);
     }
 
     #[test]
@@ -1347,6 +1729,37 @@ mod tests {
     }
 
     #[test]
+    fn path_search_covers_every_ancestor_folder() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("Family Archive");
+        let grandchild = parent.join("2026").join("October");
+        fs::create_dir_all(&grandchild).unwrap();
+        let video = grandchild.join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+        let path_only = |query: &str| SearchRequest {
+            fields: SearchFields {
+                tags: false,
+                file_name: false,
+                path: true,
+            },
+            ..request(query)
+        };
+
+        assert_eq!(
+            engine
+                .search(path_only("family october"))
+                .unwrap()
+                .total_results,
+            1
+        );
+        assert_eq!(
+            engine.search(path_only("missing")).unwrap().total_results,
+            0
+        );
+    }
+
+    #[test]
     fn every_term_may_match_a_different_selected_field() {
         let directory = tempdir().unwrap();
         let folder = directory.path().join("Holiday");
@@ -1399,6 +1812,23 @@ mod tests {
         let mut found = names(&page);
         found.sort();
         assert_eq!(found, ["summer.mp4", "winter.mp4"]);
+    }
+
+    #[test]
+    fn explicit_and_matches_implicit_and() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("summer holiday.mp4");
+        let partial = directory.path().join("summer work.mp4");
+        for path in [&matching, &partial] {
+            fs::write(path, b"test").unwrap();
+        }
+        let paths = vec![matching, partial];
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        assert_eq!(
+            names(&engine.search(request("summer AND holiday")).unwrap()),
+            names(&engine.search(request("summer holiday")).unwrap())
+        );
     }
 
     #[test]
@@ -1456,6 +1886,152 @@ mod tests {
 
         let filename_only = engine.search(request("filename:home")).unwrap();
         assert_eq!(names(&filename_only), ["home clip.mp4"]);
+    }
+
+    #[test]
+    fn not_binds_tighter_than_and_and_or() {
+        let directory = tempdir().unwrap();
+        let summer_draft = directory.path().join("summer draft.mp4");
+        let winter_final = directory.path().join("winter final.mp4");
+        let winter_draft = directory.path().join("winter draft.mp4");
+        for path in [&summer_draft, &winter_final, &winter_draft] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            summer_draft,
+            winter_final,
+            winter_draft,
+        ])));
+
+        let mut found = names(
+            &engine
+                .search(request(
+                    "filename:summer OR filename:winter AND NOT filename:draft",
+                ))
+                .unwrap(),
+        );
+        found.sort();
+        assert_eq!(found, ["summer draft.mp4", "winter final.mp4"]);
+    }
+
+    #[test]
+    fn type_extension_and_folder_qualifiers_match_exact_metadata() {
+        let directory = tempdir().unwrap();
+        let archive = directory.path().join("Family Archive");
+        fs::create_dir(&archive).unwrap();
+        let photo = archive.join("Trip.JPEG");
+        let video = archive.join("Trip.mp4");
+        for path in [&photo, &video] {
+            fs::write(path, b"test").unwrap();
+        }
+        let provider = Arc::new(FakeProvider::new(vec![photo, video]));
+        let engine = SearchEngine::new(provider.clone());
+        let both = |query: &str| SearchRequest {
+            media_type: MediaType::Both,
+            ..request(query)
+        };
+
+        assert_eq!(
+            names(
+                &engine
+                    .search(both("type:image extension:jpeg folder:\"Family Archive\"",))
+                    .unwrap(),
+            ),
+            ["Trip.JPEG"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(both("type:video extension:mp4 folder:archive"))
+                    .unwrap(),
+            ),
+            ["Trip.mp4"]
+        );
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [true, true]);
+    }
+
+    #[test]
+    fn quoted_values_keep_spaces_and_escaped_quotes() {
+        let directory = tempdir().unwrap();
+        let phrase = directory.path().join("Family Trip.mp4");
+        let quote = directory.path().join("Family \"Trip\".mp4");
+        for path in [&phrase, &quote] {
+            fs::write(path, b"test").unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![phrase, quote])));
+
+        assert_eq!(
+            names(&engine.search(request("filename:\"family trip\"")).unwrap(),),
+            ["Family Trip.mp4"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("filename:\"family \\\"trip\\\"\""))
+                    .unwrap(),
+            ),
+            ["Family \"Trip\".mp4"]
+        );
+    }
+
+    #[test]
+    fn relative_dates_resolve_once_from_the_search_date() {
+        let today = CalendarDate::new(2026, 3, 1).unwrap();
+
+        assert_eq!(
+            parse_query_at("modified:>\"3 days ago\"", today).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::Greater,
+                date: CalendarDate::new(2026, 2, 26).unwrap(),
+            })
+        );
+        assert_eq!(
+            parse_query_at("created:>=\"1 week ago\"", today).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Created,
+                comparison: Comparison::GreaterOrEqual,
+                date: CalendarDate::new(2026, 2, 22).unwrap(),
+            })
+        );
+        assert_eq!(
+            subtract_calendar_days(CalendarDate::new(2024, 3, 1).unwrap(), 1).unwrap(),
+            CalendarDate::new(2024, 2, 29).unwrap()
+        );
+        assert_eq!(
+            subtract_calendar_days(CalendarDate::new(2026, 1, 1).unwrap(), 1).unwrap(),
+            CalendarDate::new(2025, 12, 31).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_field_names_remain_plain_text() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("camera:model.mp4");
+        fs::write(&matching, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![matching])));
+
+        assert_eq!(
+            names(&engine.search(request("camera:model")).unwrap()),
+            ["camera:model.mp4"]
+        );
+    }
+
+    #[test]
+    fn new_operators_reject_missing_or_unknown_values() {
+        for invalid in [
+            "NOT",
+            "type:document",
+            "extension:",
+            "folder:",
+            "modified:\"soon\"",
+            "filename:\"unfinished",
+        ] {
+            assert!(
+                parse_query(invalid).is_err(),
+                "expected {invalid} to be rejected"
+            );
+        }
     }
 
     #[test]
@@ -1694,6 +2270,182 @@ mod tests {
         let page = engine.search(request("sample")).unwrap();
 
         assert_eq!(page.total_results, 0);
+    }
+
+    /// A folder holding `names`, inside `parent`, with every file written.
+    fn folder_of(parent: &Path, folder: &str, names: &[&str]) -> Vec<PathBuf> {
+        let folder = parent.join(folder);
+        fs::create_dir_all(&folder).unwrap();
+        names
+            .iter()
+            .map(|name| {
+                let path = folder.join(name);
+                fs::write(&path, b"test").unwrap();
+                path
+            })
+            .collect()
+    }
+
+    fn id_of(page: &SearchPage, file_name: &str) -> String {
+        page.results
+            .iter()
+            .find(|result| result.file_name == file_name)
+            .unwrap()
+            .id
+            .clone()
+    }
+
+    fn file_names(page: &SearchPage) -> Vec<String> {
+        let mut names: Vec<String> = page
+            .results
+            .iter()
+            .map(|result| result.file_name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_result_carries_the_tags_of_its_folder() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip [beach]", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+
+        let page = engine.search(request("clip")).unwrap();
+
+        assert_eq!(page.results[0].folder_tags, ["beach"]);
+        assert!(page.results[0].tags.is_empty());
+    }
+
+    #[test]
+    fn a_renamed_folder_moves_every_video_the_engine_knows_in_it() {
+        let directory = tempdir().unwrap();
+        let mut videos = folder_of(directory.path(), "Trip", &["clip-a.mp4", "clip-b.mp4"]);
+        let outside = folder_of(directory.path(), "Other", &["clip-c.mp4"]);
+        videos.extend(outside);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        let page = engine.search(request("clip")).unwrap();
+        let (a, b, c) = (
+            id_of(&page, "clip-a.mp4"),
+            id_of(&page, "clip-b.mp4"),
+            id_of(&page, "clip-c.mp4"),
+        );
+
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(directory.path().join("Trip"), &tagged).unwrap();
+        let mut moved = engine.rename_folder(&directory.path().join("Trip"), tagged.clone());
+        moved.sort();
+
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort();
+        assert_eq!(moved, expected);
+        assert_eq!(engine.video_path(&a).unwrap(), tagged.join("clip-a.mp4"));
+        assert_eq!(engine.video_path(&b).unwrap(), tagged.join("clip-b.mp4"));
+        assert!(engine.video_path(&c).is_ok());
+    }
+
+    #[test]
+    fn videos_in_a_renamed_folder_are_found_while_the_index_is_stale() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip-a.mp4", "clip-b.mp4"]);
+        let provider = Arc::new(FakeProvider::new(videos));
+        let engine = SearchEngine::new(provider.clone());
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged).unwrap();
+        engine.rename_folder(&folder, tagged.clone());
+
+        // The index still lists the videos under the folder's old name.
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 2);
+        assert!(stale.results.iter().all(|r| r.folder_tags == ["beach"]));
+
+        // The index has dropped them, because nothing is at the old name now.
+        provider.paths.lock().unwrap().clear();
+        let dropped = engine.search(request("clip")).unwrap();
+        assert_eq!(file_names(&dropped), ["clip-a.mp4", "clip-b.mp4"]);
+
+        // Once it catches up, each video is listed once.
+        *provider.paths.lock().unwrap() =
+            vec![tagged.join("clip-a.mp4"), tagged.join("clip-b.mp4")];
+        let refreshed = engine.search(request("clip")).unwrap();
+        assert_eq!(refreshed.total_results, 2);
+
+        // And a folder tag is something a search can find.
+        let by_tag = engine.search(request("beach")).unwrap();
+        assert_eq!(by_tag.total_results, 2);
+    }
+
+    #[test]
+    fn a_video_tagged_before_its_folder_follows_the_folder() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let provider = Arc::new(FakeProvider::new(videos.clone()));
+        let engine = SearchEngine::new(provider);
+        let page = engine.search(request("clip")).unwrap();
+        let id = page.results[0].id.clone();
+        let folder = directory.path().join("Trip");
+
+        let tagged_video = folder.join("clip [home].mp4");
+        fs::rename(&videos[0], &tagged_video).unwrap();
+        engine.update_video_path(&id, tagged_video).unwrap();
+        let tagged_folder = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged_folder).unwrap();
+        engine.rename_folder(&folder, tagged_folder.clone());
+
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 1);
+        assert_eq!(stale.results[0].file_name, "clip [home].mp4");
+        assert_eq!(stale.results[0].folder_tags, ["beach"]);
+        assert_eq!(
+            engine.video_path(&id).unwrap(),
+            tagged_folder.join("clip [home].mp4")
+        );
+    }
+
+    #[test]
+    fn a_video_tagged_after_its_folder_is_found_under_both_names() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged_folder = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged_folder).unwrap();
+        engine.rename_folder(&folder, tagged_folder.clone());
+        let page = engine.search(request("clip")).unwrap();
+
+        let tagged_video = tagged_folder.join("clip [home].mp4");
+        fs::rename(tagged_folder.join("clip.mp4"), &tagged_video).unwrap();
+        engine
+            .update_video_path(&page.results[0].id, tagged_video)
+            .unwrap();
+
+        let stale = engine.search(request("clip")).unwrap();
+        assert_eq!(stale.total_results, 1);
+        assert_eq!(stale.results[0].file_name, "clip [home].mp4");
+        assert_eq!(stale.results[0].tags, ["home"]);
+        assert_eq!(stale.results[0].folder_tags, ["beach"]);
+    }
+
+    #[test]
+    fn a_folder_renamed_back_to_its_indexed_name_lists_each_video_once() {
+        let directory = tempdir().unwrap();
+        let videos = folder_of(directory.path(), "Trip", &["clip.mp4"]);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(videos)));
+        engine.search(request("clip")).unwrap();
+        let folder = directory.path().join("Trip");
+        let tagged = directory.path().join("Trip [beach]");
+        fs::rename(&folder, &tagged).unwrap();
+        engine.rename_folder(&folder, tagged.clone());
+        fs::rename(&tagged, &folder).unwrap();
+        engine.rename_folder(&tagged, folder.clone());
+
+        let page = engine.search(request("clip")).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert!(page.results[0].folder_tags.is_empty());
     }
 
     #[test]
