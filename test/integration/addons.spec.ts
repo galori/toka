@@ -38,8 +38,10 @@ describe("Toka add-ons", () => {
 
     const menu = $('[role="menu"][aria-label="Add-ons"]');
     await menu.waitForDisplayed();
-    await expect(menu).toHaveText(/Open TikTok creator/);
-    await expect(menu).toHaveText(/New Toka window · tiktok\.com/);
+    await expect(menu).toHaveText(/Show this creator in Toka/);
+    await expect(menu).toHaveText(/New Toka window/);
+    await expect(menu).toHaveText(/Open this creator on TikTok/);
+    await expect(menu).toHaveText(/tiktok\.com/);
 
     await browser.execute(() => {
       window.dispatchEvent(

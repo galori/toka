@@ -57,10 +57,10 @@ the search starts. Dates use the file's local calendar date, not its time.
 
 While a video plays, press `Ctrl+Shift+A` to open actions supplied by add-ons.
 The bundled TikTok add-on recognizes names such as
-`2026-10-10_@sometiktoker_18938383490812348343.mp4`. Its creator action opens
-a new Toka window containing only that exact creator's videos, then opens the
-creator page in the default browser. The Add-ons control stays disabled when
-the current filename matches no action.
+`2026-10-10_@sometiktoker_18938383490812348343.mp4`. Its actions can open a new
+Toka window containing only that exact creator's videos, or open the creator
+page in the default browser. The Add-ons control stays disabled when the
+current filename matches no action.
 
 ## Playlists
 
