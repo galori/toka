@@ -13,6 +13,7 @@ mod subtitles;
 mod tags;
 mod thumbnails;
 
+use owned_index::{IndexUpdates, OwnedIndexUpdates};
 #[cfg(target_os = "macos")]
 use providers::MdfindSearchProvider;
 #[cfg(target_os = "linux")]
@@ -51,6 +52,19 @@ struct CommandError {
 
 struct DeletedVideo {
     trash_name: String,
+    original_path: PathBuf,
+}
+
+fn synchronize_index_path(updates: &dyn IndexUpdates, path: &Path) {
+    if let Err(error) = updates.synchronize_path(path) {
+        eprintln!("Toka could not update its owned index: {error}");
+    }
+}
+
+fn synchronize_index_rename(updates: &dyn IndexUpdates, from: &Path, to: &Path) {
+    if let Err(error) = updates.synchronize_rename(from, to) {
+        eprintln!("Toka could not update its owned index: {error}");
+    }
 }
 
 /// The playlist file Toka was launched with, kept from the command line until
@@ -546,15 +560,23 @@ fn delete_video(
     result_id: String,
     engine: State<'_, Arc<SearchEngine>>,
     deleted: State<'_, Mutex<Option<DeletedVideo>>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<(), CommandError> {
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
     let trash_name = move_to_trash(&path)?;
-    *deleted.lock().unwrap() = Some(DeletedVideo { trash_name });
+    synchronize_index_path(updates.inner(), &path);
+    *deleted.lock().unwrap() = Some(DeletedVideo {
+        trash_name,
+        original_path: path,
+    });
     Ok(())
 }
 
 #[tauri::command]
-fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
+fn undo_delete(
+    deleted: State<'_, Mutex<Option<DeletedVideo>>>,
+    updates: State<'_, OwnedIndexUpdates>,
+) -> Result<(), CommandError> {
     let item = deleted.lock().unwrap().take().ok_or_else(|| CommandError {
         kind: "Delete",
         message: "There is no video deletion to undo.".into(),
@@ -582,6 +604,7 @@ fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), Co
         message: format!("The deleted video could not be restored: {error}"),
     })?;
     if output.status.success() {
+        synchronize_index_path(updates.inner(), &item.original_path);
         Ok(())
     } else {
         Err(CommandError {
@@ -596,8 +619,9 @@ fn set_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::set)
+    update_video_tags(&result_id, &tags, &engine, tags::set, updates.inner())
 }
 
 #[tauri::command]
@@ -605,8 +629,9 @@ fn add_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::add)
+    update_video_tags(&result_id, &tags, &engine, tags::add, updates.inner())
 }
 
 #[tauri::command]
@@ -614,8 +639,9 @@ fn remove_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::remove)
+    update_video_tags(&result_id, &tags, &engine, tags::remove, updates.inner())
 }
 
 /// Puts the same tags on every video in `result_ids`, in one call rather than
@@ -626,11 +652,17 @@ fn add_tags_to_videos(
     result_ids: Vec<String>,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> BulkTagUpdate {
-    tag_videos(&result_ids, &tags, &engine)
+    tag_videos(&result_ids, &tags, &engine, updates.inner())
 }
 
-fn tag_videos(result_ids: &[String], tags: &[String], engine: &SearchEngine) -> BulkTagUpdate {
+fn tag_videos(
+    result_ids: &[String],
+    tags: &[String],
+    engine: &SearchEngine,
+    updates: &dyn IndexUpdates,
+) -> BulkTagUpdate {
     let mut tagged = Vec::new();
     let mut failed = 0;
     let mut problem = None;
@@ -638,7 +670,7 @@ fn tag_videos(result_ids: &[String], tags: &[String], engine: &SearchEngine) -> 
         // One video that has moved or been deleted since the search is a
         // reason to say so afterwards, not a reason to abandon the rest of
         // the page half tagged.
-        match update_video_tags(result_id, tags, engine, tags::add) {
+        match update_video_tags(result_id, tags, engine, tags::add, updates) {
             Ok(update) => tagged.push(TaggedVideo {
                 result_id: result_id.clone(),
                 file_name: update.file_name,
@@ -659,13 +691,14 @@ fn tag_videos(result_ids: &[String], tags: &[String], engine: &SearchEngine) -> 
     }
 }
 
-/// Retags the video behind `result_id` and keeps the search engine pointing at
-/// the renamed file.
+/// Retags the video behind `result_id` and keeps both indexes pointing at the
+/// renamed file before the command returns.
 fn update_video_tags(
     result_id: &str,
     tags: &[String],
     engine: &SearchEngine,
     operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
+    updates: &dyn IndexUpdates,
 ) -> Result<VideoTagUpdate, TagsError> {
     let path = engine.video_path(result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
@@ -681,6 +714,7 @@ fn update_video_tags(
             kind: "VideoUnavailable",
             message: error.to_string(),
         })?;
+    synchronize_index_rename(updates, &path, &update.path);
     Ok(VideoTagUpdate {
         file_name: update
             .path
@@ -697,8 +731,9 @@ fn add_folder_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<FolderTagUpdate, TagsError> {
-    update_folder_tags(&result_id, &tags, &engine, tags::add)
+    update_folder_tags(&result_id, &tags, &engine, tags::add, updates.inner())
 }
 
 #[tauri::command]
@@ -706,17 +741,19 @@ fn remove_folder_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
+    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<FolderTagUpdate, TagsError> {
-    update_folder_tags(&result_id, &tags, &engine, tags::remove)
+    update_folder_tags(&result_id, &tags, &engine, tags::remove, updates.inner())
 }
 
 /// Retags the folder the video behind `result_id` sits in. That renames the
-/// folder, so the engine follows every result it knows inside it.
+/// folder, so both indexes follow every result inside it.
 fn update_folder_tags(
     result_id: &str,
     tags: &[String],
     engine: &SearchEngine,
     operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
+    updates: &dyn IndexUpdates,
 ) -> Result<FolderTagUpdate, TagsError> {
     let path = engine.video_path(result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
@@ -734,7 +771,8 @@ fn update_folder_tags(
         kind: "Tags",
         message,
     })?;
-    let mut result_ids = engine.rename_folder(folder, update.path);
+    let mut result_ids = engine.rename_folder(folder, update.path.clone());
+    synchronize_index_rename(updates, folder, &update.path);
     result_ids.sort();
     Ok(FolderTagUpdate {
         folder_tags: update.tags,
@@ -1034,6 +1072,7 @@ pub fn run() {
     let builder = builder
         .manage(logger.clone())
         .manage(engine)
+        .manage(OwnedIndexUpdates::system())
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
     #[cfg(target_os = "linux")]
@@ -1250,8 +1289,9 @@ mod tests {
             })
             .collect();
         let (engine, ids) = engine_over(paths);
+        let updates = OwnedIndexUpdates::new(directory.path().join("missing-index.sqlite3"));
 
-        let update = tag_videos(&ids, &["beach".to_owned()], &engine);
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine, &updates);
 
         assert_eq!(update.failed, 0);
         assert_eq!(update.problem, None);
@@ -1275,9 +1315,10 @@ mod tests {
         std::fs::write(&present, b"test").unwrap();
         std::fs::write(&missing, b"test").unwrap();
         let (engine, ids) = engine_over(vec![present, missing.clone()]);
+        let updates = OwnedIndexUpdates::new(directory.path().join("missing-index.sqlite3"));
         std::fs::remove_file(&missing).unwrap();
 
-        let update = tag_videos(&ids, &["beach".to_owned()], &engine);
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine, &updates);
 
         assert_eq!(update.tagged.len(), 1);
         assert_eq!(update.failed, 1);
