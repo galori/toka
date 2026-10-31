@@ -1698,7 +1698,8 @@ test("uses the overlay player controls from the design", async () => {
   // elements they lay out. Without them every control collapses to a 24px column.
   const timeline = screen.getByLabelText("Video timeline");
   expect(timeline).toHaveClass("player-timeline");
-  expect(timeline.parentElement).toBe(controls);
+  expect(timeline.parentElement).toHaveClass("player-scrubber");
+  expect(timeline.parentElement?.parentElement).toBe(controls);
 
   const transport = controls.querySelector(".player-transport");
   const utilities = controls.querySelector(".player-utilities");
@@ -5755,11 +5756,15 @@ test("marks a range with B and E and plays only that range", async () => {
   const end = screen.getByRole("button", { name: "Mark range end" });
   expect(end).toHaveAttribute("aria-keyshortcuts", "E");
   expect(end.querySelector(".key-hint")).toHaveTextContent("E");
+  expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Range end marker")).not.toBeInTheDocument();
 
   fireEvent.keyDown(window, { key: "b" });
   expect(
     screen.getByRole("button", { name: "Range start: 0:10" }),
   ).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Range end marker")).not.toBeInTheDocument();
 
   video.currentTime = 30;
   fireEvent.timeUpdate(video);
@@ -5767,6 +5772,11 @@ test("marks a range with B and E and plays only that range", async () => {
   expect(
     screen.getByRole("button", { name: "Range end: 0:30" }),
   ).toHaveAttribute("aria-pressed", "true");
+  const startMarker = screen.getByLabelText("Range start marker");
+  const endMarker = screen.getByLabelText("Range end marker");
+  expect(startMarker).toHaveClass("player-range-marker");
+  expect(startMarker).toHaveStyle({ left: `${(10 / 120) * 100}%` });
+  expect(endMarker).toHaveStyle({ left: "25%" });
   // Closing the range goes straight back to its start.
   expect(video).toHaveProperty("currentTime", 10);
 
@@ -5823,6 +5833,8 @@ test("clears the range when moving to another video", async () => {
   fireEvent.timeUpdate(first);
   fireEvent.keyDown(window, { key: "e" });
   expect(screen.getByRole("button", { name: "Range end: 0:30" })).toBeVisible();
+  expect(screen.getByLabelText("Range start marker")).toBeInTheDocument();
+  expect(screen.getByLabelText("Range end marker")).toBeInTheDocument();
 
   fireEvent.keyDown(window, { key: "PageDown" });
   const second = await screen.findByLabelText("Playing clip-2.mp4");
@@ -5832,6 +5844,8 @@ test("clears the range when moving to another video", async () => {
   expect(
     screen.getByRole("button", { name: "Mark range end" }),
   ).toHaveAttribute("aria-pressed", "false");
+  expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Range end marker")).not.toBeInTheDocument();
 
   // The old range no longer pulls playback back.
   Object.defineProperty(second, "duration", { configurable: true, value: 120 });

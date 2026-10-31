@@ -1028,6 +1028,11 @@ button:focus-visible {
   width: 0;
   height: 0;
 }
+.player-controls.idle .player-range-marker {
+  width: 3px;
+  height: calc(var(--scrubber-sliver) * 2);
+  border-radius: 1.5px;
+}
 .player-controls {
   position: absolute;
   right: 0;
@@ -1039,9 +1044,25 @@ button:focus-visible {
   padding: 16px 20px 18px;
   background: linear-gradient(transparent, rgb(0 0 0 / 75%));
 }
+.player-scrubber {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
 .player-timeline {
   width: 100%;
   accent-color: oklch(0.68 0.19 38);
+}
+.player-range-marker {
+  position: absolute;
+  top: 50%;
+  width: 11px;
+  height: 32px;
+  border-radius: 999px;
+  background: #fff;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 /* Wrapping rather than overflowing: the row carries a lot of controls, and
    below roughly a thousand pixels the ones on either end used to be pushed
