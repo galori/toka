@@ -1292,9 +1292,15 @@ pub fn run() {
     );
     let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
-    let engine = Arc::new(SearchEngine::new_with_logger(
+    let rename_overlay_path = Some(
+        owned_index::database_path()
+            .expect("Toka could not find a place for its search rename state.")
+            .with_file_name("search-renames.json"),
+    );
+    let engine = Arc::new(SearchEngine::new_with_logger_and_rename_store(
         platform_provider(logger.clone()),
         logger.clone(),
+        rename_overlay_path,
     ));
     let builder = builder
         .manage(logger.clone())
