@@ -19,6 +19,8 @@ pub(crate) struct SearchLogContext {
     pub(crate) page_size: usize,
     pub(crate) fields: SearchFields,
     pub(crate) media_type: MediaType,
+    pub(crate) addon_id: Option<String>,
+    pub(crate) addon_capture: Option<String>,
     verbose: Option<Arc<VerboseSearchLog>>,
 }
 
@@ -30,6 +32,8 @@ impl From<&SearchRequest> for SearchLogContext {
             page_size: request.page_size,
             fields: request.fields,
             media_type: request.media_type,
+            addon_id: None,
+            addon_capture: None,
             verbose: None,
         }
     }
@@ -139,7 +143,30 @@ impl SearchLogger {
         request: &SearchRequest,
         with_verbose_log: bool,
     ) -> SearchLogContext {
+        self.context_with_addon(request, with_verbose_log, None)
+    }
+
+    pub(crate) fn context_for_addon(
+        &self,
+        request: &SearchRequest,
+        with_verbose_log: bool,
+        addon_id: &str,
+        addon_capture: &str,
+    ) -> SearchLogContext {
+        self.context_with_addon(request, with_verbose_log, Some((addon_id, addon_capture)))
+    }
+
+    fn context_with_addon(
+        &self,
+        request: &SearchRequest,
+        with_verbose_log: bool,
+        addon: Option<(&str, &str)>,
+    ) -> SearchLogContext {
         let mut context = SearchLogContext::from(request);
+        if let Some((addon_id, addon_capture)) = addon {
+            context.addon_id = Some(addon_id.to_owned());
+            context.addon_capture = Some(addon_capture.to_owned());
+        }
         if with_verbose_log {
             let settings = self.settings();
             if settings.verbose {
@@ -248,6 +275,12 @@ fn context_entry(context: &SearchLogContext, kind: &str) -> serde_json::Map<Stri
         }),
     );
     entry.insert("mediaType".into(), json!(context.media_type));
+    if let Some(addon_id) = &context.addon_id {
+        entry.insert("addonId".into(), json!(addon_id));
+    }
+    if let Some(addon_capture) = &context.addon_capture {
+        entry.insert("addonCapture".into(), json!(addon_capture));
+    }
     entry
 }
 
@@ -351,6 +384,9 @@ fn write_verbose_header(file: &mut fs::File, context: &SearchLogContext) -> std:
     writeln!(file, "Page: {}", context.page)?;
     writeln!(file, "Page size: {}", context.page_size)?;
     writeln!(file, "Media type: {:?}", context.media_type)?;
+    if let (Some(addon_id), Some(capture)) = (&context.addon_id, &context.addon_capture) {
+        writeln!(file, "Add-on: {addon_id} ({capture})")?;
+    }
     writeln!(
         file,
         "Fields: tags={}, file name={}, path={}",
@@ -548,6 +584,8 @@ mod tests {
                 path: false,
             },
             media_type: MediaType::Videos,
+            addon_id: None,
+            addon_capture: None,
             verbose: None,
         }
     }
@@ -657,6 +695,8 @@ mod tests {
             page_size: 24,
             fields: SearchFields::default(),
             media_type: MediaType::Videos,
+            addon_id: None,
+            addon_capture: None,
             verbose: None,
         };
 
