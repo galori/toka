@@ -2,17 +2,21 @@ use crate::{
     search::{is_supported_image, is_supported_video},
     tags,
 };
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SCHEMA_VERSION: i64 = 1;
+const REPAIR_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 const SCHEMA: &str = r#"
 CREATE TABLE schema_meta (
@@ -150,6 +154,18 @@ pub(crate) enum OwnedIndexError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Toka could not read {path}: {source}")]
+    PathRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Toka could not watch its search folders: {0}")]
+    Watcher(#[from] notify::Error),
+    #[error("Toka could not start its search watcher: {0}")]
+    WorkerStart(#[source] std::io::Error),
+    #[error("Toka's search watcher stopped unexpectedly.")]
+    WorkerStopped,
     #[error("Toka could not fully scan {path}: {failures} path read failed.")]
     IncompleteScan { path: String, failures: u64 },
 }
@@ -200,6 +216,14 @@ pub(crate) struct ScanProgress {
     pub updated_at_ns: i64,
     pub scan_rate: f64,
     pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRepair {
+    pub path: PathBuf,
+    pub reason: String,
+    pub attempts: u64,
+    pub last_error: Option<String>,
 }
 
 impl ScanProgress {
@@ -298,6 +322,220 @@ pub(crate) struct OwnedIndex {
     path: PathBuf,
 }
 
+#[derive(Clone)]
+pub(crate) struct OwnedIndexUpdates {
+    database: Option<PathBuf>,
+}
+
+pub(crate) trait IndexUpdates: Send + Sync {
+    fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError>;
+    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError>;
+}
+
+impl OwnedIndexUpdates {
+    pub(crate) fn new(database: PathBuf) -> Self {
+        Self {
+            database: Some(database),
+        }
+    }
+
+    pub(crate) fn system() -> Self {
+        Self {
+            database: dirs::data_local_dir().map(|directory| directory.join("toka/index.sqlite3")),
+        }
+    }
+
+    pub(crate) fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError> {
+        let Some(database) = self.database.as_deref().filter(|path| path.is_file()) else {
+            return Ok(());
+        };
+        let mut index = OwnedIndex::open(database)?;
+        for (root_id, root) in index.roots()? {
+            if path.starts_with(&root) {
+                index.synchronize_path(&root_id, &root, path)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError> {
+        let Some(database) = self.database.as_deref().filter(|path| path.is_file()) else {
+            return Ok(());
+        };
+        let mut index = OwnedIndex::open(database)?;
+        if let Some((root_id, root)) = index
+            .roots()?
+            .into_iter()
+            .find(|(_, root)| from == root || (from.starts_with(root) && to.starts_with(root)))
+        {
+            index.synchronize_rename(&root_id, &root, from, to)?;
+        }
+        Ok(())
+    }
+}
+
+impl IndexUpdates for OwnedIndexUpdates {
+    fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError> {
+        OwnedIndexUpdates::synchronize_path(self, path)
+    }
+
+    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError> {
+        OwnedIndexUpdates::synchronize_rename(self, from, to)
+    }
+}
+
+pub(crate) struct OwnedIndexWatcher {
+    stop: mpsc::Sender<()>,
+    worker: Option<JoinHandle<Result<(), OwnedIndexError>>>,
+}
+
+impl OwnedIndexWatcher {
+    pub(crate) fn start(
+        database: &Path,
+        root_id: String,
+        root: PathBuf,
+    ) -> Result<Self, OwnedIndexError> {
+        Self::start_with_progress(database, root_id, root, |_| {})
+    }
+
+    pub(crate) fn start_with_progress<F>(
+        database: &Path,
+        root_id: String,
+        root: PathBuf,
+        mut on_progress: F,
+    ) -> Result<Self, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress) + Send + 'static,
+    {
+        let mut index = OwnedIndex::open(database)?;
+        let (event_sender, event_receiver) = mpsc::channel();
+        let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
+            let _ = event_sender.send(event);
+        })?;
+        watcher.watch(&root, RecursiveMode::Recursive)?;
+        let (stop, stop_receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name(format!("toka-index-{root_id}"))
+            .spawn(move || {
+                let _watcher = watcher;
+                index.scan_root(&root_id, &root, |progress| on_progress(progress))?;
+                index.repair_pending(&root_id, &root)?;
+                let mut event_state = NotifyEventState::default();
+                let mut last_repair_scan = Instant::now();
+                loop {
+                    if stop_receiver.try_recv().is_ok() {
+                        return Ok(());
+                    }
+                    match event_receiver.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Ok(event)) => {
+                            if let Err(error) = apply_notify_event(
+                                &mut index,
+                                &root_id,
+                                &root,
+                                &mut event_state,
+                                event,
+                            ) {
+                                eprintln!("Toka could not apply a search index event: {error}");
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("Toka's folder watcher missed an event: {error}");
+                            repair_root(&mut index, &root_id, &root);
+                            last_repair_scan = Instant::now();
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                            if last_repair_scan.elapsed() >= REPAIR_SCAN_INTERVAL =>
+                        {
+                            repair_root(&mut index, &root_id, &root);
+                            last_repair_scan = Instant::now();
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(OwnedIndexError::WorkerStopped);
+                        }
+                    }
+                }
+            })
+            .map_err(OwnedIndexError::WorkerStart)?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+
+    pub(crate) fn stop(mut self) -> Result<(), OwnedIndexError> {
+        let _ = self.stop.send(());
+        match self.worker.take().expect("watcher worker missing").join() {
+            Ok(result) => result,
+            Err(_) => Err(OwnedIndexError::WorkerStopped),
+        }
+    }
+}
+
+impl Drop for OwnedIndexWatcher {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct NotifyEventState {
+    renames: HashMap<usize, PathBuf>,
+}
+
+fn repair_root(index: &mut OwnedIndex, root_id: &str, root: &Path) {
+    if let Err(error) = index.scan_root(root_id, root, |_| {}) {
+        eprintln!("Toka could not repair its search index: {error}");
+        return;
+    }
+    if let Err(error) = index.repair_pending(root_id, root) {
+        eprintln!("Toka could not replay its search index repairs: {error}");
+    }
+}
+
+fn apply_notify_event(
+    index: &mut OwnedIndex,
+    root_id: &str,
+    root: &Path,
+    state: &mut NotifyEventState,
+    event: Event,
+) -> Result<(), OwnedIndexError> {
+    if event.need_rescan() {
+        state.renames.clear();
+        index.scan_root(root_id, root, |_| {})?;
+        return Ok(());
+    }
+    match &event.kind {
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) => {
+            if let (Some(from), Some(to)) = (event.paths.first(), event.paths.last()) {
+                return index.synchronize_rename(root_id, root, from, to);
+            }
+        }
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::From)) => {
+            if let (Some(tracker), Some(from)) = (event.tracker(), event.paths.first()) {
+                state.renames.insert(tracker, from.clone());
+                return Ok(());
+            }
+        }
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To)) => {
+            if let (Some(tracker), Some(to)) = (event.tracker(), event.paths.first()) {
+                if let Some(from) = state.renames.remove(&tracker) {
+                    return index.synchronize_rename(root_id, root, &from, to);
+                }
+            }
+        }
+        EventKind::Access(_) => return Ok(()),
+        _ => {}
+    }
+    for path in event.paths {
+        index.synchronize_path(root_id, root, &path)?;
+    }
+    Ok(())
+}
+
 impl OwnedIndex {
     pub(crate) fn open(path: &Path) -> Result<Self, OwnedIndexError> {
         if let Some(parent) = path.parent() {
@@ -333,6 +571,27 @@ impl OwnedIndex {
             connection,
             path: path.to_path_buf(),
         })
+    }
+
+    fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path FROM roots ORDER BY id")?;
+        let rows =
+            statement.query_map([], |row| Ok((row.get(0)?, path_from_bytes(row.get(1)?))))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
+    }
+
+    fn roots_with_generations(&self) -> Result<Vec<(String, PathBuf, i64)>, OwnedIndexError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, scan_generation FROM roots ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get(0)?, path_from_bytes(row.get(1)?), row.get(2)?))
+        })?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
     }
 
     pub(crate) fn scan_root<F>(
@@ -704,6 +963,394 @@ impl OwnedIndex {
             )
             .optional()
             .map_err(OwnedIndexError::from)
+    }
+
+    pub(crate) fn synchronize_path(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        path: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        match self.try_synchronize_path(root_id, root, path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                self.queue_repair(path, "direct update", &message)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn try_synchronize_path(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        path: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        if !path.starts_with(root) {
+            return Ok(());
+        }
+        let metadata = if self.is_own_index_path(path) {
+            None
+        } else {
+            match fs::metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(OwnedIndexError::PathRead {
+                        path: path.display().to_string(),
+                        source,
+                    })
+                }
+            }
+        };
+        if metadata.as_ref().is_some_and(fs::Metadata::is_dir) {
+            return self.synchronize_tree(root_id, root, path);
+        }
+        let Some(file) = metadata
+            .filter(fs::Metadata::is_file)
+            .and_then(|metadata| IndexedFile::read(path.to_path_buf(), metadata))
+        else {
+            return self.remove_indexed_path(root_id, path);
+        };
+        let transaction = self.connection.transaction()?;
+        let generation: i64 = transaction.query_row(
+            "SELECT scan_generation FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO files (
+                path, display_path, file_name, extension, media_type,
+                size_bytes, created_at_ns, modified_at_ns,
+                file_name_search, tags_search, folders_search
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(path) DO UPDATE SET
+                display_path = excluded.display_path,
+                file_name = excluded.file_name,
+                extension = excluded.extension,
+                media_type = excluded.media_type,
+                size_bytes = excluded.size_bytes,
+                created_at_ns = excluded.created_at_ns,
+                modified_at_ns = excluded.modified_at_ns,
+                file_name_search = excluded.file_name_search,
+                tags_search = excluded.tags_search,
+                folders_search = excluded.folders_search",
+            params![
+                file.path_bytes,
+                file.path.to_string_lossy(),
+                file.file_name_bytes,
+                file.extension,
+                file.media_type,
+                file.size_bytes,
+                file.created_at_ns,
+                file.modified_at_ns,
+                file.file_name_search,
+                file.tags_search,
+                file.folders_search,
+            ],
+        )?;
+        let file_id: i64 = transaction.query_row(
+            "SELECT id FROM files WHERE path = ?1",
+            [file.path_bytes],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO root_files (root_id, file_id, scan_generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(root_id, file_id) DO UPDATE SET
+                scan_generation = excluded.scan_generation",
+            params![root_id, file_id, generation],
+        )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn synchronize_tree(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        tree: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        let mut pending = VecDeque::from([tree.to_path_buf()]);
+        while let Some(directory) = pending.pop_front() {
+            let entries = fs::read_dir(&directory).map_err(|source| OwnedIndexError::PathRead {
+                path: directory.display().to_string(),
+                source,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|source| OwnedIndexError::PathRead {
+                    path: directory.display().to_string(),
+                    source,
+                })?;
+                let path = entry.path();
+                let file_type = entry
+                    .file_type()
+                    .map_err(|source| OwnedIndexError::PathRead {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
+                if file_type.is_dir() {
+                    pending.push_back(path);
+                } else if file_type.is_file() {
+                    self.try_synchronize_path(root_id, root, &path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_indexed_path(&mut self, root_id: &str, path: &Path) -> Result<(), OwnedIndexError> {
+        let file_ids = {
+            let mut statement = self.connection.prepare(
+                "SELECT files.id, files.path
+                 FROM files
+                 JOIN root_files ON root_files.file_id = files.id
+                 WHERE root_files.root_id = ?1",
+            )?;
+            let rows = statement.query_map([root_id], |row| {
+                Ok((row.get::<_, i64>(0)?, path_from_bytes(row.get(1)?)))
+            })?;
+            let mut file_ids = Vec::new();
+            for row in rows {
+                let (file_id, indexed_path) = row?;
+                if indexed_path.starts_with(path) {
+                    file_ids.push(file_id);
+                }
+            }
+            file_ids
+        };
+        let transaction = self.connection.transaction()?;
+        for file_id in file_ids {
+            transaction.execute(
+                "DELETE FROM root_files WHERE root_id = ?1 AND file_id = ?2",
+                params![root_id, file_id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM files
+             WHERE NOT EXISTS (
+                SELECT 1 FROM root_files WHERE root_files.file_id = files.id
+             )",
+            [],
+        )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn queue_repair(
+        &mut self,
+        path: &Path,
+        reason: &str,
+        last_error: &str,
+    ) -> Result<(), OwnedIndexError> {
+        self.connection.execute(
+            "INSERT INTO repair_queue (
+                path, reason, queued_at_ns, attempts, last_error
+             ) VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                reason = excluded.reason,
+                queued_at_ns = excluded.queued_at_ns,
+                attempts = repair_queue.attempts + 1,
+                last_error = excluded.last_error",
+            params![path_bytes(path), reason, now_ns(), last_error],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_repairs(&self) -> Result<Vec<PendingRepair>, OwnedIndexError> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, reason, attempts, last_error
+             FROM repair_queue
+             ORDER BY queued_at_ns, path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PendingRepair {
+                path: path_from_bytes(row.get(0)?),
+                reason: row.get(1)?,
+                attempts: row.get::<_, i64>(2)? as u64,
+                last_error: row.get(3)?,
+            })
+        })?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
+    }
+
+    pub(crate) fn repair_pending(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+    ) -> Result<usize, OwnedIndexError> {
+        let repairs = self.pending_repairs()?;
+        let mut repaired = 0;
+        for repair in repairs
+            .into_iter()
+            .filter(|repair| repair.path.starts_with(root))
+        {
+            let result = if repair.reason == "direct rename" {
+                self.scan_root(root_id, root, |_| {}).map(|_| ())
+            } else {
+                self.try_synchronize_path(root_id, root, &repair.path)
+            };
+            match result {
+                Ok(()) => {
+                    self.connection.execute(
+                        "DELETE FROM repair_queue WHERE path = ?1",
+                        [path_bytes(&repair.path)],
+                    )?;
+                    repaired += 1;
+                }
+                Err(error) => {
+                    self.queue_repair(&repair.path, &repair.reason, &error.to_string())?;
+                }
+            }
+        }
+        Ok(repaired)
+    }
+
+    pub(crate) fn synchronize_rename(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        match self.try_synchronize_rename(root_id, root, from, to) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                self.queue_repair(to, "direct rename", &message)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn try_synchronize_rename(
+        &mut self,
+        root_id: &str,
+        root: &Path,
+        from: &Path,
+        to: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        let root_moved = from == root;
+        if !root_moved {
+            match (from.starts_with(root), to.starts_with(root)) {
+                (false, false) => return Ok(()),
+                (true, false) => return self.remove_indexed_path(root_id, from),
+                (false, true) => return self.try_synchronize_path(root_id, root, to),
+                (true, true) => {}
+            }
+        }
+        let mut root_memberships = self.roots_with_generations()?;
+        if root_moved {
+            for (candidate_id, candidate_root, _) in &mut root_memberships {
+                if candidate_id == root_id {
+                    *candidate_root = to.to_path_buf();
+                }
+            }
+        }
+        let moved_files = {
+            let mut statement = self.connection.prepare("SELECT id, path FROM files")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, path_from_bytes(row.get(1)?)))
+            })?;
+            let mut moved_files = Vec::new();
+            for row in rows {
+                let (file_id, old_path) = row?;
+                let Ok(relative) = old_path.strip_prefix(from) else {
+                    continue;
+                };
+                let new_path = if relative.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(relative)
+                };
+                let Some(file) = fs::metadata(&new_path)
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .and_then(|metadata| IndexedFile::read(new_path, metadata))
+                else {
+                    continue;
+                };
+                moved_files.push((file_id, file));
+            }
+            moved_files
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.query_row(
+            "SELECT scan_generation FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if root_moved {
+            transaction.execute(
+                "UPDATE roots
+                 SET path = ?2, display_path = ?3, updated_at_ns = ?4
+                 WHERE id = ?1",
+                params![root_id, path_bytes(to), to.to_string_lossy(), now_ns()],
+            )?;
+        }
+        for (file_id, file) in moved_files {
+            transaction.execute(
+                "UPDATE files SET
+                    path = ?2,
+                    display_path = ?3,
+                    file_name = ?4,
+                    extension = ?5,
+                    media_type = ?6,
+                    size_bytes = ?7,
+                    created_at_ns = ?8,
+                    modified_at_ns = ?9,
+                    file_name_search = ?10,
+                    tags_search = ?11,
+                    folders_search = ?12
+                 WHERE id = ?1",
+                params![
+                    file_id,
+                    file.path_bytes,
+                    file.path.to_string_lossy(),
+                    file.file_name_bytes,
+                    file.extension,
+                    file.media_type,
+                    file.size_bytes,
+                    file.created_at_ns,
+                    file.modified_at_ns,
+                    file.file_name_search,
+                    file.tags_search,
+                    file.folders_search,
+                ],
+            )?;
+            for (candidate_id, candidate_root, generation) in &root_memberships {
+                if file.path.starts_with(candidate_root) {
+                    transaction.execute(
+                        "INSERT INTO root_files (root_id, file_id, scan_generation)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(root_id, file_id) DO UPDATE SET
+                            scan_generation = excluded.scan_generation",
+                        params![candidate_id, file_id, generation],
+                    )?;
+                } else {
+                    transaction.execute(
+                        "DELETE FROM root_files WHERE root_id = ?1 AND file_id = ?2",
+                        params![candidate_id, file_id],
+                    )?;
+                }
+            }
+        }
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn is_own_index_path(&self, path: &Path) -> bool {
@@ -1251,6 +1898,26 @@ mod tests {
         );
     }
 
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !condition() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(condition(), "index change did not arrive within one second");
+    }
+
+    fn indexed_size(index: &OwnedIndex, path: &Path) -> Option<i64> {
+        index
+            .connection
+            .query_row(
+                "SELECT size_bytes FROM files WHERE path = ?1",
+                [path_bytes(path)],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
     fn indexed_file_count(index: &OwnedIndex) -> i64 {
         index
             .connection
@@ -1278,6 +1945,401 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn app_mutations_update_the_owned_index_before_returning() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        drop(index);
+        let updates = OwnedIndexUpdates::new(database.clone());
+
+        let tagged = tags::add(&clip, &["beach".into()]).unwrap().path;
+        updates.synchronize_rename(&clip, &tagged).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert_eq!(search_match_count(&observer, "beach"), 1);
+        assert!(!indexed_display_paths(&observer).contains(clip.to_string_lossy().as_ref()));
+        drop(observer);
+
+        std::fs::remove_file(&tagged).unwrap();
+        updates.synchronize_path(&tagged).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert!(indexed_display_paths(&observer).is_empty());
+        drop(observer);
+
+        std::fs::write(&tagged, b"restored").unwrap();
+        updates.synchronize_path(&tagged).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert!(indexed_display_paths(&observer).contains(tagged.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn a_rescan_flag_repairs_events_the_watcher_may_have_missed() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let missed = root.join("missed.mp4");
+        std::fs::write(&missed, b"video").unwrap();
+        let event = Event::new(EventKind::Any).set_flag(notify::event::Flag::Rescan);
+        let mut state = NotifyEventState::default();
+
+        apply_notify_event(&mut index, "root", &root, &mut state, event).unwrap();
+
+        assert!(indexed_display_paths(&index).contains(missed.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn recursive_watcher_applies_create_modify_rename_and_remove_within_one_second() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let watcher = OwnedIndexWatcher::start(&database, "root".into(), root.clone()).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        wait_for(|| {
+            observer
+                .scan_progress("root")
+                .unwrap()
+                .is_some_and(|progress| progress.phase == ScanPhase::Ready)
+        });
+        let clip = nested.join("clip.mp4");
+
+        std::fs::write(&clip, b"one").unwrap();
+        wait_for(|| indexed_size(&observer, &clip) == Some(3));
+
+        std::fs::write(&clip, b"a larger video").unwrap();
+        wait_for(|| indexed_size(&observer, &clip) == Some(14));
+
+        let renamed = root.join("renamed");
+        std::fs::rename(&nested, &renamed).unwrap();
+        let moved = renamed.join("clip.mp4");
+        wait_for(|| indexed_size(&observer, &moved) == Some(14));
+
+        std::fs::remove_dir_all(&renamed).unwrap();
+        wait_for(|| indexed_size(&observer, &moved).is_none());
+        watcher.stop().unwrap();
+    }
+
+    #[test]
+    fn synchronizing_a_folder_adds_and_removes_its_whole_media_tree() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let added = root.join("added");
+        std::fs::create_dir_all(added.join("nested")).unwrap();
+        std::fs::write(added.join("one.mp4"), b"one").unwrap();
+        std::fs::write(added.join("nested/two.jpg"), b"two").unwrap();
+
+        index.synchronize_path("root", &root, &added).unwrap();
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([
+                added.join("one.mp4").to_string_lossy().into_owned(),
+                added.join("nested/two.jpg").to_string_lossy().into_owned(),
+            ])
+        );
+
+        std::fs::remove_dir_all(&added).unwrap();
+        index.synchronize_path("root", &root, &added).unwrap();
+        assert!(indexed_display_paths(&index).is_empty());
+    }
+
+    #[test]
+    fn watcher_buffers_scan_events_and_indexes_them_within_one_second() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("existing.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let late = root.join("late.jpg");
+        let late_from_scan = late.clone();
+        let nested_from_scan = nested.clone();
+        let started = std::time::Instant::now();
+
+        let watcher = OwnedIndexWatcher::start_with_progress(
+            &database,
+            "root".into(),
+            root.clone(),
+            move |progress| {
+                if progress.phase == ScanPhase::Scanning
+                    && progress.current_folder.as_deref() == Some(nested_from_scan.as_path())
+                    && !late_from_scan.exists()
+                {
+                    std::fs::write(&late_from_scan, b"photo").unwrap();
+                }
+            },
+        )
+        .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let deadline = started + Duration::from_secs(1);
+        while !indexed_display_paths(&observer).contains(late.to_string_lossy().as_ref())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(indexed_display_paths(&observer).contains(late.to_string_lossy().as_ref()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        watcher.stop().unwrap();
+    }
+
+    #[test]
+    fn a_failed_direct_update_is_saved_for_repair_after_restart() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert!(index
+            .synchronize_path("missing-root", &root, &clip)
+            .is_err());
+        drop(index);
+
+        let mut reopened = OwnedIndex::open(&database).unwrap();
+        let repairs = reopened.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, clip);
+        assert_eq!(repairs[0].reason, "direct update");
+        assert!(repairs[0].last_error.is_some());
+
+        assert_eq!(reopened.repair_pending("root", &root).unwrap(), 1);
+        assert!(reopened.pending_repairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn paired_rename_events_move_a_directory_as_one_index_change() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let from = root.join("before");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let to = root.join("after");
+        std::fs::rename(&from, &to).unwrap();
+        let mut state = NotifyEventState::default();
+
+        let from_event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::From,
+        )))
+        .add_path(from.clone())
+        .set_tracker(7);
+        apply_notify_event(&mut index, "root", &root, &mut state, from_event).unwrap();
+        assert!(indexed_display_paths(&index)
+            .contains(from.join("clip.mp4").to_string_lossy().as_ref()));
+
+        let to_event = Event::new(EventKind::Modify(notify::event::ModifyKind::Name(
+            notify::event::RenameMode::To,
+        )))
+        .add_path(to.clone())
+        .set_tracker(7);
+        apply_notify_event(&mut index, "root", &root, &mut state, to_event).unwrap();
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([to.join("clip.mp4").to_string_lossy().into_owned()])
+        );
+    }
+
+    #[test]
+    fn a_failed_direct_rename_is_saved_for_repair() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let from = root.join("clip.mp4");
+        let to = root.join("clip [home].mp4");
+        std::fs::write(&from, b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+
+        assert!(index
+            .synchronize_rename("missing-root", &root, &from, &to)
+            .is_err());
+
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+        assert_eq!(repairs[0].reason, "direct rename");
+
+        assert_eq!(index.repair_pending("root", &root).unwrap(), 1);
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([to.to_string_lossy().into_owned()])
+        );
+        assert!(index.pending_repairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_an_indexed_root_moves_its_files_and_root_record() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let renamed = directory.path().join("media [home]");
+        std::fs::rename(&root, &renamed).unwrap();
+
+        index
+            .synchronize_rename("root", &root, &root, &renamed)
+            .unwrap();
+
+        assert_eq!(
+            index.roots().unwrap(),
+            vec![("root".into(), renamed.clone())]
+        );
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([renamed.join("clip.mp4").to_string_lossy().into_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rename_crossing_a_root_edge_removes_or_adds_membership() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let inside = root.join("clip.mp4");
+        let moved_out = outside.join("clip.mp4");
+        std::fs::write(&inside, b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        std::fs::rename(&inside, &moved_out).unwrap();
+        index
+            .synchronize_rename("root", &root, &inside, &moved_out)
+            .unwrap();
+        assert!(indexed_display_paths(&index).is_empty());
+
+        std::fs::rename(&moved_out, &inside).unwrap();
+        index
+            .synchronize_rename("root", &root, &moved_out, &inside)
+            .unwrap();
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([inside.to_string_lossy().into_owned()])
+        );
+    }
+
+    #[test]
+    fn a_rename_reconciles_overlapping_root_memberships() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("media");
+        let child = parent.join("photos");
+        std::fs::create_dir_all(&child).unwrap();
+        let from = child.join("trip.jpg");
+        let to = parent.join("trip.jpg");
+        std::fs::write(&from, b"photo").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("parent", &parent, |_| {}).unwrap();
+        index.scan_root("child", &child, |_| {}).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+
+        index
+            .synchronize_rename("parent", &parent, &from, &to)
+            .unwrap();
+
+        let parent_memberships: i64 = index
+            .connection
+            .query_row(
+                "SELECT count(*) FROM root_files WHERE root_id = 'parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let child_memberships: i64 = index
+            .connection
+            .query_row(
+                "SELECT count(*) FROM root_files WHERE root_id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_memberships, 1);
+        assert_eq!(child_memberships, 0);
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([to.to_string_lossy().into_owned()])
+        );
+    }
+
+    #[test]
+    fn synchronizing_a_directory_rename_moves_every_child_in_one_change() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let old_folder = root.join("Old Name");
+        std::fs::create_dir_all(old_folder.join("nested")).unwrap();
+        std::fs::write(old_folder.join("one.mp4"), b"one").unwrap();
+        std::fs::write(old_folder.join("nested/two.jpg"), b"two").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let new_folder = root.join("New Name");
+
+        std::fs::rename(&old_folder, &new_folder).unwrap();
+        index
+            .synchronize_rename("root", &root, &old_folder, &new_folder)
+            .unwrap();
+
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([
+                new_folder.join("one.mp4").to_string_lossy().into_owned(),
+                new_folder
+                    .join("nested/two.jpg")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+        );
+        assert_eq!(search_match_count(&index, "old"), 0);
+        assert_eq!(search_match_count(&index, "new"), 2);
+    }
+
+    #[test]
+    fn synchronizing_a_path_applies_create_modify_and_remove_before_returning() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let clip = root.join("clip.mp4");
+
+        std::fs::write(&clip, b"one").unwrap();
+        index.synchronize_path("root", &root, &clip).unwrap();
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([clip.to_string_lossy().into_owned()])
+        );
+
+        std::fs::write(&clip, b"a larger video").unwrap();
+        index.synchronize_path("root", &root, &clip).unwrap();
+        let size: i64 = index
+            .connection
+            .query_row("SELECT size_bytes FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(size, 14);
+
+        std::fs::remove_file(&clip).unwrap();
+        index.synchronize_path("root", &root, &clip).unwrap();
+        assert!(indexed_display_paths(&index).is_empty());
     }
 
     #[cfg(unix)]
