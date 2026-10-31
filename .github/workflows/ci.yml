@@ -8,14 +8,17 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.status-os }}, ${{ matrix.rust-target }}, ${{ matrix.bundles }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-latest
+            status-os: macos-14
             rust-target: aarch64-apple-darwin
             bundles: app,dmg
           - os: ubuntu-24.04
+            status-os: ubuntu-24.04
             rust-target: x86_64-unknown-linux-gnu
             bundles: appimage,deb
     runs-on: ${{ matrix.os }}
