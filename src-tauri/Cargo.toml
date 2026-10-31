@@ -13,6 +13,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 e2e = []
 native-e2e = ["e2e"]
 
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["e2e"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -1,4 +1,5 @@
 mod addons;
+mod cli;
 mod external_players;
 mod index_visibility;
 mod launch;
@@ -1172,7 +1173,7 @@ fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: boo
     player_linux::set_bounds(x, y, width, height, visible);
 }
 
-fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
+fn platform_provider(logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
     #[cfg(feature = "e2e")]
     {
         struct FixtureSearchProvider;
@@ -1190,29 +1191,28 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
             }
         }
         if std::env::var_os("TOKA_SEARCH_PROVIDER").is_none() {
-            return Arc::new(FixtureSearchProvider);
+            return Ok(Arc::new(FixtureSearchProvider));
         }
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(ScopedMdfindSearchProvider::system(
+        Ok(Arc::new(ScopedMdfindSearchProvider::system(
             logger,
-            owned_index::database_path().expect("Toka could not find its search index"),
-        ))
+            owned_index::database_path()?,
+        )))
     }
     #[cfg(target_os = "linux")]
     {
         match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
-            Ok("recoll") => Arc::new(RecollSearchProvider::system(logger)),
-            Ok("plocate") => Arc::new(PlocateSearchProvider::system(logger)),
-            Err(_) => Arc::new(ManagedPlocateSearchProvider::system(
-                managed_index::IndexPaths::system()
-                    .expect("Toka could not find its private index paths"),
+            Ok("recoll") => Ok(Arc::new(RecollSearchProvider::system(logger))),
+            Ok("plocate") => Ok(Arc::new(PlocateSearchProvider::system(logger))),
+            Err(_) => Ok(Arc::new(ManagedPlocateSearchProvider::system(
+                managed_index::IndexPaths::system()?,
                 logger,
-            )),
-            Ok(name) => Arc::new(InvalidProvider(format!(
-                "Unknown Linux search provider: {name}"
             ))),
+            Ok(name) => Ok(Arc::new(InvalidProvider(format!(
+                "Unknown Linux search provider: {name}"
+            )))),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1230,7 +1230,7 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
                 ))
             }
         }
-        Arc::new(UnsupportedProvider)
+        Ok(Arc::new(UnsupportedProvider))
     }
 }
 
@@ -1261,10 +1261,18 @@ fn addon_directory(
     }
 }
 
+fn search_rename_overlay_path() -> Result<PathBuf, String> {
+    Ok(owned_index::database_path()?.with_file_name("search-renames.json"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
     #[cfg(target_os = "linux")]
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--indexer")) {
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == std::ffi::OsStr::new("--indexer"))
+    {
         let paths = managed_index::IndexPaths::system().unwrap_or_else(|message| {
             eprintln!("{message}");
             std::process::exit(1);
@@ -1275,6 +1283,36 @@ pub fn run() {
         }
         return;
     }
+
+    #[cfg(not(mobile))]
+    if cli::is_command(&arguments) {
+        let status = {
+            let mut stdout = std::io::stdout();
+            let mut stderr = std::io::stderr();
+            cli::run_command(
+                &arguments,
+                || {
+                    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+                    managed_index::ensure_indexer();
+                    let logger = Arc::new(SearchLogger::system());
+                    let provider = platform_provider(logger.clone())?;
+                    let rename_overlay_path = Some(search_rename_overlay_path()?);
+                    Ok(SearchEngine::new_with_logger_and_rename_store(
+                        provider,
+                        logger,
+                        rename_overlay_path,
+                    ))
+                },
+                &mut stdout,
+                &mut stderr,
+            )
+        };
+        if status != 0 {
+            std::process::exit(status);
+        }
+        return;
+    }
+
     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
     managed_index::ensure_indexer();
     let builder = tauri::Builder::default()
@@ -1287,7 +1325,7 @@ pub fn run() {
 
     // Read before the window exists, because the command line Toka was started
     // with is the whole of what it was asked to open.
-    let launched = LaunchRequest(launch::from_arguments(std::env::args_os()));
+    let launched = LaunchRequest(launch::from_arguments(arguments));
     let user_addons = addon_directory(
         dirs::config_dir(),
         std::env::var_os("TOKA_E2E_ADDONS_DIR"),
@@ -1296,12 +1334,11 @@ pub fn run() {
     let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
     let rename_overlay_path = Some(
-        owned_index::database_path()
-            .expect("Toka could not find a place for its search rename state.")
-            .with_file_name("search-renames.json"),
+        search_rename_overlay_path()
+            .expect("Toka could not find a place for its search rename state."),
     );
     let engine = Arc::new(SearchEngine::new_with_logger_and_rename_store(
-        platform_provider(logger.clone()),
+        platform_provider(logger.clone()).expect("Toka could not initialize its search provider"),
         logger.clone(),
         rename_overlay_path,
     ));

@@ -17,6 +17,8 @@ npm run build:mac   # macOS: builds the .app and .dmg
 Build Linux artifacts on Linux and macOS bundles on macOS. The Linux command installs
 Toka, its private indexer, and its bundled plocate tools under your home directory,
 so no system-wide plocate setup is needed. See the platform quick-start guide for details.
+The macOS command installs the app in `/Applications` and links the `toka` command
+in `~/.local/bin`.
 
 ## Search
 
@@ -52,6 +54,20 @@ operators: `created:10-5-2026`, `modified:>1-1-2026`, and
 years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Quoted relative values
 such as `modified:>"3 days ago"` and `created:>="1 week ago"` resolve once when
 the search starts. Dates use the file's local calendar date, not its time.
+
+### Search from the command line
+
+Run a search from a terminal with `toka search`:
+
+```sh
+toka search "family trip"
+```
+
+The command uses Toka's index and the same query syntax. It searches videos and
+images, then writes each full file path on a separate line. It returns exit code
+`0` when the search succeeds, including when it finds no results. A search or
+output error returns exit code `1`. A missing query returns exit code `2`. Use
+`toka search --help` for command help.
 
 ## Add-ons
 
