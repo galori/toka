@@ -86,6 +86,7 @@ fn run_search(
 ) -> i32 {
     let mut current_page = 1;
     let mut last_page = None;
+    let mut search_id = None;
     let mut paths = Vec::new();
 
     loop {
@@ -93,7 +94,7 @@ fn run_search(
             query: query.to_owned(),
             page: current_page,
             page_size: PAGE_SIZE,
-            search_id: None,
+            search_id: search_id.clone(),
             fields: SearchFields::default(),
             media_type: MediaType::Both,
         };
@@ -104,6 +105,9 @@ fn run_search(
                 return 1;
             }
         };
+        if search_id.is_none() {
+            search_id = Some(page.search_id.clone());
+        }
         let last_page = *last_page.get_or_insert(page.total_pages);
 
         for result in page.results {
