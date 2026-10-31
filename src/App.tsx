@@ -1655,10 +1655,19 @@ function Player({
 
   // How far through the video the scrubber is, as the sliver it collapses to in
   // fullscreen has to paint its own fill.
-  const elapsedShare =
+  const timelineShare = (time: number) =>
+    duration > 0 ? Math.min(100, Math.max(0, (time / duration) * 100)) : 0;
+  const elapsedShare = timelineShare(currentTime);
+  const rangeMarkers =
+    !isImage &&
+    rangeStart !== undefined &&
+    rangeEnd !== undefined &&
     duration > 0
-      ? Math.min(100, Math.max(0, (currentTime / duration) * 100))
-      : 0;
+      ? [
+          { label: "Range start marker", share: timelineShare(rangeStart) },
+          { label: "Range end marker", share: timelineShare(rangeEnd) },
+        ]
+      : [];
 
   const subtitles = useMemo<SubtitleOption[]>(() => {
     if (native) return nativeSubtitles;
@@ -2915,34 +2924,45 @@ function Player({
             pointerOverControls.current = false;
           }}
         >
-          <input
-            className="player-timeline"
-            aria-label={isImage ? "Image timeline" : "Video timeline"}
-            title={isImage ? "Image timeline" : "Video timeline"}
-            type="range"
-            min="0"
-            max={duration || 0}
-            step="0.1"
-            value={Math.min(currentTime, duration || 0)}
-            // The sliver the bar collapses to in fullscreen paints its own fill:
-            // a range input's track and thumb cannot be drawn legibly at six
-            // pixels, so the progress is handed to the stylesheet instead.
-            style={{ "--progress": `${elapsedShare}%` } as CSSProperties}
-            onChange={(event) => {
-              const nextTime = Number(event.currentTarget.value);
-              if (isImage) {
-                imageElapsed.current = nextTime;
+          <div className="player-scrubber">
+            <input
+              className="player-timeline"
+              aria-label={isImage ? "Image timeline" : "Video timeline"}
+              title={isImage ? "Image timeline" : "Video timeline"}
+              type="range"
+              min="0"
+              max={duration || 0}
+              step="0.1"
+              value={Math.min(currentTime, duration || 0)}
+              // The sliver the bar collapses to in fullscreen paints its own fill:
+              // a range input's track and thumb cannot be drawn legibly at six
+              // pixels, so the progress is handed to the stylesheet instead.
+              style={{ "--progress": `${elapsedShare}%` } as CSSProperties}
+              onChange={(event) => {
+                const nextTime = Number(event.currentTarget.value);
+                if (isImage) {
+                  imageElapsed.current = nextTime;
+                  setCurrentTime(nextTime);
+                  return;
+                }
+                if (native)
+                  void seekNativeVideo(nextTime).catch((reason: unknown) =>
+                    setError(errorMessage(reason)),
+                  );
+                else if (element.current)
+                  element.current.currentTime = nextTime;
                 setCurrentTime(nextTime);
-                return;
-              }
-              if (native)
-                void seekNativeVideo(nextTime).catch((reason: unknown) =>
-                  setError(errorMessage(reason)),
-                );
-              else if (element.current) element.current.currentTime = nextTime;
-              setCurrentTime(nextTime);
-            }}
-          />
+              }}
+            />
+            {rangeMarkers.map((marker) => (
+              <span
+                key={marker.label}
+                className="player-range-marker"
+                aria-label={marker.label}
+                style={{ left: `${marker.share}%` }}
+              />
+            ))}
+          </div>
           <div className="player-transport">
             <ControlButton
               shortcut="PageUp"
