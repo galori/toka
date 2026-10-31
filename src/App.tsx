@@ -924,7 +924,11 @@ const HELP_SECTIONS: HelpSection[] = [
         shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",
         description: "Show videos, images, or both",
       },
-      { shortcut: "Ctrl+,", description: "Manage search folders" },
+      {
+        shortcut: "Ctrl+,",
+        description:
+          "Manage search folders; hidden files and folders are skipped",
+      },
       {
         shortcut: "Ctrl+Shift+L",
         description: "Configure verbose search logging",
@@ -4324,6 +4328,10 @@ export default function App() {
           <p>
             Add the folders that contain your videos and images. Toka keeps
             their search indexes up to date in the background.
+          </p>
+          <p>
+            Files and folders whose names start with a dot are skipped. On
+            macOS, folders with the hidden flag are also skipped.
           </p>
           <ControlButton
             shortcut="Ctrl+O"

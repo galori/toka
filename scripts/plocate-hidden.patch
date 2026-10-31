@@ -1,0 +1,34 @@
+--- a/updatedb.cpp
++++ b/updatedb.cpp
+@@ -522,6 +522,12 @@
+ // Takes ownership of fd.
+ int scan(const string &path, int fd, dev_t parent_dev, dir_time modified, dir_time db_modified, ExistingDB *existing_db, DatabaseReceiver *corpus, DictionaryBuilder *dict_builder)
+ {
++	// Toka: skip dot-prefixed files and folders (2026-10-31).
++	const string basename = path.substr(path.find_last_of('/') + 1);
++	if (!basename.empty() && basename[0] == '.') {
++		close(fd);
++		return 0;
++	}
+ 	if (string_list_contains_dir_path(&conf_prunepaths, &conf_prunepaths_index, path)) {
+ 		if (conf_debug_pruning) {
+ 			fprintf(stderr, "Skipping `%s': in prunepaths\n", path.c_str());
+@@ -577,6 +583,9 @@
+ 
+ 		entry e;
+ 		e.name = record.first.substr(path_plus_slash.size());
++		if (!e.name.empty() && e.name[0] == '.') {
++			continue;
++		}
+ 		e.is_directory = (record.second.sec >= 0);
+ 		e.db_modified = record.second;
+ 		db_entries.push_back(e);
+@@ -608,7 +617,7 @@
+ 
+ 		dirent *de;
+ 		while ((de = readdir(dir)) != nullptr) {
+-			if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
++			if (de->d_name[0] == '.') {
+ 				continue;
+ 			}
+ 			if (strlen(de->d_name) == 0) {

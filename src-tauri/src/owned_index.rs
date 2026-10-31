@@ -1,4 +1,5 @@
 use crate::{
+    index_visibility,
     search::{is_supported_image, is_supported_video},
     tags,
 };
@@ -1016,6 +1017,17 @@ impl OwnedIndex {
         let mut batch = Vec::with_capacity(batch_size);
 
         while let Some(directory) = pending.pop_front() {
+            match index_visibility::is_hidden(&directory) {
+                Ok(true) => {
+                    progress.skipped_paths = progress.skipped_paths.saturating_add(1);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    progress.read_failures = progress.read_failures.saturating_add(1);
+                    continue;
+                }
+            }
             progress.current_folder = Some(directory.clone());
             progress.current_file = None;
             progress.touch();
@@ -1043,6 +1055,17 @@ impl OwnedIndex {
                     }
                 };
                 let path = entry.path();
+                match index_visibility::is_hidden(&path) {
+                    Ok(true) => {
+                        progress.skipped_paths = progress.skipped_paths.saturating_add(1);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        progress.read_failures = progress.read_failures.saturating_add(1);
+                        continue;
+                    }
+                }
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(_) => {
@@ -1370,6 +1393,14 @@ impl OwnedIndex {
         if !path.starts_with(root) {
             return Ok(());
         }
+        if let Some(hidden) = index_visibility::hidden_ancestor(root, path).map_err(|source| {
+            OwnedIndexError::PathRead {
+                path: path.display().to_string(),
+                source,
+            }
+        })? {
+            return self.remove_indexed_path(root_id, hidden);
+        }
         let metadata = if self.is_own_index_path(path) {
             None
         } else {
@@ -1468,6 +1499,15 @@ impl OwnedIndex {
                     source,
                 })?;
                 let path = entry.path();
+                if index_visibility::is_hidden(&path).map_err(|source| {
+                    OwnedIndexError::PathRead {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                })? {
+                    self.remove_indexed_path(root_id, &path)?;
+                    continue;
+                }
                 let file_type = entry
                     .file_type()
                     .map_err(|source| OwnedIndexError::PathRead {
@@ -1653,6 +1693,16 @@ impl OwnedIndex {
                 } else {
                     to.join(relative)
                 };
+                if index_visibility::hidden_ancestor(if root_moved { to } else { root }, &new_path)
+                    .map_err(|source| OwnedIndexError::PathRead {
+                        path: new_path.display().to_string(),
+                        source,
+                    })?
+                    .is_some()
+                {
+                    moved_files.push((file_id, None));
+                    continue;
+                }
                 let Some(file) = fs::metadata(&new_path)
                     .ok()
                     .filter(|metadata| metadata.is_file())
@@ -1660,7 +1710,7 @@ impl OwnedIndex {
                 else {
                     continue;
                 };
-                moved_files.push((file_id, file));
+                moved_files.push((file_id, Some(file)));
             }
             moved_files
         };
@@ -1679,6 +1729,10 @@ impl OwnedIndex {
             )?;
         }
         for (file_id, file) in moved_files {
+            let Some(file) = file else {
+                transaction.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
+                continue;
+            };
             transaction.execute(
                 "UPDATE files SET
                     path = ?2,
@@ -1730,7 +1784,7 @@ impl OwnedIndex {
             [],
         )?;
         transaction.commit()?;
-        Ok(())
+        self.try_synchronize_path(root_id, if root_moved { to } else { root }, to)
     }
 
     fn is_own_index_path(&self, path: &Path) -> bool {
@@ -2101,6 +2155,163 @@ mod tests {
                 .unwrap();
             assert_eq!(matches, 1, "query: {query}");
         }
+    }
+
+    #[test]
+    fn scans_skip_dot_files_and_do_not_enter_dot_folders() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        fs::create_dir_all(root.join(".worktrees/nested")).unwrap();
+        fs::create_dir_all(root.join("visible.folder")).unwrap();
+        fs::write(root.join(".hidden.mp4"), b"video").unwrap();
+        fs::write(root.join(".worktrees/nested/clip.mp4"), b"video").unwrap();
+        fs::write(root.join("visible.folder/photo.jpg"), b"photo").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        let mut scanned_folders = Vec::new();
+
+        let progress = index
+            .scan_root("root", &root, |progress| {
+                if let Some(folder) = &progress.current_folder {
+                    scanned_folders.push(folder.clone());
+                }
+            })
+            .unwrap();
+
+        assert_eq!(progress.files_indexed, 1);
+        assert_eq!(progress.skipped_paths, 2);
+        assert_eq!(progress.read_failures, 0);
+        assert!(!scanned_folders.contains(&root.join(".worktrees")));
+        let state = OwnedIndexManager::under(database).state().unwrap();
+        assert_eq!((state.indexed_videos, state.indexed_images), (0, 1));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn rescans_remove_media_in_folders_with_the_macos_hidden_flag() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let hidden = root.join("archive");
+        fs::create_dir_all(hidden.join("nested")).unwrap();
+        fs::write(hidden.join("nested/clip.mp4"), b"video").unwrap();
+        fs::write(root.join("photo.jpg"), b"photo").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        assert!(std::process::Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(&hidden)
+            .status()
+            .unwrap()
+            .success());
+
+        let progress = index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert_eq!(progress.files_indexed, 1);
+        assert_eq!(progress.folders_scanned, 1);
+        assert_eq!(progress.skipped_paths, 1);
+        assert_eq!(progress.read_failures, 0);
+        let manager = OwnedIndexManager::under(database);
+        let state = manager.state().unwrap();
+        assert_eq!((state.indexed_videos, state.indexed_images), (0, 1));
+        assert!(std::process::Command::new("/usr/bin/chflags")
+            .arg("nohidden")
+            .arg(&hidden)
+            .status()
+            .unwrap()
+            .success());
+        index.synchronize_path("root", &root, &hidden).unwrap();
+        assert_eq!(manager.state().unwrap().indexed_videos, 1);
+        assert!(std::process::Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(&hidden)
+            .status()
+            .unwrap()
+            .success());
+        index
+            .synchronize_path("root", &root, &hidden.join("nested/clip.mp4"))
+            .unwrap();
+        assert_eq!(manager.state().unwrap().indexed_videos, 0);
+    }
+
+    #[test]
+    fn live_updates_skip_hidden_files_and_hidden_ancestors() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        fs::create_dir_all(root.join("new/.worktrees/nested")).unwrap();
+        fs::write(root.join("new/.worktrees/nested/clip.mp4"), b"video").unwrap();
+        fs::write(root.join("new/.hidden.mp4"), b"video").unwrap();
+        fs::write(root.join("new/photo.jpg"), b"photo").unwrap();
+
+        index
+            .synchronize_path("root", &root, &root.join("new"))
+            .unwrap();
+        index
+            .synchronize_path("root", &root, &root.join("new/.worktrees/nested/clip.mp4"))
+            .unwrap();
+        index
+            .synchronize_path("root", &root, &root.join("new/.hidden.mp4"))
+            .unwrap();
+
+        let state = OwnedIndexManager::under(database).state().unwrap();
+        assert_eq!((state.indexed_videos, state.indexed_images), (0, 1));
+        assert!(index.pending_repairs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn renaming_files_and_folders_to_hidden_names_removes_them_until_restored() {
+        for (visible_name, hidden_name, file_name) in [
+            ("clip.mp4", ".clip.mp4", None),
+            ("archive", ".archive", Some("clip.mp4")),
+        ] {
+            let directory = tempdir().unwrap();
+            let root = directory.path().join("media");
+            fs::create_dir(&root).unwrap();
+            let visible = root.join(visible_name);
+            let hidden = root.join(hidden_name);
+            let file = if let Some(name) = file_name {
+                fs::create_dir(&visible).unwrap();
+                visible.join(name)
+            } else {
+                visible.clone()
+            };
+            fs::write(file, b"video").unwrap();
+            let database = directory.path().join("index.sqlite3");
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            let manager = OwnedIndexManager::under(database);
+
+            fs::rename(&visible, &hidden).unwrap();
+            index
+                .synchronize_rename("root", &root, &visible, &hidden)
+                .unwrap();
+            assert_eq!(manager.state().unwrap().indexed_videos, 0, "{hidden_name}");
+
+            fs::rename(&hidden, &visible).unwrap();
+            index
+                .synchronize_rename("root", &root, &hidden, &visible)
+                .unwrap();
+            assert_eq!(manager.state().unwrap().indexed_videos, 1, "{visible_name}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_search_root_is_not_scanned() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join(".media");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+
+        let progress = index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert_eq!(progress.files_indexed, 0);
+        assert_eq!(progress.folders_scanned, 0);
+        assert_eq!(progress.skipped_paths, 1);
     }
 
     #[test]

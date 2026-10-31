@@ -184,6 +184,22 @@ impl SearchProvider for ScopedMdfindSearchProvider {
         Ok(paths)
     }
 
+    fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
+        let mut roots = crate::owned_index::root_paths(&self.database)
+            .map_err(|error| SearchError::Provider(error.to_string()))?;
+        if roots.is_empty() {
+            roots.push(PathBuf::from("/"));
+        }
+        paths.retain(|path| {
+            roots.iter().any(|root| {
+                path.starts_with(root)
+                    && crate::index_visibility::hidden_ancestor(root, path)
+                        .is_ok_and(|hidden| hidden.is_none())
+            })
+        });
+        Ok(())
+    }
+
     fn revision(&self) -> u64 {
         crate::owned_index::index_revision(&self.database).unwrap_or(0)
     }
@@ -239,6 +255,9 @@ fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if crate::index_visibility::is_hidden(&path).unwrap_or(true) {
+                continue;
+            }
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -706,6 +725,9 @@ mod tests {
         let missing_term = directory.path().join("Vacation.mov");
         std::fs::write(&matching, b"test").unwrap();
         std::fs::write(&missing_term, b"test").unwrap();
+        std::fs::create_dir(nested.join(".private")).unwrap();
+        std::fs::write(nested.join(".Untitled.mov"), b"test").unwrap();
+        std::fs::write(nested.join(".private/Untitled.mov"), b"test").unwrap();
 
         assert_eq!(
             download_folder_candidates(directory.path(), "untitled"),
@@ -780,6 +802,63 @@ mod tests {
     }
 
     #[test]
+    fn scoped_search_excludes_hidden_files_and_folders() {
+        use crate::search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(root.join(".worktrees")).unwrap();
+        std::fs::create_dir_all(root.join("archive")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let visible = root.join("clip.mp4");
+        let hidden_file = root.join(".clip.mp4");
+        let hidden_child = root.join(".worktrees/clip.mp4");
+        let archive = root.join("archive/clip.mp4");
+        for path in [&visible, &hidden_file, &hidden_child, &archive] {
+            std::fs::write(path, b"video").unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        assert!(Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(root.join("archive"))
+            .status()
+            .unwrap()
+            .success());
+        let database = directory.path().join("index.sqlite3");
+        crate::owned_index::OwnedIndexManager::under(database.clone())
+            .add_folder(&root)
+            .unwrap();
+        let output = [&visible, &hidden_file, &hidden_child, &archive]
+            .map(|path| path.to_string_lossy())
+            .join("\n");
+        let engine = SearchEngine::new(Arc::new(ScopedMdfindSearchProvider {
+            runner: Arc::new(FakeRunner::new(&output)),
+            database,
+        }));
+        // A recent folder rename adds candidates after the provider query.
+        engine.rename_folder(&root.join("previous"), root.join("archive"));
+
+        let results = engine
+            .search(SearchRequest {
+                query: "clip".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+                fields: SearchFields::default(),
+                media_type: MediaType::Both,
+            })
+            .unwrap();
+
+        assert_eq!(
+            results.total_results,
+            if cfg!(target_os = "macos") { 1 } else { 2 }
+        );
+        assert!(results
+            .results
+            .iter()
+            .all(|result| result.file_name == "clip.mp4"));
+    }
+
+    #[test]
     fn scoped_mdfind_only_searches_configured_folders() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("media");
@@ -788,10 +867,8 @@ mod tests {
         let database = directory.path().join("index.sqlite3");
         let manager = crate::owned_index::OwnedIndexManager::under(database.clone());
         manager.add_folder(&root).unwrap();
-        let runner = Arc::new(FakeRunner::new(
-            "/media/clip.mp4
-",
-        ));
+        let clip = root.join("clip.mp4");
+        let runner = Arc::new(FakeRunner::new(clip.to_string_lossy().as_ref()));
         let provider = ScopedMdfindSearchProvider {
             runner: runner.clone(),
             database,
@@ -812,7 +889,7 @@ mod tests {
                 ]
             ))
         );
-        assert_eq!(paths, vec![PathBuf::from("/media/clip.mp4")]);
+        assert_eq!(paths, vec![clip]);
     }
 
     #[test]

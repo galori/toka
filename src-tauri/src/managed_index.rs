@@ -537,11 +537,17 @@ fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
         .collect::<Vec<_>>();
 
     while let Some(directory) = pending.pop() {
+        if crate::index_visibility::is_hidden(&directory).unwrap_or(true) {
+            continue;
+        }
         let Ok(entries) = fs::read_dir(directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if crate::index_visibility::is_hidden(&path).unwrap_or(true) {
+                continue;
+            }
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };

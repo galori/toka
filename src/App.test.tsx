@@ -323,6 +323,11 @@ test("reopens configured search folders from Ctrl+,", async () => {
   expect(
     await screen.findByRole("heading", { name: "Choose where Toka searches" }),
   ).toBeVisible();
+  expect(
+    screen.getByText(
+      /Files and folders whose names start with a dot are skipped/,
+    ),
+  ).toBeVisible();
 });
 
 test("leaves configured search folder setup with Escape", async () => {
