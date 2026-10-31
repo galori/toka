@@ -1509,6 +1509,8 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
+    static WATCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn open_index() -> (tempfile::TempDir, OwnedIndex) {
         let directory = tempdir().unwrap();
         let index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
@@ -2001,6 +2003,7 @@ mod tests {
 
     #[test]
     fn recursive_watcher_applies_create_modify_rename_and_remove_promptly() {
+        let _guard = WATCHER_TEST_LOCK.lock().unwrap();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         let nested = root.join("nested");
@@ -2060,6 +2063,7 @@ mod tests {
 
     #[test]
     fn watcher_buffers_events_while_the_initial_scan_runs() {
+        let _guard = WATCHER_TEST_LOCK.lock().unwrap();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         let nested = root.join("nested");
