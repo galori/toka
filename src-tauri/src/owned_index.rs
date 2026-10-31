@@ -402,22 +402,57 @@ impl OwnedIndexWatcher {
         database: &Path,
         root_id: String,
         root: PathBuf,
-        mut on_progress: F,
+        on_progress: F,
     ) -> Result<Self, OwnedIndexError>
     where
         F: FnMut(&ScanProgress) + Send + 'static,
     {
-        let mut index = OwnedIndex::open(database)?;
+        let index = OwnedIndex::open(database)?;
         let (event_sender, event_receiver) = mpsc::channel();
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
             let _ = event_sender.send(event);
         })?;
         watcher.watch(&root, RecursiveMode::Recursive)?;
+        Self::spawn_with_events(index, root_id, root, event_receiver, watcher, on_progress)
+    }
+
+    #[cfg(test)]
+    fn start_with_test_events<F>(
+        database: &Path,
+        root_id: String,
+        root: PathBuf,
+        mut on_progress: F,
+    ) -> Result<(Self, mpsc::Sender<notify::Result<Event>>), OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress, &mpsc::Sender<notify::Result<Event>>) + Send + 'static,
+    {
+        let index = OwnedIndex::open(database)?;
+        let (event_sender, event_receiver) = mpsc::channel();
+        let scan_sender = event_sender.clone();
+        let watcher =
+            Self::spawn_with_events(index, root_id, root, event_receiver, (), move |progress| {
+                on_progress(progress, &scan_sender)
+            })?;
+        Ok((watcher, event_sender))
+    }
+
+    fn spawn_with_events<F, K>(
+        mut index: OwnedIndex,
+        root_id: String,
+        root: PathBuf,
+        event_receiver: mpsc::Receiver<notify::Result<Event>>,
+        keepalive: K,
+        mut on_progress: F,
+    ) -> Result<Self, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress) + Send + 'static,
+        K: Send + 'static,
+    {
         let (stop, stop_receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("toka-index-{root_id}"))
             .spawn(move || {
-                let _watcher = watcher;
+                let _keepalive = keepalive;
                 index.scan_root(&root_id, &root, |progress| on_progress(progress))?;
                 index.repair_pending(&root_id, &root)?;
                 let mut event_state = NotifyEventState::default();
@@ -1509,8 +1544,6 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
 
-    static WATCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn open_index() -> (tempfile::TempDir, OwnedIndex) {
         let directory = tempdir().unwrap();
         let index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
@@ -2002,14 +2035,41 @@ mod tests {
     }
 
     #[test]
+    fn production_watcher_starts_recursively_and_completes_its_first_scan() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("existing.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        let watcher = OwnedIndexWatcher::start(&database, "root".into(), root).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        wait_for(|| {
+            observer
+                .scan_progress("root")
+                .unwrap()
+                .is_some_and(|progress| progress.phase == ScanPhase::Ready)
+        });
+
+        assert_eq!(indexed_file_count(&observer), 1);
+        watcher.stop().unwrap();
+    }
+
+    #[test]
     fn recursive_watcher_applies_create_modify_rename_and_remove_promptly() {
-        let _guard = WATCHER_TEST_LOCK.lock().unwrap();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let database = directory.path().join("index.sqlite3");
-        let watcher = OwnedIndexWatcher::start(&database, "root".into(), root.clone()).unwrap();
+        let (watcher, events) = OwnedIndexWatcher::start_with_test_events(
+            &database,
+            "root".into(),
+            root.clone(),
+            |_, _| {},
+        )
+        .unwrap();
         let observer = OwnedIndex::open(&database).unwrap();
         wait_for(|| {
             observer
@@ -2020,17 +2080,42 @@ mod tests {
         let clip = nested.join("clip.mp4");
 
         std::fs::write(&clip, b"one").unwrap();
+        events
+            .send(Ok(Event::new(EventKind::Create(
+                notify::event::CreateKind::File,
+            ))
+            .add_path(clip.clone())))
+            .unwrap();
         wait_for(|| indexed_size(&observer, &clip) == Some(3));
 
         std::fs::write(&clip, b"a larger video").unwrap();
+        events
+            .send(Ok(Event::new(EventKind::Modify(
+                notify::event::ModifyKind::Data(notify::event::DataChange::Content),
+            ))
+            .add_path(clip.clone())))
+            .unwrap();
         wait_for(|| indexed_size(&observer, &clip) == Some(14));
 
         let renamed = root.join("renamed");
         std::fs::rename(&nested, &renamed).unwrap();
         let moved = renamed.join("clip.mp4");
+        events
+            .send(Ok(Event::new(EventKind::Modify(
+                notify::event::ModifyKind::Name(notify::event::RenameMode::Both),
+            ))
+            .add_path(nested)
+            .add_path(renamed.clone())))
+            .unwrap();
         wait_for(|| indexed_size(&observer, &moved) == Some(14));
 
         std::fs::remove_dir_all(&renamed).unwrap();
+        events
+            .send(Ok(Event::new(EventKind::Remove(
+                notify::event::RemoveKind::Folder,
+            ))
+            .add_path(renamed)))
+            .unwrap();
         wait_for(|| indexed_size(&observer, &moved).is_none());
         watcher.stop().unwrap();
     }
@@ -2063,7 +2148,6 @@ mod tests {
 
     #[test]
     fn watcher_buffers_events_while_the_initial_scan_runs() {
-        let _guard = WATCHER_TEST_LOCK.lock().unwrap();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         let nested = root.join("nested");
@@ -2074,16 +2158,22 @@ mod tests {
         let late_from_scan = late.clone();
         let nested_from_scan = nested.clone();
 
-        let watcher = OwnedIndexWatcher::start_with_progress(
+        let (watcher, _events) = OwnedIndexWatcher::start_with_test_events(
             &database,
             "root".into(),
             root.clone(),
-            move |progress| {
+            move |progress, events| {
                 if progress.phase == ScanPhase::Scanning
                     && progress.current_folder.as_deref() == Some(nested_from_scan.as_path())
                     && !late_from_scan.exists()
                 {
                     std::fs::write(&late_from_scan, b"photo").unwrap();
+                    events
+                        .send(Ok(Event::new(EventKind::Create(
+                            notify::event::CreateKind::File,
+                        ))
+                        .add_path(late_from_scan.clone())))
+                        .unwrap();
                 }
             },
         )
