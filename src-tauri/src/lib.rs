@@ -243,6 +243,7 @@ impl From<SearchError> for CommandError {
             SearchError::InvalidQuery => "InvalidQuery",
             SearchError::NoSearchFields => "NoSearchFields",
             SearchError::InvalidPage => "InvalidPage",
+            SearchError::SearchExpired => "SearchExpired",
             SearchError::Provider(_) => "Provider",
             SearchError::VideoUnavailable => "VideoUnavailable",
         };
@@ -317,6 +318,7 @@ fn addon_search_page(
         query: addon_search.query.clone(),
         page: 1,
         page_size: search::PAGE_SIZE,
+        search_id: None,
         fields: addon_search.fields,
         media_type: addon_search.media_type,
     };
@@ -1623,6 +1625,7 @@ mod tests {
                 query: "clip".into(),
                 page: 1,
                 page_size: search::PAGE_SIZE,
+                search_id: None,
                 fields: Default::default(),
                 media_type: Default::default(),
             })

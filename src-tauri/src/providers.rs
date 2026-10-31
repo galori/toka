@@ -633,6 +633,7 @@ mod tests {
             query: query.into(),
             page: 1,
             page_size: crate::search::PAGE_SIZE,
+            search_id: None,
             fields: crate::search::SearchFields::default(),
             media_type: crate::search::MediaType::default(),
         })

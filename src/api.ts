@@ -15,6 +15,7 @@ export type VideoResult = {
 export type VideoTagUpdate = Pick<VideoResult, "fileName" | "tags">;
 
 export type SearchPage = {
+  searchId?: string;
   query: string;
   page: number;
   pageSize: typeof PAGE_SIZE;
@@ -124,8 +125,16 @@ export function searchVideos(
   fields: SearchFields = DEFAULT_SEARCH_FIELDS,
   mediaType: MediaType = DEFAULT_MEDIA_TYPE,
   addonSearch?: AddonSearch,
+  searchId?: string,
 ): Promise<SearchPage> {
-  const request = { query, page, pageSize: PAGE_SIZE, fields, mediaType };
+  const request = {
+    query,
+    page,
+    pageSize: PAGE_SIZE,
+    fields,
+    mediaType,
+    searchId,
+  };
   return invoke<SearchPage>(
     "search_videos",
     addonSearch ? { request, addonSearch } : { request },

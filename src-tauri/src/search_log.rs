@@ -648,6 +648,7 @@ mod tests {
                 query: "summer".into(),
                 page: 1,
                 page_size: 24,
+                search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
             },

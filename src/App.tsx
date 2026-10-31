@@ -3370,6 +3370,7 @@ async function loadResultPages(
   fields: SearchFields,
   mediaType: MediaType,
   addonSearch?: AddonSearch,
+  searchId?: string,
 ): Promise<VideoResult[][]> {
   const pages = Array.from(
     { length: Math.max(0, lastPage - firstPage + 1) },
@@ -3385,6 +3386,7 @@ async function loadResultPages(
         fields,
         mediaType,
         addonSearch,
+        searchId,
       );
       pages[pageIndex] = response.results;
     }
@@ -3549,6 +3551,7 @@ export default function App() {
         fields,
         mediaType,
         addonSearch,
+        page.searchId,
       );
       setPage((current) =>
         current && current.query === next.query
@@ -3572,6 +3575,7 @@ export default function App() {
       fields,
       mediaType,
       addonSearch,
+      page.searchId,
     );
     setPage((current) =>
       current && current.query === next.query && current.page === loadedPage
@@ -3889,6 +3893,7 @@ export default function App() {
           fields,
           mediaType,
           addonSearch,
+          page.searchId,
         )
       : [];
     return [page.results, ...pages].flat();
