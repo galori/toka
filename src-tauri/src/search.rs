@@ -122,6 +122,11 @@ pub trait SearchProvider: Send + Sync {
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError>;
 
+    /// Apply provider scope and visibility rules after recent renames are added.
+    fn retain_visible_paths(&self, _paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
+        Ok(())
+    }
+
     fn revision(&self) -> u64 {
         0
     }
@@ -526,7 +531,9 @@ impl SearchEngine {
         let mut seen = HashSet::new();
         let needs_whole_path = request.fields.path || query_needs_whole_path(&expression);
         let mut paths = Vec::new();
-        for path in self.candidates(query, needs_whole_path, context)? {
+        let mut candidates = self.candidates(query, needs_whole_path, context)?;
+        self.provider.retain_visible_paths(&mut candidates)?;
+        for path in candidates {
             if !is_supported_media(&path, request.media_type) {
                 self.logger
                     .record_filtered(context, &path, "unsupported media type");

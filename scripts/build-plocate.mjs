@@ -82,6 +82,22 @@ export async function buildPlocate(targetTriple = hostTriple()) {
     run("tar", ["-xzf", archive, "-C", cacheDir]);
   }
 
+  // Restore this file before patching so cached source trees get the same policy.
+  run("tar", [
+    "-xzf",
+    archive,
+    "-C",
+    cacheDir,
+    `plocate-${version}/updatedb.cpp`,
+  ]);
+  run("patch", [
+    "-d",
+    sourceDir,
+    "-p1",
+    "-i",
+    path.join(root, "scripts/plocate-hidden.patch"),
+  ]);
+
   run("meson", [
     "setup",
     buildDir,
@@ -91,10 +107,17 @@ export async function buildPlocate(targetTriple = hostTriple()) {
     "-Dinstall_cron=false",
   ]);
   run("meson", ["compile", "-C", buildDir, "plocate", "updatedb"]);
+  // Ship the source used by this build, including the hidden-entry change.
+  run("tar", [
+    "-czf",
+    path.join(resourcesDir, `plocate-${version}.tar.gz`),
+    "-C",
+    cacheDir,
+    `plocate-${version}`,
+  ]);
   await Promise.all([
     copyFile(path.join(buildDir, "plocate"), outputs[0]),
     copyFile(path.join(buildDir, "updatedb"), outputs[1]),
-    copyFile(archive, path.join(resourcesDir, `plocate-${version}.tar.gz`)),
     copyFile(
       path.join(sourceDir, "COPYING"),
       path.join(resourcesDir, "plocate-COPYING"),

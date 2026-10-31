@@ -1,5 +1,6 @@
 mod addons;
 mod external_players;
+mod index_visibility;
 mod launch;
 #[cfg(target_os = "linux")]
 mod managed_index;

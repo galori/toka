@@ -88,6 +88,7 @@ jobs:
           } >> "$GITHUB_ENV"
           if [ "$RUNNER_OS" = Linux ]; then
             node scripts/build-plocate.mjs "${{ matrix.rust-target }}"
+            node scripts/test-plocate-hidden.mjs "src-tauri/binaries/toka-updatedb-${{ matrix.rust-target }}" "src-tauri/binaries/toka-plocate-${{ matrix.rust-target }}" /usr/bin/updatedb
             npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.linux-owned-index.conf.json
           else
             npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
