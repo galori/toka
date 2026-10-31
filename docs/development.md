@@ -99,7 +99,7 @@ network.
 
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
-- macOS search runs `/usr/bin/mdfind`.
+- macOS search runs `/usr/bin/mdfind`, limited with `-onlyin` when search folders are configured. Those folders are also scanned by the owned index in `src-tauri/src/owned_index.rs`.
 - Linux release builds bundle plocate 1.1.24 and use one private database per configured folder. Set `TOKA_SEARCH_PROVIDER=plocate` to exercise the legacy system database or `TOKA_SEARCH_PROVIDER=recoll` to use `recollq`.
 - `scripts/build-plocate.mjs` verifies the upstream source checksum, builds `plocate` and `updatedb`, and stages the GPL source and license beside the generated sidecars. Meson, Ninja, and the zstd development headers are required.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.

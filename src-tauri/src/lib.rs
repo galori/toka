@@ -17,7 +17,7 @@ mod thumbnails;
 
 use owned_index::{IndexUpdates, OwnedIndexUpdates};
 #[cfg(target_os = "macos")]
-use providers::MdfindSearchProvider;
+use providers::ScopedMdfindSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
@@ -123,7 +123,7 @@ struct BulkTagUpdate {
     problem: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "e2e"))))]
 fn index_error(message: String) -> CommandError {
     CommandError {
         kind: "Index",
@@ -140,9 +140,9 @@ fn index_state(
 }
 
 // Integration builds use a fixture search provider rather than a persistent
-// Linux index. Reporting that index management is unsupported keeps the
-// fixture's search screen deterministic and prevents tests from writing the
-// developer's real folder configuration.
+// index. Reporting that index management is unsupported keeps the fixture's
+// search screen deterministic and prevents tests from writing the developer's
+// real folder configuration.
 #[cfg(all(target_os = "linux", feature = "e2e"))]
 #[tauri::command]
 fn index_state() -> managed_index::IndexState {
@@ -156,7 +156,7 @@ fn index_state() -> managed_index::IndexState {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Serialize)]
 struct UnsupportedIndexState {
     supported: bool,
@@ -167,7 +167,7 @@ struct UnsupportedIndexState {
     folders: Vec<String>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[tauri::command]
 fn index_state() -> UnsupportedIndexState {
     UnsupportedIndexState {
@@ -195,6 +195,45 @@ fn remove_index_folder(
     id: String,
     manager: State<'_, managed_index::IndexManager>,
 ) -> Result<managed_index::IndexState, CommandError> {
+    manager.remove_folder(&id).map_err(index_error)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "e2e")))]
+#[tauri::command]
+fn index_state(
+    manager: State<'_, owned_index::OwnedIndexManager>,
+) -> Result<owned_index::OwnedIndexState, CommandError> {
+    manager.state().map_err(index_error)
+}
+
+#[cfg(all(target_os = "macos", feature = "e2e"))]
+#[tauri::command]
+fn index_state() -> owned_index::OwnedIndexState {
+    owned_index::OwnedIndexState {
+        supported: false,
+        revision: 0,
+        indexed_videos: 0,
+        indexed_images: 0,
+        indexing_files: 0,
+        folders: Vec::new(),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "e2e")))]
+#[tauri::command]
+fn add_index_folder(
+    path: String,
+    manager: State<'_, owned_index::OwnedIndexManager>,
+) -> Result<owned_index::OwnedIndexState, CommandError> {
+    manager.add_folder(Path::new(&path)).map_err(index_error)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "e2e")))]
+#[tauri::command]
+fn remove_index_folder(
+    id: String,
+    manager: State<'_, owned_index::OwnedIndexManager>,
+) -> Result<owned_index::OwnedIndexState, CommandError> {
     manager.remove_folder(&id).map_err(index_error)
 }
 
@@ -1153,7 +1192,10 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Arc<dyn SearchProvider> {
     }
     #[cfg(target_os = "macos")]
     {
-        Arc::new(MdfindSearchProvider::system(logger))
+        Arc::new(ScopedMdfindSearchProvider::system(
+            logger,
+            owned_index::database_path().expect("Toka could not find its search index"),
+        ))
     }
     #[cfg(target_os = "linux")]
     {
@@ -1266,6 +1308,10 @@ pub fn run() {
         managed_index::IndexManager::system()
             .expect("Toka could not find its private index settings"),
     );
+    #[cfg(all(target_os = "macos", not(feature = "e2e")))]
+    let builder = builder.manage(
+        owned_index::OwnedIndexManager::system().expect("Toka could not find its search index"),
+    );
     #[cfg(target_os = "linux")]
     let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
         builder.invoke_handler(tauri::generate_handler![
@@ -1344,7 +1390,63 @@ pub fn run() {
                 set_native_video_bounds
             ])
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(target_os = "macos", not(feature = "e2e")))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        search_videos,
+        search_match_count,
+        search_log_settings,
+        set_search_log_settings,
+        index_state,
+        add_index_folder,
+        remove_index_folder,
+        launch_intent,
+        video_thumbnail,
+        video_preview,
+        delete_video,
+        undo_delete,
+        external_players,
+        open_in_external_player,
+        open_new_window,
+        open_folder_in_new_window,
+        matching_addon_actions,
+        run_addon_action,
+        set_video_tags,
+        add_video_tags,
+        remove_video_tags,
+        add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
+        prepare_video,
+        subtitle_cues
+    ]);
+    #[cfg(all(target_os = "macos", feature = "e2e"))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        search_videos,
+        search_match_count,
+        search_log_settings,
+        set_search_log_settings,
+        index_state,
+        launch_intent,
+        video_thumbnail,
+        video_preview,
+        delete_video,
+        undo_delete,
+        external_players,
+        open_in_external_player,
+        open_new_window,
+        open_folder_in_new_window,
+        matching_addon_actions,
+        run_addon_action,
+        set_video_tags,
+        add_video_tags,
+        remove_video_tags,
+        add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
+        prepare_video,
+        subtitle_cues
+    ]);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
         search_match_count,
@@ -1436,7 +1538,7 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", feature = "e2e"))]
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "e2e"))]
     #[test]
     fn fixture_search_builds_do_not_open_real_folder_setup() {
         assert!(!index_state().supported);

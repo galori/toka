@@ -19,7 +19,7 @@ npm ci
 npm run tauri dev
 ```
 
-Toka searches the existing Spotlight index; no separate search service is required.
+Toka searches the existing Spotlight index; no separate search service is required. Open Search folders with `Ctrl+,` to limit searches to the folders you choose. Toka also maintains its own index of those folders in the background.
 
 ## 3. Build an installable app
 
@@ -29,4 +29,4 @@ npm run build:mac
 
 The `.app` and `.dmg` bundles are written below `src-tauri/target/release/bundle/`.
 
-If searches omit expected files, check Spotlight exclusions and Toka's access under **System Settings → Privacy & Security**.
+If searches omit expected files, check the folders under Search folders (`Ctrl+,`), then check Spotlight exclusions and Toka's access under **System Settings → Privacy & Security**.
