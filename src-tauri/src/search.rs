@@ -4,7 +4,8 @@ use crate::thumbnails;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -130,20 +131,193 @@ pub struct SearchEngine {
     provider: Arc<dyn SearchProvider>,
     logger: Arc<SearchLogger>,
     result_paths: Mutex<HashMap<String, PathBuf>>,
-    /// Files this session has renamed, indexed by the name the search provider
-    /// knew them under. Every provider Toka uses answers from an index that is
-    /// rebuilt on a schedule, so a file tagged a moment ago is still indexed
-    /// under its old name — and an index that filters out names whose file is
-    /// gone, as `plocate --existing` does, stops listing it at all. Keeping the
-    /// renames here lets a search see the file the way it is now.
+    /// Files Toka renamed since the search provider last indexed them, keyed by
+    /// the name the provider knew. An index that filters out names whose file
+    /// is gone, as `plocate --existing` does, stops listing it at all. Saving
+    /// these renames lets a search find the file by its current name after a
+    /// restart.
     renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
-    /// Folders this session has renamed, the same way: under the name the index
-    /// knew them by. Tagging a folder renames it, which moves every file in it.
+    /// Folders Toka renamed since the provider last indexed them, keyed by the
+    /// name the provider knew. Tagging a folder moves every file in it.
     renamed_folders: Mutex<HashMap<PathBuf, PathBuf>>,
+    rename_overlay_path: Option<PathBuf>,
+    rename_overlay_write: Mutex<()>,
     /// The order the search on screen is being read in. Only the current one is
     /// kept: a new question replaces it, and there is never a second search to
     /// go back to — the frontend asks for page one and then walks forward.
     shuffle: Mutex<Option<Shuffle>>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedRenameOverlay {
+    #[serde(default)]
+    files: Vec<PersistedRename>,
+    #[serde(default)]
+    folders: Vec<PersistedRename>,
+}
+
+// Keep raw Unix path bytes; real media folders can have non-UTF-8 names.
+#[cfg(unix)]
+type StoredPath = Vec<u8>;
+#[cfg(not(unix))]
+type StoredPath = PathBuf;
+
+#[derive(Deserialize, Serialize)]
+struct PersistedRename {
+    indexed: StoredPath,
+    current: StoredPath,
+}
+
+fn store_path(path: &Path) -> StoredPath {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_path_buf()
+    }
+}
+
+fn restore_path(path: StoredPath) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(path))
+    }
+    #[cfg(not(unix))]
+    {
+        path
+    }
+}
+
+impl PersistedRenameOverlay {
+    fn from_maps(files: &HashMap<PathBuf, PathBuf>, folders: &HashMap<PathBuf, PathBuf>) -> Self {
+        fn entries(paths: &HashMap<PathBuf, PathBuf>) -> Vec<PersistedRename> {
+            let mut entries = paths
+                .iter()
+                .map(|(indexed, current)| PersistedRename {
+                    indexed: store_path(indexed),
+                    current: store_path(current),
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.indexed.cmp(&right.indexed));
+            entries
+        }
+
+        Self {
+            files: entries(files),
+            folders: entries(folders),
+        }
+    }
+
+    fn into_maps(self) -> (HashMap<PathBuf, PathBuf>, HashMap<PathBuf, PathBuf>) {
+        fn paths(entries: Vec<PersistedRename>) -> HashMap<PathBuf, PathBuf> {
+            entries
+                .into_iter()
+                .map(|entry| (restore_path(entry.indexed), restore_path(entry.current)))
+                .collect()
+        }
+
+        (paths(self.files), paths(self.folders))
+    }
+}
+
+fn load_rename_overlay(path: &Path) -> io::Result<PersistedRenameOverlay> {
+    match fs::read(path) {
+        Ok(contents) => serde_json::from_slice(&contents)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(PersistedRenameOverlay::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn lock_rename_overlay(path: &Path) -> io::Result<File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "search rename state has no parent directory",
+        )
+    })?;
+    ensure_private_directory(parent)?;
+    let lock_path = path.with_extension("lock");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        fs::set_permissions(lock_path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+fn write_rename_overlay(path: &Path, overlay: &PersistedRenameOverlay) -> io::Result<()> {
+    static TEMPORARY_FILES: AtomicU64 = AtomicU64::new(0);
+
+    let contents = serde_json::to_vec(overlay)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "search rename state has no parent directory",
+        )
+    })?;
+    ensure_private_directory(parent)?;
+
+    let temporary = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 
 /// The seed a search's order was drawn from, under the question that asked for
@@ -162,13 +336,35 @@ impl SearchEngine {
         Self::new_with_logger(provider, Arc::new(SearchLogger::disabled()))
     }
 
+    #[cfg(test)]
     pub fn new_with_logger(provider: Arc<dyn SearchProvider>, logger: Arc<SearchLogger>) -> Self {
+        Self::new_with_logger_and_rename_store(provider, logger, None)
+    }
+
+    pub(crate) fn new_with_logger_and_rename_store(
+        provider: Arc<dyn SearchProvider>,
+        logger: Arc<SearchLogger>,
+        rename_overlay_path: Option<PathBuf>,
+    ) -> Self {
+        let (renamed_paths, renamed_folders) = match rename_overlay_path.as_deref() {
+            Some(path) => match load_rename_overlay(path) {
+                Ok(overlay) => overlay.into_maps(),
+                Err(error) => {
+                    eprintln!("Toka could not restore pending search renames: {error}");
+                    PersistedRenameOverlay::default().into_maps()
+                }
+            },
+            None => PersistedRenameOverlay::default().into_maps(),
+        };
+
         Self {
             provider,
             logger,
             result_paths: Mutex::new(HashMap::new()),
-            renamed_paths: Mutex::new(HashMap::new()),
-            renamed_folders: Mutex::new(HashMap::new()),
+            renamed_paths: Mutex::new(renamed_paths),
+            renamed_folders: Mutex::new(renamed_folders),
+            rename_overlay_path,
+            rename_overlay_write: Mutex::new(()),
             shuffle: Mutex::new(None),
         }
     }
@@ -392,11 +588,11 @@ impl SearchEngine {
         seed
     }
 
-    /// The provider's candidates, corrected for the renames this session has
-    /// made: a stale name is replaced by the name its file carries now, and
-    /// every renamed file the index has already dropped is added back. The
-    /// caller still filters these by the search terms, so a rename only shows
-    /// up when the query matches the name the file actually has.
+    /// The provider's candidates, corrected for renames Toka has recorded: a
+    /// stale name is replaced by the name its file carries now, and every
+    /// renamed file the index has already dropped is added back. The caller
+    /// still filters these by the search terms, so a rename only shows up when
+    /// the query matches the name the file actually has.
     fn candidates(
         &self,
         query: &str,
@@ -404,28 +600,123 @@ impl SearchEngine {
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
         let mut paths = self.provider.candidates(query, whole_path, context)?;
-        let renamed = self.renamed_paths.lock().unwrap();
-        let folders = self.renamed_folders.lock().unwrap();
-        if renamed.is_empty() && folders.is_empty() {
-            return Ok(paths);
-        }
-        for path in &mut paths {
-            if let Some(current) = renamed.get(path) {
-                *path = current.clone();
-            } else if let Some(current) = through_folders(folders.iter(), path) {
-                *path = current;
+        let indexed_paths: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let _update = self.rename_overlay_write.lock().unwrap();
+        if let Some(path) = self.rename_overlay_path.as_deref() {
+            match lock_rename_overlay(path) {
+                Ok(file_lock) => {
+                    self.reload_rename_overlay_locked(path);
+                    drop(file_lock);
+                }
+                Err(error) => {
+                    eprintln!("Toka could not lock pending search renames: {error}");
+                }
             }
         }
-        // A renamed file that has since been deleted is not a search result,
-        // and this is the only place a path Toka renamed itself can be checked
-        // cheaply — provider candidates are deliberately left untouched.
-        paths.extend(renamed.values().filter(|path| path.is_file()).cloned());
-        // An index that drops names whose file is gone drops a renamed
-        // folder's whole contents, so they are listed from the folder itself.
-        for folder in folders.values() {
-            files_under(folder, &mut paths);
+        let should_prune = {
+            let renamed = self.renamed_paths.lock().unwrap();
+            let folders = self.renamed_folders.lock().unwrap();
+            if renamed.is_empty() && folders.is_empty() {
+                return Ok(paths);
+            }
+            for path in &mut paths {
+                if let Some(current) = renamed.get(path) {
+                    *path = current.clone();
+                } else if let Some(current) = through_folders(folders.iter(), path) {
+                    *path = current;
+                }
+            }
+            let should_prune = renamed
+                .values()
+                .any(|current| !current.is_file() || indexed_paths.contains(current));
+            // A renamed file that has since been deleted is not a search
+            // result, and this is the only place a path Toka renamed itself
+            // can be checked cheaply — provider candidates are deliberately
+            // left untouched.
+            paths.extend(
+                renamed
+                    .values()
+                    .filter(|current| current.is_file() && !indexed_paths.contains(*current))
+                    .cloned(),
+            );
+            // An index that drops names whose file is gone drops a renamed
+            // folder's whole contents, so they are listed from the folder.
+            for folder in folders.values() {
+                files_under(folder, &mut paths);
+            }
+            should_prune
+        };
+        if should_prune {
+            self.update_rename_overlay_locked(|renamed, _| {
+                let before = renamed.len();
+                renamed.retain(|_, current| current.is_file() && !indexed_paths.contains(current));
+                renamed.len() != before
+            });
         }
         Ok(paths)
+    }
+
+    fn reload_rename_overlay_locked(&self, path: &Path) -> bool {
+        let overlay = match load_rename_overlay(path) {
+            Ok(overlay) => overlay,
+            Err(error) => {
+                eprintln!("Toka could not refresh pending search renames: {error}");
+                return false;
+            }
+        };
+        let (renamed_paths, renamed_folders) = overlay.into_maps();
+        *self.renamed_paths.lock().unwrap() = renamed_paths;
+        *self.renamed_folders.lock().unwrap() = renamed_folders;
+        true
+    }
+
+    fn update_rename_overlay(
+        &self,
+        update: impl Fn(&mut HashMap<PathBuf, PathBuf>, &mut HashMap<PathBuf, PathBuf>) -> bool,
+    ) {
+        let _write = self.rename_overlay_write.lock().unwrap();
+        self.update_rename_overlay_locked(update);
+    }
+
+    fn update_rename_overlay_locked(
+        &self,
+        update: impl Fn(&mut HashMap<PathBuf, PathBuf>, &mut HashMap<PathBuf, PathBuf>) -> bool,
+    ) {
+        let Some(path) = self.rename_overlay_path.as_deref() else {
+            let mut renamed = self.renamed_paths.lock().unwrap();
+            let mut folders = self.renamed_folders.lock().unwrap();
+            update(&mut renamed, &mut folders);
+            return;
+        };
+        let file_lock = match lock_rename_overlay(path) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                eprintln!("Toka could not lock pending search renames: {error}");
+                None
+            }
+        };
+        let can_write = file_lock
+            .as_ref()
+            .is_some_and(|_| self.reload_rename_overlay_locked(path));
+        let changed = {
+            let mut renamed = self.renamed_paths.lock().unwrap();
+            let mut folders = self.renamed_folders.lock().unwrap();
+            update(&mut renamed, &mut folders)
+        };
+        if changed && can_write {
+            self.persist_rename_overlay_locked(path);
+        }
+    }
+
+    fn persist_rename_overlay_locked(&self, path: &Path) {
+        let overlay = {
+            let renamed = self.renamed_paths.lock().unwrap();
+            let folders = self.renamed_folders.lock().unwrap();
+            PersistedRenameOverlay::from_maps(&renamed, &folders)
+        };
+        if let Err(error) = write_rename_overlay(path, &overlay) {
+            eprintln!("Toka could not save pending search renames: {error}");
+        }
     }
 
     /// A page of results for videos Toka was handed rather than found, so a
@@ -490,19 +781,19 @@ impl SearchEngine {
     /// chaining, and renaming it back to its indexed name drops the entry, so
     /// the index's own answer is enough again.
     fn record_rename(&self, previous: PathBuf, current: PathBuf) {
-        let mut renamed = self.renamed_paths.lock().unwrap();
-        let folders = self.renamed_folders.lock().unwrap();
-        let indexed = renamed
-            .iter()
-            .find(|(_, path)| **path == previous)
-            .map(|(indexed, _)| indexed.clone())
-            .or_else(|| through_folders(folders.iter().map(|(i, c)| (c, i)), &previous))
-            .unwrap_or(previous);
-        if indexed == current {
-            renamed.remove(&indexed);
-        } else {
-            renamed.insert(indexed, current);
-        }
+        self.update_rename_overlay(|renamed, folders| {
+            let indexed = renamed
+                .iter()
+                .find(|(_, path)| **path == previous)
+                .map(|(indexed, _)| indexed.clone())
+                .or_else(|| through_folders(folders.iter().map(|(i, c)| (c, i)), &previous))
+                .unwrap_or_else(|| previous.clone());
+            if indexed == current {
+                renamed.remove(&indexed).is_some()
+            } else {
+                renamed.insert(indexed, current.clone()).as_ref() != Some(&current)
+            }
+        });
     }
 
     /// Follows a folder from `previous` to `current`: every result the engine
@@ -510,8 +801,6 @@ impl SearchEngine {
     /// while the index still has the old one. Returns the ids that moved.
     pub fn rename_folder(&self, previous: &Path, current: PathBuf) -> Vec<String> {
         let mut known_paths = self.result_paths.lock().unwrap();
-        let mut renamed = self.renamed_paths.lock().unwrap();
-        let mut folders = self.renamed_folders.lock().unwrap();
         let mut moved = Vec::new();
         for (id, path) in known_paths.iter_mut() {
             if let Some(next) = moved_under(path, previous, &current) {
@@ -519,24 +808,28 @@ impl SearchEngine {
                 moved.push(id.clone());
             }
         }
+        drop(known_paths);
         if previous == current {
             return moved;
         }
-        for path in renamed.values_mut() {
-            if let Some(next) = moved_under(path, previous, &current) {
-                *path = next;
+        self.update_rename_overlay(|renamed, folders| {
+            for path in renamed.values_mut() {
+                if let Some(next) = moved_under(path, previous, &current) {
+                    *path = next;
+                }
             }
-        }
-        renamed.retain(|indexed, path| indexed != path);
-        let indexed = through_folders(folders.iter().map(|(i, c)| (c, i)), previous)
-            .unwrap_or_else(|| previous.to_path_buf());
-        for path in folders.values_mut() {
-            if let Some(next) = moved_under(path, previous, &current) {
-                *path = next;
+            renamed.retain(|indexed, path| indexed != path);
+            let indexed = through_folders(folders.iter().map(|(i, c)| (c, i)), previous)
+                .unwrap_or_else(|| previous.to_path_buf());
+            for path in folders.values_mut() {
+                if let Some(next) = moved_under(path, previous, &current) {
+                    *path = next;
+                }
             }
-        }
-        folders.insert(indexed, current);
-        folders.retain(|indexed, path| indexed != path);
+            folders.insert(indexed, current.clone());
+            folders.retain(|indexed, path| indexed != path);
+            true
+        });
         moved
     }
 
@@ -2202,6 +2495,139 @@ mod tests {
         *provider.paths.lock().unwrap() = vec![tagged];
         let refreshed = engine.search(request("sample")).unwrap();
         assert_eq!(refreshed.total_results, 1);
+    }
+
+    #[test]
+    fn a_tagged_video_stays_searchable_after_restart_before_the_index_catches_up() {
+        let directory = tempdir().unwrap();
+        let indexed = directory.path().join("sample1.mp4");
+        fs::write(&indexed, b"test").unwrap();
+        let provider = Arc::new(FakeProvider::new(vec![indexed.clone()]));
+        let rename_store = directory.path().join("state/search-renames.json");
+        let new_engine = || {
+            SearchEngine::new_with_logger_and_rename_store(
+                provider.clone(),
+                Arc::new(SearchLogger::disabled()),
+                Some(rename_store.clone()),
+            )
+        };
+        let engine = new_engine();
+        let first = engine.search(request("sample")).unwrap();
+
+        let tagged = tags::add(&indexed, &["home".into()]).unwrap().path;
+        engine
+            .update_video_path(&first.results[0].id, tagged.clone())
+            .unwrap();
+
+        // Model the managed plocate provider dropping the stale path with
+        // --existing until the background indexer has rebuilt its database.
+        provider.paths.lock().unwrap().clear();
+        drop(engine);
+
+        let restarted = new_engine();
+        let page = restarted.search(request("home")).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "sample1 [home].mp4");
+    }
+
+    #[test]
+    fn open_search_engines_keep_each_others_pending_renames() {
+        let directory = tempdir().unwrap();
+        let indexed = [
+            directory.path().join("clip-one.mp4"),
+            directory.path().join("clip-two.mp4"),
+        ];
+        for path in &indexed {
+            fs::write(path, b"test").unwrap();
+        }
+        let provider_one = Arc::new(FakeProvider::new(indexed.to_vec()));
+        let provider_two = Arc::new(FakeProvider::new(indexed.to_vec()));
+        let rename_store = directory.path().join("state/search-renames.json");
+        let new_engine = |provider| {
+            SearchEngine::new_with_logger_and_rename_store(
+                provider,
+                Arc::new(SearchLogger::disabled()),
+                Some(rename_store.clone()),
+            )
+        };
+        let first_engine = new_engine(provider_one.clone());
+        let second_engine = new_engine(provider_two.clone());
+        let first_ids = first_engine.search(request("clip")).unwrap();
+        let second_ids = second_engine.search(request("clip")).unwrap();
+
+        let first_id = first_ids
+            .results
+            .iter()
+            .find(|result| result.file_name == "clip-one.mp4")
+            .unwrap()
+            .id
+            .clone();
+        let second_id = second_ids
+            .results
+            .iter()
+            .find(|result| result.file_name == "clip-two.mp4")
+            .unwrap()
+            .id
+            .clone();
+        let tagged_one = tags::add(&indexed[0], &["home".into()]).unwrap().path;
+        first_engine
+            .update_video_path(&first_id, tagged_one)
+            .unwrap();
+        let tagged_two = tags::add(&indexed[1], &["home".into()]).unwrap().path;
+        second_engine
+            .update_video_path(&second_id, tagged_two)
+            .unwrap();
+
+        provider_one.paths.lock().unwrap().clear();
+        provider_two.paths.lock().unwrap().clear();
+        let visible_to_first = first_engine.search(request("home")).unwrap();
+        assert_eq!(visible_to_first.total_results, 2);
+
+        let restarted = new_engine(provider_one);
+        let after_restart = restarted.search(request("home")).unwrap();
+        assert_eq!(after_restart.total_results, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_overlay_lock_waits_for_another_engine_write() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let directory = tempdir().unwrap();
+        let rename_store = directory.path().join("state/search-renames.json");
+        let held_lock = lock_rename_overlay(&rename_store).unwrap();
+        let path = rename_store.clone();
+        let (started, started_rx) = mpsc::channel();
+        let (acquired, acquired_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started.send(()).unwrap();
+            let _lock = lock_rename_overlay(&path).unwrap();
+            acquired.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(held_lock);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_rename_state_preserves_non_unicode_path_bytes() {
+        use std::{collections::HashMap, ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let indexed = PathBuf::from(OsString::from_vec(b"/videos-\xff/clip.mp4".to_vec()));
+        let current = PathBuf::from(OsString::from_vec(b"/videos-\xff/clip [home].mp4".to_vec()));
+        let files = HashMap::from([(indexed, current)]);
+        let folders = HashMap::new();
+        let overlay = PersistedRenameOverlay::from_maps(&files, &folders);
+
+        let bytes = serde_json::to_vec(&overlay).unwrap();
+        let restored: PersistedRenameOverlay = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(restored.into_maps(), (files, folders));
     }
 
     #[test]
