@@ -42,9 +42,9 @@ jobs:
           npm test
           if [ "$RUNNER_OS" = Linux ]; then
             # The GTK widget tests need a display to open a window on.
-            xvfb-run --auto-servernum cargo test --manifest-path src-tauri/Cargo.toml
+            xvfb-run --auto-servernum npm run rust:test
           else
-            cargo test --manifest-path src-tauri/Cargo.toml
+            npm run rust:test
           fi
       - name: Integration tests
         run: |
