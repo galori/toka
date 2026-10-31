@@ -18,8 +18,8 @@ mod tags;
 mod thumbnails;
 
 use owned_index::{IndexUpdates, OwnedIndexUpdates};
-#[cfg(target_os = "macos")]
-use providers::ScopedMdfindSearchProvider;
+#[cfg(any(target_os = "macos", test))]
+use providers::OwnedIndexSearchProvider;
 #[cfg(target_os = "linux")]
 use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
@@ -1173,7 +1173,12 @@ fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: boo
     player_linux::set_bounds(x, y, width, height, visible);
 }
 
-fn platform_provider(logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
+#[cfg(any(target_os = "macos", test))]
+fn macos_platform_provider(database: PathBuf) -> Arc<dyn SearchProvider> {
+    Arc::new(OwnedIndexSearchProvider::new(database))
+}
+
+fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
     #[cfg(feature = "e2e")]
     {
         struct FixtureSearchProvider;
@@ -1196,19 +1201,16 @@ fn platform_provider(logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider
     }
     #[cfg(target_os = "macos")]
     {
-        Ok(Arc::new(ScopedMdfindSearchProvider::system(
-            logger,
-            owned_index::database_path()?,
-        )))
+        Ok(macos_platform_provider(owned_index::database_path()?))
     }
     #[cfg(target_os = "linux")]
     {
         match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
-            Ok("recoll") => Ok(Arc::new(RecollSearchProvider::system(logger))),
-            Ok("plocate") => Ok(Arc::new(PlocateSearchProvider::system(logger))),
+            Ok("recoll") => Ok(Arc::new(RecollSearchProvider::system(_logger))),
+            Ok("plocate") => Ok(Arc::new(PlocateSearchProvider::system(_logger))),
             Err(_) => Ok(Arc::new(ManagedPlocateSearchProvider::system(
                 managed_index::IndexPaths::system()?,
-                logger,
+                _logger,
             ))),
             Ok(name) => Ok(Arc::new(InvalidProvider(format!(
                 "Unknown Linux search provider: {name}"
@@ -1639,6 +1641,48 @@ mod tests {
         let error = outcome(false, "   ", true).unwrap_err();
 
         assert!(error.message.contains("clip.mp4"), "{}", error.message);
+    }
+
+    #[test]
+    fn macos_startup_provider_searches_the_owned_index_without_mdfind() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("fixtures");
+        std::fs::create_dir(&root).unwrap();
+        let sample = root.join("sample.mp4");
+        std::fs::write(&sample, b"sample video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = owned_index::OwnedIndexManager::under(database.clone());
+        let state = manager.add_folder(&root).unwrap();
+        let folder_id = &state.folders[0].id;
+        owned_index::OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(folder_id, &root, |_| {})
+            .unwrap();
+
+        let log_path = directory.path().join("search.jsonl");
+        let logger = Arc::new(SearchLogger::new(log_path.clone()));
+        let provider = macos_platform_provider(database);
+        let engine = SearchEngine::new_with_logger(provider, logger);
+
+        let page = engine
+            .search(SearchRequest {
+                query: "sample".into(),
+                page: 1,
+                page_size: search::PAGE_SIZE,
+                search_id: None,
+                fields: Default::default(),
+                media_type: search::MediaType::Videos,
+            })
+            .unwrap();
+
+        assert_eq!(page.total_results, 1);
+        assert_eq!(page.results[0].file_name, "sample.mp4");
+        let search_log = match std::fs::read_to_string(log_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("could not read search log: {error}"),
+        };
+        assert!(!search_log.contains("/usr/bin/mdfind"));
     }
 
     struct FakeProvider(Vec<PathBuf>);

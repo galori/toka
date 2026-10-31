@@ -93,6 +93,7 @@ fn run_search(
             query: query.to_owned(),
             page: current_page,
             page_size: PAGE_SIZE,
+            search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::Both,
         };

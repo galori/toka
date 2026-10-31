@@ -17,7 +17,7 @@ and skips AppImage bundling, which roughly halves the build. Use `--appimage`
 when you need to check the packaged artifact; CI builds the real bundles either
 way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
-The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Spotlight or plocate index.
+The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
 
 ## Search diagnostics
 
@@ -30,7 +30,7 @@ indexer writes its own `indexer.log` beside the search log.
 
 The Search logging settings pane, available from the keyboard-help pane, can
 enable verbose per-search logs and choose their destination folder. Verbose
-logs include the provider command, filtered candidates, returned paths, and
+logs include any provider command, filtered candidates, returned paths, and
 errors. Zero-byte media is ignored by indexing, search results, and thumbnail
 discovery.
 
@@ -105,7 +105,7 @@ network.
 
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
-- macOS search runs `/usr/bin/mdfind`, limited with `-onlyin` when search folders are configured. Those folders are also scanned by the owned index in `src-tauri/src/owned_index.rs`.
+- macOS search reads candidates from Toka's owned SQLite index in `src-tauri/src/owned_index.rs`. Linux uses Toka's managed plocate index by default.
 - Linux release builds bundle plocate 1.1.24 and use one private database per configured folder. Set `TOKA_SEARCH_PROVIDER=plocate` to exercise the legacy system database or `TOKA_SEARCH_PROVIDER=recoll` to use `recollq`.
 - `scripts/build-plocate.mjs` verifies the upstream source checksum, builds `plocate` and `updatedb`, and stages the GPL source and license beside the generated sidecars. Meson, Ninja, and the zstd development headers are required.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.

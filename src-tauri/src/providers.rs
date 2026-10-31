@@ -1,15 +1,14 @@
 #[cfg(target_os = "linux")]
 use crate::managed_index::{self, IndexPaths};
 use crate::search::{tokenize_query, SearchError, SearchProvider};
-use crate::search_log::{CommandOutcome, SearchLogContext, SearchLogger};
-#[cfg(all(target_os = "macos", not(test)))]
-use std::sync::Once;
-use std::{path::PathBuf, sync::Arc};
+use crate::search_log::SearchLogContext;
+#[cfg(any(target_os = "linux", test))]
+use crate::search_log::{CommandOutcome, SearchLogger};
+use std::path::PathBuf;
+#[cfg(any(target_os = "linux", test))]
+use std::{process::Command, sync::Arc};
 
-#[cfg(any(target_os = "macos", test))]
-use std::path::Path;
-use std::process::Command;
-
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug)]
 struct ProcessOutput {
     success: bool,
@@ -18,6 +17,7 @@ struct ProcessOutput {
     stderr: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
 trait ProcessRunner: Send + Sync {
     fn run(
         &self,
@@ -27,16 +27,19 @@ trait ProcessRunner: Send + Sync {
     ) -> Result<ProcessOutput, std::io::Error>;
 }
 
+#[cfg(any(target_os = "linux", test))]
 struct SystemProcessRunner {
     logger: Arc<SearchLogger>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl SystemProcessRunner {
     fn new(logger: Arc<SearchLogger>) -> Self {
         Self { logger }
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl ProcessRunner for SystemProcessRunner {
     fn run(
         &self,
@@ -74,122 +77,34 @@ impl ProcessRunner for SystemProcessRunner {
 }
 
 #[cfg(any(target_os = "macos", test))]
-pub struct MdfindSearchProvider {
-    runner: Arc<dyn ProcessRunner>,
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl MdfindSearchProvider {
-    #[cfg(target_os = "macos")]
-    pub fn system(logger: Arc<SearchLogger>) -> Self {
-        Self {
-            runner: Arc::new(SystemProcessRunner::new(logger)),
-        }
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-impl SearchProvider for MdfindSearchProvider {
-    fn candidates(
-        &self,
-        query: &str,
-        whole_path: bool,
-        context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
-        prepare_macos_downloads_folder_access();
-        let predicate = mdfind_predicate(query, whole_path)?;
-        let mut paths = run_mdfind(&*self.runner, vec![predicate], context)?;
-        paths.extend(macos_download_candidates(query)?);
-        Ok(paths)
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn mdfind_predicate(query: &str, whole_path: bool) -> Result<String, SearchError> {
-    let terms = query_terms(query)?;
-    // Spotlight's display name is the file's own name; its path attribute
-    // covers the folders above it, which is what a folder search needs.
-    let attribute = if whole_path {
-        "kMDItemPath"
-    } else {
-        "kMDItemDisplayName"
-    };
-    let term_predicates = terms
-        .iter()
-        .map(|term| {
-            if term == "*" {
-                return format!("{attribute} == \"*\"cd");
-            }
-            let escaped = term.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("{attribute} == \"*{escaped}*\"cd")
-        })
-        .collect::<Vec<_>>();
-    let matching = if term_predicates.len() == 1 {
-        term_predicates[0].clone()
-    } else {
-        format!("({})", term_predicates.join(" || "))
-    };
-    let media_predicate = "(kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")";
-    Ok(format!("{matching} && {media_predicate}"))
-}
-
-#[cfg(any(target_os = "macos", test))]
-pub struct ScopedMdfindSearchProvider {
-    runner: Arc<dyn ProcessRunner>,
+pub(crate) struct OwnedIndexSearchProvider {
     database: PathBuf,
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl ScopedMdfindSearchProvider {
-    #[cfg(target_os = "macos")]
-    pub fn system(logger: Arc<SearchLogger>, database: PathBuf) -> Self {
-        Self {
-            runner: MdfindSearchProvider::system(logger).runner,
-            database,
-        }
+impl OwnedIndexSearchProvider {
+    pub(crate) fn new(database: PathBuf) -> Self {
+        Self { database }
     }
 }
 
 #[cfg(any(target_os = "macos", test))]
-impl SearchProvider for ScopedMdfindSearchProvider {
+impl SearchProvider for OwnedIndexSearchProvider {
     fn candidates(
         &self,
         query: &str,
-        whole_path: bool,
-        context: &SearchLogContext,
+        _whole_path: bool,
+        _context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let roots = crate::owned_index::root_paths(&self.database)
-            .map_err(|error| SearchError::Provider(error.to_string()))?;
-        if roots.is_empty() {
-            return MdfindSearchProvider {
-                runner: self.runner.clone(),
-            }
-            .candidates(query, whole_path, context);
-        }
-
-        let predicate = mdfind_predicate(query, whole_path)?;
-        let mut paths = Vec::new();
-        for root in &roots {
-            paths.extend(run_mdfind(
-                &*self.runner,
-                vec![
-                    "-onlyin".into(),
-                    root.to_string_lossy().into_owned(),
-                    predicate.clone(),
-                ],
-                context,
-            )?);
-        }
-        paths.extend(macos_download_candidates_in_roots(query, &roots)?);
-        Ok(paths)
+        let terms = query_terms(query)?;
+        crate::owned_index::OwnedIndex::open(&self.database)
+            .and_then(|index| index.search_candidates(&terms))
+            .map_err(|error| SearchError::Provider(error.to_string()))
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
-        let mut roots = crate::owned_index::root_paths(&self.database)
+        let roots = crate::owned_index::root_paths(&self.database)
             .map_err(|error| SearchError::Provider(error.to_string()))?;
-        if roots.is_empty() {
-            roots.push(PathBuf::from("/"));
-        }
         paths.retain(|path| {
             roots.iter().any(|root| {
                 path.starts_with(root)
@@ -204,146 +119,6 @@ impl SearchProvider for ScopedMdfindSearchProvider {
         crate::owned_index::index_revision(&self.database).unwrap_or(0)
     }
 }
-
-#[cfg(any(target_os = "macos", test))]
-fn run_mdfind(
-    runner: &dyn ProcessRunner,
-    args: Vec<String>,
-    context: &SearchLogContext,
-) -> Result<Vec<PathBuf>, SearchError> {
-    let output = runner
-        .run("/usr/bin/mdfind", &args, context)
-        .map_err(|error| {
-            SearchError::Provider(format!(
-            "Spotlight search could not start. Check macOS privacy and indexing settings: {error}"
-        ))
-        })?;
-    parse_output(output, "Spotlight search failed")
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn macos_download_candidates(query: &str) -> Result<Vec<PathBuf>, SearchError> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(Vec::new());
-    };
-    Ok(download_folder_candidates(
-        &PathBuf::from(home).join("Downloads"),
-        query,
-    ))
-}
-
-#[cfg(test)]
-fn macos_download_candidates(_query: &str) -> Result<Vec<PathBuf>, SearchError> {
-    Ok(Vec::new())
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn download_folder_candidates(root: &Path, query: &str) -> Vec<PathBuf> {
-    let Ok(terms) = query_terms(query) else {
-        return Vec::new();
-    };
-    let terms = terms
-        .into_iter()
-        .map(|term| term.to_lowercase())
-        .collect::<Vec<_>>();
-    let mut candidates = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if crate::index_visibility::is_hidden(&path).unwrap_or(true) {
-                continue;
-            }
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                pending.push(path);
-            } else {
-                let haystack = path.to_string_lossy().to_lowercase();
-                if terms
-                    .iter()
-                    .any(|term| term == "*" || haystack.contains(term))
-                {
-                    candidates.push(path);
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn download_folder_candidates_in_roots(
-    downloads: &Path,
-    query: &str,
-    roots: &[PathBuf],
-) -> Vec<PathBuf> {
-    roots
-        .iter()
-        .flat_map(|root| {
-            let search_root = if root.starts_with(downloads) {
-                root.as_path()
-            } else if downloads.starts_with(root) {
-                downloads
-            } else {
-                return Vec::new();
-            };
-            download_folder_candidates(search_root, query)
-                .into_iter()
-                .filter(|path| path.starts_with(root))
-                .collect()
-        })
-        .collect()
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn macos_download_candidates_in_roots(
-    query: &str,
-    roots: &[PathBuf],
-) -> Result<Vec<PathBuf>, SearchError> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(Vec::new());
-    };
-    let downloads = PathBuf::from(home).join("Downloads");
-    if !roots
-        .iter()
-        .any(|root| root.starts_with(&downloads) || downloads.starts_with(root))
-    {
-        return Ok(Vec::new());
-    }
-    prepare_macos_downloads_folder_access();
-    Ok(download_folder_candidates_in_roots(
-        &downloads, query, roots,
-    ))
-}
-
-#[cfg(test)]
-fn macos_download_candidates_in_roots(
-    _query: &str,
-    _roots: &[PathBuf],
-) -> Result<Vec<PathBuf>, SearchError> {
-    Ok(Vec::new())
-}
-
-#[cfg(all(target_os = "macos", not(test)))]
-fn prepare_macos_downloads_folder_access() {
-    static DOWNLOADS_ACCESS: Once = Once::new();
-    DOWNLOADS_ACCESS.call_once(|| {
-        let Some(home) = std::env::var_os("HOME") else {
-            return;
-        };
-        let _ = std::fs::read_dir(PathBuf::from(home).join("Downloads"));
-    });
-}
-
-#[cfg(test)]
-fn prepare_macos_downloads_folder_access() {}
 
 #[cfg(any(target_os = "linux", test))]
 pub struct RecollSearchProvider {
@@ -551,6 +326,7 @@ fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_output(output: ProcessOutput, failure_message: &str) -> Result<Vec<PathBuf>, SearchError> {
     if !output.success {
         let detail = output.stderr.trim();
@@ -659,30 +435,78 @@ mod tests {
     }
 
     #[test]
-    fn mdfind_uses_display_name_movie_search_for_all_terms_and_parses_paths() {
-        let runner = Arc::new(FakeRunner::new(
-            "/Videos/Summer Vacation.mp4\n/Videos/another.mov\n",
-        ));
-        let provider = MdfindSearchProvider {
-            runner: runner.clone(),
-        };
+    fn owned_index_provider_excludes_hidden_and_out_of_scope_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(root.join(".worktrees")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        crate::owned_index::OwnedIndexManager::under(database.clone())
+            .add_folder(&root)
+            .unwrap();
+        let provider = OwnedIndexSearchProvider::new(database);
+        let visible = root.join("clip.mp4");
+        let mut paths = vec![
+            visible.clone(),
+            root.join(".clip.mp4"),
+            root.join(".worktrees/clip.mp4"),
+            directory.path().join("outside.mp4"),
+        ];
 
-        let paths = provider
-            .candidates("summer vacation", false, &context("summer vacation"))
+        provider.retain_visible_paths(&mut paths).unwrap();
+
+        assert_eq!(paths, vec![visible]);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn owned_index_search_excludes_a_folder_hidden_after_indexing() {
+        use crate::search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("media");
+        let archive = root.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let visible = root.join("clip-visible.mp4");
+        let hidden = archive.join("clip-hidden.mp4");
+        std::fs::write(&visible, b"video").unwrap();
+        std::fs::write(&hidden, b"video").unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let state = crate::owned_index::OwnedIndexManager::under(database.clone())
+            .add_folder(&root)
+            .unwrap();
+        crate::owned_index::OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&state.folders[0].id, &root, |_| {})
+            .unwrap();
+        assert!(std::process::Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success());
+
+        let engine = SearchEngine::new(Arc::new(OwnedIndexSearchProvider::new(database)));
+        let result = engine
+            .search(SearchRequest {
+                query: "clip".into(),
+                page: 1,
+                page_size: PAGE_SIZE,
+                search_id: None,
+                fields: SearchFields::default(),
+                media_type: MediaType::Videos,
+            })
             .unwrap();
 
-        let invocations = runner.invocations.lock().unwrap();
-        assert_eq!(
-            invocations.first(),
-            Some(&(
-                "/usr/bin/mdfind".into(),
-                vec![
-                    "(kMDItemDisplayName == \"*summer*\"cd || kMDItemDisplayName == \"*vacation*\"cd) && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
-                        .into()
-                ]
-            ))
-        );
-        assert_eq!(paths[0], PathBuf::from("/Videos/Summer Vacation.mp4"));
+        assert_eq!(result.total_results, 1);
+        assert_eq!(result.results[0].file_name, "clip-visible.mp4");
+        assert!(std::process::Command::new("/usr/bin/chflags")
+            .arg("nohidden")
+            .arg(archive)
+            .status()
+            .unwrap()
+            .success());
     }
 
     #[test]
@@ -715,208 +539,6 @@ mod tests {
             ))
         );
         assert_eq!(paths, vec![PathBuf::from("/media/Summer Vacation.mkv")]);
-    }
-
-    #[test]
-    fn downloads_fallback_finds_matching_names_recursively() {
-        let directory = tempfile::tempdir().unwrap();
-        let nested = directory.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        let matching = nested.join("Untitled.mov");
-        let missing_term = directory.path().join("Vacation.mov");
-        std::fs::write(&matching, b"test").unwrap();
-        std::fs::write(&missing_term, b"test").unwrap();
-        std::fs::create_dir(nested.join(".private")).unwrap();
-        std::fs::write(nested.join(".Untitled.mov"), b"test").unwrap();
-        std::fs::write(nested.join(".private/Untitled.mov"), b"test").unwrap();
-
-        assert_eq!(
-            download_folder_candidates(directory.path(), "untitled"),
-            vec![matching]
-        );
-    }
-
-    #[test]
-    fn downloads_fallback_widens_folder_and_metadata_queries() {
-        let directory = tempfile::tempdir().unwrap();
-        let archive = directory.path().join("Family Archive");
-        std::fs::create_dir(&archive).unwrap();
-        let photo = archive.join("Trip.jpg");
-        let video = directory.path().join("Clip.mov");
-        std::fs::write(&photo, b"test").unwrap();
-        std::fs::write(&video, b"test").unwrap();
-
-        assert_eq!(
-            download_folder_candidates(directory.path(), "folder:archive"),
-            vec![photo.clone()]
-        );
-        let mut metadata = download_folder_candidates(directory.path(), "type:image");
-        metadata.sort();
-        let mut expected = vec![photo, video];
-        expected.sort();
-        assert_eq!(metadata, expected);
-    }
-
-    #[test]
-    fn downloads_fallback_can_be_limited_to_configured_roots() {
-        let directory = tempfile::tempdir().unwrap();
-        let downloads = directory.path().join("Downloads");
-        let included_root = downloads.join("Videos");
-        let excluded_root = downloads.join("Unconfigured");
-        std::fs::create_dir_all(&included_root).unwrap();
-        std::fs::create_dir_all(&excluded_root).unwrap();
-        let included = included_root.join("clip.mov");
-        std::fs::write(&included, b"video").unwrap();
-        std::fs::write(excluded_root.join("clip.mov"), b"video").unwrap();
-
-        assert_eq!(
-            download_folder_candidates_in_roots(
-                &downloads,
-                "clip",
-                std::slice::from_ref(&included_root),
-            ),
-            vec![included]
-        );
-    }
-
-    #[test]
-    fn mdfind_searches_images_and_videos_for_local_type_filtering() {
-        let runner = Arc::new(FakeRunner::new("/Pictures/Trip.jpg\n"));
-        let provider = MdfindSearchProvider {
-            runner: runner.clone(),
-        };
-
-        provider
-            .candidates("type:image", false, &context("type:image"))
-            .unwrap();
-
-        assert_eq!(
-            runner.invocations.lock().unwrap().first(),
-            Some(&(
-                "/usr/bin/mdfind".into(),
-                vec![
-                    "kMDItemDisplayName == \"*\"cd && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
-                        .into()
-                ]
-            ))
-        );
-    }
-
-    #[test]
-    fn scoped_search_excludes_hidden_files_and_folders() {
-        use crate::search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE};
-
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("media");
-        std::fs::create_dir_all(root.join(".worktrees")).unwrap();
-        std::fs::create_dir_all(root.join("archive")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let visible = root.join("clip.mp4");
-        let hidden_file = root.join(".clip.mp4");
-        let hidden_child = root.join(".worktrees/clip.mp4");
-        let archive = root.join("archive/clip.mp4");
-        for path in [&visible, &hidden_file, &hidden_child, &archive] {
-            std::fs::write(path, b"video").unwrap();
-        }
-        #[cfg(target_os = "macos")]
-        assert!(Command::new("/usr/bin/chflags")
-            .arg("hidden")
-            .arg(root.join("archive"))
-            .status()
-            .unwrap()
-            .success());
-        let database = directory.path().join("index.sqlite3");
-        crate::owned_index::OwnedIndexManager::under(database.clone())
-            .add_folder(&root)
-            .unwrap();
-        let output = [&visible, &hidden_file, &hidden_child, &archive]
-            .map(|path| path.to_string_lossy())
-            .join("\n");
-        let engine = SearchEngine::new(Arc::new(ScopedMdfindSearchProvider {
-            runner: Arc::new(FakeRunner::new(&output)),
-            database,
-        }));
-        // A recent folder rename adds candidates after the provider query.
-        engine.rename_folder(&root.join("previous"), root.join("archive"));
-
-        let results = engine
-            .search(SearchRequest {
-                query: "clip".into(),
-                page: 1,
-                page_size: PAGE_SIZE,
-                fields: SearchFields::default(),
-                media_type: MediaType::Both,
-            })
-            .unwrap();
-
-        assert_eq!(
-            results.total_results,
-            if cfg!(target_os = "macos") { 1 } else { 2 }
-        );
-        assert!(results
-            .results
-            .iter()
-            .all(|result| result.file_name == "clip.mp4"));
-    }
-
-    #[test]
-    fn scoped_mdfind_only_searches_configured_folders() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("media");
-        std::fs::create_dir(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let database = directory.path().join("index.sqlite3");
-        let manager = crate::owned_index::OwnedIndexManager::under(database.clone());
-        manager.add_folder(&root).unwrap();
-        let clip = root.join("clip.mp4");
-        let runner = Arc::new(FakeRunner::new(clip.to_string_lossy().as_ref()));
-        let provider = ScopedMdfindSearchProvider {
-            runner: runner.clone(),
-            database,
-        };
-
-        let paths = provider
-            .candidates("clip", false, &context("clip"))
-            .unwrap();
-
-        assert_eq!(
-            runner.invocations.lock().unwrap().first(),
-            Some(&(
-                "/usr/bin/mdfind".into(),
-                vec![
-                    "-onlyin".into(),
-                    root.to_string_lossy().into_owned(),
-                    mdfind_predicate("clip", false).unwrap(),
-                ]
-            ))
-        );
-        assert_eq!(paths, vec![clip]);
-    }
-
-    #[test]
-    fn scoped_mdfind_falls_back_to_unscoped_search_without_folders() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("index.sqlite3");
-        let runner = Arc::new(FakeRunner::new(
-            "/media/clip.mp4
-",
-        ));
-        let provider = ScopedMdfindSearchProvider {
-            runner: runner.clone(),
-            database,
-        };
-
-        provider
-            .candidates("clip", false, &context("clip"))
-            .unwrap();
-
-        assert_eq!(
-            runner.invocations.lock().unwrap().first(),
-            Some(&(
-                "/usr/bin/mdfind".into(),
-                vec![mdfind_predicate("clip", false).unwrap()]
-            ))
-        );
     }
 
     #[test]
@@ -1081,29 +703,6 @@ mod tests {
                     .into_iter()
                     .map(String::from)
                     .collect()
-            ))
-        );
-    }
-
-    #[test]
-    fn mdfind_matches_whole_paths_when_the_folder_is_searched() {
-        let runner = Arc::new(FakeRunner::new("/media/Holiday/clip.mkv\n"));
-        let provider = MdfindSearchProvider {
-            runner: runner.clone(),
-        };
-
-        provider
-            .candidates("holiday", true, &context("holiday"))
-            .unwrap();
-
-        assert_eq!(
-            runner.invocations.lock().unwrap().first(),
-            Some(&(
-                "/usr/bin/mdfind".into(),
-                vec![
-                    "kMDItemPath == \"*holiday*\"cd && (kMDItemContentTypeTree == \"public.movie\" || kMDItemContentTypeTree == \"public.image\")"
-                        .into()
-                ]
             ))
         );
     }

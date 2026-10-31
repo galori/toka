@@ -19,7 +19,7 @@ npm ci
 npm run tauri dev
 ```
 
-Toka searches the existing Spotlight index; no separate search service is required. Open Search folders with `Ctrl+,` to limit searches to the folders you choose. Toka also maintains its own index of those folders in the background.
+Toka searches its own index of the folders you choose. No Spotlight index or separate search service is required. Open Search folders with `Ctrl+,` to choose folders. Toka indexes those folders in the background.
 
 ## 3. Build an installable app
 
@@ -50,4 +50,4 @@ Then search from a terminal with `toka search "family trip"`. Toka prints each
 matching video or image path on a separate line. The command uses the same
 query syntax as the app.
 
-If searches omit expected files, check the folders under Search folders (`Ctrl+,`), then check Spotlight exclusions and Toka's access under **System Settings → Privacy & Security**.
+If searches omit expected files, check the folders and indexing status under Search folders (`Ctrl+,`), then check Toka's access under **System Settings → Privacy & Security**.
