@@ -11,11 +11,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
 pub const PAGE_SIZE: usize = 24;
+const SNAPSHOT_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_SNAPSHOTS: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -35,6 +37,8 @@ pub struct SearchRequest {
     pub query: String,
     pub page: usize,
     pub page_size: usize,
+    #[serde(default)]
+    pub search_id: Option<String>,
     #[serde(default)]
     pub fields: SearchFields,
     #[serde(default)]
@@ -86,6 +90,7 @@ pub struct VideoResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchPage {
+    pub search_id: String,
     pub query: String,
     pub page: usize,
     pub page_size: usize,
@@ -103,6 +108,8 @@ pub enum SearchError {
     NoSearchFields,
     #[error("The requested search page is invalid.")]
     InvalidPage,
+    #[error("That search has expired. Start it again from page one.")]
+    SearchExpired,
     #[error("{0}")]
     Provider(String),
     #[error("That video is no longer available.")]
@@ -147,10 +154,8 @@ pub struct SearchEngine {
     renamed_folders: Mutex<HashMap<PathBuf, PathBuf>>,
     rename_overlay_path: Option<PathBuf>,
     rename_overlay_write: Mutex<()>,
-    /// The order the search on screen is being read in. Only the current one is
-    /// kept: a new question replaces it, and there is never a second search to
-    /// go back to — the frontend asks for page one and then walks forward.
-    shuffle: Mutex<Option<Shuffle>>,
+    snapshots: Mutex<SearchSnapshots>,
+    snapshot_ttl: Duration,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -325,14 +330,21 @@ fn write_rename_overlay(path: &Path, overlay: &PersistedRenameOverlay) -> io::Re
     result
 }
 
-/// The seed a search's order was drawn from, under the question that asked for
-/// it. Pages after the first reuse the seed so they continue that order instead
-/// of drawing a new one, which would repeat some videos and skip others.
-struct Shuffle {
+#[derive(Clone)]
+struct SearchSnapshot {
+    id: String,
     query: String,
     fields: SearchFields,
     media_type: MediaType,
-    seed: u64,
+    paths: Vec<PathBuf>,
+    index_revision: u64,
+    created_at: Instant,
+}
+
+#[derive(Default)]
+struct SearchSnapshots {
+    active: Option<String>,
+    by_id: HashMap<String, SearchSnapshot>,
 }
 
 impl SearchEngine {
@@ -343,13 +355,41 @@ impl SearchEngine {
 
     #[cfg(test)]
     pub fn new_with_logger(provider: Arc<dyn SearchProvider>, logger: Arc<SearchLogger>) -> Self {
-        Self::new_with_logger_and_rename_store(provider, logger, None)
+        Self::new_with_logger_and_ttl(provider, logger, SNAPSHOT_TTL)
     }
 
     pub(crate) fn new_with_logger_and_rename_store(
         provider: Arc<dyn SearchProvider>,
         logger: Arc<SearchLogger>,
         rename_overlay_path: Option<PathBuf>,
+    ) -> Self {
+        Self::new_with_logger_and_rename_store_and_ttl(
+            provider,
+            logger,
+            rename_overlay_path,
+            SNAPSHOT_TTL,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_snapshot_ttl(provider: Arc<dyn SearchProvider>, snapshot_ttl: Duration) -> Self {
+        Self::new_with_logger_and_ttl(provider, Arc::new(SearchLogger::disabled()), snapshot_ttl)
+    }
+
+    #[cfg(test)]
+    fn new_with_logger_and_ttl(
+        provider: Arc<dyn SearchProvider>,
+        logger: Arc<SearchLogger>,
+        snapshot_ttl: Duration,
+    ) -> Self {
+        Self::new_with_logger_and_rename_store_and_ttl(provider, logger, None, snapshot_ttl)
+    }
+
+    fn new_with_logger_and_rename_store_and_ttl(
+        provider: Arc<dyn SearchProvider>,
+        logger: Arc<SearchLogger>,
+        rename_overlay_path: Option<PathBuf>,
+        snapshot_ttl: Duration,
     ) -> Self {
         let (renamed_paths, renamed_folders) = match rename_overlay_path.as_deref() {
             Some(path) => match load_rename_overlay(path) {
@@ -370,7 +410,8 @@ impl SearchEngine {
             renamed_folders: Mutex::new(renamed_folders),
             rename_overlay_path,
             rename_overlay_write: Mutex::new(()),
-            shuffle: Mutex::new(None),
+            snapshots: Mutex::new(SearchSnapshots::default()),
+            snapshot_ttl,
         }
     }
 
@@ -419,34 +460,33 @@ impl SearchEngine {
         context: &SearchLogContext,
         filter: &dyn Fn(&Path) -> bool,
     ) -> Result<SearchPage, SearchError> {
-        let (query, mut paths) = self.matching_paths(&request, context, filter)?;
-        let fields = request.fields;
-        let media_type = request.media_type;
+        let snapshot = if request.page == 1 {
+            let (query, mut paths) = self.matching_paths(&request, context, filter)?;
+            // Providers may return a different order each time. Sorting before
+            // shuffling makes the saved order depend only on this search's seed.
+            paths.sort_by(|left, right| {
+                let left_name = left.file_name().unwrap_or_default().to_string_lossy();
+                let right_name = right.file_name().unwrap_or_default().to_string_lossy();
+                left_name
+                    .to_lowercase()
+                    .cmp(&right_name.to_lowercase())
+                    .then_with(|| left.cmp(right))
+            });
+            shuffle(&mut paths, fresh_seed());
+            self.remember_snapshot(query, request.fields, request.media_type, paths)
+        } else {
+            self.snapshot_for(&request)?
+        };
 
-        // Sorted not to be read in this order — the shuffle below undoes it —
-        // but so that the shuffle has something fixed to work from. A provider
-        // is free to answer the same query in a different order each time, and
-        // page two has to continue the order page one started.
-        paths.sort_by(|left, right| {
-            let left_name = left.file_name().unwrap_or_default().to_string_lossy();
-            let right_name = right.file_name().unwrap_or_default().to_string_lossy();
-            left_name
-                .to_lowercase()
-                .cmp(&right_name.to_lowercase())
-                .then_with(|| left.cmp(right))
-        });
-        shuffle(
-            &mut paths,
-            self.shuffle_seed(&query, fields, media_type, request.page),
-        );
-
-        let total_results = paths.len();
+        let total_results = snapshot.paths.len();
         let total_pages = total_results.div_ceil(PAGE_SIZE);
         let start = (request.page - 1).saturating_mul(PAGE_SIZE);
-        let page_paths = paths
-            .into_iter()
+        let page_paths = snapshot
+            .paths
+            .iter()
             .skip(start)
             .take(PAGE_SIZE)
+            .cloned()
             .collect::<Vec<_>>();
         self.logger.record_returned(context, &page_paths);
         let mut known_paths = self.result_paths.lock().unwrap();
@@ -460,18 +500,98 @@ impl SearchEngine {
             .collect();
 
         Ok(SearchPage {
-            query: query.to_owned(),
+            search_id: snapshot.id,
+            query: snapshot.query,
             page: request.page,
             page_size: PAGE_SIZE,
             total_results,
             total_pages,
-            index_revision: self.provider.revision(),
+            index_revision: snapshot.index_revision,
             results,
         })
     }
 
+    fn remember_snapshot(
+        &self,
+        query: String,
+        fields: SearchFields,
+        media_type: MediaType,
+        paths: Vec<PathBuf>,
+    ) -> SearchSnapshot {
+        let snapshot = SearchSnapshot {
+            id: Uuid::new_v4().to_string(),
+            query,
+            fields,
+            media_type,
+            paths,
+            index_revision: self.provider.revision(),
+            created_at: Instant::now(),
+        };
+        let mut snapshots = self.snapshots.lock().unwrap();
+        self.prune_snapshots(&mut snapshots);
+        while snapshots.by_id.len() >= MAX_SNAPSHOTS {
+            let Some(oldest) = snapshots
+                .by_id
+                .values()
+                .min_by_key(|saved| saved.created_at)
+                .map(|saved| saved.id.clone())
+            else {
+                break;
+            };
+            snapshots.by_id.remove(&oldest);
+        }
+        snapshots.active = Some(snapshot.id.clone());
+        snapshots
+            .by_id
+            .insert(snapshot.id.clone(), snapshot.clone());
+        snapshot
+    }
+
+    fn snapshot_for(&self, request: &SearchRequest) -> Result<SearchSnapshot, SearchError> {
+        let query = request.query.trim();
+        parse_query(query)?;
+        if !request.fields.any() {
+            return Err(SearchError::NoSearchFields);
+        }
+        if request.page == 0 || request.page_size != PAGE_SIZE {
+            return Err(SearchError::InvalidPage);
+        }
+        let mut snapshots = self.snapshots.lock().unwrap();
+        self.prune_snapshots(&mut snapshots);
+        let id = request
+            .search_id
+            .as_ref()
+            .or(snapshots.active.as_ref())
+            .ok_or(SearchError::SearchExpired)?;
+        let snapshot = snapshots
+            .by_id
+            .get(id)
+            .filter(|saved| {
+                saved.query == query
+                    && saved.fields == request.fields
+                    && saved.media_type == request.media_type
+            })
+            .cloned()
+            .ok_or(SearchError::SearchExpired)?;
+        Ok(snapshot)
+    }
+
+    fn prune_snapshots(&self, snapshots: &mut SearchSnapshots) {
+        let now = Instant::now();
+        snapshots
+            .by_id
+            .retain(|_, saved| now.duration_since(saved.created_at) < self.snapshot_ttl);
+        if snapshots
+            .active
+            .as_ref()
+            .is_some_and(|active| !snapshots.by_id.contains_key(active))
+        {
+            snapshots.active = None;
+        }
+    }
+
     /// Answers whether a query's match count changed without creating result
-    /// ids or replacing the shuffle used by the visible result pages.
+    /// ids or replacing the saved pages for the visible search.
     pub fn match_count(&self, request: SearchRequest) -> Result<usize, SearchError> {
         self.match_count_filtered(request, |_| true)
     }
@@ -561,38 +681,6 @@ impl SearchEngine {
             paths.push(path);
         }
         Ok((query.to_owned(), paths))
-    }
-
-    /// The seed the order of this page is drawn from. Page one is a new
-    /// question and always gets a new one, so asking the same thing twice shows
-    /// a different part of what matched rather than the same screenful again.
-    /// The pages after it continue whatever order page one started.
-    fn shuffle_seed(
-        &self,
-        query: &str,
-        fields: SearchFields,
-        media_type: MediaType,
-        page: usize,
-    ) -> u64 {
-        let mut current = self.shuffle.lock().unwrap();
-        if page > 1 {
-            if let Some(shuffle) = current.as_ref() {
-                if shuffle.query == query
-                    && shuffle.fields == fields
-                    && shuffle.media_type == media_type
-                {
-                    return shuffle.seed;
-                }
-            }
-        }
-        let seed = fresh_seed();
-        *current = Some(Shuffle {
-            query: query.to_owned(),
-            fields,
-            media_type,
-            seed,
-        });
-        seed
     }
 
     /// The provider's candidates, corrected for renames Toka has recorded: a
@@ -745,6 +833,7 @@ impl SearchEngine {
             })
             .collect();
         SearchPage {
+            search_id: Uuid::new_v4().to_string(),
             query,
             page: 1,
             page_size: PAGE_SIZE,
@@ -1616,6 +1705,7 @@ mod tests {
             query: query.into(),
             page: 1,
             page_size: PAGE_SIZE,
+            search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::default(),
         }
@@ -1915,6 +2005,44 @@ mod tests {
         let mut every_name = [first, second].concat();
         every_name.sort();
         assert_eq!(every_name, every_clip_name(30));
+    }
+
+    #[test]
+    fn later_pages_use_the_first_pages_fixed_snapshot() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let provider = Arc::new(FakeProvider::new(paths));
+        let engine = SearchEngine::new(provider.clone());
+        let first = engine.search(request("clip")).unwrap();
+        let replacement = directory.path().join("clip-99.mp4");
+        fs::write(&replacement, b"test").unwrap();
+        *provider.paths.lock().unwrap() = vec![replacement];
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id.clone());
+
+        let second = engine.search(next_request).unwrap();
+
+        assert_eq!(second.search_id, first.search_id);
+        assert_eq!(second.total_results, 30);
+        let mut every_name = [names(&first), names(&second)].concat();
+        every_name.sort();
+        assert_eq!(every_name, every_clip_name(30));
+    }
+
+    #[test]
+    fn expired_snapshots_tell_the_caller_to_restart_from_page_one() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let engine =
+            SearchEngine::new_with_snapshot_ttl(Arc::new(FakeProvider::new(paths)), Duration::ZERO);
+        let first = engine.search(request("clip")).unwrap();
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id);
+
+        let error = engine.search(next_request).unwrap_err();
+
+        assert!(matches!(error, SearchError::SearchExpired));
+        assert!(error.to_string().contains("page one"));
     }
 
     /// Asking the same question again is a new search, and gets a new order —
