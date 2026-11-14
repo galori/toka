@@ -1322,7 +1322,9 @@ function Player({
   }>();
   const [addingTag, setAddingTag] = useState(false);
   const [addingFolderTag, setAddingFolderTag] = useState(false);
-  tagFieldOpen.current = addingTag || addingFolderTag;
+  useEffect(() => {
+    tagFieldOpen.current = addingTag || addingFolderTag;
+  }, [addingTag, addingFolderTag]);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
   const [cursorHidden, setCursorHidden] = useState(false);
