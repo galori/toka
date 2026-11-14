@@ -4792,6 +4792,86 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
   }
 });
 
+test("hides the native surface while the Add-ons menu is open", async () => {
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "native-1", fileName: "native-1.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      const resultId = (args as { resultId: string }).resultId;
+      return Promise.resolve({
+        filePath: `/Videos/${resultId}.mp4`,
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [
+      {
+        addonId: "tiktok",
+        actionId: "creator-search",
+        label: "Show this creator in Toka",
+        effects: ["New Toka window"],
+      },
+    ],
+    errors: [],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native-1.mp4" }),
+  );
+  await screen.findByLabelText("Playing native-1.mp4");
+  const addons = await screen.findByRole("button", { name: "Add-ons" });
+
+  // GTK composites the mpv surface above the WebView, so a menu drawn over the
+  // picture is invisible on Linux unless the surface is hidden while it's open.
+  invokeMock.mockClear();
+  await user.click(addons);
+  await screen.findByRole("menu", { name: "Add-ons" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: false }),
+    ),
+  );
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(screen.getByRole("menu", { name: "Add-ons" }), {
+    key: "Escape",
+  });
+  await waitFor(() =>
+    expect(screen.queryByRole("menu", { name: "Add-ons" })).toBeNull(),
+  );
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: true }),
+    ),
+  );
+});
+
 test("hands the fullscreen native surface everything but the scrubber sliver", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   const results = [1, 2].map((number) => ({

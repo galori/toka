@@ -1739,7 +1739,9 @@ function Player({
         y: Math.round(bounds.top),
         width: Math.round(visibleWidth),
         height: Math.round(visibleHeight),
-        visible: visibleWidth > 0 && visibleHeight > 0,
+        // The Add-ons menu drops over the picture, and GTK paints the native
+        // surface above it, so the picture steps aside while the menu is open.
+        visible: !addonOpen && visibleWidth > 0 && visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -1784,6 +1786,7 @@ function Player({
       window.clearInterval(poll);
     };
   }, [
+    addonOpen,
     controlsIdle,
     drawerOpen,
     error,
