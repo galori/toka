@@ -4022,7 +4022,7 @@ export default function App() {
       void indexState()
         .then(setManagedIndex)
         .catch(() => {});
-    }, 2_000);
+    }, 1_000);
     return () => window.clearInterval(poll);
   }, [managedIndex?.supported]);
 
@@ -4031,6 +4031,10 @@ export default function App() {
     managedIndex?.folders.filter(
       (folder) => folder.status === "pending" || folder.status === "indexing",
     ).length ?? 0;
+
+  const managedIndexScanningPath = managedIndex?.folders.find(
+    (folder) => folder.status === "indexing" && folder.currentPath,
+  )?.currentPath;
 
   const chooseIndexFolder = async () => {
     setFolderError(undefined);
@@ -4548,6 +4552,11 @@ export default function App() {
                 ? "Indexing search folders…"
                 : "Search index idle"}
             </strong>
+            {managedIndexScanningPath ? (
+              <span className="index-status-path">
+                Scanning {managedIndexScanningPath}
+              </span>
+            ) : null}
             <span>
               {managedIndexIsActive
                 ? `${managedIndexActiveFolderCount} folder${

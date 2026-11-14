@@ -1715,6 +1715,14 @@ button:focus-visible {
   color: #bbb;
 }
 
+.index-status-copy > .index-status-path {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @keyframes index-status-pulse {
   50% {
     opacity: 0.35;
