@@ -2352,6 +2352,17 @@ function Player({
     setControlsPinned(!controlsPinned);
   };
 
+  // Closing the last tag editor in fullscreen starts a fresh countdown instead
+  // of hiding the controls at once or on what was left of an older one.
+  const tagFieldWasOpen = useRef(false);
+  useEffect(() => {
+    if (tagFieldWasOpen.current && !tagFieldOpen && fullscreen) {
+      controlsLastNear.current = Date.now();
+      setControlsRevealed(true);
+    }
+    tagFieldWasOpen.current = tagFieldOpen;
+  }, [tagFieldOpen, fullscreen]);
+
   // While revealed, a single timer waits out the hide delay, measured from the
   // last time the controls were wanted, and checks again if they still are.
   useEffect(() => {

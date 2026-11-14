@@ -3073,6 +3073,33 @@ test("lets the fullscreen controls hide once the tag editor has closed", async (
   }
 });
 
+test("gives the fullscreen controls a fresh countdown when the tag editor closes", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    fireEvent.keyDown(window, { key: "t" });
+    const field = await screen.findByRole("textbox", {
+      name: "Add tag to clip.mp4",
+    });
+    await enterFullscreen(user);
+    act(() => void fireEvent.mouseLeave(controls));
+    fireEvent.keyDown(field, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("textbox", { name: "Add tag to clip.mp4" }),
+      ).not.toBeInTheDocument(),
+    );
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(controls).not.toHaveClass("idle");
+    act(() => void vi.advanceTimersByTime(2_000));
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
 test("keeps an open tag editor visible when fullscreen is entered", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
