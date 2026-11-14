@@ -11,6 +11,7 @@ mod owned_index;
 mod player_linux;
 mod playlist;
 mod providers;
+mod reset;
 mod search;
 mod search_log;
 mod subtitles;
@@ -1267,6 +1268,35 @@ fn search_rename_overlay_path() -> Result<PathBuf, String> {
     Ok(owned_index::database_path()?.with_file_name("search-renames.json"))
 }
 
+/// Everything Toka stores: its search folders and index (and their caches),
+/// thumbnail and web caches, and log files. Never the user's media, tags, or
+/// add-ons.
+#[cfg(not(mobile))]
+fn reset_plan() -> Result<reset::ResetPlan, String> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "linux")]
+    let index_paths = managed_index::IndexPaths::system()?;
+    #[cfg(target_os = "linux")]
+    paths.extend(index_paths.reset_paths());
+    // The macOS index, the search rename overlay, and on Linux the same
+    // folder the indexer keeps its state in.
+    if let Some(directory) = owned_index::database_path()?.parent() {
+        paths.push(directory.to_path_buf());
+    }
+    paths.push(thumbnails::cache_output_root());
+    if let Some(cache) = dirs::cache_dir() {
+        paths.push(cache.join("app.toka.desktop"));
+    }
+    paths.extend(search_log::reset_paths());
+    #[allow(unused_mut)]
+    let mut plan = reset::ResetPlan::new(paths);
+    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+    {
+        plan.stop_indexer = Some(managed_index::stop_indexer);
+    }
+    Ok(plan)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
@@ -1305,6 +1335,7 @@ pub fn run() {
                         rename_overlay_path,
                     ))
                 },
+                reset_plan,
                 &mut stdout,
                 &mut stderr,
             )

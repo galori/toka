@@ -69,6 +69,16 @@ images, then writes each full file path on a separate line. It returns exit code
 output error returns exit code `1`. A missing query returns exit code `2`. Use
 `toka search --help` for command help.
 
+### Reset Toka
+
+`toka reset --yes` puts Toka back to a first-run state. It removes every search
+folder, the search index and its caches, the thumbnail and other caches, and
+Toka's log files (including verbose search logs saved to your chosen folder).
+It never touches your media files, tags, or add-ons. On Linux it also stops the
+background indexer; the next time you open Toka it starts again with no folders.
+Without `--yes`, `toka reset` only lists what it would remove and changes
+nothing. Close Toka before resetting.
+
 ## Add-ons
 
 While a video plays, press `Ctrl+Shift+A` to open actions supplied by add-ons.

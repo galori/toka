@@ -151,7 +151,7 @@ fn cache_output(video: &Path) -> PathBuf {
     cache_output_root().join(format!("{}.jpg", fingerprint(video)))
 }
 
-fn cache_output_root() -> PathBuf {
+pub(crate) fn cache_output_root() -> PathBuf {
     std::env::temp_dir().join("toka-thumbnails")
 }
 
