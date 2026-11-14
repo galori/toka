@@ -2339,9 +2339,19 @@ function Player({
 
   // The pointer is on the controls or focus is in them. Focus is read from the
   // document, not tracked: a removed tag input never reports its own blur.
-  const controlsHeld = () =>
-    pointerOverControls.current ||
-    Boolean(playerControls.current?.contains(document.activeElement));
+  // Only a field or selector in use counts: a button or the timeline that merely
+  // kept focus after a click must not hold the controls up for good.
+  const controlsHeld = () => {
+    const active = document.activeElement;
+    return (
+      pointerOverControls.current ||
+      Boolean(
+        active instanceof HTMLElement &&
+        playerControls.current?.contains(active) &&
+        active.matches("select, input:not([type=range])"),
+      )
+    );
+  };
 
   const toggleControlsPinned = () => {
     // Letting go of the pin must not hide controls the viewer is still using.

@@ -3123,7 +3123,15 @@ test("reveals the fullscreen controls when focus reaches them", async () => {
     await enterFullscreen(user);
     expect(controls).toHaveClass("idle");
 
+    act(() => void fireEvent.mouseLeave(controls));
     act(() => screen.getByLabelText("Video timeline").focus());
+    expect(controls).not.toHaveClass("idle");
+    // A control that merely kept focus does not hold the controls up for good.
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).toHaveClass("idle");
+
+    // A selector in use does.
+    act(() => screen.getByLabelText("Playback speed").focus());
     expect(controls).not.toHaveClass("idle");
     act(() => void vi.advanceTimersByTime(5_000));
     expect(controls).not.toHaveClass("idle");
