@@ -59,6 +59,18 @@ impl IndexPaths {
         }
     }
 
+    /// The folders holding the search folder list, index databases, status and
+    /// indexer log: all the indexer's state, none of the user's media.
+    pub fn reset_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
+            self.root.clone(),
+            self.databases.clone(),
+            self.index_log.clone(),
+        ];
+        paths.extend(self.status.parent().map(Path::to_path_buf));
+        paths
+    }
+
     pub fn database(&self, id: &str) -> PathBuf {
         self.databases.join(format!("{id}.db"))
     }
@@ -358,6 +370,23 @@ pub fn ensure_indexer() {
         ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
     {
         eprintln!("{message}");
+    }
+}
+
+/// Stops the indexer service so it cannot recreate state while it is deleted.
+/// The next Toka launch starts it again.
+#[cfg(not(feature = "e2e"))]
+pub fn stop_indexer() -> Result<(), String> {
+    let status = Command::new("systemctl")
+        .args(["--user", "stop", INDEXER_SERVICE])
+        .status()
+        .map_err(|error| format!("could not stop the indexer service: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the indexer service could not be stopped (systemctl exited with {status})"
+        ))
     }
 }
 

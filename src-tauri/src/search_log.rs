@@ -75,7 +75,7 @@ impl SearchLogger {
         Self::new(PathBuf::new())
     }
 
-    pub(crate) fn system() -> Self {
+    fn system_path() -> PathBuf {
         #[cfg(target_os = "macos")]
         let path = dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)
@@ -84,6 +84,11 @@ impl SearchLogger {
         let path = dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
             .join("app.toka.desktop/logs/search.log");
+        path
+    }
+
+    pub(crate) fn system() -> Self {
+        let path = Self::system_path();
         let settings_path = path.with_file_name("search-log-settings.json");
         let settings = load_settings(&settings_path);
         let session = SessionMarker::register(&path);
@@ -291,6 +296,41 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Every log file Toka writes: its log folder (the search log, its settings and
+/// session markers, and on Linux the indexer log) and any verbose search logs
+/// saved to the folder the user chose.
+pub(crate) fn reset_paths() -> Vec<PathBuf> {
+    let path = SearchLogger::system_path();
+    let Some(directory) = path.parent() else {
+        return Vec::new();
+    };
+    let settings = load_settings(&directory.join("search-log-settings.json"));
+    let mut paths = vec![directory.to_path_buf()];
+    if let Some(verbose) = settings.path {
+        paths.extend(verbose_log_files(&verbose));
+    }
+    paths
+}
+
+fn verbose_log_files(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("toka_search_log_")
+                && name.ends_with(".log")
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 fn now_millis() -> u128 {
@@ -637,6 +677,24 @@ mod tests {
         );
         assert_eq!(entry["exitCode"], 0);
         assert!(entry["timestamp"].as_u64().is_some());
+    }
+
+    #[test]
+    fn verbose_log_files_are_only_toka_search_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            "toka_search_log_1_2_3.log",
+            "notes.log",
+            "toka_search_log_x.txt",
+        ] {
+            fs::write(directory.path().join(name), b"x").unwrap();
+        }
+        fs::create_dir(directory.path().join("toka_search_log_dir.log")).unwrap();
+
+        assert_eq!(
+            verbose_log_files(directory.path()),
+            vec![directory.path().join("toka_search_log_1_2_3.log")]
+        );
     }
 
     #[test]

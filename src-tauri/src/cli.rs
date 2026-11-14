@@ -1,17 +1,23 @@
-use crate::search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE};
+use crate::{
+    reset::{self, ResetPlan},
+    search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
+};
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
 };
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths";
+const RESET_USAGE: &str = "Usage: toka reset --yes";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs";
+const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
 pub fn is_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         argument == OsStr::new("search")
+            || argument == OsStr::new("reset")
             || argument == OsStr::new("--help")
             || argument == OsStr::new("-h")
     })
@@ -20,6 +26,7 @@ pub fn is_command(arguments: &[OsString]) -> bool {
 pub fn run_command(
     arguments: &[OsString],
     create_engine: impl FnOnce() -> Result<SearchEngine, String>,
+    create_reset_plan: impl FnOnce() -> Result<ResetPlan, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -30,6 +37,10 @@ pub fn run_command(
 
     if command == OsStr::new("--help") || command == OsStr::new("-h") {
         return print_help(GENERAL_HELP, stdout, stderr);
+    }
+
+    if command == OsStr::new("reset") {
+        return run_reset_command(&arguments[2..], create_reset_plan, stdout, stderr);
     }
 
     if command != OsStr::new("search") {
@@ -68,6 +79,61 @@ fn run_search_command(
         }
     };
     run_search(&query, &engine, stdout, stderr)
+}
+
+fn run_reset_command(
+    arguments: &[OsString],
+    create_plan: impl FnOnce() -> Result<ResetPlan, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_help(RESET_HELP, stdout, stderr);
+    }
+    let confirmed = arguments.len() == 1
+        && (arguments[0] == OsStr::new("--yes") || arguments[0] == OsStr::new("-y"));
+    if !arguments.is_empty() && !confirmed {
+        let _ = writeln!(
+            stderr,
+            "Reset does not take those arguments.\n{RESET_USAGE}"
+        );
+        return 2;
+    }
+
+    let plan = match create_plan() {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = writeln!(stderr, "toka reset: {error}");
+            return 1;
+        }
+    };
+
+    if !confirmed {
+        let _ = writeln!(stdout, "Reset would remove these, if present:");
+        for path in &plan.paths {
+            let _ = writeln!(stdout, "  {}", path.display());
+        }
+        let _ = writeln!(
+            stderr,
+            "Nothing was changed. Run `toka reset --yes` to reset."
+        );
+        return 2;
+    }
+
+    let report = reset::apply(&plan);
+    for path in &report.removed {
+        let _ = writeln!(stdout, "removed {}", path.display());
+    }
+    for failure in &report.failures {
+        let _ = writeln!(stderr, "toka reset: {failure}");
+    }
+    if !report.failures.is_empty() {
+        return 1;
+    }
+    let _ = writeln!(stdout, "Toka was reset.");
+    0
 }
 
 fn print_help(help: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
@@ -156,11 +222,20 @@ fn query_from_arguments(arguments: &[OsString]) -> Result<String, &'static str> 
 mod tests {
     use super::run_command;
     use crate::{
+        reset::ResetPlan,
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
     };
     use std::{ffi::OsString, fs, path::PathBuf, sync::Arc};
     use tempfile::tempdir;
+
+    fn no_reset() -> Result<ResetPlan, String> {
+        panic!("only reset builds a reset plan")
+    }
+
+    fn no_engine() -> Result<SearchEngine, String> {
+        panic!("reset must not create the search engine")
+    }
 
     struct FixtureProvider(Vec<PathBuf>);
 
@@ -187,7 +262,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let status = run_command(&args, || Ok(engine), &mut stdout, &mut stderr);
+        let status = run_command(&args, || Ok(engine), no_reset, &mut stdout, &mut stderr);
 
         assert_eq!(status, 0);
         assert_eq!(
@@ -206,6 +281,7 @@ mod tests {
         let status = run_command(
             &args,
             || panic!("help must not create the search engine"),
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -226,6 +302,7 @@ mod tests {
         let status = run_command(
             &args,
             || Err("search index could not be opened".into()),
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -236,5 +313,67 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "toka search: search index could not be opened\n"
         );
+    }
+
+    #[test]
+    fn reset_without_yes_lists_what_it_would_remove_and_changes_nothing() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let args = ["toka", "reset"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            || Ok(ResetPlan::new(vec![state.clone()])),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(String::from_utf8(stdout)
+            .unwrap()
+            .contains(&state.display().to_string()));
+        assert!(String::from_utf8(stderr).unwrap().contains("--yes"));
+        assert!(state.exists());
+    }
+
+    #[test]
+    fn reset_with_yes_removes_the_planned_paths() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let args = ["toka", "reset", "--yes"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            || Ok(ResetPlan::new(vec![state.clone()])),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert!(!state.exists());
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains(&format!("removed {}", state.display())));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn reset_help_and_bad_arguments_never_build_a_plan() {
+        for (extra, status) in [("--help", 0), ("--force", 2)] {
+            let args = ["toka", "reset", extra].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let code = run_command(&args, no_engine, no_reset, &mut stdout, &mut stderr);
+
+            assert_eq!(code, status);
+        }
     }
 }
