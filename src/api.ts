@@ -77,6 +77,7 @@ export type IndexFolder = {
   status: "pending" | "indexing" | "ready" | "offline" | "error";
   message?: string;
   scannedFiles?: number;
+  currentPath?: string;
 };
 
 export type IndexState = {
