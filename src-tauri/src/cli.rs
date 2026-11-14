@@ -38,11 +38,11 @@ pub fn run_command(
     };
 
     if command == OsStr::new("--help") || command == OsStr::new("-h") {
-        return print_help(GENERAL_HELP, stdout, stderr);
+        return print_text(GENERAL_HELP, stdout, stderr);
     }
 
     if command == OsStr::new("--version") || command == OsStr::new("-v") {
-        return print_help(
+        return print_text(
             &format!("toka {}", env!("CARGO_PKG_VERSION")),
             stdout,
             stderr,
@@ -70,7 +70,7 @@ fn run_search_command(
     if arguments.len() == 1
         && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
     {
-        return print_help(SEARCH_HELP, stdout, stderr);
+        return print_text(SEARCH_HELP, stdout, stderr);
     }
 
     let query = match query_from_arguments(arguments) {
@@ -100,7 +100,7 @@ fn run_reset_command(
     if arguments.len() == 1
         && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
     {
-        return print_help(RESET_HELP, stdout, stderr);
+        return print_text(RESET_HELP, stdout, stderr);
     }
     let confirmed = arguments.len() == 1
         && (arguments[0] == OsStr::new("--yes") || arguments[0] == OsStr::new("-y"));
@@ -146,9 +146,9 @@ fn run_reset_command(
     0
 }
 
-fn print_help(help: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
+fn print_text(help: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
     if let Err(error) = writeln!(stdout, "{help}").and_then(|()| stdout.flush()) {
-        let _ = writeln!(stderr, "toka: could not write help: {error}");
+        let _ = writeln!(stderr, "toka: could not write output: {error}");
         return 1;
     }
     0
@@ -284,7 +284,12 @@ mod tests {
 
     #[test]
     fn version_and_help_flags_print_without_building_anything() {
-        for flag in ["-v", "--version", "-h", "--help"] {
+        for (flag, is_version) in [
+            ("-v", true),
+            ("--version", true),
+            ("-h", false),
+            ("--help", false),
+        ] {
             let args = ["toka", flag].map(OsString::from).to_vec();
             assert!(super::is_command(&args), "{flag}");
             let mut stdout = Vec::new();
@@ -294,7 +299,7 @@ mod tests {
 
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
-            if flag.contains('v') {
+            if is_version {
                 assert_eq!(output, format!("toka {}\n", env!("CARGO_PKG_VERSION")));
             } else {
                 assert!(output.contains("--version"), "{output}");
