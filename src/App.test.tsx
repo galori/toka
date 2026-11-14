@@ -162,7 +162,8 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
-  expect(help).toHaveTextContent("Enter fullscreen, show controls, or exit");
+  expect(help).toHaveTextContent("Enter or leave fullscreen");
+  expect(help).toHaveTextContent("Keep fullscreen controls visible");
   expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
@@ -2586,7 +2587,7 @@ test("enters fullscreen mode for the player", async () => {
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
 
-test("enters fullscreen with the scrubber and cycles F through controls and windowed modes", async () => {
+test("enters fullscreen with the scrubber and toggles F between windowed and fullscreen", async () => {
   const userAgent = vi
     .spyOn(window.navigator, "userAgent", "get")
     .mockReturnValue("AppleWebKit Mac OS X");
@@ -2626,11 +2627,7 @@ test("enters fullscreen with the scrubber and cycles F through controls and wind
     expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
     expect(screen.getByLabelText("Video timeline")).toBeVisible();
 
-    fireEvent.keyDown(window, { key: "f" });
-    await waitFor(() =>
-      expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle"),
-    );
-
+    // A second F leaves fullscreen directly; there is no intermediate mode.
     fireEvent.keyDown(window, { key: "f" });
     await waitFor(() =>
       expect(windowApiMock.setFullscreen).toHaveBeenLastCalledWith(false),
@@ -2950,8 +2947,8 @@ async function playForFullscreen(names = ["clip.mp4"]) {
   return user;
 }
 
-// Pointer movement must leave the F-selected mode alone; only reaching the
-// right edge has a fullscreen action, where it summons the playlist.
+// Only the bottom edge (controls) and the right edge (playlist) have a
+// fullscreen action; movement elsewhere leaves the overlay alone.
 function movePointer(clientX = 10) {
   act(() => void fireEvent.mouseMove(window, { clientX, clientY: 10 }));
 }
@@ -3003,31 +3000,17 @@ test("keeps the tag editor visible when opened in fullscreen information mode", 
     expect(field).toBeVisible();
     expect(field).toHaveFocus();
     expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle");
+
+    // It outlives the hide delay for as long as the field is open.
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle");
   } finally {
     reportFullscreen(false);
     vi.useRealTimers();
   }
 });
 
-test("keeps the fullscreen controls selected with F visible", async () => {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
-  try {
-    const user = await playForFullscreen();
-    const controls = await screen.findByLabelText("Video controls");
-    await enterFullscreen(user);
-
-    fireEvent.keyDown(window, { key: "f" });
-    expect(controls).not.toHaveClass("idle");
-
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).not.toHaveClass("idle");
-  } finally {
-    reportFullscreen(false);
-    vi.useRealTimers();
-  }
-});
-
-test("keeps pointer movement from changing the selected fullscreen mode", async () => {
+test("pins the fullscreen controls from the keyboard with V", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen();
@@ -3035,7 +3018,137 @@ test("keeps pointer movement from changing the selected fullscreen mode", async 
     await enterFullscreen(user);
     expect(controls).toHaveClass("idle");
 
+    act(() => (document.activeElement as HTMLElement).blur());
+    act(() => void fireEvent.mouseLeave(controls));
+    fireEvent.keyDown(window, { key: "v" });
+    expect(controls).not.toHaveClass("idle");
+    const pin = screen.getByRole("button", {
+      name: "Auto-hide fullscreen controls",
+    });
+    expect(pin).toHaveAttribute("aria-keyshortcuts", "V");
+    act(() => void vi.advanceTimersByTime(10_000));
+    expect(controls).not.toHaveClass("idle");
+
+    fireEvent.keyDown(window, { key: "v" });
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("keeps hovered fullscreen controls when the pin is removed", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+
+    fireEvent.keyDown(window, { key: "v" });
+    act(() => void fireEvent.mouseEnter(controls));
+    fireEvent.keyDown(window, { key: "v" });
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("lets the fullscreen controls hide once the tag editor has closed", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+
+    fireEvent.keyDown(window, { key: "t" });
+    const field = await screen.findByRole("textbox", {
+      name: "Add tag to clip.mp4",
+    });
+    expect(field).toHaveFocus();
+    fireEvent.keyDown(field, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("textbox", { name: "Add tag to clip.mp4" }),
+      ).not.toBeInTheDocument(),
+    );
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("keeps an open tag editor visible when fullscreen is entered", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    fireEvent.keyDown(window, { key: "t" });
+    await screen.findByRole("textbox", { name: "Add tag to clip.mp4" });
+    await enterFullscreen(user);
+    expect(controls).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("reveals the fullscreen controls when focus reaches them", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
+
+    act(() => screen.getByLabelText("Video timeline").focus());
+    expect(controls).not.toHaveClass("idle");
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+
+    act(() => (document.activeElement as HTMLElement).blur());
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("reveals the fullscreen controls at the bottom edge and hides them after a delay", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
+
+    // Elsewhere on the screen leaves them hidden.
     movePointer();
+    expect(controls).toHaveClass("idle");
+
+    act(
+      () =>
+        void fireEvent.mouseMove(window, {
+          clientX: 10,
+          clientY: window.innerHeight - 1,
+        }),
+    );
+    expect(controls).not.toHaveClass("idle");
+
+    // They stay while the pointer is on them.
+    act(() => void fireEvent.mouseEnter(controls));
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+
+    act(() => void fireEvent.mouseLeave(controls));
+    // The delay runs from the last time they were wanted, not from the leave.
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(controls).not.toHaveClass("idle");
+    act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
