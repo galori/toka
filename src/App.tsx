@@ -4553,7 +4553,10 @@ export default function App() {
                 : "Search index idle"}
             </strong>
             {managedIndexScanningPath ? (
-              <span className="index-status-path">
+              <span
+                className="index-status-path"
+                title={managedIndexScanningPath}
+              >
                 Scanning {managedIndexScanningPath}
               </span>
             ) : null}
