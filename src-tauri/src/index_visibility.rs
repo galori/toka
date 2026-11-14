@@ -1,21 +1,16 @@
 use std::{io, path::Path};
 
 pub(crate) fn is_hidden(path: &Path) -> io::Result<bool> {
-    if path
+    let dotted = path
         .file_name()
-        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."))
-    {
-        return Ok(true);
-    }
+        .is_some_and(|name| name.as_encoded_bytes().starts_with(b"."));
     #[cfg(target_os = "macos")]
-    {
+    if !dotted {
         use std::os::macos::fs::MetadataExt;
         let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.is_dir() && metadata.st_flags() & libc::UF_HIDDEN != 0 {
-            return Ok(true);
-        }
+        return Ok(metadata.is_dir() && metadata.st_flags() & libc::UF_HIDDEN != 0);
     }
-    Ok(false)
+    Ok(dotted)
 }
 
 pub(crate) fn hidden_ancestor<'a>(root: &Path, path: &'a Path) -> io::Result<Option<&'a Path>> {
