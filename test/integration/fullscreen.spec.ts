@@ -66,14 +66,6 @@ async function enterFullscreen(): Promise<boolean> {
     .then(() => true)
     .catch(() => false);
   if (!entered) return false;
-  // Fullscreen now opens video-only. Advance once to the information/scrubber
-  // mode these layout checks exercise; dispatch inside the page because some
-  // WebKit builds reserve the physical F key for their own fullscreen UI.
-  await browser.execute(() =>
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
-    ),
-  );
   await $(".fullscreen-info").waitForExist();
   return true;
 }
@@ -88,7 +80,8 @@ function holdPointerAtRightEdge() {
       window.dispatchEvent(
         new MouseEvent("mousemove", {
           clientX: window.innerWidth - 1,
-          clientY: Math.round(window.innerHeight / 2),
+          // The bottom-right corner keeps the controls up as well.
+          clientY: window.innerHeight - 1,
         }),
       );
     send();
@@ -96,12 +89,21 @@ function holdPointerAtRightEdge() {
   });
 }
 
-function advanceFullscreenMode() {
-  return browser.execute(() =>
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
-    ),
-  );
+// The complete controls appear while the pointer is at the bottom edge.
+function holdPointerAtBottomEdge() {
+  return browser.execute(() => {
+    const held = window as unknown as { __tokaPointer?: number };
+    if (held.__tokaPointer) window.clearInterval(held.__tokaPointer);
+    const send = () =>
+      window.dispatchEvent(
+        new MouseEvent("mousemove", {
+          clientX: Math.round(window.innerWidth / 2),
+          clientY: window.innerHeight - 1,
+        }),
+      );
+    send();
+    held.__tokaPointer = window.setInterval(send, 100);
+  });
 }
 
 function releasePointer() {
@@ -235,7 +237,7 @@ describe("Toka fullscreen", () => {
     ).toBeLessThanOrEqual(1);
   });
 
-  it("keeps F-selected controls and the playlist over the picture", async function () {
+  it("reveals the controls at the bottom edge and the playlist over the picture", async function () {
     if (!(await enterFullscreen())) this.skip();
     await releasePointer();
     const hidden = await layoutWhile(
@@ -243,13 +245,13 @@ describe("Toka fullscreen", () => {
       "The information/scrubber mode was not selected",
     );
 
-    // F advances to the complete controls. They remain selected without any
-    // pointer activity or idle timer changing the mode behind the viewer.
-    await advanceFullscreenMode();
-    await browser.pause(3_000);
+    // The bottom edge reveals the complete controls, and they stay for as long
+    // as the pointer is there.
+    await holdPointerAtBottomEdge();
+    await browser.pause(2_000);
     const shown = await layoutWhile(
       false,
-      "F never selected the complete fullscreen controls",
+      "The bottom edge never revealed the complete fullscreen controls",
     );
     expect(shown.picture).toEqual(hidden.picture);
     if (!shown.timeline || !shown.picture)
@@ -288,8 +290,8 @@ describe("Toka fullscreen", () => {
       timeoutMsg: "The playlist stayed up after the pointer left it",
     });
     const back = await layoutWhile(
-      false,
-      "The F-selected controls changed after the pointer left the playlist",
+      true,
+      "The picture moved after the pointer left the playlist",
     );
     expect(back.picture).toEqual(hidden.picture);
   });

@@ -162,7 +162,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
-  expect(help).toHaveTextContent("Enter fullscreen, show controls, or exit");
+  expect(help).toHaveTextContent("Enter or leave fullscreen");
   expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
@@ -2578,7 +2578,7 @@ test("enters fullscreen mode for the player", async () => {
   expect(requestFullscreen).toHaveBeenCalledOnce();
 });
 
-test("enters fullscreen with the scrubber and cycles F through controls and windowed modes", async () => {
+test("enters fullscreen with the scrubber and toggles F between windowed and fullscreen", async () => {
   const userAgent = vi
     .spyOn(window.navigator, "userAgent", "get")
     .mockReturnValue("AppleWebKit Mac OS X");
@@ -2618,11 +2618,7 @@ test("enters fullscreen with the scrubber and cycles F through controls and wind
     expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
     expect(screen.getByLabelText("Video timeline")).toBeVisible();
 
-    fireEvent.keyDown(window, { key: "f" });
-    await waitFor(() =>
-      expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle"),
-    );
-
+    // A second F leaves fullscreen directly; there is no intermediate mode.
     fireEvent.keyDown(window, { key: "f" });
     await waitFor(() =>
       expect(windowApiMock.setFullscreen).toHaveBeenLastCalledWith(false),
@@ -2942,8 +2938,8 @@ async function playForFullscreen(names = ["clip.mp4"]) {
   return user;
 }
 
-// Pointer movement must leave the F-selected mode alone; only reaching the
-// right edge has a fullscreen action, where it summons the playlist.
+// Only the bottom edge (controls) and the right edge (playlist) have a
+// fullscreen action; movement elsewhere leaves the overlay alone.
 function movePointer(clientX = 10) {
   act(() => void fireEvent.mouseMove(window, { clientX, clientY: 10 }));
 }
@@ -3001,25 +2997,7 @@ test("keeps the tag editor visible when opened in fullscreen information mode", 
   }
 });
 
-test("keeps the fullscreen controls selected with F visible", async () => {
-  vi.useFakeTimers({ shouldAdvanceTime: true });
-  try {
-    const user = await playForFullscreen();
-    const controls = await screen.findByLabelText("Video controls");
-    await enterFullscreen(user);
-
-    fireEvent.keyDown(window, { key: "f" });
-    expect(controls).not.toHaveClass("idle");
-
-    act(() => void vi.advanceTimersByTime(3_000));
-    expect(controls).not.toHaveClass("idle");
-  } finally {
-    reportFullscreen(false);
-    vi.useRealTimers();
-  }
-});
-
-test("keeps pointer movement from changing the selected fullscreen mode", async () => {
+test("reveals the fullscreen controls at the bottom edge and hides them after a delay", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
     const user = await playForFullscreen();
@@ -3027,7 +3005,26 @@ test("keeps pointer movement from changing the selected fullscreen mode", async 
     await enterFullscreen(user);
     expect(controls).toHaveClass("idle");
 
+    // Elsewhere on the screen leaves them hidden.
     movePointer();
+    expect(controls).toHaveClass("idle");
+
+    act(
+      () =>
+        void fireEvent.mouseMove(window, {
+          clientX: 10,
+          clientY: window.innerHeight - 1,
+        }),
+    );
+    expect(controls).not.toHaveClass("idle");
+
+    // They stay while the pointer is on them.
+    act(() => void fireEvent.mouseEnter(controls));
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+
+    act(() => void fireEvent.mouseLeave(controls));
+    act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
