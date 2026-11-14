@@ -1266,7 +1266,6 @@ function Player({
   const playerShell = useRef<HTMLDivElement>(null);
   const playerControls = useRef<HTMLDivElement>(null);
   const pointerOverControls = useRef(false);
-  const focusWithinControls = useRef(false);
   const controlsLastNear = useRef(0);
   const pointerOverPlaylist = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
@@ -1286,7 +1285,7 @@ function Player({
   // Fullscreen shows only the scrubber and clock until the pointer visits the
   // bottom edge, which reveals the complete controls for a little while.
   const [controlsPinned, setControlsPinned] = useState(false);
-  const controlsIdle = fullscreen && !controlsRevealed && !controlsPinned;
+
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
   // A new window starts at half volume, so the first video is not full blast.
@@ -1329,6 +1328,9 @@ function Player({
   const [addingTag, setAddingTag] = useState(false);
   const [addingFolderTag, setAddingFolderTag] = useState(false);
   const tagFieldOpen = addingTag || addingFolderTag;
+  // An open tag editor keeps the controls up however fullscreen was entered.
+  const controlsIdle =
+    fullscreen && !controlsRevealed && !controlsPinned && !tagFieldOpen;
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
   const [cursorHidden, setCursorHidden] = useState(false);
@@ -2326,7 +2328,6 @@ function Player({
     // Entering fullscreen starts from a clean slate, however it was entered;
     // the idle controls ignore the pointer, so no mouseleave can be trusted.
     pointerOverControls.current = false;
-    setControlsRevealed(false);
     const follow = (event: MouseEvent) => {
       if (event.clientY < window.innerHeight - CONTROLS_EDGE_MARGIN) return;
       controlsLastNear.current = Date.now();
@@ -2336,18 +2337,28 @@ function Player({
     return () => window.removeEventListener("mousemove", follow);
   }, [fullscreen]);
 
+  // The pointer is on the controls or focus is in them. Focus is read from the
+  // document, not tracked: a removed tag input never reports its own blur.
+  const controlsHeld = () =>
+    pointerOverControls.current ||
+    Boolean(playerControls.current?.contains(document.activeElement));
+
+  const toggleControlsPinned = () => {
+    // Letting go of the pin must not hide controls the viewer is still using.
+    if (controlsPinned && controlsHeld()) {
+      controlsLastNear.current = Date.now();
+      setControlsRevealed(true);
+    }
+    setControlsPinned(!controlsPinned);
+  };
+
   // While revealed, a single timer waits out the hide delay, measured from the
   // last time the controls were wanted, and checks again if they still are.
   useEffect(() => {
     if (!fullscreen || !controlsRevealed) return;
     let timer: number;
     const check = () => {
-      if (
-        pointerOverControls.current ||
-        focusWithinControls.current ||
-        tagFieldOpen
-      )
-        controlsLastNear.current = Date.now();
+      if (controlsHeld() || tagFieldOpen) controlsLastNear.current = Date.now();
       const remaining =
         CONTROLS_HIDE_DELAY - (Date.now() - controlsLastNear.current);
       if (remaining > 0) {
@@ -2648,7 +2659,7 @@ function Player({
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
       } else if (event.key.toLowerCase() === "v" && fullscreen) {
-        run(() => setControlsPinned((pinned) => !pinned));
+        run(toggleControlsPinned);
       } else if (event.key.toLowerCase() === "i" && fullscreen) {
         run(() => setShowFullscreenInfo((visible) => !visible));
       } else if (event.key === "Escape") {
@@ -2662,6 +2673,7 @@ function Player({
     addonLoading,
     addonOpen,
     closeAddonMenu,
+    controlsPinned,
     currentTime,
     duration,
     fullscreen,
@@ -2987,15 +2999,10 @@ function Player({
             controlsLastNear.current = Date.now();
           }}
           onFocus={() => {
-            focusWithinControls.current = true;
             if (fullscreen) {
               controlsLastNear.current = Date.now();
               setControlsRevealed(true);
             }
-          }}
-          onBlur={(event) => {
-            if (!event.currentTarget.contains(event.relatedTarget as Node))
-              focusWithinControls.current = false;
           }}
         >
           <div className="player-scrubber">
@@ -3368,7 +3375,7 @@ function Player({
               {fullscreen ? (
                 <ControlButton
                   shortcut="V"
-                  onClick={() => setControlsPinned((pinned) => !pinned)}
+                  onClick={toggleControlsPinned}
                   aria-label={
                     controlsPinned
                       ? "Auto-hide fullscreen controls"

@@ -3010,6 +3010,8 @@ test("pins the fullscreen controls from the keyboard with V", async () => {
     await enterFullscreen(user);
     expect(controls).toHaveClass("idle");
 
+    act(() => (document.activeElement as HTMLElement).blur());
+    act(() => void fireEvent.mouseLeave(controls));
     fireEvent.keyDown(window, { key: "v" });
     expect(controls).not.toHaveClass("idle");
     const pin = screen.getByRole("button", {
@@ -3021,6 +3023,65 @@ test("pins the fullscreen controls from the keyboard with V", async () => {
 
     fireEvent.keyDown(window, { key: "v" });
     expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("keeps hovered fullscreen controls when the pin is removed", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+
+    fireEvent.keyDown(window, { key: "v" });
+    act(() => void fireEvent.mouseEnter(controls));
+    fireEvent.keyDown(window, { key: "v" });
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("lets the fullscreen controls hide once the tag editor has closed", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+
+    fireEvent.keyDown(window, { key: "t" });
+    const field = await screen.findByRole("textbox", {
+      name: "Add tag to clip.mp4",
+    });
+    expect(field).toHaveFocus();
+    fireEvent.keyDown(field, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("textbox", { name: "Add tag to clip.mp4" }),
+      ).not.toBeInTheDocument(),
+    );
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("keeps an open tag editor visible when fullscreen is entered", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    fireEvent.keyDown(window, { key: "t" });
+    await screen.findByRole("textbox", { name: "Add tag to clip.mp4" });
+    await enterFullscreen(user);
+    expect(controls).not.toHaveClass("idle");
   } finally {
     reportFullscreen(false);
     vi.useRealTimers();

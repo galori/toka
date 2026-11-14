@@ -1,5 +1,7 @@
 use std::{io, path::Path};
 
+// The macOS block below makes the dotfile check a real early return there.
+#[allow(clippy::needless_bool)]
 pub(crate) fn is_hidden(path: &Path) -> io::Result<bool> {
     if path
         .file_name()
