@@ -445,6 +445,11 @@ impl OwnedIndexManager {
         Ok(manager)
     }
 
+    /// A manager for reading the index without starting watchers.
+    pub(crate) fn for_inspection() -> Result<Self, String> {
+        Ok(Self::new(database_path()?, false))
+    }
+
     #[cfg(test)]
     pub(crate) fn under(database: PathBuf) -> Self {
         Self::new(database, false)
@@ -510,6 +515,40 @@ impl OwnedIndexManager {
             indexed_videos,
             indexed_images,
             indexing_files,
+            folders,
+        })
+    }
+
+    /// Everything the index knows, for `toka --index-stats`.
+    pub(crate) fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
+        use crate::index_stats::{FolderState, FolderStats, IndexStats};
+        let state = self.state()?;
+        let index = self.open().map_err(|error| error.to_string())?;
+        let mut folders = Vec::new();
+        for folder in state.folders {
+            let (videos, images) = index
+                .root_media_counts(&folder.id)
+                .map_err(|error| error.to_string())?;
+            folders.push(FolderStats {
+                path: folder.path,
+                state: match folder.status {
+                    OwnedFolderStatus::Pending => FolderState::Pending,
+                    OwnedFolderStatus::Indexing => FolderState::Indexing,
+                    OwnedFolderStatus::Ready => FolderState::Ready,
+                    OwnedFolderStatus::Offline => FolderState::Offline,
+                    OwnedFolderStatus::Error => FolderState::Error,
+                },
+                message: folder.message,
+                scanned_files: folder.scanned_files,
+                videos: Some(videos),
+                images: Some(images),
+            });
+        }
+        Ok(IndexStats {
+            revision: state.revision,
+            videos: state.indexed_videos,
+            images: state.indexed_images,
+            service_running: None,
             folders,
         })
     }
@@ -1010,6 +1049,20 @@ impl OwnedIndex {
                 COALESCE(SUM(media_type = 'image'), 0)
              FROM files",
             [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((videos as u64, images as u64))
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn root_media_counts(&self, root_id: &str) -> Result<(u64, u64), OwnedIndexError> {
+        let (videos, images): (i64, i64) = self.connection.query_row(
+            "SELECT
+                COALESCE(SUM(files.media_type = 'video'), 0),
+                COALESCE(SUM(files.media_type = 'image'), 0)
+             FROM root_files JOIN files ON files.id = root_files.file_id
+             WHERE root_files.root_id = ?1",
+            [root_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok((videos as u64, images as u64))

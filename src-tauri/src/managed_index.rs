@@ -295,6 +295,47 @@ impl IndexManager {
         })
     }
 
+    /// Everything the indexer knows, for `toka --index-stats`. Per-folder
+    /// media counts walk each folder the way the app's own totals do.
+    pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
+        use crate::index_stats::{FolderState, FolderStats, IndexStats};
+        let state = self.state()?;
+        let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
+        let folders = state
+            .folders
+            .into_iter()
+            .map(|folder| {
+                let counts = config
+                    .folders
+                    .iter()
+                    .find(|configured| configured.id == folder.id)
+                    .filter(|_| folder.status != FolderStatus::Offline)
+                    .map(|configured| count_indexed_media(std::slice::from_ref(configured)));
+                FolderStats {
+                    path: folder.path,
+                    state: match folder.status {
+                        FolderStatus::Pending => FolderState::Pending,
+                        FolderStatus::Indexing => FolderState::Indexing,
+                        FolderStatus::Ready => FolderState::Ready,
+                        FolderStatus::Offline => FolderState::Offline,
+                        FolderStatus::Error => FolderState::Error,
+                    },
+                    message: folder.message,
+                    scanned_files: folder.scanned_files,
+                    videos: counts.map(|counts| counts.videos),
+                    images: counts.map(|counts| counts.images),
+                }
+            })
+            .collect();
+        Ok(IndexStats {
+            revision: state.revision,
+            videos: state.indexed_videos,
+            images: state.indexed_images,
+            service_running: indexer_running(),
+            folders,
+        })
+    }
+
     pub fn add_folder(&self, requested: &Path) -> Result<IndexState, String> {
         let path = requested
             .canonicalize()
@@ -409,6 +450,21 @@ pub fn ensure_indexer() {
     {
         eprintln!("{message}");
     }
+}
+
+/// Whether the indexer service is running right now, if systemd can say.
+#[cfg(not(feature = "e2e"))]
+fn indexer_running() -> Option<bool> {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", INDEXER_SERVICE])
+        .status()
+        .ok()
+        .map(|status| status.success())
+}
+
+#[cfg(feature = "e2e")]
+fn indexer_running() -> Option<bool> {
+    None
 }
 
 /// Stops the indexer service so it cannot recreate state while it is deleted.
