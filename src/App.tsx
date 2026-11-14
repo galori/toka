@@ -1015,6 +1015,10 @@ const HELP_SECTIONS: HelpSection[] = [
         description: "Enter or leave fullscreen",
       },
       { shortcut: "I", description: "Show or hide fullscreen information" },
+      {
+        shortcut: "V",
+        description: "Keep fullscreen controls visible or let them auto-hide",
+      },
       { shortcut: "Shift+Delete", description: "Delete the current item" },
       { shortcut: "Ctrl+Shift+Delete", description: "Undo a deletion" },
     ],
@@ -1262,7 +1266,8 @@ function Player({
   const playerShell = useRef<HTMLDivElement>(null);
   const playerControls = useRef<HTMLDivElement>(null);
   const pointerOverControls = useRef(false);
-  const tagFieldOpen = useRef(false);
+  const focusWithinControls = useRef(false);
+  const controlsLastNear = useRef(0);
   const pointerOverPlaylist = useRef(false);
   const nativeSurface = useRef<HTMLDivElement>(null);
   const playlistDrawer = useRef<HTMLElement>(null);
@@ -1280,7 +1285,8 @@ function Player({
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   // Fullscreen shows only the scrubber and clock until the pointer visits the
   // bottom edge, which reveals the complete controls for a little while.
-  const controlsIdle = fullscreen && !controlsRevealed;
+  const [controlsPinned, setControlsPinned] = useState(false);
+  const controlsIdle = fullscreen && !controlsRevealed && !controlsPinned;
   const [loop, setLoop] = useState<LoopMode>("playlist");
   const [speed, setSpeed] = useState(1);
   // A new window starts at half volume, so the first video is not full blast.
@@ -1322,9 +1328,7 @@ function Player({
   }>();
   const [addingTag, setAddingTag] = useState(false);
   const [addingFolderTag, setAddingFolderTag] = useState(false);
-  useEffect(() => {
-    tagFieldOpen.current = addingTag || addingFolderTag;
-  }, [addingTag, addingFolderTag]);
+  const tagFieldOpen = addingTag || addingFolderTag;
   const [copyFeedback, setCopyFeedback] = useState(false);
   const copyTimeout = useRef<number | undefined>(undefined);
   const [cursorHidden, setCursorHidden] = useState(false);
@@ -1827,7 +1831,10 @@ function Player({
     // The tag editor lives in the controls row, which fullscreen hides down to
     // the scrubber, so opening the editor reveals the controls at the same time
     // or the focused field is invisible.
-    if (fullscreen) setControlsRevealed(true);
+    if (fullscreen) {
+      controlsLastNear.current = Date.now();
+      setControlsRevealed(true);
+    }
     if (playingBack) pause();
     // One field at a time: both claim every keystroke while open.
     setAddingTag(!folder);
@@ -2307,33 +2314,58 @@ function Player({
   }, [fullscreen]);
 
   // Fullscreen hides the controls until the pointer is brought to the bottom
-  // edge. They stay while the pointer is on them or a tag is being typed, and
-  // go again shortly after.
+  // edge (or focus reaches them, or V pins them). They stay while the pointer
+  // is on them, focus is in them or a tag is being typed, and go again shortly
+  // after.
   useEffect(() => {
     if (!fullscreen) {
       setControlsRevealed(false);
+      setControlsPinned(false);
       return;
     }
-    let lastNearControls = 0;
+    // Entering fullscreen starts from a clean slate, however it was entered;
+    // the idle controls ignore the pointer, so no mouseleave can be trusted.
+    pointerOverControls.current = false;
+    setControlsRevealed(false);
     const follow = (event: MouseEvent) => {
       if (event.clientY < window.innerHeight - CONTROLS_EDGE_MARGIN) return;
-      lastNearControls = Date.now();
+      controlsLastNear.current = Date.now();
       setControlsRevealed(true);
     };
-    const tick = window.setInterval(() => {
-      if (pointerOverControls.current || tagFieldOpen.current) {
-        lastNearControls = Date.now();
+    window.addEventListener("mousemove", follow);
+    return () => window.removeEventListener("mousemove", follow);
+  }, [fullscreen]);
+
+  // While revealed, a single timer waits out the hide delay, measured from the
+  // last time the controls were wanted, and checks again if they still are.
+  useEffect(() => {
+    if (!fullscreen || !controlsRevealed) return;
+    let timer: number;
+    const check = () => {
+      if (
+        pointerOverControls.current ||
+        focusWithinControls.current ||
+        tagFieldOpen
+      )
+        controlsLastNear.current = Date.now();
+      const remaining =
+        CONTROLS_HIDE_DELAY - (Date.now() - controlsLastNear.current);
+      if (remaining > 0) {
+        timer = window.setTimeout(check, remaining);
         return;
       }
-      if (Date.now() - lastNearControls >= CONTROLS_HIDE_DELAY)
-        setControlsRevealed(false);
-    }, 100);
-    window.addEventListener("mousemove", follow);
-    return () => {
-      window.clearInterval(tick);
-      window.removeEventListener("mousemove", follow);
+      pointerOverControls.current = false;
+      setControlsRevealed(false);
     };
-  }, [fullscreen]);
+    timer = window.setTimeout(
+      check,
+      Math.max(
+        0,
+        CONTROLS_HIDE_DELAY - (Date.now() - controlsLastNear.current),
+      ),
+    );
+    return () => window.clearTimeout(timer);
+  }, [fullscreen, controlsRevealed, tagFieldOpen]);
 
   // Hide the cursor while it rests on the picture during playback. It shows
   // again at once on movement and whenever it is not over the picture, so it
@@ -2478,7 +2510,6 @@ function Player({
       leaveFullscreen();
       return;
     }
-    setControlsRevealed(false);
     setShowFullscreenInfo(true);
     setFullscreenError(undefined);
     const shell = playerShell.current;
@@ -2616,6 +2647,8 @@ function Player({
         run(togglePlaylist);
       } else if (event.key.toLowerCase() === "f") {
         run(toggleFullscreen);
+      } else if (event.key.toLowerCase() === "v" && fullscreen) {
+        run(() => setControlsPinned((pinned) => !pinned));
       } else if (event.key.toLowerCase() === "i" && fullscreen) {
         run(() => setShowFullscreenInfo((visible) => !visible));
       } else if (event.key === "Escape") {
@@ -2951,6 +2984,18 @@ function Player({
           }}
           onMouseLeave={() => {
             pointerOverControls.current = false;
+            controlsLastNear.current = Date.now();
+          }}
+          onFocus={() => {
+            focusWithinControls.current = true;
+            if (fullscreen) {
+              controlsLastNear.current = Date.now();
+              setControlsRevealed(true);
+            }
+          }}
+          onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node))
+              focusWithinControls.current = false;
           }}
         >
           <div className="player-scrubber">
@@ -3318,6 +3363,20 @@ function Player({
                   aria-pressed={showFullscreenInfo}
                 >
                   <Label>Info</Label>
+                </ControlButton>
+              ) : null}
+              {fullscreen ? (
+                <ControlButton
+                  shortcut="V"
+                  onClick={() => setControlsPinned((pinned) => !pinned)}
+                  aria-label={
+                    controlsPinned
+                      ? "Auto-hide fullscreen controls"
+                      : "Keep fullscreen controls visible"
+                  }
+                  aria-pressed={controlsPinned}
+                >
+                  <Label>Controls</Label>
                 </ControlButton>
               ) : null}
               <ControlButton

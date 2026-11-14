@@ -163,6 +163,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
   expect(help).toHaveTextContent("Enter or leave fullscreen");
+  expect(help).toHaveTextContent("Keep fullscreen controls visible");
   expect(help).toHaveTextContent("Change image display duration");
   expect(help).toHaveTextContent("Mark the start and end of a range to play");
   expect(help).toHaveTextContent("Ctrl+Shift+T");
@@ -2991,6 +2992,57 @@ test("keeps the tag editor visible when opened in fullscreen information mode", 
     expect(field).toBeVisible();
     expect(field).toHaveFocus();
     expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle");
+
+    // It outlives the hide delay for as long as the field is open.
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(screen.getByLabelText("Video controls")).not.toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("pins the fullscreen controls from the keyboard with V", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
+
+    fireEvent.keyDown(window, { key: "v" });
+    expect(controls).not.toHaveClass("idle");
+    const pin = screen.getByRole("button", {
+      name: "Auto-hide fullscreen controls",
+    });
+    expect(pin).toHaveAttribute("aria-keyshortcuts", "V");
+    act(() => void vi.advanceTimersByTime(10_000));
+    expect(controls).not.toHaveClass("idle");
+
+    fireEvent.keyDown(window, { key: "v" });
+    expect(controls).toHaveClass("idle");
+  } finally {
+    reportFullscreen(false);
+    vi.useRealTimers();
+  }
+});
+
+test("reveals the fullscreen controls when focus reaches them", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    const user = await playForFullscreen();
+    const controls = await screen.findByLabelText("Video controls");
+    await enterFullscreen(user);
+    expect(controls).toHaveClass("idle");
+
+    act(() => screen.getByLabelText("Video timeline").focus());
+    expect(controls).not.toHaveClass("idle");
+    act(() => void vi.advanceTimersByTime(5_000));
+    expect(controls).not.toHaveClass("idle");
+
+    act(() => (document.activeElement as HTMLElement).blur());
+    act(() => void vi.advanceTimersByTime(3_000));
+    expect(controls).toHaveClass("idle");
   } finally {
     reportFullscreen(false);
     vi.useRealTimers();
@@ -3024,6 +3076,9 @@ test("reveals the fullscreen controls at the bottom edge and hides them after a 
     expect(controls).not.toHaveClass("idle");
 
     act(() => void fireEvent.mouseLeave(controls));
+    // The delay runs from the last time they were wanted, not from the leave.
+    act(() => void vi.advanceTimersByTime(1_000));
+    expect(controls).not.toHaveClass("idle");
     act(() => void vi.advanceTimersByTime(3_000));
     expect(controls).toHaveClass("idle");
   } finally {
