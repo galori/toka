@@ -9,7 +9,7 @@ use std::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
@@ -20,6 +20,8 @@ pub fn is_command(arguments: &[OsString]) -> bool {
             || argument == OsStr::new("reset")
             || argument == OsStr::new("--help")
             || argument == OsStr::new("-h")
+            || argument == OsStr::new("--version")
+            || argument == OsStr::new("-v")
     })
 }
 
@@ -37,6 +39,14 @@ pub fn run_command(
 
     if command == OsStr::new("--help") || command == OsStr::new("-h") {
         return print_help(GENERAL_HELP, stdout, stderr);
+    }
+
+    if command == OsStr::new("--version") || command == OsStr::new("-v") {
+        return print_help(
+            &format!("toka {}", env!("CARGO_PKG_VERSION")),
+            stdout,
+            stderr,
+        );
     }
 
     if command == OsStr::new("reset") {
@@ -270,6 +280,27 @@ mod tests {
             format!("{}\n", video.display())
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn version_and_help_flags_print_without_building_anything() {
+        for flag in ["-v", "--version", "-h", "--help"] {
+            let args = ["toka", flag].map(OsString::from).to_vec();
+            assert!(super::is_command(&args), "{flag}");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(&args, no_engine, no_reset, &mut stdout, &mut stderr);
+
+            assert_eq!(status, 0, "{flag}");
+            let output = String::from_utf8(stdout).unwrap();
+            if flag.contains('v') {
+                assert_eq!(output, format!("toka {}\n", env!("CARGO_PKG_VERSION")));
+            } else {
+                assert!(output.contains("--version"), "{output}");
+            }
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]
