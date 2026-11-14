@@ -6,6 +6,7 @@
 //! anywhere — by Toka's own handoff, by VLC, by hand — opens the same way.
 
 use crate::search::{is_supported_media, is_supported_video, MediaType};
+use std::collections::HashSet;
 use std::{
     borrow::Cow,
     ffi::OsString,
@@ -92,7 +93,7 @@ pub fn collect_directory_media(directory: &Path) -> Result<Vec<PathBuf>, String>
         ));
     }
     let mut videos = Vec::new();
-    collect_recursive(directory, &mut videos)
+    collect_recursive(directory, &mut videos, &mut HashSet::new())
         .map_err(|error| format!("{} could not be read: {error}", name(directory)))?;
     if videos.is_empty() {
         return Err(format!(
@@ -103,14 +104,22 @@ pub fn collect_directory_media(directory: &Path) -> Result<Vec<PathBuf>, String>
     Ok(videos)
 }
 
-fn collect_recursive(directory: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn collect_recursive(
+    directory: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    // Symlinked folders are followed, but each real folder is walked once, so
+    // a link back up the tree cannot loop.
+    if !visited.insert(std::fs::canonicalize(directory)?) {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(directory)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
-        // `file_type` does not follow symlinks, so a link back up the tree
-        // cannot loop; a subfolder that cannot be read is skipped.
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            let _ = collect_recursive(&path, out);
+        // A subfolder that cannot be read is skipped.
+        if path.is_dir() {
+            let _ = collect_recursive(&path, out, visited);
         } else if path.is_file() && is_supported_media(&path, MediaType::Both) {
             out.push(path);
         }

@@ -839,7 +839,25 @@ fn restore_from_trash(item: &DeletedVideo) -> std::io::Result<bool> {
     if item.original_path.symlink_metadata().is_ok() {
         return Ok(false);
     }
-    std::fs::rename(&item.trash_name, &item.original_path).map(|()| true)
+    // The Trash is protected, so a plain move can be refused; Finder is allowed.
+    if std::fs::rename(&item.trash_name, &item.original_path).is_ok() {
+        return Ok(true);
+    }
+    let Some(folder) = item.original_path.parent() else {
+        return Ok(false);
+    };
+    let moved = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv\ntell application \"Finder\" to move (POSIX file (item 1 of argv) as alias) to (POSIX file (item 2 of argv) as alias)\nend run",
+            "--",
+        ])
+        .arg(&item.trash_name)
+        .arg(folder)
+        .output()?
+        .status
+        .success();
+    Ok(moved)
 }
 
 #[tauri::command]

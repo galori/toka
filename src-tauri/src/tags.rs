@@ -242,11 +242,40 @@ fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::subtitles::Sidec
         else {
             continue;
         };
+        // `talk.en.srt` belongs to `talk.en.mp4` when that video exists.
+        if belongs_to_longer_video(&sidecar.path, old_stem) {
+            continue;
+        }
         let destination = sidecar.path.with_file_name(format!("{new_stem}{rest}"));
         if !exists(&destination) {
             let _ = fs::rename(&sidecar.path, &destination);
         }
     }
+}
+
+fn belongs_to_longer_video(sidecar: &Path, stem: &str) -> bool {
+    let (Some(directory), Some(name)) = (
+        sidecar.parent(),
+        sidecar.file_stem().and_then(|name| name.to_str()),
+    ) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        crate::search::is_supported_video(&path)
+            && path
+                .file_stem()
+                .and_then(|other| other.to_str())
+                .map(str::to_lowercase)
+                .is_some_and(|other| {
+                    other.len() > stem.len()
+                        && (name == other || name.starts_with(&format!("{other}.")))
+                })
+    })
 }
 
 fn target_path(path: &Path, tags: &Tags) -> PathBuf {
@@ -309,6 +338,20 @@ mod tests {
         assert!(directory.path().join(format!("{stem}.srt")).exists());
         assert!(directory.path().join(format!("{stem}.en.srt")).exists());
         assert!(directory.path().join("other.srt").exists());
+        assert!(!directory.path().join("talk.srt").exists());
+    }
+
+    #[test]
+    fn tagging_leaves_the_subtitles_of_a_longer_named_video_alone() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "talk.mp4");
+        file(&directory, "talk.en.mp4");
+        file(&directory, "talk.srt");
+        file(&directory, "talk.en.srt");
+
+        rename(&video, &Tags::new(["beach"])).unwrap();
+
+        assert!(directory.path().join("talk.en.srt").exists());
         assert!(!directory.path().join("talk.srt").exists());
     }
 

@@ -296,7 +296,15 @@ fn plocate_terms(query: &str) -> Result<Vec<String>, SearchError> {
     }
     Ok(terms
         .into_iter()
-        .map(|term| term.replace('[', "\\["))
+        .map(|term| {
+            if term.contains('[') {
+                // A pattern with a glob character must match the whole name, so
+                // the substring match is spelled out.
+                format!("*{}*", term.replace('[', "\\["))
+            } else {
+                term
+            }
+        })
         .collect())
 }
 
@@ -636,7 +644,7 @@ mod tests {
                     "--",
                     "@",
                     "12",
-                    "\\["
+                    "*\\[*"
                 ]
                 .into_iter()
                 .map(String::from)
@@ -648,7 +656,7 @@ mod tests {
     #[test]
     fn plocate_gets_every_path_for_or_and_escapes_tag_brackets() {
         assert_eq!(plocate_terms("beach OR mountain").unwrap(), ["*"]);
-        assert_eq!(plocate_terms("[beach]").unwrap(), ["\\[beach]"]);
+        assert_eq!(plocate_terms("[beach]").unwrap(), ["*\\[beach]*"]);
         assert_eq!(
             plocate_terms("beach mountain").unwrap(),
             ["beach", "mountain"]
