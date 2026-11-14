@@ -198,7 +198,7 @@ impl SearchProvider for PlocateSearchProvider {
         whole_path: bool,
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let terms = query_terms(query)?;
+        let terms = plocate_terms(query)?;
         // plocate matches the whole path unless it is confined to the base
         // name, so a folder search is the flag left off rather than added.
         let mut args = vec!["--ignore-case"];
@@ -245,7 +245,7 @@ impl SearchProvider for ManagedPlocateSearchProvider {
         whole_path: bool,
         context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        let terms = query_terms(query)?;
+        let terms = plocate_terms(query)?;
         let databases = managed_index::database_paths(&self.paths);
         if databases.is_empty() {
             return Ok(Vec::new());
@@ -279,6 +279,25 @@ impl SearchProvider for ManagedPlocateSearchProvider {
     fn revision(&self) -> u64 {
         managed_index::revision(&self.paths)
     }
+}
+
+/// plocate ANDs its patterns and reads `[` as the start of a glob class, so
+/// the shared terms need adjusting: an OR query asks for every path (the
+/// engine applies the expression afterwards) and a literal `[` is escaped, so
+/// the `[tag]` file-name syntax matches itself.
+#[cfg(any(target_os = "linux", test))]
+fn plocate_terms(query: &str) -> Result<Vec<String>, SearchError> {
+    let terms = query_terms(query)?;
+    let has_or = tokenize_query(query)?
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("OR"));
+    if has_or && terms.len() > 1 {
+        return Ok(vec!["*".into()]);
+    }
+    Ok(terms
+        .into_iter()
+        .map(|term| term.replace('[', "\\["))
+        .collect())
 }
 
 fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
@@ -617,12 +636,22 @@ mod tests {
                     "--",
                     "@",
                     "12",
-                    "["
+                    "\\["
                 ]
                 .into_iter()
                 .map(String::from)
                 .collect()
             ))
+        );
+    }
+
+    #[test]
+    fn plocate_gets_every_path_for_or_and_escapes_tag_brackets() {
+        assert_eq!(plocate_terms("beach OR mountain").unwrap(), ["*"]);
+        assert_eq!(plocate_terms("[beach]").unwrap(), ["\\[beach]"]);
+        assert_eq!(
+            plocate_terms("beach mountain").unwrap(),
+            ["beach", "mountain"]
         );
     }
 
@@ -665,17 +694,10 @@ mod tests {
             runner.invocations.lock().unwrap().first(),
             Some(&(
                 "plocate".into(),
-                [
-                    "--ignore-case",
-                    "--existing",
-                    "--",
-                    "home",
-                    "clip",
-                    "Holiday",
-                ]
-                .into_iter()
-                .map(String::from)
-                .collect()
+                ["--ignore-case", "--existing", "--", "*",]
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
             ))
         );
     }

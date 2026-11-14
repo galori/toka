@@ -3649,7 +3649,9 @@ export default function App() {
         page.searchId,
       );
       setPage((current) =>
-        current && current.query === next.query
+        current &&
+        current.query === next.query &&
+        current.searchId === page.searchId
           ? { ...next, results: [...current.results, ...next.results] }
           : current,
       );
@@ -3673,7 +3675,10 @@ export default function App() {
       page.searchId,
     );
     setPage((current) =>
-      current && current.query === next.query && current.page === loadedPage
+      current &&
+      current.query === next.query &&
+      current.searchId === page.searchId &&
+      current.page === loadedPage
         ? { ...next, results: [...current.results, ...next.results] }
         : current,
     );
@@ -3862,7 +3867,7 @@ export default function App() {
   // be typed into it rather than reaching the app; Ctrl is what gets a shortcut
   // through, beside the Ctrl+O that hands a search to another player.
   useEffect(() => {
-    if (playing) return;
+    if (playing || showFolderSetup || showSearchLogSettings || showHelp) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
         return;
@@ -3878,7 +3883,10 @@ export default function App() {
   });
 
   useEffect(() => {
+    // Ctrl+O is "Add folder" on the setup screen, so it must not also launch
+    // a player while another screen is in front of the results.
     if (playing || !activePlayer) return;
+    if (showFolderSetup || showSearchLogSettings || showHelp) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.key.toLowerCase() !== "o") return;

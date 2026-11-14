@@ -105,10 +105,12 @@ pub fn collect_directory_media(directory: &Path) -> Result<Vec<PathBuf>, String>
 
 fn collect_recursive(directory: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
-        if path.is_dir() {
-            collect_recursive(&path, out)?;
+        // `file_type` does not follow symlinks, so a link back up the tree
+        // cannot loop; a subfolder that cannot be read is skipped.
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let _ = collect_recursive(&path, out);
         } else if path.is_file() && is_supported_media(&path, MediaType::Both) {
             out.push(path);
         }

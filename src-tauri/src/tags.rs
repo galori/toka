@@ -205,13 +205,48 @@ fn rename(path: &Path, tags: &Tags) -> Result<TagUpdate, String> {
         if exists(&target) {
             return Err(format!("That name already exists: {}", target.display()));
         }
+        // Found before the move, while the video still has the name they match.
+        let sidecars = if path.is_dir() {
+            Vec::new()
+        } else {
+            crate::subtitles::sidecar_subtitles(path)
+        };
         fs::rename(path, &target)
             .map_err(|error| format!("{} could not be renamed: {error}", path.display()))?;
+        rename_sidecars(path, &target, sidecars);
     }
     Ok(TagUpdate {
         tags: tags.values().to_vec(),
         path: target,
     })
+}
+
+/// Keeps subtitle files beside a renamed video, so `talk.srt` follows
+/// `talk.mp4` to `talk [beach].mp4`. Best effort: a sidecar that cannot move
+/// (or whose new name is taken) stays where it is.
+fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::subtitles::SidecarSubtitle>) {
+    let (Some(old_stem), Some(new_stem)) = (
+        from.file_stem().and_then(|stem| stem.to_str()),
+        to.file_stem().and_then(|stem| stem.to_str()),
+    ) else {
+        return;
+    };
+    for sidecar in sidecars {
+        let Some(name) = sidecar.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name
+            .get(..old_stem.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(old_stem))
+            .and_then(|_| name.get(old_stem.len()..))
+        else {
+            continue;
+        };
+        let destination = sidecar.path.with_file_name(format!("{new_stem}{rest}"));
+        if !exists(&destination) {
+            let _ = fs::rename(&sidecar.path, &destination);
+        }
+    }
 }
 
 fn target_path(path: &Path, tags: &Tags) -> PathBuf {
@@ -253,6 +288,28 @@ mod tests {
 
     fn name_of(path: &Path) -> String {
         path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn tagging_a_video_carries_its_subtitle_files_along() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "talk.mp4");
+        file(&directory, "talk.srt");
+        file(&directory, "talk.en.srt");
+        file(&directory, "other.srt");
+
+        let update = rename(&video, &Tags::new(["beach"])).unwrap();
+
+        let stem = update
+            .path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(directory.path().join(format!("{stem}.srt")).exists());
+        assert!(directory.path().join(format!("{stem}.en.srt")).exists());
+        assert!(directory.path().join("other.srt").exists());
+        assert!(!directory.path().join("talk.srt").exists());
     }
 
     #[test]
