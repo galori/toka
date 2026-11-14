@@ -4870,6 +4870,18 @@ test("hides the native surface while the Add-ons menu is open", async () => {
       expect.objectContaining({ visible: true }),
     ),
   );
+
+  // Clicking away closes it too, and the picture has to come back then as well.
+  await user.click(addons);
+  await screen.findByRole("menu", { name: "Add-ons" });
+  invokeMock.mockClear();
+  fireEvent.pointerDown(document.body);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: true }),
+    ),
+  );
 });
 
 test("hands the fullscreen native surface everything but the scrubber sliver", async () => {
