@@ -2626,6 +2626,14 @@ test("enters fullscreen with the scrubber and toggles F between windowed and ful
     ).toBeVisible();
     expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
     expect(screen.getByLabelText("Video timeline")).toBeVisible();
+    // The collapsed bar ignores the pointer so the picture beneath stays
+    // clickable, but the scrubber itself must still take clicks and drags.
+    expect(
+      getComputedStyle(screen.getByLabelText("Video controls")).pointerEvents,
+    ).toBe("none");
+    expect(
+      getComputedStyle(screen.getByLabelText("Video timeline")).pointerEvents,
+    ).toBe("auto");
 
     // A second F leaves fullscreen directly; there is no intermediate mode.
     fireEvent.keyDown(window, { key: "f" });
