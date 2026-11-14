@@ -242,7 +242,8 @@ fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::subtitles::Sidec
         else {
             continue;
         };
-        // `talk.en.srt` belongs to `talk.en.mp4` when that video exists.
+        // `talk.en.srt` belongs to `talk.en.mp4` when that video exists, and
+        // `talk.srt` to `talk.mkv` once `talk.mp4` has moved away.
         if belongs_to_longer_video(&sidecar.path, old_stem) {
             continue;
         }
@@ -272,7 +273,7 @@ fn belongs_to_longer_video(sidecar: &Path, stem: &str) -> bool {
                 .and_then(|other| other.to_str())
                 .map(str::to_lowercase)
                 .is_some_and(|other| {
-                    other.len() > stem.len()
+                    other.len() >= stem.len()
                         && (name == other || name.starts_with(&format!("{other}.")))
                 })
     })

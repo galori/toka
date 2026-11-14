@@ -3651,7 +3651,8 @@ export default function App() {
       setPage((current) =>
         current &&
         current.query === next.query &&
-        current.searchId === page.searchId
+        current.searchId === page.searchId &&
+        current.page === loadedPages
           ? { ...next, results: [...current.results, ...next.results] }
           : current,
       );

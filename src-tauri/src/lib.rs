@@ -836,7 +836,7 @@ fn delete_video(
 /// has taken the original path since, the restore is reported as failed.
 #[cfg(target_os = "macos")]
 fn restore_from_trash(item: &DeletedVideo) -> std::io::Result<bool> {
-    if item.original_path.symlink_metadata().is_ok() {
+    if !Path::new(&item.trash_name).is_absolute() || item.original_path.symlink_metadata().is_ok() {
         return Ok(false);
     }
     // The Trash is protected, so a plain move can be refused; Finder is allowed.
