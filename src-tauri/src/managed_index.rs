@@ -143,6 +143,10 @@ struct PersistedFolderStatus {
     scanned_images: u64,
     #[serde(default)]
     current_path: Option<PathBuf>,
+    /// True while the scan is building this folder's first database, so its
+    /// totals are not yet part of the persisted `counts`.
+    #[serde(default)]
+    first_scan: bool,
 }
 
 /// What the indexer has seen so far during one folder scan.
@@ -152,6 +156,7 @@ struct ScanProgress {
     videos: u64,
     images: u64,
     current: Option<PathBuf>,
+    first_scan: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -224,17 +229,14 @@ impl IndexManager {
             let mut cached = self.legacy_counts.lock().unwrap();
             *cached.get_or_insert_with(|| indexed_media_counts(&self.paths, &config.folders))
         });
-        // A folder's first scan has no database yet, so its totals are not in
-        // `counts`; show what the scan has found so far. Rescans of folders
-        // that already have a database are in `counts` already.
+        // A folder's first scan is not in `counts` until it is Ready, so show
+        // what the scan has found so far. Rescans of folders that already have
+        // a database are in `counts` already.
         for folder in &config.folders {
-            if self.paths.database(&folder.id).is_file() {
-                continue;
-            }
             if let Some(entry) = status
                 .folders
                 .get(&folder.id)
-                .filter(|entry| entry.status == FolderStatus::Indexing)
+                .filter(|entry| entry.status == FolderStatus::Indexing && entry.first_scan)
             {
                 counts.videos = counts.videos.saturating_add(entry.scanned_videos);
                 counts.images = counts.images.saturating_add(entry.scanned_images);
@@ -328,6 +330,7 @@ impl IndexManager {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("Toka could not remove its old index: {error}")),
         }
+        let _guard = STATUS_LOCK.lock().unwrap();
         let mut status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
         status.folders.remove(id);
         status.counts = Some(indexed_media_counts(&self.paths, &config.folders));
@@ -531,6 +534,9 @@ fn updatedb_path() -> PathBuf {
     bundled_tool("updatedb", "TOKA_UPDATEDB_PATH")
 }
 
+/// Serialises read-modify-write updates of the status file within this process.
+static STATUS_LOCK: Mutex<()> = Mutex::new(());
+
 fn set_folder_status(
     paths: &IndexPaths,
     id: &str,
@@ -538,6 +544,7 @@ fn set_folder_status(
     message: Option<String>,
     advance_revision: bool,
 ) -> Result<(), String> {
+    let _guard = STATUS_LOCK.lock().unwrap();
     let mut status = load_json::<PersistedStatus>(&paths.status)?.unwrap_or_default();
     status.folders.insert(
         id.to_owned(),
@@ -560,6 +567,7 @@ fn set_folder_progress(
     id: &str,
     progress: &ScanProgress,
 ) -> Result<(), String> {
+    let _guard = STATUS_LOCK.lock().unwrap();
     let mut status = load_json::<PersistedStatus>(&paths.status)?.unwrap_or_default();
     let folder = status.folders.entry(id.to_owned()).or_default();
     folder.status = FolderStatus::Indexing;
@@ -568,6 +576,7 @@ fn set_folder_progress(
     folder.scanned_videos = progress.videos;
     folder.scanned_images = progress.images;
     folder.current_path = progress.current.clone();
+    folder.first_scan = progress.first_scan;
     write_json(&paths.status, &status)
 }
 
@@ -618,12 +627,43 @@ fn indexed_media_counts(paths: &IndexPaths, folders: &[ConfiguredFolder]) -> Med
     count_indexed_media(&indexed)
 }
 
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn hash_path(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether any component below `root` starts with a dot, matching the entries
+/// `count_indexed_media` leaves out.
+fn is_under_hidden_entry(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root).is_ok_and(|relative| {
+        relative
+            .components()
+            .any(|part| part.as_os_str().as_encoded_bytes().starts_with(b"."))
+    })
+}
+
 fn run_updatedb_with_progress(
     paths: &IndexPaths,
     folder: &ConfiguredFolder,
     program: &Path,
+    logger: &IndexLogger,
 ) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
     let database = paths.database(&folder.id);
+    let first_scan = !database.is_file();
     let mut child = Command::new(program)
         .args(updatedb_arguments(&folder.path, &database))
         .stdout(Stdio::piped())
@@ -654,8 +694,11 @@ fn run_updatedb_with_progress(
 
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
-    let logger = IndexLogger::new(paths.index_log.clone());
-    let mut progress = ScanProgress::default();
+    let mut progress = ScanProgress {
+        first_scan,
+        ..ScanProgress::default()
+    };
+    let mut logged_directories = HashSet::new();
     let mut last_report = Instant::now() - Duration::from_secs(1);
     loop {
         line.clear();
@@ -672,25 +715,30 @@ fn run_updatedb_with_progress(
             break;
         }
         progress.files = progress.files.saturating_add(1);
-        let seen = PathBuf::from(
-            String::from_utf8_lossy(line.strip_suffix(b"\n").unwrap_or(&line)).into_owned(),
-        );
-        if is_supported_video(&seen) && is_non_empty_file(&seen) {
-            progress.videos = progress.videos.saturating_add(1);
-        }
-        if is_supported_image(&seen) && is_non_empty_file(&seen) {
-            progress.images = progress.images.saturating_add(1);
+        let seen = path_from_bytes(line.strip_suffix(b"\n").unwrap_or(&line));
+        // Live counts are approximate: they skip the per-file size check, and
+        // the exact totals replace them when the folder becomes Ready.
+        if !is_under_hidden_entry(&folder.path, &seen) {
+            if is_supported_video(&seen) {
+                progress.videos = progress.videos.saturating_add(1);
+            }
+            if is_supported_image(&seen) {
+                progress.images = progress.images.saturating_add(1);
+            }
         }
         if let Some(directory) = seen.parent() {
             if progress.current.as_deref() != Some(directory) {
                 progress.current = Some(directory.to_path_buf());
-                logger.record(format!(
-                    "scanning {} ({} files, {} videos, {} images so far)",
-                    directory.display(),
-                    progress.files,
-                    progress.videos,
-                    progress.images
-                ));
+                // Log each directory once, even if updatedb returns to it.
+                if logged_directories.insert(hash_path(directory)) {
+                    logger.record(format!(
+                        "scanning {} ({} files, {} videos, {} images so far)",
+                        directory.display(),
+                        progress.files,
+                        progress.videos,
+                        progress.images
+                    ));
+                }
             }
         }
         if last_report.elapsed() >= Duration::from_millis(500) {
@@ -703,6 +751,8 @@ fn run_updatedb_with_progress(
             last_report = Instant::now();
         }
     }
+    // Record the final tallies the throttled reports above may have skipped.
+    let _ = set_folder_progress(paths, &folder.id, &progress);
     let status = match child.wait() {
         Ok(status) => status,
         Err(error) => {
@@ -797,7 +847,7 @@ fn refresh_folder_with_optional_worker(
     logger.record(format!("indexing folder: {}", folder.path.display()));
     set_folder_status(paths, &folder.id, FolderStatus::Indexing, None, false)?;
     let database = paths.database(&folder.id);
-    let (status, stderr) = match run_updatedb_with_progress(paths, folder, program) {
+    let (status, stderr) = match run_updatedb_with_progress(paths, folder, program, &logger) {
         Ok(output) => output,
         Err(error) => {
             logger.record(format!(
@@ -1099,7 +1149,13 @@ mod tests {
         fs::write(&fake_updatedb, "#!/bin/sh\nprintf 'one\\none\\n'\n").unwrap();
         fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let (status, stderr) = run_updatedb_with_progress(&paths, &folder, &fake_updatedb).unwrap();
+        let (status, stderr) = run_updatedb_with_progress(
+            &paths,
+            &folder,
+            &fake_updatedb,
+            &IndexLogger::new(paths.index_log.clone()),
+        )
+        .unwrap();
 
         assert!(status.success());
         assert!(stderr.is_empty());
@@ -1109,9 +1165,9 @@ mod tests {
                 .unwrap()
                 .folders["folder"]
                 .scanned_files,
-            1
+            2
         );
-        assert_eq!(IndexManager::new(paths).state().unwrap().indexing_files, 1);
+        assert_eq!(IndexManager::new(paths).state().unwrap().indexing_files, 2);
     }
 
     #[cfg(unix)]
@@ -1143,7 +1199,13 @@ mod tests {
         .unwrap();
         fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
 
-        run_updatedb_with_progress(&paths, &folder, &fake_updatedb).unwrap();
+        run_updatedb_with_progress(
+            &paths,
+            &folder,
+            &fake_updatedb,
+            &IndexLogger::new(paths.index_log.clone()),
+        )
+        .unwrap();
 
         let log = fs::read_to_string(&paths.index_log).unwrap();
         let in_a = log
@@ -1176,6 +1238,7 @@ mod tests {
                 videos: 3,
                 images: 1,
                 current: Some(media.join("Trips")),
+                first_scan: true,
             },
         )
         .unwrap();
@@ -1425,5 +1488,88 @@ mod tests {
         let state = manager.state().unwrap();
         assert_eq!(state.revision, 1);
         assert_eq!(state.folders[0].status, FolderStatus::Ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_counts_skip_hidden_entries_and_log_each_directory_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        let paths = IndexPaths::under(root.path().join("state"));
+        let folder = ConfiguredFolder {
+            id: "folder".into(),
+            path: media.clone(),
+            mount: None,
+        };
+        let fake_updatedb = root.path().join("updatedb");
+        fs::write(
+            &fake_updatedb,
+            format!(
+                "#!/bin/sh\nprintf '{m}/a/one.mp4\\n{m}/a/sub/two.mp4\\n{m}/a/three.mp4\\n{m}/.Trash/x.mp4\\n{m}/a/.hidden.png\\n'\n",
+                m = media.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_updatedb, fs::Permissions::from_mode(0o700)).unwrap();
+
+        run_updatedb_with_progress(
+            &paths,
+            &folder,
+            &fake_updatedb,
+            &IndexLogger::new(paths.index_log.clone()),
+        )
+        .unwrap();
+
+        let entry = &load_json::<PersistedStatus>(&paths.status)
+            .unwrap()
+            .unwrap()
+            .folders["folder"];
+        assert_eq!((entry.scanned_videos, entry.scanned_images), (3, 0));
+        let log = fs::read_to_string(&paths.index_log).unwrap();
+        let in_a = format!("scanning {}/a ", media.display());
+        assert_eq!(log.matches(&in_a).count(), 1, "{log}");
+    }
+
+    #[test]
+    fn first_scan_live_counts_persist_until_ready() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        fs::create_dir_all(&paths.databases).unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        write_json(
+            &paths.config,
+            &IndexConfig {
+                folders: vec![ConfiguredFolder {
+                    id: "f".into(),
+                    path: media,
+                    mount: None,
+                }],
+            },
+        )
+        .unwrap();
+        // The database already exists but the folder is not Ready yet.
+        fs::write(paths.database("f"), b"db").unwrap();
+        let mut status = PersistedStatus {
+            counts: Some(MediaCounts::default()),
+            ..PersistedStatus::default()
+        };
+        status.folders.insert(
+            "f".into(),
+            PersistedFolderStatus {
+                status: FolderStatus::Indexing,
+                scanned_videos: 4,
+                scanned_images: 2,
+                first_scan: true,
+                ..PersistedFolderStatus::default()
+            },
+        );
+        write_json(&paths.status, &status).unwrap();
+
+        let state = IndexManager::new(paths).state().unwrap();
+
+        assert_eq!((state.indexed_videos, state.indexed_images), (4, 2));
     }
 }
