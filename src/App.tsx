@@ -1352,6 +1352,8 @@ function Player({
   const [addonError, setAddonError] = useState<string>();
   const addonMenuWrap = useRef<HTMLDivElement>(null);
   const addonMenuElement = useRef<HTMLDivElement>(null);
+  const addonOpenRef = useRef(false);
+  const refreshNativeBounds = useRef<(() => void) | undefined>(undefined);
   const addonVideoGeneration = useRef(0);
   useLayoutEffect(() => {
     addonVideoGeneration.current += 1;
@@ -1699,6 +1701,13 @@ function Player({
 
   const selectedSubtitle = subtitles[subtitleIndex];
 
+  // Opening or closing the menu only changes visibility. It must not restart
+  // the effect below, whose locals (an ended video already advancing, the
+  // subtitle lookup budget) belong to the current playback.
+  useEffect(() => {
+    addonOpenRef.current = addonOpen;
+    refreshNativeBounds.current?.();
+  }, [addonOpen]);
   useEffect(() => {
     // The error view replaces the surface these measurements come from, so the
     // watchers have to go with it: left running, the next resize would measure
@@ -1739,10 +1748,13 @@ function Player({
         y: Math.round(bounds.top),
         width: Math.round(visibleWidth),
         height: Math.round(visibleHeight),
-        visible: visibleWidth > 0 && visibleHeight > 0,
+        // The Add-ons menu drops over the picture, and GTK paints the native
+        // surface above it, so the picture steps aside while the menu is open.
+        visible: !addonOpenRef.current && visibleWidth > 0 && visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
+    refreshNativeBounds.current = updateBounds;
     const observer = new ResizeObserver(updateBounds);
     observer.observe(surface);
     window.addEventListener("resize", updateBounds);
@@ -1779,6 +1791,7 @@ function Player({
       }
     }, 250);
     return () => {
+      refreshNativeBounds.current = undefined;
       observer.disconnect();
       window.removeEventListener("resize", updateBounds);
       window.clearInterval(poll);

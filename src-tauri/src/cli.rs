@@ -10,7 +10,7 @@ use std::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  --index-stats   Show what the indexer has found and whether it is running";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version\n  --index-stats   Show what the indexer has found and whether it is running";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the indexer is active, the indexer service state, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const SEARCH_HELP: &str =
@@ -23,6 +23,8 @@ pub fn is_command(arguments: &[OsString]) -> bool {
             || argument == OsStr::new("--index-stats")
             || argument == OsStr::new("--help")
             || argument == OsStr::new("-h")
+            || argument == OsStr::new("--version")
+            || argument == OsStr::new("-v")
     })
 }
 
@@ -40,14 +42,22 @@ pub fn run_command(
     };
 
     if command == OsStr::new("--help") || command == OsStr::new("-h") {
-        return print_help(GENERAL_HELP, stdout, stderr);
+        return print_text(GENERAL_HELP, stdout, stderr);
+    }
+
+    if command == OsStr::new("--version") || command == OsStr::new("-v") {
+        return print_text(
+            &format!("toka {}", env!("CARGO_PKG_VERSION")),
+            stdout,
+            stderr,
+        );
     }
 
     if command == OsStr::new("--index-stats") {
         if arguments.len() == 3
             && (arguments[2] == OsStr::new("--help") || arguments[2] == OsStr::new("-h"))
         {
-            return print_help(INDEX_STATS_HELP, stdout, stderr);
+            return print_text(INDEX_STATS_HELP, stdout, stderr);
         }
         if arguments.len() > 2 {
             let _ = writeln!(stderr, "Usage: toka --index-stats");
@@ -92,7 +102,7 @@ fn run_search_command(
     if arguments.len() == 1
         && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
     {
-        return print_help(SEARCH_HELP, stdout, stderr);
+        return print_text(SEARCH_HELP, stdout, stderr);
     }
 
     let query = match query_from_arguments(arguments) {
@@ -122,7 +132,7 @@ fn run_reset_command(
     if arguments.len() == 1
         && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
     {
-        return print_help(RESET_HELP, stdout, stderr);
+        return print_text(RESET_HELP, stdout, stderr);
     }
     let confirmed = arguments.len() == 1
         && (arguments[0] == OsStr::new("--yes") || arguments[0] == OsStr::new("-y"));
@@ -168,9 +178,9 @@ fn run_reset_command(
     0
 }
 
-fn print_help(help: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
+fn print_text(help: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
     if let Err(error) = writeln!(stdout, "{help}").and_then(|()| stdout.flush()) {
-        let _ = writeln!(stderr, "toka: could not write help: {error}");
+        let _ = writeln!(stderr, "toka: could not write output: {error}");
         return 1;
     }
     0
@@ -314,6 +324,39 @@ mod tests {
             format!("{}\n", video.display())
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn version_and_help_flags_print_without_building_anything() {
+        for (flag, is_version) in [
+            ("-v", true),
+            ("--version", true),
+            ("-h", false),
+            ("--help", false),
+        ] {
+            let args = ["toka", flag].map(OsString::from).to_vec();
+            assert!(super::is_command(&args), "{flag}");
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_reset,
+                no_stats,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            let output = String::from_utf8(stdout).unwrap();
+            if is_version {
+                assert_eq!(output, format!("toka {}\n", env!("CARGO_PKG_VERSION")));
+            } else {
+                assert!(output.contains("--version"), "{output}");
+            }
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]
