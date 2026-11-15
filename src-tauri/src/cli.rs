@@ -17,10 +17,12 @@ const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
 /// The version line shows the same Git SHA as the launch screen. The build
-/// script hands it over as `VITE_GIT_SHA`; a plain `cargo build` has none, so it
-/// reads "development" exactly as the frontend does.
+/// script hands it over as `TOKA_GIT_SHA`; a build with no provenance has none,
+/// so it reads "development" exactly as the frontend does.
 fn version_text(git_sha: Option<&str>) -> String {
-    let sha = git_sha.filter(|sha| !sha.is_empty()).unwrap_or("development");
+    let sha = git_sha
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or("development");
     format!("toka {} (Git SHA {sha})", env!("CARGO_PKG_VERSION"))
 }
 
@@ -55,7 +57,7 @@ pub fn run_command(
     }
 
     if command == OsStr::new("--version") || command == OsStr::new("-v") {
-        return print_text(&version_text(option_env!("VITE_GIT_SHA")), stdout, stderr);
+        return print_text(&version_text(option_env!("TOKA_GIT_SHA")), stdout, stderr);
     }
 
     if command == OsStr::new("--index-stats") {
@@ -362,7 +364,7 @@ mod tests {
             if is_version {
                 assert_eq!(
                     output,
-                    format!("{}\n", super::version_text(option_env!("VITE_GIT_SHA")))
+                    format!("{}\n", super::version_text(option_env!("TOKA_GIT_SHA")))
                 );
             } else {
                 assert!(output.contains("--version"), "{output}");
