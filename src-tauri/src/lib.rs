@@ -471,6 +471,8 @@ async fn video_preview(
 /// are looked up after the move, because the trash renames an item whose name
 /// is already taken, so the file's own name is not enough to identify it.
 fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
+    #[cfg(not(target_os = "macos"))]
+    let before = trash_listing();
     #[cfg(target_os = "linux")]
     let output = std::process::Command::new("gio")
         .args(["trash", path.to_string_lossy().as_ref()])
@@ -499,19 +501,20 @@ fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let listing = std::process::Command::new("gio")
-            .args([
-                "list",
-                "-u",
-                "-a",
-                "trash::orig-path,trash::deletion-date",
-                "trash:///",
-            ])
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default();
-        Ok(newest_trash_item(&listing, path).unwrap_or(name))
+        // The item this call added is the one whose name was not there before,
+        // whatever the trash renamed it to and whatever the clock says.
+        Ok(new_trash_item(&before, &trash_listing()).unwrap_or_else(|| percent_encode(&name)))
     }
+}
+
+/// The names of everything in the Linux trash, as URIs (`gio list -u`).
+#[cfg(not(target_os = "macos"))]
+fn trash_listing() -> String {
+    std::process::Command::new("gio")
+        .args(["list", "-u", "trash:///"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// The AppleScript run by `move_to_trash`. The path arrives as an argument, so
@@ -524,26 +527,39 @@ const MACOS_TRASH_SCRIPT: &str = "on run argv\n\
     end tell\n\
     end run";
 
-/// The name, inside the trash, of the most recently trashed item that came from
-/// `original`, read from `gio list -u -a trash::orig-path,trash::deletion-date`.
+/// The one item in `after` that was not in `before`: two listings of the
+/// trash, one name per line. Anything other than exactly one new item is
+/// ambiguous (something else was trashed meanwhile), so it is not guessed at.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn newest_trash_item(listing: &str, original: &Path) -> Option<String> {
-    let original = original.to_string_lossy();
-    listing
+fn new_trash_item(before: &str, after: &str) -> Option<String> {
+    let known: std::collections::HashSet<&str> = before.lines().map(name_column).collect();
+    let mut added = after
         .lines()
-        .filter_map(|line| {
-            let mut columns = line.split('\t');
-            let uri = columns.next()?;
-            let attributes = columns.last()?;
-            let from = attributes.strip_prefix("trash::orig-path=")?;
-            let (orig, date) = from.split_once(" trash::deletion-date=")?;
-            if orig != original {
-                return None;
+        .map(name_column)
+        .filter(|uri| !known.contains(uri));
+    let item = added.next()?;
+    if added.next().is_some() {
+        return None;
+    }
+    item.strip_prefix("trash:///").map(str::to_owned)
+}
+
+fn name_column(line: &str) -> &str {
+    line.split('\t').next().unwrap_or(line)
+}
+
+/// The percent-encoded form `gio list -u` uses for names, so a name that had
+/// to be guessed still restores.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn percent_encode(name: &str) -> String {
+    name.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
             }
-            Some((date.to_owned(), uri.strip_prefix("trash:///")?.to_owned()))
+            _ => format!("%{byte:02X}"),
         })
-        .max()
-        .map(|(_, name)| name)
+        .collect()
 }
 
 /// What a trash helper's result means for the file it was handed. A helper that
@@ -840,7 +856,9 @@ fn restore_from_trash(item: &DeletedVideo) -> std::io::Result<bool> {
         return Ok(false);
     }
     // The Trash is protected, so a plain move can be refused; Finder is allowed.
-    if std::fs::rename(&item.trash_name, &item.original_path).is_ok() {
+    if tags::move_without_replacing(std::path::Path::new(&item.trash_name), &item.original_path)
+        .is_ok()
+    {
         return Ok(true);
     }
     let Some(folder) = item.original_path.parent() else {
@@ -1705,16 +1723,21 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_trash_item_from_a_path_is_the_one_restored() {
-        let listing = "trash:///clip.mp4\t2\t(regular)\ttrash::orig-path=/a/clip.mp4 trash::deletion-date=2026-01-01T10:00:00\n\
-trash:///clip.mp4.2\t2\t(regular)\ttrash::orig-path=/b/clip.mp4 trash::deletion-date=2026-01-02T10:00:00\n\
-trash:///clip.mp4.3\t2\t(regular)\ttrash::orig-path=/a/clip.mp4 trash::deletion-date=2026-01-03T10:00:00\n";
+    fn the_item_a_delete_added_to_the_trash_is_the_one_restored() {
+        let before = "trash:///clip.mp4\t2\t(regular)\ntrash:///clip.mp4.9\t2\t(regular)\n";
+        let after = "trash:///clip.mp4\t2\t(regular)\ntrash:///clip.mp4.9\t2\t(regular)\ntrash:///clip.mp4.10\t2\t(regular)\n";
 
         assert_eq!(
-            newest_trash_item(listing, Path::new("/a/clip.mp4")).as_deref(),
-            Some("clip.mp4.3")
+            new_trash_item(before, after).as_deref(),
+            Some("clip.mp4.10")
         );
-        assert_eq!(newest_trash_item(listing, Path::new("/c/clip.mp4")), None);
+        assert_eq!(new_trash_item(after, after), None);
+        assert_eq!(new_trash_item("", after), None);
+    }
+
+    #[test]
+    fn a_guessed_trash_name_is_percent_encoded() {
+        assert_eq!(percent_encode("100% [a].mp4"), "100%25%20%5Ba%5D.mp4");
     }
 
     #[test]
