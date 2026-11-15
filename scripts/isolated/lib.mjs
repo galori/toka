@@ -72,6 +72,9 @@ export function isolatedPaths(worktree, env = process.env) {
     shimDir: path.join(home, "bin"),
     shim: path.join(home, "bin", "systemctl"),
     shimLog: path.join(home, "run", "systemctl-shim.log"),
+    indexerPidFile: path.join(home, "run", "indexer.pid"),
+    indexerLog: path.join(home, "run", "indexer.log"),
+    tmp: path.join(home, "tmp"),
     fixtures: path.join(home, "fixtures"),
     runDir: path.join(home, "run"),
     state: path.join(home, "run", "state.json"),
@@ -93,21 +96,41 @@ export function isolatedEnv(paths, base = process.env) {
     XDG_CONFIG_HOME: paths.config,
     XDG_DATA_HOME: paths.data,
     XDG_CACHE_HOME: paths.cache,
+    // Toka keeps its thumbnail cache under the temp dir, and reset deletes it.
+    TMPDIR: paths.tmp,
     PATH: `${paths.shimDir}${path.delimiter}${base.PATH ?? ""}`,
   };
+}
+
+function quote(text) {
+  return `'${text.replaceAll("'", "'\\''")}'`;
 }
 
 /**
  * A stand-in `systemctl`. The app runs `systemctl --user start|stop
  * toka-indexer.service` on launch and on "reset index"; unshimmed, an isolated
- * instance would stop the user's real indexer. The shim records the call and
- * succeeds without doing anything.
+ * instance would stop the user's real indexer. The shim logs each call and acts
+ * only on the isolated indexer: `stop` ends it and `start` respawns it if it is
+ * not running, as systemd would. Every other call is a no-op that succeeds.
  */
-export function shimScript(logPath) {
+export function shimScript(paths) {
   return `#!/bin/sh
 # Installed by scripts/isolated: isolated Toka must never control the real
-# toka-indexer.service. Every call is recorded here and reported as success.
-printf '%s systemctl %s\\n' "$(date -Is)" "$*" >> '${logPath.replaceAll("'", "'\\''")}'
+# toka-indexer.service. It controls the isolated indexer instead.
+PIDFILE=${quote(paths.indexerPidFile)}
+printf '%s systemctl %s\\n' "$(date -Is)" "$*" >> ${quote(paths.shimLog)}
+pid=$(cat "$PIDFILE" 2>/dev/null)
+case "$*" in
+  *"stop toka-indexer.service"*)
+    [ -n "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null
+    ;;
+  *"start toka-indexer.service"*)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      setsid ${quote(paths.binary)} --indexer >> ${quote(paths.indexerLog)} 2>&1 </dev/null &
+      echo $! > "$PIDFILE"
+    fi
+    ;;
+esac
 exit 0
 `;
 }
@@ -147,6 +170,35 @@ export function isProcessOf(pid, binary, procRoot = "/proc") {
   }
 }
 
+/**
+ * True when `pid` is `paths.binary` running with this worktree's isolated
+ * config. The environment check keeps one worktree from signalling another's
+ * app when they share a cargo target directory.
+ */
+export function isIsolatedProcess(pid, paths, procRoot = "/proc") {
+  if (!isProcessOf(pid, paths.binary, procRoot)) return false;
+  try {
+    const environment = readFileSync(
+      path.join(procRoot, String(pid), "environ"),
+      "utf8",
+    ).split("\0");
+    return environment.includes(`XDG_CONFIG_HOME=${paths.config}`);
+  } catch {
+    return false;
+  }
+}
+
+/** The live indexer PID: the pid file wins, since the shim may have respawned it. */
+export function currentIndexerPid(paths, state) {
+  try {
+    const pid = Number.parseInt(readFileSync(paths.indexerPidFile, "utf8"), 10);
+    if (Number.isInteger(pid)) return pid;
+  } catch {
+    /* no pid file yet */
+  }
+  return state?.indexerPid ?? null;
+}
+
 /** True when `pid` is alive and is the node process running `scriptPath`. */
 export function isSupervisorOf(pid, scriptPath, procRoot = "/proc") {
   if (!Number.isInteger(pid) || pid <= 1) return false;
@@ -155,7 +207,13 @@ export function isSupervisorOf(pid, scriptPath, procRoot = "/proc") {
       path.join(procRoot, String(pid), "cmdline"),
       "utf8",
     ).split("\0");
-    return parts.includes(scriptPath);
+    // A foreground launch may have been started with a relative path.
+    return parts.some(
+      (part) =>
+        part.endsWith(".mjs") &&
+        (part === scriptPath ||
+          scriptPath.endsWith(`/${path.normalize(part)}`)),
+    );
   } catch {
     return false;
   }
@@ -171,8 +229,9 @@ export function readState(paths) {
 
 /** What is actually running for a worktree, judged from live processes. */
 export function describeRun(paths, state = readState(paths)) {
-  const app = state ? isProcessOf(state.appPid, paths.binary) : false;
-  const indexer = state ? isProcessOf(state.indexerPid, paths.binary) : false;
+  const indexerPid = state ? currentIndexerPid(paths, state) : null;
+  const app = state ? isIsolatedProcess(state.appPid, paths) : false;
+  const indexer = state ? isIsolatedProcess(indexerPid, paths) : false;
   return {
     worktree: paths.worktree,
     name: paths.name,
@@ -180,7 +239,7 @@ export function describeRun(paths, state = readState(paths)) {
     binary: paths.binary,
     built: existsSync(paths.binary),
     appPid: state?.appPid ?? null,
-    indexerPid: state?.indexerPid ?? null,
+    indexerPid,
     appRunning: app,
     indexerRunning: indexer,
     running: app || indexer,

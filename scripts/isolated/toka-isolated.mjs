@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -17,7 +18,8 @@ import {
   gitToplevel,
   gitWorktrees,
   indexerArguments,
-  isProcessOf,
+  currentIndexerPid,
+  isIsolatedProcess,
   isSupervisorOf,
   isolatedEnv,
   isolatedPaths,
@@ -41,7 +43,7 @@ Commands:
   stop     Stop the app and indexer (--clean also deletes the isolated home).
   status   Show what is running, per worktree (--all lists every worktree).
   env      Print shell exports that point a shell at the isolated home, so
-           "eval \\"$(... env)\\"" lets the toka CLI act on it.
+           'eval "$(... env)"' lets the toka CLI act on it.
 
 Flags:
   --worktree <path>   Target this worktree (default: the current one).
@@ -118,6 +120,10 @@ async function build(flags) {
     ],
     { cwd: worktree, env, stdio: "inherit", detached: true },
   );
+  child.on("error", (error) => {
+    console.error(`Could not run npm: ${error.message}`);
+    process.exit(1);
+  });
   const forward = (signal) => () => {
     try {
       process.kill(-child.pid, signal);
@@ -136,15 +142,15 @@ async function build(flags) {
   } else {
     console.error(`${paths.schemaFile} had local edits; left as is.`);
   }
-  const leftovers = spawnSync(
-    "pgrep",
-    ["-f", "-a", `${worktree}.*(rustc|cargo)`],
-    {
-      encoding: "utf8",
-    },
-  );
+  // Leftovers cannot be attributed to this build reliably, so report them and
+  // leave killing them to the caller (AGENTS.md: check, then terminate).
+  const leftovers = spawnSync("pgrep", ["-a", "-f", "rustc|cargo"], {
+    encoding: "utf8",
+  });
   if (leftovers.stdout.trim()) {
-    console.error(`Leftover build processes:\n${leftovers.stdout}`);
+    console.error(
+      `cargo/rustc processes still running after the build; terminate them if they are orphans:\n${leftovers.stdout}`,
+    );
   }
   if (status !== 0) process.exit(status);
   console.log(`Built (not installed): ${paths.binary}`);
@@ -159,10 +165,11 @@ function prepareHome(paths, flags) {
     paths.cache,
     paths.shimDir,
     paths.runDir,
+    paths.tmp,
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  writeFileSync(paths.shim, shimScript(paths.shimLog));
+  writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
   if (flags["no-seed"] || existsSync(paths.indexFolders)) return;
   const source = path.resolve(
@@ -176,7 +183,12 @@ function prepareHome(paths, flags) {
   // A throwaway copy: Toka renames and tags what it plays, which would dirty
   // the tracked fixtures.
   if (!existsSync(paths.fixtures)) {
-    cpSync(source, paths.fixtures, { recursive: true, mode: 1 });
+    // Copy beside the target and rename, so an interrupted copy is never taken
+    // for a finished one.
+    const partial = `${paths.fixtures}.partial`;
+    rmSync(partial, { recursive: true, force: true });
+    cpSync(source, partial, { recursive: true });
+    renameSync(partial, paths.fixtures);
   }
   mkdirSync(path.dirname(paths.indexFolders), { recursive: true });
   writeFileSync(
@@ -256,17 +268,24 @@ async function launch(flags) {
     cwd: worktree,
     env,
     detached: true,
-    stdio: [
-      "ignore",
-      openSync(path.join(paths.runDir, "indexer.log"), "a"),
-      "inherit",
-    ],
+    stdio: ["ignore", openSync(paths.indexerLog, "a"), "inherit"],
   });
+  indexer.on("error", (error) => {
+    console.error(`Could not start the indexer: ${error.message}`);
+    process.exit(1);
+  });
+  writeFileSync(paths.indexerPidFile, `${indexer.pid}\n`);
   const app = spawn(paths.binary, [], {
     cwd: worktree,
     env,
     detached: true,
     stdio: stdio("app.log"),
+  });
+  app.on("error", (error) => {
+    console.error(`Could not start the app: ${error.message}`);
+    killGroup(indexer.pid, "SIGKILL");
+    rmSync(paths.state, { force: true });
+    process.exit(1);
   });
   writeFileSync(
     paths.state,
@@ -285,7 +304,7 @@ async function launch(flags) {
   // only then drop the state file, so a survivor is never left untracked.
   const cleanup = () => {
     cleaning ??= (async () => {
-      const groups = [app.pid, indexer.pid];
+      const groups = [app.pid, currentIndexerPid(paths, null) ?? indexer.pid];
       for (const pid of groups) killGroup(pid, "SIGTERM");
       for (
         let waited = 0;
@@ -317,15 +336,16 @@ async function stopOne(paths, { clean }) {
         /* gone */
       }
     }
-    for (const pid of [state.appPid, state.indexerPid]) {
-      if (isProcessOf(pid, paths.binary)) killGroup(pid, "SIGTERM");
+    const pids = [state.appPid, currentIndexerPid(paths, state)];
+    for (const pid of pids) {
+      if (isIsolatedProcess(pid, paths)) killGroup(pid, "SIGTERM");
     }
     for (let waited = 0; waited < 5000; waited += 100) {
       if (!describeRun(paths, state).running) break;
       await sleepMs(100);
     }
-    for (const pid of [state.appPid, state.indexerPid]) {
-      if (isProcessOf(pid, paths.binary)) killGroup(pid, "SIGKILL");
+    for (const pid of pids) {
+      if (isIsolatedProcess(pid, paths)) killGroup(pid, "SIGKILL");
     }
     await sleepMs(100);
     if (describeRun(paths, state).running) {
@@ -381,13 +401,20 @@ function printEnv(flags) {
   const paths = isolatedPaths(targetWorktree(flags));
   mkdirSync(paths.shimDir, { recursive: true });
   mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.shim, shimScript(paths.shimLog));
+  writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
   const env = isolatedEnv(paths, {});
-  for (const key of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]) {
-    console.log(`export ${key}='${env[key]}'`);
+  mkdirSync(paths.tmp, { recursive: true });
+  const quoted = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  for (const key of [
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "TMPDIR",
+  ]) {
+    console.log(`export ${key}=${quoted(env[key])}`);
   }
-  console.log(`export PATH='${paths.shimDir}':"$PATH"`);
+  console.log(`export PATH=${quoted(paths.shimDir)}:"$PATH"`);
 }
 
 // ----------------------------------------------------------------- main

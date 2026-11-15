@@ -52,12 +52,20 @@ them and pass `--worktree`.
   `run/state.json`, verifies the command line before signalling, and kills both
   process groups on exit, Ctrl-C or `stop`.
 - **`systemctl` is shimmed.** `<home>/bin` comes first on PATH with a `systemctl`
-  that logs to `run/systemctl-shim.log` and succeeds. This is what stops the
-  isolated app's "reset index" from running `systemctl --user stop
-  toka-indexer.service` against the user's real indexer. Never launch the
-  isolated binary by hand without the env (use `env` below).
+  that logs to `run/systemctl-shim.log`. For `toka-indexer.service` it stops or
+  (re)starts the **isolated** indexer (pid in `run/indexer.pid`), as systemd would
+  for the app's launch and "reset index" calls; every other call is a no-op that
+  succeeds. The real service is never reachable. Never launch the isolated binary
+  by hand without the env (use `env` below).
+- `TMPDIR` is also isolated (`<home>/tmp`): Toka's thumbnail cache lives in the
+  temp dir and "reset index" deletes it.
+- Trade-off: redirecting `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` also hides GTK theme,
+  font and WebKit settings, so the window may look slightly different (and start
+  slower) than the installed app. That is expected.
+- A shared `CARGO_TARGET_DIR` means every worktree maps to one binary; `stop` and
+  `status` still tell runs apart by each process's `XDG_CONFIG_HOME`.
 - **Fixtures are a throwaway copy.** First launch copies `test/fixtures` (or
-  `--seed-from <dir>`) to `<home>/fixtures` and indexes that, so Toka's
+  `--seed-from <dir>`, copied in full, so keep it small) to `<home>/fixtures` and indexes that, so Toka's
   tag/rename-on-play never dirties the worktree. `--no-seed` starts empty. Adding
   a real media folder in the UI indexes it in place and playing there can rename
   files; warn the user before they do.

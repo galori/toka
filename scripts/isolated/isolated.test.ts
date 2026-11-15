@@ -77,6 +77,7 @@ describe("isolatedPaths and isolatedEnv", () => {
     expect(env.XDG_CONFIG_HOME).toBe(paths.config);
     expect(env.XDG_DATA_HOME).toBe(paths.data);
     expect(env.XDG_CACHE_HOME).toBe(paths.cache);
+    expect(env.TMPDIR).toBe(paths.tmp);
     expect(env.PATH).toBe(`${paths.shimDir}:/usr/bin`);
     expect(env.HOME).toBe("/home/u");
   });
@@ -93,7 +94,10 @@ describe("shimScript and seedConfig", () => {
     try {
       const shim = path.join(dir, "systemctl");
       const log = path.join(dir, "it's.log");
-      await writeFile(shim, shimScript(log));
+      await writeFile(
+        shim,
+        shimScript({ ...isolatedPaths(dir, {}), shimLog: log }),
+      );
       await chmod(shim, 0o755);
       const result = spawnSync(shim, [
         "--user",
@@ -216,6 +220,28 @@ setInterval(() => {}, 1000);
 
       expect(run("stop", "--clean").status).toBe(0);
       await expect(stat(home)).rejects.toThrow();
+    }, 30000);
+
+    it("lets the app's systemctl stop and start act on the isolated indexer only, and cleans up the respawned one", async () => {
+      expect(run("launch", "--detach").status).toBe(0);
+      const home = path.join(repo, ".scratch/isolated-home");
+      const shim = path.join(home, "bin/systemctl");
+      const first = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
+
+      spawnSync(shim, ["--user", "stop", "toka-indexer.service"]);
+      await vi.waitFor(() => expect(() => process.kill(first, 0)).toThrow());
+
+      spawnSync(shim, ["--user", "start", "toka-indexer.service"]);
+      const second = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
+      expect(second).not.toBe(first);
+      expect(() => process.kill(second, 0)).not.toThrow();
+
+      expect(run("stop").status).toBe(0);
+      await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
     }, 30000);
 
     it("refuses to launch when nothing has been built", () => {
