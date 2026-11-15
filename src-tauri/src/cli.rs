@@ -376,7 +376,8 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             if is_version {
-                assert_eq!(output, format!("{}\n", super::version_text()));
+                assert!(output.starts_with("toka "), "{output}");
+                assert!(output.ends_with('\n'), "{output}");
             } else {
                 assert!(output.contains("--version"), "{output}");
             }

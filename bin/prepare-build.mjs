@@ -26,7 +26,8 @@ export function resolveBuiltAt({ isDirty, commitTime, now }) {
 export function resolveBuildVersion({ version, commitCount, sha, branch, isDirty }) {
   if (commitCount == null || !sha) return version;
   const parts = [String(commitCount), sha.slice(0, 7)];
-  const label = (branch ?? "").replace(/[^0-9A-Za-z-]+/g, "-").replace(/^-+|-+$/g, "");
+  const label = (branch ?? "").replace(/[^0-9A-Za-z-]+/g, "-").replace(/^-+|-+$/g, "")
+    .slice(0, 32);
   if (label && label !== "main" && label !== "HEAD") parts.push(label);
   if (isDirty) parts.push("dirty");
   return `${version}+${parts.join(".")}`;

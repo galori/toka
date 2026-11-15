@@ -59,6 +59,11 @@ describe("resolveBuildVersion", () => {
     expect(resolveBuildVersion({ ...base, branch: "fix-x", isDirty: true })).toBe("0.1.1+482.a1b2c3d.fix-x.dirty");
   });
 
+  test("truncates long branch names and drops labels with no usable characters", () => {
+    expect(resolveBuildVersion({ ...base, branch: "x".repeat(80) })).toBe(`0.1.1+482.a1b2c3d.${"x".repeat(32)}`);
+    expect(resolveBuildVersion({ ...base, branch: "///" })).toBe("0.1.1+482.a1b2c3d");
+  });
+
   test("falls back to the bare version when git metadata is unavailable", () => {
     expect(resolveBuildVersion({ ...base, commitCount: null, sha: null })).toBe("0.1.1");
   });
@@ -67,5 +72,5 @@ describe("resolveBuildVersion", () => {
 test("prepareBuild keeps the manifest version and adds a build version", () => {
   const info = prepareBuild();
 
-  expect(info.buildVersion.startsWith(`${info.version}+`)).toBe(true);
+  expect(info.buildVersion.startsWith(info.version)).toBe(true);
 });

@@ -36,7 +36,7 @@ function main() {
     behind = "unknown (fetch origin/main or run this from the repository)";
   }
 
-  console.log(`Version: ${info.version} (installed package: ${version})`);
+  console.log(`Version: ${info.buildVersion ?? info.version} (installed package: ${version})`);
   console.log(`Built: ${info.builtAt} (${formatAge(minutes)} ago)`);
   console.log(`Git SHA: ${info.gitSha}`);
   console.log(`Behind origin/main: ${behind} commits`);
