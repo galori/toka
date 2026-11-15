@@ -1120,6 +1120,9 @@ mod tests {
         let log = fs::read_to_string(paths.index_log).unwrap();
         assert!(log.contains("folder added:"));
         assert!(log.contains("folder removed:"));
+        // Each line starts with a readable UTC timestamp, not epoch millis.
+        let first = log.lines().next().unwrap();
+        assert!(first.starts_with("[20") && first[1..].split(']').next().unwrap().ends_with('Z'));
     }
 
     #[test]

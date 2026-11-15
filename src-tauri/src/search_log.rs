@@ -684,6 +684,30 @@ mod tests {
     }
 
     #[test]
+    fn verbose_log_header_has_a_readable_start_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("header.log");
+        let mut file = fs::File::create(&path).unwrap();
+        let context = SearchLogContext {
+            query: "vacation".into(),
+            page: 0,
+            page_size: 10,
+            fields: SearchFields::default(),
+            media_type: MediaType::default(),
+            addon_id: None,
+            addon_capture: None,
+            verbose: None,
+        };
+        write_verbose_header(&mut file, &context).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        let started = text
+            .lines()
+            .find_map(|l| l.strip_prefix("Started: "))
+            .unwrap();
+        assert!(started.ends_with('Z') && started.contains('T'), "{started}");
+    }
+
+    #[test]
     fn verbose_log_files_are_only_toka_search_logs() {
         let directory = tempfile::tempdir().unwrap();
         for name in [
