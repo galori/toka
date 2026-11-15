@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readlinkSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -122,12 +122,21 @@ PIDFILE=${quote(paths.indexerPidFile)}
 printf '%s systemctl %s\\n' "$(date -Is)" "$*" >> ${quote(paths.shimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
 # A stale pid file may name a recycled PID: only trust it if it is our binary.
-if [ -n "$pid" ] && ! tr '\\0' '\\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 | grep -qxF ${quote(paths.binary)}; then
+if [ -n "$pid" ] && { ! tr '\\0' '\\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 | grep -qxF ${quote(paths.binary)} || ! tr '\\0' '\\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF ${quote(`XDG_CONFIG_HOME=${paths.config}`)}; }; then
   pid=
 fi
 case "$*" in
   *"stop toka-indexer.service"*)
-    [ -n "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null
+    if [ -n "$pid" ]; then
+      kill -s TERM -- "-$pid" 2>/dev/null
+      # Like the real "systemctl stop", return only once the indexer is gone.
+      n=0
+      while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 100 ]; do
+        sleep 0.1
+        n=$((n + 1))
+      done
+      kill -s KILL -- "-$pid" 2>/dev/null
+    fi
     ;;
   *"start toka-indexer.service"*)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
@@ -211,11 +220,11 @@ export function isSupervisorOf(pid, scriptPath, procRoot = "/proc") {
       "utf8",
     ).split("\0");
     // A foreground launch may have been started with a relative path.
+    const cwd = readlinkSync(path.join(procRoot, String(pid), "cwd"));
     return parts.some(
       (part) =>
         part.endsWith(".mjs") &&
-        (part === scriptPath ||
-          scriptPath.endsWith(`/${path.normalize(part)}`)),
+        (part === scriptPath || path.resolve(cwd, part) === scriptPath),
     );
   } catch {
     return false;

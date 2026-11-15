@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -89,6 +90,9 @@ async function build(flags) {
     spawnSync("git", ["diff", "--quiet", "--", paths.schemaFile], {
       cwd: worktree,
     }).status === 0;
+  const schemaBackup = schemaWasClean
+    ? null
+    : readFileSync(path.join(worktree, paths.schemaFile));
   const busy = spawnSync("pgrep", ["-x", "rustc|cargo"], { encoding: "utf8" });
   if (busy.stdout.trim()) {
     console.error(
@@ -140,7 +144,8 @@ async function build(flags) {
   if (schemaWasClean) {
     spawnSync("git", ["checkout", "--", paths.schemaFile], { cwd: worktree });
   } else {
-    console.error(`${paths.schemaFile} had local edits; left as is.`);
+    // The build rewrote a file that had local edits; put them back.
+    writeFileSync(path.join(worktree, paths.schemaFile), schemaBackup);
   }
   // Leftovers cannot be attributed to this build reliably, so report them and
   // leave killing them to the caller (AGENTS.md: check, then terminate).
@@ -192,7 +197,9 @@ function prepareHome(paths, flags) {
     // for a finished one.
     const partial = `${paths.fixtures}.partial`;
     rmSync(partial, { recursive: true, force: true });
-    cpSync(source, partial, { recursive: true });
+    // Dereference, so a symlinked source is copied rather than linked back to
+    // the original media.
+    cpSync(source, partial, { recursive: true, dereference: true });
     renameSync(partial, paths.fixtures);
   }
   mkdirSync(path.dirname(paths.indexFolders), { recursive: true });
@@ -315,10 +322,10 @@ async function launch(flags) {
       const liveIndexer = currentIndexerPid(paths, null);
       const groups = [
         app.pid,
-        liveIndexer !== null && isIsolatedProcess(liveIndexer, paths)
-          ? liveIndexer
-          : indexer.pid,
-      ];
+        [liveIndexer, indexer.pid].find(
+          (pid) => pid !== null && isIsolatedProcess(pid, paths),
+        ),
+      ].filter((pid) => pid !== undefined);
       for (const pid of groups) killGroup(pid, "SIGTERM");
       for (
         let waited = 0;

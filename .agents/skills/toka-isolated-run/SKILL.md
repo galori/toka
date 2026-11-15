@@ -24,13 +24,15 @@ them and pass `--worktree`.
 
 ## Test a branch or PR
 
-1. Check for stray builds first: `pgrep -a -f 'rustc|cargo'`. One build at a time.
+1. Check for stray builds first: `pgrep -a -x 'rustc|cargo'`. One build at a time.
 2. `build`: reproduces `bin/build.mjs` minus the install (`-j 4`, `--no-bundle`),
    then restores the tracked `src-tauri/gen/schemas/linux-schema.json` that the
    build rewrites. Warm rebuild about 1 minute, cold about 30. Run it in the
    background and wait without tight polling.
    Output: `src-tauri/target/release/toka`. Afterwards check
-   `pgrep -a -f 'rustc|cargo'` and kill leftovers.
+   `pgrep -a -x 'rustc|cargo'`. Terminate only processes that are demonstrably
+   orphans of an interrupted build of this worktree (check `ps -o ppid,cwd`);
+   another project's concurrent build is not yours to kill.
 3. `launch --detach`: starts the app and its own `--indexer`, returns once the
    app is up. Without `--detach` it runs in the foreground and Ctrl-C stops both.
 4. Tell the user what is running and where: the `status` output (app and indexer
@@ -62,7 +64,9 @@ them and pass `--worktree`.
 - Trade-off: redirecting `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` also hides GTK theme,
   font and WebKit settings, so the window may look slightly different (and start
   slower) than the installed app. That is expected.
-- A shared `CARGO_TARGET_DIR` means every worktree maps to one binary; `stop` and
+- A shared `CARGO_TARGET_DIR` means every worktree maps to one binary. `launch`
+  runs whichever worktree built it last and does not check the source, so build
+  the worktree you want to test immediately before launching it. `stop` and
   `status` still tell runs apart by each process's `XDG_CONFIG_HOME`.
 - **Fixtures are a throwaway copy.** First launch copies `test/fixtures` (or
   `--seed-from <dir>`, copied in full, so keep it small) to `<home>/fixtures` and indexes that, so Toka's
@@ -72,9 +76,11 @@ them and pass `--worktree`.
 
 ## Using the toka CLI against the isolated home
 
-`eval "$(node scripts/isolated/toka-isolated.mjs env)"` exports the same
-variables in the current shell (including the shim), so
-`src-tauri/target/release/toka <cli command>` acts on the isolated home only.
+Run it in a subshell so the shim and XDG variables do not linger in your shell:
+
+```sh
+( eval "$(node scripts/isolated/toka-isolated.mjs env)"; src-tauri/target/release/toka <cli command> )
+```
 
 ## Reporting
 

@@ -11,6 +11,7 @@ import {
 import path from "node:path";
 import {
   indexerArguments,
+  isIsolatedProcess,
   isProcessOf,
   isolatedEnv,
   isolatedPaths,
@@ -240,11 +241,16 @@ setInterval(() => {}, 1000);
       spawnSync(shim, ["--user", "stop", "toka-indexer.service"]);
       await vi.waitFor(() => expect(() => process.kill(first, 0)).toThrow());
 
-      spawnSync(shim, ["--user", "start", "toka-indexer.service"]);
+      spawnSync(shim, ["--user", "start", "toka-indexer.service"], {
+        env: isolatedEnv(isolatedPaths(repo, env), env),
+      });
       const second = Number(
         (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
       );
       expect(second).not.toBe(first);
+      await vi.waitFor(() =>
+        expect(isIsolatedProcess(second, isolatedPaths(repo, env))).toBe(true),
+      );
       expect(() => process.kill(second, 0)).not.toThrow();
 
       expect(run("stop").status).toBe(0);
