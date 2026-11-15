@@ -107,7 +107,7 @@ async function build(flags) {
   const env = {
     ...process.env,
     CARGO_BUILD_JOBS: process.env.CARGO_BUILD_JOBS ?? "4",
-    VITE_APP_VERSION: info.version,
+    VITE_APP_VERSION: info.buildVersion,
     VITE_BUILD_TIME: info.builtAt,
     VITE_GIT_SHA: info.gitSha,
   };

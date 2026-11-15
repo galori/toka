@@ -16,6 +16,19 @@ const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the in
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
+/// Build scripts pass the git-derived version (`0.1.1+482.a1b2c3d.branch`) as
+/// `VITE_APP_VERSION`; a plain `cargo build` falls back to the manifest version.
+fn version_text() -> String {
+    format_version(option_env!("VITE_APP_VERSION"))
+}
+
+fn format_version(build_version: Option<&str>) -> String {
+    let version = build_version
+        .filter(|version| !version.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    format!("toka {version}")
+}
+
 pub fn is_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         argument == OsStr::new("search")
@@ -47,11 +60,7 @@ pub fn run_command(
     }
 
     if command == OsStr::new("--version") || command == OsStr::new("-v") {
-        return print_text(
-            &format!("toka {}", env!("CARGO_PKG_VERSION")),
-            stdout,
-            stderr,
-        );
+        return print_text(&version_text(), stdout, stderr);
     }
 
     if command == OsStr::new("--index-stats") {
@@ -332,6 +341,17 @@ mod tests {
     }
 
     #[test]
+    fn version_prefers_the_build_version_over_the_manifest_version() {
+        assert_eq!(
+            super::format_version(Some("0.1.1+482.a1b2c3d.feat")),
+            "toka 0.1.1+482.a1b2c3d.feat"
+        );
+        let manifest = format!("toka {}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(super::format_version(None), manifest);
+        assert_eq!(super::format_version(Some("")), manifest);
+    }
+
+    #[test]
     fn version_and_help_flags_print_without_building_anything() {
         for (flag, is_version) in [
             ("-v", true),
@@ -356,7 +376,7 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             if is_version {
-                assert_eq!(output, format!("toka {}\n", env!("CARGO_PKG_VERSION")));
+                assert_eq!(output, format!("{}\n", super::version_text()));
             } else {
                 assert!(output.contains("--version"), "{output}");
             }

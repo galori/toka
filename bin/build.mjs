@@ -17,7 +17,7 @@ if (target === "linux") await buildPlocate();
 const info = prepareBuild();
 const env = {
   ...process.env,
-  VITE_APP_VERSION: info.version,
+  VITE_APP_VERSION: info.buildVersion,
   VITE_BUILD_TIME: info.builtAt,
   VITE_GIT_SHA: info.gitSha,
 };
