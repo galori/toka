@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -20,11 +20,11 @@ const BOOLEAN_FLAGS = new Set([
 ]);
 const VALUE_FLAGS = new Set(["worktree", "seed-from"]);
 
-/** Parses `<command> [flags] [-- passthrough]`; throws on anything unknown. */
+/** Parses `<command> [flags]`; throws on anything unknown. */
 export function parseArguments(argv) {
   const [command, ...rest] = argv;
   if (!command || command === "--help" || command === "-h") {
-    return { command: "help", flags: {}, passthrough: [] };
+    return { command: "help", flags: {} };
   }
   if (!COMMANDS.includes(command)) {
     throw new Error(
@@ -32,13 +32,8 @@ export function parseArguments(argv) {
     );
   }
   const flags = {};
-  const passthrough = [];
   for (let index = 0; index < rest.length; index += 1) {
     const argument = rest[index];
-    if (argument === "--") {
-      passthrough.push(...rest.slice(index + 1));
-      break;
-    }
     if (argument === "--help" || argument === "-h") {
       flags.help = true;
       continue;
@@ -58,7 +53,7 @@ export function parseArguments(argv) {
       throw new Error(`Unknown flag "--${name}".`);
     }
   }
-  return { command, flags, passthrough };
+  return { command, flags };
 }
 
 /** Every location an isolated run uses, all under `<worktree>/.scratch`. */
@@ -214,12 +209,4 @@ export function gitToplevel(cwd) {
     throw new Error(`${cwd} is not inside a git worktree.`);
   }
   return result.stdout.trim();
-}
-
-export function readlinkSafe(target) {
-  try {
-    return readlinkSync(target);
-  } catch {
-    return null;
-  }
 }

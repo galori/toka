@@ -81,6 +81,12 @@ async function build(flags) {
   requireLinux();
   const worktree = targetWorktree(flags);
   const paths = isolatedPaths(worktree);
+  // The build rewrites this tracked file. Restore it afterwards, but only if it
+  // was clean going in, so a deliberate local edit is never discarded.
+  const schemaWasClean =
+    spawnSync("git", ["diff", "--quiet", "--", paths.schemaFile], {
+      cwd: worktree,
+    }).status === 0;
   const busy = spawnSync("pgrep", ["-f", "rustc|cargo"], { encoding: "utf8" });
   if (busy.stdout.trim()) {
     console.error(
@@ -125,8 +131,11 @@ async function build(flags) {
   const status = await new Promise((resolve) =>
     child.on("exit", (code, signal) => resolve(code ?? (signal ? 1 : 0))),
   );
-  // The build rewrites this tracked file; never let it reach a commit.
-  spawnSync("git", ["checkout", "--", paths.schemaFile], { cwd: worktree });
+  if (schemaWasClean) {
+    spawnSync("git", ["checkout", "--", paths.schemaFile], { cwd: worktree });
+  } else {
+    console.error(`${paths.schemaFile} had local edits; left as is.`);
+  }
   const leftovers = spawnSync(
     "pgrep",
     ["-f", "-a", `${worktree}.*(rustc|cargo)`],
@@ -174,6 +183,15 @@ function prepareHome(paths, flags) {
     paths.indexFolders,
     `${JSON.stringify(seedConfig([paths.fixtures], randomUUID), null, 2)}\n`,
   );
+}
+
+function groupAlive(pid) {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function killGroup(pid, signal) {
@@ -224,10 +242,12 @@ async function launch(flags) {
       }
       await sleepMs(100);
     }
+    killGroup(supervisor.pid, "SIGTERM");
     fail(`The app did not start; see ${paths.supervisorLog}`);
   }
 
   const env = isolatedEnv(paths);
+  delete env.TOKA_ISOLATED_SUPERVISOR;
   const stdio = (name) =>
     supervising
       ? ["ignore", openSync(path.join(paths.runDir, name), "a"), "inherit"]
@@ -260,32 +280,29 @@ async function launch(flags) {
   );
   if (!supervising) report(describeRun(paths));
 
-  let cleaned = false;
+  let cleaning = null;
+  // SIGTERM both groups, wait for them to go, SIGKILL whatever survives, and
+  // only then drop the state file, so a survivor is never left untracked.
   const cleanup = () => {
-    if (cleaned) return;
-    cleaned = true;
-    killGroup(app.pid, "SIGTERM");
-    killGroup(indexer.pid, "SIGTERM");
-    setTimeout(() => {
-      killGroup(app.pid, "SIGKILL");
-      killGroup(indexer.pid, "SIGKILL");
-    }, 3000).unref();
-    rmSync(paths.state, { force: true });
+    cleaning ??= (async () => {
+      const groups = [app.pid, indexer.pid];
+      for (const pid of groups) killGroup(pid, "SIGTERM");
+      for (
+        let waited = 0;
+        waited < 3000 && groups.some(groupAlive);
+        waited += 100
+      ) {
+        await sleepMs(100);
+      }
+      for (const pid of groups) if (groupAlive(pid)) killGroup(pid, "SIGKILL");
+      rmSync(paths.state, { force: true });
+    })();
+    return cleaning;
   };
   for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    process.on(signal, () => {
-      cleanup();
-      setTimeout(() => process.exit(0), 500);
-    });
+    process.on(signal, () => cleanup().then(() => process.exit(0)));
   }
-  indexer.on("exit", () => {
-    // An indexer that died on its own is worth knowing about, but the app
-    // keeps running; only app exit ends the session.
-  });
-  app.on("exit", (code) => {
-    cleanup();
-    setTimeout(() => process.exit(code ?? 0), 100);
-  });
+  app.on("exit", (code) => cleanup().then(() => process.exit(code ?? 0)));
 }
 
 // ----------------------------------------------------------------- stop
@@ -366,7 +383,7 @@ function printEnv(flags) {
   mkdirSync(paths.runDir, { recursive: true });
   writeFileSync(paths.shim, shimScript(paths.shimLog));
   chmodSync(paths.shim, 0o755);
-  const env = isolatedEnv(paths, { PATH: "$PATH" });
+  const env = isolatedEnv(paths, {});
   for (const key of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]) {
     console.log(`export ${key}='${env[key]}'`);
   }

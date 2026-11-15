@@ -26,7 +26,6 @@ describe("parseArguments", () => {
     ).toEqual({
       command: "launch",
       flags: { detach: true, "seed-from": "media", "no-seed": true },
-      passthrough: [],
     });
     expect(parseArguments(["stop", "--worktree", "/w"]).flags).toEqual({
       worktree: "/w",
@@ -89,7 +88,8 @@ describe("isolatedPaths and isolatedEnv", () => {
 
 describe("shimScript and seedConfig", () => {
   it("logs and succeeds instead of touching systemd", async () => {
-    const dir = await mkdtemp(path.resolve(".scratch-shim-"));
+    await mkdir(path.resolve(".scratch"), { recursive: true });
+    const dir = await mkdtemp(path.resolve(".scratch/shim-test-"));
     try {
       const shim = path.join(dir, "systemctl");
       const log = path.join(dir, "it's.log");
@@ -128,93 +128,101 @@ describe("isProcessOf", () => {
   });
 });
 
-describe("toka-isolated launch, status and stop", () => {
-  const cli = path.resolve("scripts/isolated/toka-isolated.mjs");
-  let repo: string;
-  let env: NodeJS.ProcessEnv;
+describe.skipIf(process.platform !== "linux")(
+  "toka-isolated launch, status and stop",
+  () => {
+    const cli = path.resolve("scripts/isolated/toka-isolated.mjs");
+    let repo: string;
+    let env: NodeJS.ProcessEnv;
 
-  const run = (...args: string[]) =>
-    spawnSync(process.execPath, [cli, ...args, "--worktree", repo], {
-      encoding: "utf8",
-      env,
-    });
+    const run = (...args: string[]) =>
+      spawnSync(process.execPath, [cli, ...args, "--worktree", repo], {
+        encoding: "utf8",
+        env,
+      });
 
-  beforeEach(async () => {
-    await mkdir(path.resolve(".scratch"), { recursive: true });
-    repo = await mkdtemp(path.resolve(".scratch/isolated-test-"));
-    spawnSync("git", ["init", "-q"], { cwd: repo });
-    await mkdir(path.join(repo, "test/fixtures"), { recursive: true });
-    await writeFile(path.join(repo, "test/fixtures/a.mp4"), "x");
-    // A stand-in for the real binary: records its environment and arguments,
-    // then idles like the app and the indexer do.
-    const target = path.join(repo, "target");
-    await mkdir(path.join(target, "release"), { recursive: true });
-    const fake = path.join(target, "release/toka");
-    await writeFile(
-      fake,
-      `#!/usr/bin/env node
+    beforeEach(async () => {
+      await mkdir(path.resolve(".scratch"), { recursive: true });
+      repo = await mkdtemp(path.resolve(".scratch/isolated-test-"));
+      spawnSync("git", ["init", "-q"], { cwd: repo });
+      await mkdir(path.join(repo, "test/fixtures"), { recursive: true });
+      await writeFile(path.join(repo, "test/fixtures/a.mp4"), "x");
+      // A stand-in for the real binary: records its environment and arguments,
+      // then idles like the app and the indexer do.
+      const target = path.join(repo, "target");
+      await mkdir(path.join(target, "release"), { recursive: true });
+      const fake = path.join(target, "release/toka");
+      await writeFile(
+        fake,
+        `#!/usr/bin/env node
 import fs from "node:fs";
 const role = process.argv[2] === "--indexer" ? "indexer" : "app";
 fs.writeFileSync(process.env.XDG_DATA_HOME + "/" + role + ".json",
   JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
 setInterval(() => {}, 1000);
 `,
-    );
-    await chmod(fake, 0o755);
-    env = { ...process.env, CARGO_TARGET_DIR: target };
-    delete env.TOKA_ISOLATED_SUPERVISOR;
-  });
-
-  afterEach(async () => {
-    run("stop", "--clean");
-    await rm(repo, { recursive: true, force: true });
-  });
-
-  it("runs app and indexer with isolated env, seeds a copy, and stops both with no orphans", async () => {
-    const launched = run("launch", "--detach");
-    expect(launched.status, launched.stderr).toBe(0);
-
-    const status = JSON.parse(run("status", "--json").stdout);
-    const here = status.find((s: { worktree: string }) => s.worktree === repo);
-    expect(here.appRunning).toBe(true);
-    expect(here.indexerRunning).toBe(true);
-    const { appPid, indexerPid } = here;
-
-    const home = path.join(repo, ".scratch/isolated-home");
-    await vi.waitFor(async () => {
-      await stat(path.join(home, "data/app.json"));
-      await stat(path.join(home, "data/indexer.json"));
+      );
+      await chmod(fake, 0o755);
+      env = { ...process.env, CARGO_TARGET_DIR: target };
+      delete env.TOKA_ISOLATED_SUPERVISOR;
     });
-    const indexer = JSON.parse(
-      await readFile(path.join(home, "data/indexer.json"), "utf8"),
-    );
-    expect(indexer.argv).toEqual(["--indexer"]);
-    expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
-    expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
 
-    const config = JSON.parse(
-      await readFile(path.join(home, "config/toka/index-folders.json"), "utf8"),
-    );
-    expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
-    await stat(path.join(home, "fixtures/a.mp4"));
+    afterEach(async () => {
+      run("stop", "--clean");
+      await rm(repo, { recursive: true, force: true });
+    });
 
-    expect(run("launch", "--detach").status).not.toBe(0);
+    it("runs app and indexer with isolated env, seeds a copy, and stops both with no orphans", async () => {
+      const launched = run("launch", "--detach");
+      expect(launched.status, launched.stderr).toBe(0);
 
-    const stopped = run("stop");
-    expect(stopped.status, stopped.stderr).toBe(0);
-    for (const pid of [appPid, indexerPid]) {
-      expect(() => process.kill(pid, 0)).toThrow();
-    }
-    expect(JSON.parse(run("status", "--json").stdout)[0].running).toBe(false);
+      const status = JSON.parse(run("status", "--json").stdout);
+      const here = status.find(
+        (s: { worktree: string }) => s.worktree === repo,
+      );
+      expect(here.appRunning).toBe(true);
+      expect(here.indexerRunning).toBe(true);
+      const { appPid, indexerPid } = here;
 
-    expect(run("stop", "--clean").status).toBe(0);
-    await expect(stat(home)).rejects.toThrow();
-  }, 30000);
+      const home = path.join(repo, ".scratch/isolated-home");
+      await vi.waitFor(async () => {
+        await stat(path.join(home, "data/app.json"));
+        await stat(path.join(home, "data/indexer.json"));
+      });
+      const indexer = JSON.parse(
+        await readFile(path.join(home, "data/indexer.json"), "utf8"),
+      );
+      expect(indexer.argv).toEqual(["--indexer"]);
+      expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
+      expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
 
-  it("refuses to launch when nothing has been built", () => {
-    env.CARGO_TARGET_DIR = path.join(repo, "missing");
-    const result = run("launch");
-    expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/No built binary/);
-  });
-});
+      const config = JSON.parse(
+        await readFile(
+          path.join(home, "config/toka/index-folders.json"),
+          "utf8",
+        ),
+      );
+      expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
+      await stat(path.join(home, "fixtures/a.mp4"));
+
+      expect(run("launch", "--detach").status).not.toBe(0);
+
+      const stopped = run("stop");
+      expect(stopped.status, stopped.stderr).toBe(0);
+      for (const pid of [appPid, indexerPid]) {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+      expect(JSON.parse(run("status", "--json").stdout)[0].running).toBe(false);
+
+      expect(run("stop", "--clean").status).toBe(0);
+      await expect(stat(home)).rejects.toThrow();
+    }, 30000);
+
+    it("refuses to launch when nothing has been built", () => {
+      env.CARGO_TARGET_DIR = path.join(repo, "missing");
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binary/);
+    });
+  },
+);
