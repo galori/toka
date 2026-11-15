@@ -205,12 +205,106 @@ fn rename(path: &Path, tags: &Tags) -> Result<TagUpdate, String> {
         if exists(&target) {
             return Err(format!("That name already exists: {}", target.display()));
         }
+        // Found before the move, while the video still has the name they match.
+        let sidecars = if path.is_dir() {
+            Vec::new()
+        } else {
+            crate::subtitles::sidecar_subtitles(path)
+        };
         fs::rename(path, &target)
             .map_err(|error| format!("{} could not be renamed: {error}", path.display()))?;
+        rename_sidecars(path, &target, sidecars);
     }
     Ok(TagUpdate {
         tags: tags.values().to_vec(),
         path: target,
+    })
+}
+
+/// Moves a file without ever replacing what is at `to`: the hard link fails
+/// if the name is taken, even when it was taken a moment ago, which a
+/// check-then-rename cannot promise.
+pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::hard_link(from, to) {
+        Ok(()) => fs::remove_file(from),
+        // exFAT and FAT32 have no hard links; fall back to check-then-rename,
+        // which is the strongest guarantee those filesystems allow here.
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            if to.symlink_metadata().is_ok() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(from, to)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// What follows `stem` at the start of `name`, comparing the way subtitle
+/// discovery does (Unicode lowercase) while cutting at a real character
+/// boundary, since lowercasing can change a name's byte length.
+fn after_stem<'a>(name: &'a str, stem_lower: &str) -> Option<&'a str> {
+    // Whole-string lowercasing, as discovery does: per-character lowercasing
+    // differs for context-sensitive letters such as Greek final sigma.
+    name.char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .find(|&end| name[..end].to_lowercase() == stem_lower)
+        .map(|end| &name[end..])
+}
+
+/// Keeps subtitle files beside a renamed video, so `talk.srt` follows
+/// `talk.mp4` to `talk [beach].mp4`. Best effort: a sidecar that cannot move
+/// (or whose new name is taken) stays where it is.
+fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::subtitles::SidecarSubtitle>) {
+    let (Some(old_stem), Some(new_stem)) = (
+        from.file_stem().and_then(|stem| stem.to_str()),
+        to.file_stem().and_then(|stem| stem.to_str()),
+    ) else {
+        return;
+    };
+    let old_stem = old_stem.to_lowercase();
+    for sidecar in sidecars {
+        let Some(name) = sidecar.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(rest) = after_stem(name, &old_stem) else {
+            continue;
+        };
+        // `talk.en.srt` belongs to `talk.en.mp4` when that video exists, and
+        // `talk.srt` to `talk.mkv` once `talk.mp4` has moved away.
+        if belongs_to_other_video(&sidecar.path, &old_stem) {
+            continue;
+        }
+        let destination = sidecar.path.with_file_name(format!("{new_stem}{rest}"));
+        let _ = move_without_replacing(&sidecar.path, &destination);
+    }
+}
+
+/// Whether a video other than the renamed one (whose old stem is `stem`, in
+/// lowercase) has a claim on `sidecar`: its stem is at least as long and is
+/// the whole sidecar stem or a dotted prefix of it.
+fn belongs_to_other_video(sidecar: &Path, stem: &str) -> bool {
+    let (Some(directory), Some(name)) = (
+        sidecar.parent(),
+        sidecar.file_stem().and_then(|name| name.to_str()),
+    ) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        crate::search::is_supported_video(&path)
+            && path.is_file()
+            && path
+                .file_stem()
+                .and_then(|other| other.to_str())
+                .map(str::to_lowercase)
+                .is_some_and(|other| {
+                    other.len() >= stem.len()
+                        && (name == other || name.starts_with(&format!("{other}.")))
+                })
     })
 }
 
@@ -253,6 +347,113 @@ mod tests {
 
     fn name_of(path: &Path) -> String {
         path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn tagging_a_video_carries_its_subtitle_files_along() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "talk.mp4");
+        file(&directory, "talk.srt");
+        file(&directory, "talk.en.srt");
+        file(&directory, "other.srt");
+
+        let update = rename(&video, &Tags::new(["beach"])).unwrap();
+
+        let stem = update
+            .path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(directory.path().join(format!("{stem}.srt")).exists());
+        assert!(directory.path().join(format!("{stem}.en.srt")).exists());
+        assert!(directory.path().join("other.srt").exists());
+        assert!(!directory.path().join("talk.srt").exists());
+    }
+
+    #[test]
+    fn tagging_leaves_the_subtitles_of_a_longer_named_video_alone() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "talk.mp4");
+        file(&directory, "talk.en.mp4");
+        file(&directory, "talk.srt");
+        file(&directory, "talk.en.srt");
+
+        rename(&video, &Tags::new(["beach"])).unwrap();
+
+        assert!(directory.path().join("talk.en.srt").exists());
+        assert!(!directory.path().join("talk.srt").exists());
+    }
+
+    #[test]
+    fn subtitles_follow_a_video_whose_name_differs_only_in_unicode_case() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "Ä.mp4");
+        file(&directory, "ä.srt");
+
+        let update = rename(&video, &Tags::new(["beach"])).unwrap();
+
+        let stem = update
+            .path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(directory.path().join(format!("{stem}.srt")).exists());
+        assert!(!directory.path().join("ä.srt").exists());
+    }
+
+    #[test]
+    fn a_shared_subtitle_stays_when_lowercasing_changes_the_stem_length() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "STRAẞE.mp4");
+        file(&directory, "STRAẞE.mkv");
+        file(&directory, "STRAẞE.srt");
+
+        rename(&video, &Tags::new(["beach"])).unwrap();
+
+        assert!(directory.path().join("STRAẞE.srt").exists());
+    }
+
+    #[test]
+    fn a_subtitle_follows_a_video_whose_name_ends_in_a_greek_sigma() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "ΟΣ.mp4");
+        file(&directory, "ΟΣ.srt");
+
+        rename(&video, &Tags::new(["beach"])).unwrap();
+
+        assert!(!directory.path().join("ΟΣ.srt").exists());
+    }
+
+    #[test]
+    fn a_folder_named_like_a_video_does_not_own_a_subtitle() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "talk.mp4");
+        fs::create_dir(directory.path().join("talk.en.mp4")).unwrap();
+        file(&directory, "talk.en.srt");
+
+        let update = rename(&video, &Tags::new(["beach"])).unwrap();
+
+        let stem = update
+            .path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(directory.path().join(format!("{stem}.en.srt")).exists());
+    }
+
+    #[test]
+    fn moving_never_replaces_an_existing_file() {
+        let directory = tempdir().unwrap();
+        let from = file(&directory, "a.srt");
+        let to = file(&directory, "b.srt");
+        fs::write(&to, b"keep").unwrap();
+
+        assert!(move_without_replacing(&from, &to).is_err());
+        assert_eq!(fs::read(&to).unwrap(), b"keep");
+        assert!(from.exists());
     }
 
     #[test]

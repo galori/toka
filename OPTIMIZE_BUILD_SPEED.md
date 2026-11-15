@@ -25,10 +25,10 @@ carry GTK and WebKit to machines that lack them, but the machine doing the build
 is the one that just compiled against those libraries.
 
 `src-tauri/target/release/toka` (9.6 MB) is already built and runnable before
-bundling starts. `build:linux` now builds with `--no-bundle` and installs that
+bundling starts. `build:linux` now builds with `--no-bundle`, and `build:linux:install` installs that
 executable directly, with the desktop entry's `Exec=` pointing at it.
 
-Pass `--appimage` (`npm run build:linux -- --appimage`) to produce and install a
+Pass `--appimage` (`npm run build:linux:install -- --appimage`) to produce and install a
 real AppImage when you want to check the packaged artifact. CI is unaffected:
 `.github/workflows/ci.yml` runs its own `tauri build --bundles`, and never calls
 `bin/build.mjs`.

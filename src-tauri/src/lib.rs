@@ -1,6 +1,7 @@
 mod addons;
 mod cli;
 mod external_players;
+mod index_stats;
 mod index_visibility;
 mod launch;
 #[cfg(target_os = "linux")]
@@ -468,33 +469,89 @@ async fn video_preview(
     Ok(sources)
 }
 
-fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
+/// Moves a video to the trash and returns what undo needs to find it again:
+/// the item's name inside the Linux trash, or its trashed path on macOS. Both
+/// are looked up after the move, because the trash renames an item whose name
+/// is already taken, so the file's own name is not enough to identify it.
+fn move_to_trash(path: &std::path::Path) -> Result<Option<String>, CommandError> {
+    #[cfg(not(target_os = "macos"))]
+    let before = trash_listing();
     #[cfg(target_os = "linux")]
     let output = std::process::Command::new("gio")
         .args(["trash", path.to_string_lossy().as_ref()])
         .output();
     #[cfg(target_os = "macos")]
     let output = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "tell application \"Finder\" to delete POSIX file \"{}\"",
-                path.display()
-            ),
-        ])
+        .args(["-e", MACOS_TRASH_SCRIPT, "--"])
+        .arg(path)
         .output();
     let output = output.map_err(|error| CommandError {
         kind: "Delete",
         message: format!("The video could not be moved to the trash: {error}"),
     })?;
-    trash_outcome(
+    let name = trash_outcome(
         path,
         output.status.success(),
         &String::from_utf8_lossy(&output.stderr),
         // Checked after the helper has run, and deliberately not through
         // `exists`: a symlink that still dangles was not trashed either.
         path.symlink_metadata().is_ok(),
-    )
+    )?;
+    #[cfg(target_os = "macos")]
+    {
+        let trashed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        return Ok(Some(if trashed.is_empty() { name } else { trashed }));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The item this call added is the one whose name was not there before,
+        // whatever the trash renamed it to and whatever the clock says.
+        // An ambiguous listing leaves the identity unknown: undo is then not
+        // offered, rather than risking restoring an older item of the same name.
+        let _ = name;
+        Ok(new_trash_item(&before, &trash_listing()))
+    }
+}
+
+/// The names of everything in the Linux trash, as URIs (`gio list -u`).
+#[cfg(not(target_os = "macos"))]
+fn trash_listing() -> String {
+    std::process::Command::new("gio")
+        .args(["list", "--hidden", "-u", "trash:///"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// The AppleScript run by `move_to_trash`. The path arrives as an argument, so
+/// no file name can alter the script; it returns where the item now lives.
+#[cfg(target_os = "macos")]
+const MACOS_TRASH_SCRIPT: &str = "on run argv\n\
+    tell application \"Finder\"\n\
+    set trashed to delete (POSIX file (item 1 of argv))\n\
+    return POSIX path of (trashed as alias)\n\
+    end tell\n\
+    end run";
+
+/// The one item in `after` that was not in `before`: two listings of the
+/// trash, one name per line. Anything other than exactly one new item is
+/// ambiguous (something else was trashed meanwhile), so it is not guessed at.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn new_trash_item(before: &str, after: &str) -> Option<String> {
+    let known: std::collections::HashSet<&str> = before.lines().map(name_column).collect();
+    let mut added = after
+        .lines()
+        .map(name_column)
+        .filter(|uri| !known.contains(uri));
+    let item = added.next()?;
+    if added.next().is_some() {
+        return None;
+    }
+    item.strip_prefix("trash:///").map(str::to_owned)
+}
+
+fn name_column(line: &str) -> &str {
+    line.split('\t').next().unwrap_or(line)
 }
 
 /// What a trash helper's result means for the file it was handed. A helper that
@@ -776,11 +833,41 @@ fn delete_video(
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
     let trash_name = move_to_trash(&path)?;
     synchronize_index_path(updates.inner(), &path);
-    *deleted.lock().unwrap() = Some(DeletedVideo {
+    *deleted.lock().unwrap() = trash_name.map(|trash_name| DeletedVideo {
         trash_name,
         original_path: path,
     });
     Ok(())
+}
+
+/// Puts a trashed video back where it came from. Never overwrites: if something
+/// has taken the original path since, the restore is reported as failed.
+#[cfg(target_os = "macos")]
+fn restore_from_trash(item: &DeletedVideo) -> std::io::Result<bool> {
+    if !Path::new(&item.trash_name).is_absolute() || item.original_path.symlink_metadata().is_ok() {
+        return Ok(false);
+    }
+    // The Trash is protected, so a plain move can be refused; Finder is allowed.
+    if tags::move_without_replacing(std::path::Path::new(&item.trash_name), &item.original_path)
+        .is_ok()
+    {
+        return Ok(true);
+    }
+    let Some(folder) = item.original_path.parent() else {
+        return Ok(false);
+    };
+    let moved = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv\ntell application \"Finder\" to move (POSIX file (item 1 of argv) as alias) to (POSIX file (item 2 of argv) as alias)\nend run",
+            "--",
+        ])
+        .arg(&item.trash_name)
+        .arg(folder)
+        .output()?
+        .status
+        .success();
+    Ok(moved)
 }
 
 #[tauri::command]
@@ -799,22 +886,15 @@ fn undo_delete(
             "--restore",
             &format!("trash:///{}", item.trash_name),
         ])
-        .output();
+        .output()
+        .map(|out| out.status.success());
     #[cfg(target_os = "macos")]
-    let output = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "tell application \"Finder\" to move POSIX file \"{}\" to original location",
-                item.trash_name
-            ),
-        ])
-        .output();
+    let output = restore_from_trash(&item);
     let output = output.map_err(|error| CommandError {
         kind: "Delete",
         message: format!("The deleted video could not be restored: {error}"),
     })?;
-    if output.status.success() {
+    if output {
         synchronize_index_path(updates.inner(), &item.original_path);
         Ok(())
     } else {
@@ -1299,6 +1379,21 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
     Ok(plan)
 }
 
+fn read_index_stats() -> Result<index_stats::IndexStats, String> {
+    #[cfg(target_os = "linux")]
+    {
+        managed_index::IndexManager::system()?.stats()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        owned_index::OwnedIndexManager::for_inspection()?.stats()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err("The indexer is not supported on this platform.".to_owned())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
@@ -1338,6 +1433,7 @@ pub fn run() {
                     ))
                 },
                 reset_plan,
+                read_index_stats,
                 &mut stdout,
                 &mut stderr,
             )
@@ -1632,6 +1728,19 @@ mod tests {
             stderr,
             still_on_disk,
         )
+    }
+
+    #[test]
+    fn the_item_a_delete_added_to_the_trash_is_the_one_restored() {
+        let before = "trash:///clip.mp4\t2\t(regular)\ntrash:///clip.mp4.9\t2\t(regular)\n";
+        let after = "trash:///clip.mp4\t2\t(regular)\ntrash:///clip.mp4.9\t2\t(regular)\ntrash:///clip.mp4.10\t2\t(regular)\n";
+
+        assert_eq!(
+            new_trash_item(before, after).as_deref(),
+            Some("clip.mp4.10")
+        );
+        assert_eq!(new_trash_item(after, after), None);
+        assert_eq!(new_trash_item("", after), None);
     }
 
     #[test]

@@ -8,16 +8,31 @@ npm test                # React unit tests
 npm run test:integration # build, launch, and interact with the native app
 npm run build           # type-check and build only the web frontend
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run build:linux     # build, install, and record provenance without modifying tracked files
-npm run build:linux -- --appimage # the same, packaged as an AppImage
+npm run build:linux     # build only and print the binary path; the installed Toka is untouched
+npm run build:linux:install # build, then install for the current user
+npm run build:linux:install -- --appimage # the same, packaged as an AppImage
 ```
 
-`build:linux` installs the release executable straight into `~/.local/opt/toka`
+`build:linux:install` installs the release executable straight into `~/.local/opt/toka`
 and skips AppImage bundling, which roughly halves the build. Use `--appimage`
 when you need to check the packaged artifact; CI builds the real bundles either
 way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
+
+## Testing a branch without installing it (Linux)
+
+```sh
+node scripts/isolated/toka-isolated.mjs build            # build only, nothing installed
+node scripts/isolated/toka-isolated.mjs launch --detach  # own config, data, cache and indexer
+node scripts/isolated/toka-isolated.mjs status
+node scripts/isolated/toka-isolated.mjs stop --clean
+```
+
+The branch runs beside your installed Toka with its own settings, index and
+indexer, under `<worktree>/.scratch/isolated-home`. It indexes a throwaway copy of
+`test/fixtures`, and a `systemctl` shim keeps it from controlling your real
+`toka-indexer.service`.
 
 ## Search diagnostics
 
@@ -55,7 +70,7 @@ The bundled TikTok reference lives at `src-tauri/addons/tiktok.json`:
   "id": "tiktok",
   "name": "TikTok",
   "match": {
-    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?i:\\.mp4)$"
+    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?: \\[.+\\])?(?i:\\.mp4)$"
   },
   "actions": [
     {
@@ -126,7 +141,7 @@ to see its version, build age, Git SHA, and number of commits behind
 ## Linux troubleshooting
 
 - No results: press `Ctrl+,` and check that the folder is configured and reports Ready. A disconnected drive reports Drive disconnected and keeps its existing database.
-- Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux` refreshes and restarts the user service.
+- Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux:install` refreshes and restarts the user service.
 - Slow indexing: the status pane reports folders in progress and files scanned; if those numbers stop changing, inspect the indexer log at `~/.local/share/app.toka.desktop/logs/indexer.log`.
 - Optional Recoll provider: install `recoll`, run `recollindex`, and launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).

@@ -39,6 +39,12 @@ describe("linux build script", () => {
     );
 
     expect(packageJson.scripts["build:linux"]).toBe("node bin/build.mjs linux");
+    expect(packageJson.scripts["build:linux:install"]).toBe(
+      "node bin/build.mjs linux --install",
+    );
+    expect(packageJson.scripts["build:mac:install"]).toBe(
+      "node bin/build.mjs mac --install",
+    );
     expect(buildScript).toContain("--no-bundle");
     expect(buildScript).toContain('"scripts/install-linux.mjs"');
     expect(buildScript).not.toContain('"sudo"');
@@ -91,7 +97,7 @@ describe("installAppImage", () => {
       "test appimage",
     );
     await expect(readFile(desktopEntry, "utf8")).resolves.toContain(
-      `Exec=${installedAppImage} %U`,
+      `Exec=${installedAppImage} %F`,
     );
   });
 });
@@ -189,7 +195,7 @@ describe("installBinary", () => {
     );
     expect((await stat(installedBinary)).mode & 0o111).toBeTruthy();
     await expect(readFile(desktopEntry, "utf8")).resolves.toContain(
-      `Exec=${installedBinary} %U`,
+      `Exec=${installedBinary} %F`,
     );
   });
 
