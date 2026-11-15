@@ -89,7 +89,7 @@ async function build(flags) {
     spawnSync("git", ["diff", "--quiet", "--", paths.schemaFile], {
       cwd: worktree,
     }).status === 0;
-  const busy = spawnSync("pgrep", ["-f", "rustc|cargo"], { encoding: "utf8" });
+  const busy = spawnSync("pgrep", ["-x", "rustc|cargo"], { encoding: "utf8" });
   if (busy.stdout.trim()) {
     console.error(
       "Warning: cargo/rustc processes are already running; builds compete for the CPU.",
@@ -144,7 +144,7 @@ async function build(flags) {
   }
   // Leftovers cannot be attributed to this build reliably, so report them and
   // leave killing them to the caller (AGENTS.md: check, then terminate).
-  const leftovers = spawnSync("pgrep", ["-a", "-f", "rustc|cargo"], {
+  const leftovers = spawnSync("pgrep", ["-a", "-x", "rustc|cargo"], {
     encoding: "utf8",
   });
   if (leftovers.stdout.trim()) {
@@ -176,6 +176,11 @@ function prepareHome(paths, flags) {
     paths.worktree,
     flags["seed-from"] ?? "test/fixtures",
   );
+  if (paths.home === source || paths.home.startsWith(`${source}${path.sep}`)) {
+    fail(
+      `--seed-from ${source} contains the isolated home; pick a smaller folder.`,
+    );
+  }
   if (!existsSync(source)) {
     console.error(`Seed folder ${source} not found; starting with no folders.`);
     return;
@@ -252,10 +257,13 @@ async function launch(flags) {
         report(describeRun(paths));
         return;
       }
+      if (!isSupervisorOf(supervisor.pid, scriptPath)) break;
       await sleepMs(100);
     }
     killGroup(supervisor.pid, "SIGTERM");
-    fail(`The app did not start; see ${paths.supervisorLog}`);
+    fail(
+      `The app did not start (it exited or took over 15s). See ${paths.supervisorLog} and ${path.join(paths.runDir, "app.log")}`,
+    );
   }
 
   const env = isolatedEnv(paths);
@@ -304,7 +312,13 @@ async function launch(flags) {
   // only then drop the state file, so a survivor is never left untracked.
   const cleanup = () => {
     cleaning ??= (async () => {
-      const groups = [app.pid, currentIndexerPid(paths, null) ?? indexer.pid];
+      const liveIndexer = currentIndexerPid(paths, null);
+      const groups = [
+        app.pid,
+        liveIndexer !== null && isIsolatedProcess(liveIndexer, paths)
+          ? liveIndexer
+          : indexer.pid,
+      ];
       for (const pid of groups) killGroup(pid, "SIGTERM");
       for (
         let waited = 0;
@@ -384,13 +398,13 @@ function status(flags) {
     .filter(
       (run) => run.running || existsSync(run.home) || run.worktree === here,
     );
-  if (flags.json) {
-    console.log(JSON.stringify(runs, null, 2));
-    return;
-  }
   const interesting = flags.all
     ? runs
     : runs.filter((run) => run.running || run.worktree === here);
+  if (flags.json) {
+    console.log(JSON.stringify(interesting, null, 2));
+    return;
+  }
   if (interesting.length === 0) console.log("No isolated runs.");
   for (const run of interesting) report(run);
 }

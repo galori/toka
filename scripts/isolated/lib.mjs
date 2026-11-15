@@ -47,7 +47,8 @@ export function parseArguments(argv) {
       flags[name] = true;
     } else if (VALUE_FLAGS.has(name)) {
       const value = inline ?? rest[(index += 1)];
-      if (!value) throw new Error(`--${name} needs a value.`);
+      if (!value || value.startsWith("--"))
+        throw new Error(`--${name} needs a value.`);
       flags[name] = value;
     } else {
       throw new Error(`Unknown flag "--${name}".`);
@@ -60,7 +61,7 @@ export function parseArguments(argv) {
 export function isolatedPaths(worktree, env = process.env) {
   const home = path.join(worktree, ".scratch", "isolated-home");
   const targetDir = env.CARGO_TARGET_DIR
-    ? path.resolve(worktree, env.CARGO_TARGET_DIR)
+    ? path.resolve(worktree, "src-tauri", env.CARGO_TARGET_DIR)
     : path.join(worktree, "src-tauri", "target");
   return {
     worktree,
@@ -120,6 +121,10 @@ export function shimScript(paths) {
 PIDFILE=${quote(paths.indexerPidFile)}
 printf '%s systemctl %s\\n' "$(date -Is)" "$*" >> ${quote(paths.shimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
+# A stale pid file may name a recycled PID: only trust it if it is our binary.
+if [ -n "$pid" ] && ! tr '\\0' '\\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 | grep -qxF ${quote(paths.binary)}; then
+  pid=
+fi
 case "$*" in
   *"stop toka-indexer.service"*)
     [ -n "$pid" ] && kill -s TERM -- "-$pid" 2>/dev/null
@@ -153,8 +158,7 @@ export function indexerArguments() {
 /**
  * True when `pid` is alive and running `binary`. A PID recorded earlier may
  * since belong to an unrelated process, so the command line is checked before
- * anything is signalled. Either argv[0] or argv[1] may name the binary, the
- * latter for scripts run through an interpreter.
+ * anything is signalled.
  */
 export function isProcessOf(pid, binary, procRoot = "/proc") {
   if (!Number.isInteger(pid) || pid <= 1) return false;
@@ -163,8 +167,7 @@ export function isProcessOf(pid, binary, procRoot = "/proc") {
       path.join(procRoot, String(pid), "cmdline"),
       "utf8",
     );
-    const [first, second] = commandLine.split("\0");
-    return first === binary || second === binary;
+    return commandLine.split("\0")[0] === binary;
   } catch {
     return false;
   }

@@ -17,6 +17,8 @@ and skips AppImage bundling, which roughly halves the build. Use `--appimage`
 when you need to check the packaged artifact; CI builds the real bundles either
 way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
+The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
+
 ## Testing a branch without installing it (Linux)
 
 ```sh
@@ -30,8 +32,6 @@ The branch runs beside your installed Toka with its own settings, index and
 indexer, under `<worktree>/.scratch/isolated-home`. It indexes a throwaway copy of
 `test/fixtures`, and a `systemctl` shim keeps it from controlling your real
 `toka-indexer.service`.
-
-The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
 
 ## Search diagnostics
 

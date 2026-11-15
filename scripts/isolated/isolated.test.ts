@@ -156,10 +156,17 @@ describe.skipIf(process.platform !== "linux")(
       const target = path.join(repo, "target");
       await mkdir(path.join(target, "release"), { recursive: true });
       const fake = path.join(target, "release/toka");
+      // Re-exec node under the binary's own name, as a compiled binary appears
+      // in /proc/<pid>/cmdline.
       await writeFile(
         fake,
-        `#!/usr/bin/env node
-import fs from "node:fs";
+        `#!/bin/bash
+exec -a "$0" node "$(dirname "$0")/fake.mjs" "$@"
+`,
+      );
+      await writeFile(
+        path.join(target, "release/fake.mjs"),
+        `import fs from "node:fs";
 const role = process.argv[2] === "--indexer" ? "indexer" : "app";
 fs.writeFileSync(process.env.XDG_DATA_HOME + "/" + role + ".json",
   JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
