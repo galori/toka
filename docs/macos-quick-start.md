@@ -24,11 +24,11 @@ Toka searches its own index of the folders you choose. No Spotlight index or sep
 ## 3. Build an installable app
 
 ```sh
-npm run build:mac
+npm run build:mac:install
 ```
 
 The `.app` and `.dmg` bundles are written below `src-tauri/target/release/bundle/`.
-The build installs the app in `/Applications` and links the `toka` command at
+`build:mac:install` also installs the app in `/Applications` and links the `toka` command at
 `~/.local/bin/toka`. Add that folder to your `PATH` if your shell does not find
 the command:
 

@@ -30,7 +30,7 @@ current after the Toka window closes. Use `Ctrl+,` to change the folders later.
 ## 3. Build an installable app
 
 ```sh
-npm run build:linux
+npm run build:linux:install
 ```
 
 This installs Toka into `~/.local/opt/toka` and registers a desktop entry, so it

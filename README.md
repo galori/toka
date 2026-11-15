@@ -10,8 +10,10 @@ Toka is a small desktop app for finding and playing videos on macOS and Linux. O
 ## Build
 
 ```sh
-npm run build:linux # Linux: builds and installs for the current user
-npm run build:mac   # macOS: builds the .app and .dmg
+npm run build:linux         # Linux: builds only, prints the binary path
+npm run build:linux:install # Linux: builds and installs for the current user
+npm run build:mac           # macOS: builds the .app and .dmg only
+npm run build:mac:install   # macOS: builds, then installs into /Applications
 ```
 
 Build Linux artifacts on Linux and macOS bundles on macOS. The Linux command installs

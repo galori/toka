@@ -39,6 +39,12 @@ describe("linux build script", () => {
     );
 
     expect(packageJson.scripts["build:linux"]).toBe("node bin/build.mjs linux");
+    expect(packageJson.scripts["build:linux:install"]).toBe(
+      "node bin/build.mjs linux --install",
+    );
+    expect(packageJson.scripts["build:mac:install"]).toBe(
+      "node bin/build.mjs mac --install",
+    );
     expect(buildScript).toContain("--no-bundle");
     expect(buildScript).toContain('"scripts/install-linux.mjs"');
     expect(buildScript).not.toContain('"sudo"');
