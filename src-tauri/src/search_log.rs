@@ -270,6 +270,7 @@ fn context_entry(context: &SearchLogContext, kind: &str) -> serde_json::Map<Stri
     let mut entry = serde_json::Map::new();
     entry.insert("kind".into(), json!(kind));
     entry.insert("timestamp".into(), json!(now_seconds()));
+    entry.insert("time".into(), json!(crate::timestamp::now_rfc3339()));
     entry.insert("query".into(), json!(context.query));
     entry.insert("page".into(), json!(context.page));
     entry.insert("pageSize".into(), json!(context.page_size));
@@ -421,7 +422,7 @@ fn create_verbose_log(
 
 fn write_verbose_header(file: &mut fs::File, context: &SearchLogContext) -> std::io::Result<()> {
     writeln!(file, "Toka verbose search log")?;
-    writeln!(file, "Started: {}", now_seconds())?;
+    writeln!(file, "Started: {}", crate::timestamp::now_rfc3339())?;
     writeln!(file, "Query: {}", context.query)?;
     writeln!(file, "Page: {}", context.page)?;
     writeln!(file, "Page size: {}", context.page_size)?;
@@ -677,6 +678,9 @@ mod tests {
         );
         assert_eq!(entry["exitCode"], 0);
         assert!(entry["timestamp"].as_u64().is_some());
+        assert!(entry["time"]
+            .as_str()
+            .is_some_and(|time| time.ends_with('Z')));
     }
 
     #[test]

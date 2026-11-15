@@ -106,7 +106,12 @@ impl IndexLogger {
             eprintln!("Could not open Toka indexer log: {}", self.path.display());
             return;
         };
-        if let Err(error) = writeln!(file, "[{}] {}", now_millis(), message.as_ref()) {
+        if let Err(error) = writeln!(
+            file,
+            "[{}] {}",
+            crate::timestamp::now_rfc3339(),
+            message.as_ref()
+        ) {
             eprintln!("Could not write Toka indexer log: {error}");
         }
     }
