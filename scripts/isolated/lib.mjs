@@ -131,7 +131,7 @@ case "$*" in
       kill -s TERM -- "-$pid" 2>/dev/null
       # Like the real "systemctl stop", return only once the indexer is gone.
       n=0
-      while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 100 ]; do
+      while kill -s 0 -- "-$pid" 2>/dev/null && [ "$n" -lt 100 ]; do
         sleep 0.1
         n=$((n + 1))
       done

@@ -79,7 +79,7 @@ them and pass `--worktree`.
 Run it in a subshell so the shim and XDG variables do not linger in your shell:
 
 ```sh
-( eval "$(node scripts/isolated/toka-isolated.mjs env)"; src-tauri/target/release/toka <cli command> )
+( eval "$(node scripts/isolated/toka-isolated.mjs env)"; <binary from status> <cli command> )
 ```
 
 ## Reporting
