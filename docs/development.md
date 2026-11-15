@@ -26,7 +26,7 @@ directory. Print it with `npm run search-log`, or follow new entries with
 `npm run search-log -- --follow`; pass a path to either command to inspect a
 different log. Each running Toka window has its own session marker, so closing
 one window does not delete the shared log while another window is active. The
-indexer writes its own `indexer.log` beside the search log.
+indexer writes its own `indexer.log` beside the search log. Search log entries carry a readable UTC `time` (RFC 3339) next to the epoch `timestamp`, and each `indexer.log` line starts with `[<RFC 3339 UTC time>]`.
 
 The Search logging settings pane, available from the keyboard-help pane, can
 enable verbose per-search logs and choose their destination folder. Verbose

@@ -106,7 +106,12 @@ impl IndexLogger {
             eprintln!("Could not open Toka indexer log: {}", self.path.display());
             return;
         };
-        if let Err(error) = writeln!(file, "[{}] {}", now_millis(), message.as_ref()) {
+        if let Err(error) = writeln!(
+            file,
+            "[{}] {}",
+            crate::timestamp::now_rfc3339(),
+            message.as_ref()
+        ) {
             eprintln!("Could not write Toka indexer log: {error}");
         }
     }
@@ -1115,6 +1120,9 @@ mod tests {
         let log = fs::read_to_string(paths.index_log).unwrap();
         assert!(log.contains("folder added:"));
         assert!(log.contains("folder removed:"));
+        // Each line starts with a readable UTC timestamp, not epoch millis.
+        let first = log.lines().next().unwrap();
+        assert!(first.starts_with("[20") && first[1..].split(']').next().unwrap().ends_with('Z'));
     }
 
     #[test]
