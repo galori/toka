@@ -950,7 +950,6 @@ fn run_updatedb_with_progress(
     };
     let mut logged_directories = HashSet::new();
     let mut tracker = DirectoryTracker::new(&folder.path);
-    let mut last_report_was_empty = true;
     let mut last_report = Instant::now() - Duration::from_secs(1);
     loop {
         line.clear();
@@ -977,7 +976,9 @@ fn run_updatedb_with_progress(
             progress.videos = progress.videos.saturating_add(u64::from(video));
             progress.images = progress.images.saturating_add(u64::from(image));
         }
-        let entered_directory = tracker.observe(&seen, video, image);
+        // Hidden entries stay out of the totals, so keep them out of the list.
+        let hidden = is_under_hidden_entry(&folder.path, &seen);
+        let entered_directory = !hidden && tracker.observe(&seen, video, image);
         if let Some(directory) = seen.parent() {
             if progress.current.as_deref() != Some(directory) {
                 progress.current = Some(directory.to_path_buf());
@@ -993,13 +994,12 @@ fn run_updatedb_with_progress(
                 }
             }
         }
-        // Show a directory the moment the scan reaches it for the first time,
-        // then at most every half second.
+        // Show a newly entered directory within 100ms, other updates every
+        // half second.
         if last_report.elapsed() >= Duration::from_millis(500)
-            || (entered_directory && last_report_was_empty)
+            || (entered_directory && last_report.elapsed() >= Duration::from_millis(100))
         {
             progress.recent_directories = tracker.recent();
-            last_report_was_empty = false;
             if let Err(error) = set_folder_progress(paths, &folder.id, &progress) {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1587,6 +1587,47 @@ mod tests {
         // /m/c has no files of its own, so it is only counted as a subfolder.
         assert!(find("/m/c").is_none());
         assert_eq!(tracker.counts[root].subfolders, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_directories_are_not_listed_as_scanned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        let folder = ConfiguredFolder {
+            id: "folder".into(),
+            path: media.clone(),
+            mount: None,
+        };
+        let fake = root.path().join("updatedb");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '{m}/.git/x.mp4\\n{m}/a/y.mp4\\n'\n",
+                m = media.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        run_updatedb_with_progress(
+            &paths,
+            &folder,
+            &fake,
+            &IndexLogger::new(paths.index_log.clone()),
+        )
+        .unwrap();
+        let recent = load_json::<PersistedStatus>(&paths.status)
+            .unwrap()
+            .unwrap()
+            .folders["folder"]
+            .recent_directories
+            .clone();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].path, media.join("a"));
     }
 
     #[test]
