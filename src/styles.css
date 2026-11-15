@@ -1726,6 +1726,33 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.index-status-copy > .index-status-directories {
+  flex-basis: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: #bbb;
+  font-size: 0.85em;
+}
+
+.index-status-directories li {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.index-status-directory-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-status-directory-found {
+  flex: 0 0 auto;
+  color: #999;
+}
+
 @keyframes index-status-pulse {
   50% {
     opacity: 0.35;
