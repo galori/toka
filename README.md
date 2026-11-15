@@ -74,7 +74,7 @@ output error returns exit code `1`. A missing query returns exit code `2`. Use
 `toka --help` (or `-h`) lists the available commands, and `toka --version` (or
 `-v`) prints the installed Toka version and the Git SHA it was built from
 (the same SHA shown when the app first launches), e.g.
-`toka 0.1.0 (Git SHA 1a2b3c…)`.
+`toka <version> (Git SHA 1a2b3c…)`.
 
 ### Reset Toka
 

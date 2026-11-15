@@ -20,9 +20,8 @@ fn main() {
     // build-info.json. A bare `cargo build` afterwards reuses that `dist`, so
     // the file keeps the CLI in step with the launch screen.
     let build_info = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("build-info.json");
-    if build_info.exists() {
-        println!("cargo:rerun-if-changed={}", build_info.display());
-    }
+    // Unconditional: Cargo also reruns when a watched path appears or vanishes.
+    println!("cargo:rerun-if-changed={}", build_info.display());
     println!("cargo:rerun-if-env-changed=VITE_GIT_SHA");
     let sha = env::var("VITE_GIT_SHA")
         .ok()
