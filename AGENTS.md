@@ -21,3 +21,5 @@
 - If `gh` or GitHub network operations fail inside the sandbox, retry the same operation outside the sandbox with the required approval before treating GitHub as unavailable or marking the task blocked.
 - When setting up a new environment or diagnosing E2E test failures on Linux, ensure the following dependencies are installed to support `WebKitWebDriver` and headless integration tests: `sudo apt-get install -y webkitgtk-webdriver xvfb imagemagick gstreamer1.0-plugins-bad libgtk-3-0t64 libasound2t64 libatk-bridge2.0-0t64 libcups2t64` (note that older Ubuntu versions may use the non-`t64` package names).
 - When addressing a code review finding - resopnd to the code review finding and resolve the comment thread. Even if you decide not to fix, still respond and resolve.
+- Add the PR# to the session name if you're able to rename your own session.
+- After you are done with your turns before going back to idle always display a link to the PR so the user could easily see which PR is being worked on and be able to click on it to view it on github.
