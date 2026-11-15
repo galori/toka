@@ -470,7 +470,7 @@ async fn video_preview(
 /// the item's name inside the Linux trash, or its trashed path on macOS. Both
 /// are looked up after the move, because the trash renames an item whose name
 /// is already taken, so the file's own name is not enough to identify it.
-fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
+fn move_to_trash(path: &std::path::Path) -> Result<Option<String>, CommandError> {
     #[cfg(not(target_os = "macos"))]
     let before = trash_listing();
     #[cfg(target_os = "linux")]
@@ -497,13 +497,16 @@ fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
     #[cfg(target_os = "macos")]
     {
         let trashed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        return Ok(if trashed.is_empty() { name } else { trashed });
+        return Ok(Some(if trashed.is_empty() { name } else { trashed }));
     }
     #[cfg(not(target_os = "macos"))]
     {
         // The item this call added is the one whose name was not there before,
         // whatever the trash renamed it to and whatever the clock says.
-        Ok(new_trash_item(&before, &trash_listing()).unwrap_or_else(|| percent_encode(&name)))
+        // An ambiguous listing leaves the identity unknown: undo is then not
+        // offered, rather than risking restoring an older item of the same name.
+        let _ = name;
+        Ok(new_trash_item(&before, &trash_listing()))
     }
 }
 
@@ -511,7 +514,7 @@ fn move_to_trash(path: &std::path::Path) -> Result<String, CommandError> {
 #[cfg(not(target_os = "macos"))]
 fn trash_listing() -> String {
     std::process::Command::new("gio")
-        .args(["list", "-u", "trash:///"])
+        .args(["list", "--hidden", "-u", "trash:///"])
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .unwrap_or_default()
@@ -546,20 +549,6 @@ fn new_trash_item(before: &str, after: &str) -> Option<String> {
 
 fn name_column(line: &str) -> &str {
     line.split('\t').next().unwrap_or(line)
-}
-
-/// The percent-encoded form `gio list -u` uses for names, so a name that had
-/// to be guessed still restores.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-fn percent_encode(name: &str) -> String {
-    name.bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
 
 /// What a trash helper's result means for the file it was handed. A helper that
@@ -841,7 +830,7 @@ fn delete_video(
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
     let trash_name = move_to_trash(&path)?;
     synchronize_index_path(updates.inner(), &path);
-    *deleted.lock().unwrap() = Some(DeletedVideo {
+    *deleted.lock().unwrap() = trash_name.map(|trash_name| DeletedVideo {
         trash_name,
         original_path: path,
     });
@@ -1733,11 +1722,6 @@ mod tests {
         );
         assert_eq!(new_trash_item(after, after), None);
         assert_eq!(new_trash_item("", after), None);
-    }
-
-    #[test]
-    fn a_guessed_trash_name_is_percent_encoded() {
-        assert_eq!(percent_encode("100% [a].mp4"), "100%25%20%5Ba%5D.mp4");
     }
 
     #[test]

@@ -225,25 +225,30 @@ fn rename(path: &Path, tags: &Tags) -> Result<TagUpdate, String> {
 /// if the name is taken, even when it was taken a moment ago, which a
 /// check-then-rename cannot promise.
 pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::hard_link(from, to)?;
-    fs::remove_file(from)
+    match fs::hard_link(from, to) {
+        Ok(()) => fs::remove_file(from),
+        // exFAT and FAT32 have no hard links; fall back to check-then-rename,
+        // which is the strongest guarantee those filesystems allow here.
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+            if to.symlink_metadata().is_ok() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(from, to)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// What follows `stem` at the start of `name`, comparing the way subtitle
 /// discovery does (Unicode lowercase) while cutting at a real character
 /// boundary, since lowercasing can change a name's byte length.
 fn after_stem<'a>(name: &'a str, stem_lower: &str) -> Option<&'a str> {
-    let mut lowered = String::new();
-    for (index, character) in name.char_indices() {
-        lowered.extend(character.to_lowercase());
-        if !stem_lower.starts_with(&lowered) {
-            return None;
-        }
-        if lowered == stem_lower {
-            return Some(&name[index + character.len_utf8()..]);
-        }
-    }
-    None
+    // Whole-string lowercasing, as discovery does: per-character lowercasing
+    // differs for context-sensitive letters such as Greek final sigma.
+    name.char_indices()
+        .map(|(index, character)| index + character.len_utf8())
+        .find(|&end| name[..end].to_lowercase() == stem_lower)
+        .map(|end| &name[end..])
 }
 
 /// Keeps subtitle files beside a renamed video, so `talk.srt` follows
@@ -408,6 +413,17 @@ mod tests {
         rename(&video, &Tags::new(["beach"])).unwrap();
 
         assert!(directory.path().join("STRAẞE.srt").exists());
+    }
+
+    #[test]
+    fn a_subtitle_follows_a_video_whose_name_ends_in_a_greek_sigma() {
+        let directory = tempdir().unwrap();
+        let video = file(&directory, "ΟΣ.mp4");
+        file(&directory, "ΟΣ.srt");
+
+        rename(&video, &Tags::new(["beach"])).unwrap();
+
+        assert!(!directory.path().join("ΟΣ.srt").exists());
     }
 
     #[test]
