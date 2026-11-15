@@ -20,6 +20,20 @@ way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
 The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
 
+## Testing a branch without installing it (Linux)
+
+```sh
+node scripts/isolated/toka-isolated.mjs build            # build only, nothing installed
+node scripts/isolated/toka-isolated.mjs launch --detach  # own config, data, cache and indexer
+node scripts/isolated/toka-isolated.mjs status
+node scripts/isolated/toka-isolated.mjs stop --clean
+```
+
+The branch runs beside your installed Toka with its own settings, index and
+indexer, under `<worktree>/.scratch/isolated-home`. It indexes a throwaway copy of
+`test/fixtures`, and a `systemctl` shim keeps it from controlling your real
+`toka-indexer.service`.
+
 ## Search diagnostics
 
 Toka writes the normal search log as JSON lines under the platform data
