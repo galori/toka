@@ -236,6 +236,14 @@ impl IndexManager {
     pub fn state(&self) -> Result<IndexState, String> {
         let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
         let status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
+        self.state_from(&config, status)
+    }
+
+    fn state_from(
+        &self,
+        config: &IndexConfig,
+        status: PersistedStatus,
+    ) -> Result<IndexState, String> {
         let indexing_files = status
             .folders
             .values()
@@ -261,7 +269,8 @@ impl IndexManager {
         }
         let folders = config
             .folders
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|folder| {
                 let persisted = status.folders.get(&folder.id);
                 let available = folder_available(&folder);
@@ -304,9 +313,9 @@ impl IndexManager {
     /// media counts walk each indexed folder the way the app's own totals do.
     pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
-        let state = self.state()?;
         let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
         let persisted = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
+        let state = self.state_from(&config, persisted.clone())?;
         let folders = state
             .folders
             .into_iter()
@@ -331,7 +340,7 @@ impl IndexManager {
                         .folders
                         .iter()
                         .find(|configured| configured.id == folder.id)
-                        .map(|configured| count_indexed_media(std::slice::from_ref(configured)))
+                        .and_then(|configured| walk_media(std::slice::from_ref(configured), true))
                 };
                 FolderStats {
                     path: folder.path,
@@ -694,6 +703,12 @@ fn set_folder_progress(
 }
 
 fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
+    walk_media(folders, false).unwrap_or_default()
+}
+
+/// With `strict`, an unreadable directory makes the whole count `None`
+/// instead of silently leaving its files out.
+fn walk_media(folders: &[ConfiguredFolder], strict: bool) -> Option<MediaCounts> {
     let mut counts = MediaCounts::default();
     let mut pending = folders
         .iter()
@@ -704,8 +719,10 @@ fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
         if crate::index_visibility::is_hidden(&directory).unwrap_or(true) {
             continue;
         }
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(_) if strict => return None,
+            Err(_) => continue,
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -728,7 +745,7 @@ fn count_indexed_media(folders: &[ConfiguredFolder]) -> MediaCounts {
         }
     }
 
-    counts
+    Some(counts)
 }
 
 fn indexed_media_counts(paths: &IndexPaths, folders: &[ConfiguredFolder]) -> MediaCounts {
