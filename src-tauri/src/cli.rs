@@ -16,14 +16,27 @@ const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the in
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
-/// The version line shows the same Git SHA as the launch screen. The build
+/// The build version is the git-derived `0.1.1+482.a1b2c3d.branch` that build
+/// scripts pass as `VITE_APP_VERSION`; a plain `cargo build` has none and falls
+/// back to the manifest version.
+fn build_version() -> &'static str {
+    pick_version(option_env!("VITE_APP_VERSION"))
+}
+
+fn pick_version(build_version: Option<&'static str>) -> &'static str {
+    build_version
+        .filter(|version| !version.is_empty())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// The version line also shows the same Git SHA as the launch screen. The build
 /// script hands it over as `TOKA_GIT_SHA`; a build with no provenance has none,
 /// so it reads "development" exactly as the frontend does.
-fn version_text(git_sha: Option<&str>) -> String {
+fn version_text(version: &str, git_sha: Option<&str>) -> String {
     let sha = git_sha
         .filter(|sha| !sha.is_empty())
         .unwrap_or("development");
-    format!("toka {} (Git SHA {sha})", env!("CARGO_PKG_VERSION"))
+    format!("toka {version} (Git SHA {sha})")
 }
 
 pub fn is_command(arguments: &[OsString]) -> bool {
@@ -57,7 +70,11 @@ pub fn run_command(
     }
 
     if command == OsStr::new("--version") || command == OsStr::new("-v") {
-        return print_text(&version_text(option_env!("TOKA_GIT_SHA")), stdout, stderr);
+        return print_text(
+            &version_text(build_version(), option_env!("TOKA_GIT_SHA")),
+            stdout,
+            stderr,
+        );
     }
 
     if command == OsStr::new("--index-stats") {
@@ -338,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn version_prefers_the_build_version_over_the_manifest_version() {
+        assert_eq!(
+            super::pick_version(Some("0.1.1+482.a1b2c3d.feat")),
+            "0.1.1+482.a1b2c3d.feat"
+        );
+        assert_eq!(super::pick_version(None), env!("CARGO_PKG_VERSION"));
+        assert_eq!(super::pick_version(Some("")), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
     fn version_and_help_flags_print_without_building_anything() {
         for (flag, is_version) in [
             ("-v", true),
@@ -364,7 +391,7 @@ mod tests {
             if is_version {
                 // The SHA is whatever the build recorded, so check the shape, and
                 // that a recorded SHA really reaches the output.
-                let prefix = format!("toka {} (Git SHA ", env!("CARGO_PKG_VERSION"));
+                let prefix = format!("toka {} (Git SHA ", super::build_version());
                 let sha = output
                     .strip_prefix(&prefix)
                     .and_then(|rest| rest.strip_suffix(")\n"))
@@ -382,16 +409,18 @@ mod tests {
 
     #[test]
     fn version_text_includes_the_git_sha_or_development() {
-        let version = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            super::version_text(Some("abc123")),
-            format!("toka {version} (Git SHA abc123)")
+            super::version_text("0.1.1+5.abc", Some("abc123")),
+            "toka 0.1.1+5.abc (Git SHA abc123)"
         );
         assert_eq!(
-            super::version_text(None),
-            format!("toka {version} (Git SHA development)")
+            super::version_text("0.1.1", None),
+            "toka 0.1.1 (Git SHA development)"
         );
-        assert_eq!(super::version_text(Some("")), super::version_text(None));
+        assert_eq!(
+            super::version_text("0.1.1", Some("")),
+            super::version_text("0.1.1", None)
+        );
     }
 
     #[test]

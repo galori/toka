@@ -16,6 +16,8 @@ fn sha_from_build_info(path: &Path) -> Option<String> {
 }
 
 fn main() {
+    // The CLI embeds the git-derived build version (see `cli::version_text`).
+    println!("cargo:rerun-if-env-changed=VITE_APP_VERSION");
     // `build:*` passes VITE_GIT_SHA to the frontend and records the same SHA in
     // build-info.json. A bare `cargo build` afterwards reuses that `dist`, so
     // the file keeps the CLI in step with the launch screen.
