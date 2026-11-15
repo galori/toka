@@ -296,21 +296,38 @@ impl IndexManager {
     }
 
     /// Everything the indexer knows, for `toka --index-stats`. Per-folder
-    /// media counts walk each folder the way the app's own totals do.
+    /// media counts walk each indexed folder the way the app's own totals do.
     pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
         let state = self.state()?;
         let config = load_json::<IndexConfig>(&self.paths.config)?.unwrap_or_default();
+        let persisted = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
         let folders = state
             .folders
             .into_iter()
             .map(|folder| {
-                let counts = config
-                    .folders
-                    .iter()
-                    .find(|configured| configured.id == folder.id)
-                    .filter(|_| folder.status != FolderStatus::Offline)
-                    .map(|configured| count_indexed_media(std::slice::from_ref(configured)));
+                let entry = persisted.folders.get(&folder.id);
+                // A folder's first scan has no database yet, so show what the
+                // scan has found. Otherwise count the media the index covers;
+                // folders never indexed, or offline, have nothing to count.
+                let first_scan = folder.status == FolderStatus::Indexing
+                    && entry.is_some_and(|entry| entry.first_scan);
+                let counts = if first_scan {
+                    entry.map(|entry| MediaCounts {
+                        videos: entry.scanned_videos,
+                        images: entry.scanned_images,
+                    })
+                } else if matches!(folder.status, FolderStatus::Pending | FolderStatus::Offline)
+                    || !self.paths.database(&folder.id).is_file()
+                {
+                    None
+                } else {
+                    config
+                        .folders
+                        .iter()
+                        .find(|configured| configured.id == folder.id)
+                        .map(|configured| count_indexed_media(std::slice::from_ref(configured)))
+                };
                 FolderStats {
                     path: folder.path,
                     state: match folder.status {
