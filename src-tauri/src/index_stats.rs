@@ -60,7 +60,9 @@ impl IndexStats {
 pub fn render(stats: &IndexStats) -> String {
     let mut out = String::new();
     let scanning = stats.scanning();
-    let activity = if scanning > 0 {
+    let activity = if scanning > 0 && stats.service_running == Some(false) {
+        format!("stalled, {scanning} scan(s) interrupted (service not running)")
+    } else if scanning > 0 {
         format!(
             "active, scanning {scanning} folder{}",
             if scanning == 1 { "" } else { "s" }
@@ -89,15 +91,12 @@ pub fn render(stats: &IndexStats) -> String {
             folder.path.display(),
             folder.state.label()
         );
-        match (folder.videos, folder.images) {
-            (Some(videos), Some(images)) => {
-                let _ = write!(
-                    out,
-                    "  {} files ({videos} videos, {images} images)",
-                    videos + images
-                );
-            }
-            _ => {}
+        if let (Some(videos), Some(images)) = (folder.videos, folder.images) {
+            let _ = write!(
+                out,
+                "  {} files ({videos} videos, {images} images)",
+                videos + images
+            );
         }
         if folder.state == FolderState::Indexing {
             let _ = write!(out, "  {} files scanned so far", folder.scanned_files);
@@ -149,6 +148,19 @@ mod tests {
     }
 
     #[test]
+    fn scan_with_a_stopped_service_is_reported_as_stalled() {
+        let stats = IndexStats {
+            revision: 1,
+            videos: 0,
+            images: 0,
+            service_running: Some(false),
+            folders: vec![folder("/media/new", FolderState::Indexing)],
+        };
+        let text = render(&stats);
+        assert!(text.contains("Indexer:  stalled"), "{text}");
+    }
+
+    #[test]
     fn scanning_folder_makes_the_indexer_active_and_shows_progress() {
         let mut scanning = folder("/media/new", FolderState::Indexing);
         scanning.scanned_files = 42;
@@ -160,7 +172,7 @@ mod tests {
             revision: 1,
             videos: 0,
             images: 0,
-            service_running: Some(false),
+            service_running: Some(true),
             folders: vec![scanning, offline],
         };
         let text = render(&stats);
@@ -168,7 +180,7 @@ mod tests {
             text.contains("Indexer:  active, scanning 1 folder\n"),
             "{text}"
         );
-        assert!(text.contains("Service:  not running"), "{text}");
+        assert!(text.contains("Service:  running"), "{text}");
         assert!(text.contains("42 files scanned so far"), "{text}");
         assert!(
             text.contains("/media/gone  [offline]  - not mounted"),

@@ -476,7 +476,13 @@ fn indexer_running() -> Option<bool> {
         .args(["--user", "is-active", "--quiet", INDEXER_SERVICE])
         .status()
         .ok()
-        .map(|status| status.success())
+        .and_then(|status| match status.code() {
+            Some(0) => Some(true),
+            // `is-active` reports an inactive or failed unit with status 3;
+            // anything else (no user bus, signals) means systemd can't say.
+            Some(3) => Some(false),
+            _ => None,
+        })
 }
 
 #[cfg(feature = "e2e")]

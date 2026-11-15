@@ -1300,11 +1300,17 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
 
 fn read_index_stats() -> Result<index_stats::IndexStats, String> {
     #[cfg(target_os = "linux")]
-    return managed_index::IndexManager::system()?.stats();
+    {
+        managed_index::IndexManager::system()?.stats()
+    }
     #[cfg(target_os = "macos")]
-    return owned_index::OwnedIndexManager::for_inspection()?.stats();
+    {
+        owned_index::OwnedIndexManager::for_inspection()?.stats()
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Err("The indexer is not supported on this platform.".to_owned())
+    {
+        Err("The indexer is not supported on this platform.".to_owned())
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -522,13 +522,23 @@ impl OwnedIndexManager {
     /// Everything the index knows, for `toka --index-stats`.
     pub(crate) fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
+        // Inspecting must not create an index that does not exist yet.
+        if !self.database.is_file() {
+            return Ok(IndexStats {
+                revision: 0,
+                videos: 0,
+                images: 0,
+                service_running: None,
+                folders: Vec::new(),
+            });
+        }
         let state = self.state()?;
         let index = self.open().map_err(|error| error.to_string())?;
         let mut folders = Vec::new();
         for folder in state.folders {
-            let (videos, images) = index
-                .root_media_counts(&folder.id)
-                .map_err(|error| error.to_string())?;
+            // One failed count (e.g. a busy database mid-scan) shouldn't
+            // hide the rest of the report.
+            let counts = index.root_media_counts(&folder.id).ok();
             folders.push(FolderStats {
                 path: folder.path,
                 state: match folder.status {
@@ -540,8 +550,8 @@ impl OwnedIndexManager {
                 },
                 message: folder.message,
                 scanned_files: folder.scanned_files,
-                videos: Some(videos),
-                images: Some(images),
+                videos: counts.map(|(videos, _)| videos),
+                images: counts.map(|(_, images)| images),
             });
         }
         Ok(IndexStats {

@@ -12,6 +12,7 @@ const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
 const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  --index-stats   Show what the indexer has found and whether it is running";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
+const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the indexer is active, the indexer service state, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
@@ -43,6 +44,11 @@ pub fn run_command(
     }
 
     if command == OsStr::new("--index-stats") {
+        if arguments.len() == 3
+            && (arguments[2] == OsStr::new("--help") || arguments[2] == OsStr::new("-h"))
+        {
+            return print_help(INDEX_STATS_HELP, stdout, stderr);
+        }
         if arguments.len() > 2 {
             let _ = writeln!(stderr, "Usage: toka --index-stats");
             return 2;
