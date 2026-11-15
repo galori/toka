@@ -10,23 +10,33 @@ use std::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  restart         Restart this Toka and its indexer\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version\n  --index-stats   Show what the indexer has found and whether it is running";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  restart         Restart this Toka and its indexer\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version and Git SHA\n  --index-stats   Show what the indexer has found and whether it is running";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the indexer is active, the indexer service state, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
-/// Build scripts pass the git-derived version (`0.1.1+482.a1b2c3d.branch`) as
-/// `VITE_APP_VERSION`; a plain `cargo build` falls back to the manifest version.
-fn version_text() -> String {
-    format_version(option_env!("VITE_APP_VERSION"))
+/// The build version is the git-derived `0.1.1+482.a1b2c3d.branch` that build
+/// scripts pass as `VITE_APP_VERSION`; a plain `cargo build` has none and falls
+/// back to the manifest version.
+fn build_version() -> &'static str {
+    pick_version(option_env!("VITE_APP_VERSION"))
 }
 
-fn format_version(build_version: Option<&str>) -> String {
-    let version = build_version
+fn pick_version(build_version: Option<&'static str>) -> &'static str {
+    build_version
         .filter(|version| !version.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    format!("toka {version}")
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// The version line also shows the same Git SHA as the launch screen. The build
+/// script hands it over as `TOKA_GIT_SHA`; a build with no provenance has none,
+/// so it reads "development" exactly as the frontend does.
+fn version_text(version: &str, git_sha: Option<&str>) -> String {
+    let sha = git_sha
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or("development");
+    format!("toka {version} (Git SHA {sha})")
 }
 
 pub fn is_command(arguments: &[OsString]) -> bool {
@@ -60,7 +70,11 @@ pub fn run_command(
     }
 
     if command == OsStr::new("--version") || command == OsStr::new("-v") {
-        return print_text(&version_text(), stdout, stderr);
+        return print_text(
+            &version_text(build_version(), option_env!("TOKA_GIT_SHA")),
+            stdout,
+            stderr,
+        );
     }
 
     if command == OsStr::new("--index-stats") {
@@ -343,12 +357,11 @@ mod tests {
     #[test]
     fn version_prefers_the_build_version_over_the_manifest_version() {
         assert_eq!(
-            super::format_version(Some("0.1.1+482.a1b2c3d.feat")),
-            "toka 0.1.1+482.a1b2c3d.feat"
+            super::pick_version(Some("0.1.1+482.a1b2c3d.feat")),
+            "0.1.1+482.a1b2c3d.feat"
         );
-        let manifest = format!("toka {}", env!("CARGO_PKG_VERSION"));
-        assert_eq!(super::format_version(None), manifest);
-        assert_eq!(super::format_version(Some("")), manifest);
+        assert_eq!(super::pick_version(None), env!("CARGO_PKG_VERSION"));
+        assert_eq!(super::pick_version(Some("")), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -376,15 +389,38 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             if is_version {
-                let expected = option_env!("VITE_APP_VERSION")
-                    .filter(|version| !version.is_empty())
-                    .unwrap_or(env!("CARGO_PKG_VERSION"));
-                assert_eq!(output, format!("toka {expected}\n"));
+                // The SHA is whatever the build recorded, so check the shape, and
+                // that a recorded SHA really reaches the output.
+                let prefix = format!("toka {} (Git SHA ", super::build_version());
+                let sha = output
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(")\n"))
+                    .unwrap_or_else(|| panic!("unexpected version line: {output}"));
+                assert_eq!(
+                    Some(sha),
+                    option_env!("TOKA_GIT_SHA").or(Some("development"))
+                );
             } else {
                 assert!(output.contains("--version"), "{output}");
             }
             assert!(stderr.is_empty());
         }
+    }
+
+    #[test]
+    fn version_text_includes_the_git_sha_or_development() {
+        assert_eq!(
+            super::version_text("0.1.1+5.abc", Some("abc123")),
+            "toka 0.1.1+5.abc (Git SHA abc123)"
+        );
+        assert_eq!(
+            super::version_text("0.1.1", None),
+            "toka 0.1.1 (Git SHA development)"
+        );
+        assert_eq!(
+            super::version_text("0.1.1", Some("")),
+            super::version_text("0.1.1", None)
+        );
     }
 
     #[test]
