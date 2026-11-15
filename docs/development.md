@@ -55,7 +55,7 @@ The bundled TikTok reference lives at `src-tauri/addons/tiktok.json`:
   "id": "tiktok",
   "name": "TikTok",
   "match": {
-    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?:\\s*\\[[^\\]]*\\])?(?i:\\.mp4)$"
+    "fileNameRegex": "^\\d{4}-\\d{2}-\\d{2}_(?P<handle>@[A-Za-z0-9._]+)_\\d+(?: \\[.+\\])?(?i:\\.mp4)$"
   },
   "actions": [
     {
