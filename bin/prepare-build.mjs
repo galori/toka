@@ -41,13 +41,19 @@ function tryGit(args) {
   }
 }
 
+function commitTimeOf(value) {
+  return value ? new Date(value).toISOString() : new Date().toISOString();
+}
+
 export function prepareBuild() {
   const packagePath = join(root, "package.json");
   const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
   const version = packageJson.version;
 
-  const gitShaValue = git(["rev-parse", "HEAD"]);
-  const isDirty = git(["status", "--porcelain"]) !== "";
+  // A source archive has no repository: every git lookup is optional, and the
+  // build falls back to the bare manifest version.
+  const gitShaValue = tryGit(["rev-parse", "HEAD"]);
+  const isDirty = (tryGit(["status", "--porcelain"]) ?? "") !== "";
   const count = tryGit(["rev-list", "--count", "HEAD"]);
   const buildVersion = resolveBuildVersion({
     version,
@@ -58,10 +64,10 @@ export function prepareBuild() {
   });
   const builtAt = resolveBuiltAt({
     isDirty,
-    commitTime: new Date(git(["show", "-s", "--format=%cI", "HEAD"])).toISOString(),
+    commitTime: commitTimeOf(tryGit(["show", "-s", "--format=%cI", "HEAD"])),
     now: new Date().toISOString(),
   });
-  const info = { version, buildVersion, builtAt, gitSha: gitShaValue };
+  const info = { version, buildVersion, builtAt, gitSha: gitShaValue ?? "unknown" };
   writeFileSync(join(root, "src-tauri/build-info.json"), `${JSON.stringify(info, null, 2)}\n`);
   return info;
 }

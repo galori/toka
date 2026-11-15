@@ -376,8 +376,10 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             if is_version {
-                assert!(output.starts_with("toka "), "{output}");
-                assert!(output.ends_with('\n'), "{output}");
+                let expected = option_env!("VITE_APP_VERSION")
+                    .filter(|version| !version.is_empty())
+                    .unwrap_or(env!("CARGO_PKG_VERSION"));
+                assert_eq!(output, format!("toka {expected}\n"));
             } else {
                 assert!(output.contains("--version"), "{output}");
             }
