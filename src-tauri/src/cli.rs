@@ -362,9 +362,16 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             if is_version {
+                // The SHA is whatever the build recorded, so check the shape, and
+                // that a recorded SHA really reaches the output.
+                let prefix = format!("toka {} (Git SHA ", env!("CARGO_PKG_VERSION"));
+                let sha = output
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(")\n"))
+                    .unwrap_or_else(|| panic!("unexpected version line: {output}"));
                 assert_eq!(
-                    output,
-                    format!("{}\n", super::version_text(option_env!("TOKA_GIT_SHA")))
+                    Some(sha),
+                    option_env!("TOKA_GIT_SHA").or(Some("development"))
                 );
             } else {
                 assert!(output.contains("--version"), "{output}");
