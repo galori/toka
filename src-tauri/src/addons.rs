@@ -774,4 +774,40 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn tiktok_filename_with_bracketed_title_still_matches() {
+        let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
+
+        for name in [
+            "2022-03-08_@_travelguy_6072957405910338821 [travel home view].mp4",
+            "2022-03-08_@_travelguy_6072957405910338821 [best [of] 2022].MP4",
+        ] {
+            let menu = registry.matching_actions(name);
+            assert_eq!(menu.errors, Vec::<String>::new());
+            assert_eq!(menu.actions.len(), 2, "{name}");
+            let mut host = FakeHost::default();
+            registry
+                .run_action(name, "tiktok", "creator-profile", &mut host)
+                .unwrap();
+            assert_eq!(
+                host.0,
+                [HostedAction::Url("https://tiktok.com/@_travelguy".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn tiktok_filename_with_malformed_title_does_not_match() {
+        let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
+
+        for name in [
+            "2022-03-08_@guy_123[title].mp4",
+            "2022-03-08_@guy_123 [].mp4",
+            "2022-03-08_@guy_123 [unclosed.mp4",
+            "2022-03-08_@guy_123 [title]",
+        ] {
+            assert!(registry.matching_actions(name).actions.is_empty(), "{name}");
+        }
+    }
 }
