@@ -16,10 +16,10 @@ npm run build:mac           # macOS: builds the .app and .dmg only
 npm run build:mac:install   # macOS: builds, then installs into /Applications
 ```
 
-Build Linux artifacts on Linux and macOS bundles on macOS. The Linux command installs
-Toka, its private indexer, and its bundled plocate tools under your home directory,
+Build Linux artifacts on Linux and macOS bundles on macOS. Only the `:install` variants install
+anything. The Linux install puts Toka, its private indexer, and its bundled plocate tools under your home directory,
 so no system-wide plocate setup is needed. See the platform quick-start guide for details.
-The macOS command installs the app in `/Applications` and links the `toka` command
+The macOS install puts the app in `/Applications` and links the `toka` command
 in `~/.local/bin`.
 
 ## Search

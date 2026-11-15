@@ -31,7 +31,10 @@ export function builtArtifactPath(
   env = process.env,
 ) {
   const releaseDir = path.join(
-    env.CARGO_TARGET_DIR ?? path.join(root, "src-tauri", "target"),
+    path.resolve(
+      root,
+      env.CARGO_TARGET_DIR ?? path.join("src-tauri", "target"),
+    ),
     "release",
   );
   if (target === "mac")

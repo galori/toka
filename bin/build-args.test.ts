@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { builtArtifactPath, parseBuildArgs } from "./build-args.mjs";
 
@@ -51,11 +52,29 @@ describe("builtArtifactPath", () => {
     ).toBe("/w/src-tauri/target/release/bundle/macos/Toka.app");
   });
 
+  it("resolves a relative CARGO_TARGET_DIR against the build root", () => {
+    expect(
+      builtArtifactPath({ target: "linux", appimage: false }, "/w", {
+        CARGO_TARGET_DIR: "tgt",
+      }),
+    ).toBe("/w/tgt/release/toka");
+  });
+
   it("honours CARGO_TARGET_DIR", () => {
     expect(
       builtArtifactPath({ target: "linux", appimage: false }, "/w", {
         CARGO_TARGET_DIR: "/t",
       }),
     ).toBe("/t/release/toka");
+  });
+});
+
+describe("build.mjs install guard", () => {
+  it("exits before any install step unless --install was given", async () => {
+    const source = await readFile("bin/build.mjs", "utf8");
+    const guard = source.indexOf("if (!install)");
+    expect(guard).toBeGreaterThan(-1);
+    expect(source.indexOf("install-linux.mjs")).toBeGreaterThan(guard);
+    expect(source.indexOf("install-macos-app.mjs")).toBeGreaterThan(guard);
   });
 });
