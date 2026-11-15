@@ -15,6 +15,7 @@
     "lint": "eslint . --max-warnings=0",
     "format:check": "prettier --check package.json package-lock.json eslint.config.js .prettierrc.json .github/workflows/pr-quality.yml",
     "test": "vitest run",
+    "gen:test-data": "node scripts/generate-test-data.mjs",
     "test:integration": "node scripts/run-integration.mjs all",
     "test:integration:real-provider": "node scripts/run-integration.mjs plocate",
     "test:integration:native": "node scripts/run-integration.mjs native",
