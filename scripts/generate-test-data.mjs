@@ -6,7 +6,8 @@
 // Every folder (the root plus each generated subfolder) gets exactly one file,
 // randomly a copy of the sample video or of the sample image. Each subfolder
 // is attached to a randomly chosen existing folder, so the tree shape varies.
-import { copyFile, mkdir, readdir } from "node:fs/promises";
+import { access, copyFile, mkdir, readdir } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,6 +20,7 @@ export const SAMPLE_IMAGE = path.join(
   repoRoot,
   "test/fixtures/Screenshot From 2026-07-27 21-56-52.png",
 );
+export const MAX_SUBFOLDERS = 100000;
 export const DEFAULT_OUT = path.join(repoRoot, ".scratch/test-data");
 
 // mulberry32: tiny seedable PRNG so a tree can be reproduced with --seed.
@@ -52,7 +54,15 @@ export function planTree(subfolders, rng = Math.random) {
 }
 
 export async function generate({ subfolders, out = DEFAULT_OUT, seed }) {
-  const existing = await readdir(out).catch(() => []);
+  for (const source of [SAMPLE_VIDEO, SAMPLE_IMAGE]) {
+    await access(source).catch(() => {
+      throw new Error(`Sample file is missing: ${source}`);
+    });
+  }
+  const existing = await readdir(out).catch((error) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
   if (existing.length > 0) {
     throw new Error(
       `Output directory ${out} is not empty; pick another with --out.`,
@@ -72,12 +82,17 @@ function parseArgs(argv) {
   let count;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--out") opts.out = path.resolve(argv[++i] ?? "");
-    else if (arg === "--seed") opts.seed = Number(argv[++i]);
-    else if (count === undefined) count = Number(arg);
+    if (arg === "--out" || arg === "--seed") {
+      const value = argv[++i];
+      if (value === undefined || value.startsWith("--")) {
+        throw new Error(`${arg} needs a value`);
+      }
+      if (arg === "--out") opts.out = path.resolve(value);
+      else opts.seed = Number(value);
+    } else if (count === undefined) count = Number(arg);
     else throw new Error(`Unexpected argument: ${arg}`);
   }
-  if (!Number.isInteger(count) || count < 0) {
+  if (!Number.isInteger(count) || count < 0 || count > MAX_SUBFOLDERS) {
     throw new Error(
       "Usage: generate-test-data.mjs <subfolders> [--out DIR] [--seed N]",
     );
@@ -88,7 +103,10 @@ function parseArgs(argv) {
   return { ...opts, subfolders: count };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (
+  process.argv[1] &&
+  realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+) {
   try {
     const opts = parseArgs(process.argv.slice(2));
     const plan = await generate(opts);
