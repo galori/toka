@@ -238,9 +238,13 @@ impl IndexManager {
         let status = load_json::<PersistedStatus>(&self.paths.status)?.unwrap_or_default();
         let indexing_files = status
             .folders
-            .values()
-            .filter(|entry| entry.status == FolderStatus::Indexing)
-            .map(|entry| entry.scanned_files)
+            .iter()
+            // Entries for removed folders can linger after a killed scan.
+            .filter(|(id, entry)| {
+                entry.status == FolderStatus::Indexing
+                    && config.folders.iter().any(|folder| &folder.id == *id)
+            })
+            .map(|(_, entry)| entry.scanned_files)
             .sum();
         let mut counts = status.counts.unwrap_or_else(|| {
             let mut cached = self.legacy_counts.lock().unwrap();
@@ -960,6 +964,90 @@ fn is_configuration_change(paths: &IndexPaths, event: &notify::Event) -> bool {
         .any(|path| path == &paths.config || path == &temporary_config || path == &paths.wake)
 }
 
+enum Collected {
+    Changes {
+        config_changed: bool,
+        dirty: HashSet<String>,
+    },
+    Idle,
+    Disconnected,
+}
+
+/// Waits up to `wait` for a relevant event, then gathers relevant events until
+/// `quiet` passes without another. Irrelevant events (reads of the
+/// configuration, which Toka itself does constantly) neither end the wait nor
+/// extend the quiet window, so they can never starve a pending change.
+fn collect_changes(
+    receiver: &mpsc::Receiver<notify::Result<notify::Event>>,
+    paths: &IndexPaths,
+    folders: &[ConfiguredFolder],
+    wait: Duration,
+    quiet: Duration,
+) -> Collected {
+    let mut config_changed = false;
+    let mut dirty = HashSet::<String>::new();
+    let mut deadline = Instant::now() + wait;
+    let mut seen_change = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(event)) => {
+                let relevant = if is_configuration_change(paths, &event) {
+                    config_changed = true;
+                    true
+                } else if is_path_change(&event.kind) {
+                    // Events under unconfigured paths (such as a removed
+                    // folder whose watch lingers) must not extend the window.
+                    let mut matched = false;
+                    for folder in folders {
+                        if event
+                            .paths
+                            .iter()
+                            .any(|path| path.starts_with(&folder.path))
+                        {
+                            dirty.insert(folder.id.clone());
+                            matched = true;
+                        }
+                    }
+                    matched
+                } else {
+                    false
+                };
+                if relevant {
+                    seen_change = true;
+                    deadline = Instant::now() + quiet;
+                }
+            }
+            Ok(Err(_)) => {
+                if !seen_change {
+                    return Collected::Idle;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return if seen_change {
+                    Collected::Changes {
+                        config_changed,
+                        dirty,
+                    }
+                } else {
+                    Collected::Idle
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Collected::Disconnected,
+        }
+        if Instant::now() >= deadline {
+            return if seen_change {
+                Collected::Changes {
+                    config_changed,
+                    dirty,
+                }
+            } else {
+                Collected::Idle
+            };
+        }
+    }
+}
+
 pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
     fs::create_dir_all(&paths.root)
         .map_err(|error| format!("Toka could not create its settings folder: {error}"))?;
@@ -1016,38 +1104,21 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         }
         let mut dirty = HashSet::<String>::new();
         let mut config_changed = false;
-        match receiver.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(event)) => {
-                if is_configuration_change(&paths, &event) {
-                    config_changed = true;
-                } else if is_path_change(&event.kind) {
-                    for folder in &config.folders {
-                        if event
-                            .paths
-                            .iter()
-                            .any(|path| path.starts_with(&folder.path))
-                        {
-                            dirty.insert(folder.id.clone());
-                        }
-                    }
-                }
-                while let Ok(Ok(event)) = receiver.recv_timeout(Duration::from_secs(2)) {
-                    if is_configuration_change(&paths, &event) {
-                        config_changed = true;
-                    } else if is_path_change(&event.kind) {
-                        for folder in &config.folders {
-                            if event
-                                .paths
-                                .iter()
-                                .any(|path| path.starts_with(&folder.path))
-                            {
-                                dirty.insert(folder.id.clone());
-                            }
-                        }
-                    }
-                }
+        match collect_changes(
+            &receiver,
+            &paths,
+            &config.folders,
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        ) {
+            Collected::Changes {
+                config_changed: changed,
+                dirty: changed_folders,
+            } => {
+                config_changed = changed;
+                dirty = changed_folders;
             }
-            Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {
+            Collected::Idle => {
                 for folder in &config.folders {
                     if !folder_available(folder) {
                         let _ = set_folder_status(
@@ -1062,7 +1133,7 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Collected::Disconnected => {
                 return Err("Toka's folder watcher stopped unexpectedly.".into())
             }
         }
@@ -1204,7 +1275,18 @@ mod tests {
                 .scanned_files,
             2
         );
-        assert_eq!(IndexManager::new(paths).state().unwrap().indexing_files, 2);
+        let manager = IndexManager::new(paths.clone());
+        // Only folders that are still configured count; an orphaned entry from
+        // a removed folder must not inflate the total.
+        assert_eq!(manager.state().unwrap().indexing_files, 0);
+        write_json(
+            &paths.config,
+            &IndexConfig {
+                folders: vec![folder],
+            },
+        )
+        .unwrap();
+        assert_eq!(manager.state().unwrap().indexing_files, 2);
     }
 
     #[cfg(unix)]
@@ -1454,6 +1536,92 @@ mod tests {
             &paths,
             &event(modified, &paths.root.join(".hidden-metadata"))
         ));
+    }
+
+    #[test]
+    fn constant_configuration_reads_do_not_starve_a_pending_change() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().to_path_buf());
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &paths.config,
+            )))
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let config = paths.config.clone();
+        let reader = thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sender.send(Ok(event(
+                    EventKind::Access(notify::event::AccessKind::Any),
+                    &config,
+                )));
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        let collected = collect_changes(
+            &receiver,
+            &paths,
+            &[],
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        assert!(matches!(
+            collected,
+            Collected::Changes {
+                config_changed: true,
+                ..
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn events_outside_configured_folders_do_not_starve_a_pending_change() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().to_path_buf());
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &paths.config,
+            )))
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let removed = root.path().join("removed-folder/file");
+        let noise = thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sender.send(Ok(event(
+                    EventKind::Create(notify::event::CreateKind::File),
+                    &removed,
+                )));
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        let collected = collect_changes(
+            &receiver,
+            &paths,
+            &[],
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        noise.join().unwrap();
+        assert!(matches!(
+            collected,
+            Collected::Changes {
+                config_changed: true,
+                ..
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
