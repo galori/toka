@@ -62,6 +62,7 @@ import {
   type PreparedVideo,
   type SearchFields,
   type IndexState,
+  type ScannedDirectory,
   type SearchPage,
   type SearchLogSettings,
   type VideoResult,
@@ -127,6 +128,18 @@ function errorMessage(error: unknown): string {
     return String(error.message);
   }
   return "Something went wrong while searching for videos.";
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function describeScannedDirectory(directory: ScannedDirectory): string {
+  return [
+    pluralize(directory.videos, "video"),
+    pluralize(directory.images, "image"),
+    pluralize(directory.subfolders, "subfolder"),
+  ].join(" · ");
 }
 
 function indexIsActive(index?: IndexState): boolean {
@@ -4149,6 +4162,12 @@ export default function App() {
     (folder) => folder.status === "indexing" && folder.currentPath,
   )?.currentPath;
 
+  const managedIndexRecentDirectories =
+    managedIndex?.folders.find(
+      (folder) =>
+        folder.status === "indexing" && folder.recentDirectories?.length,
+    )?.recentDirectories ?? [];
+
   const chooseIndexFolder = async () => {
     setFolderError(undefined);
     try {
@@ -4665,7 +4684,28 @@ export default function App() {
                 ? "Indexing search folders…"
                 : "Search index idle"}
             </strong>
-            {managedIndexScanningPath ? (
+            {managedIndexRecentDirectories.length ? (
+              <ul
+                className="index-status-directories"
+                aria-label="Recently scanned folders"
+              >
+                {managedIndexRecentDirectories.map((directory) => (
+                  <li key={directory.path}>
+                    <span
+                      className="index-status-directory-path"
+                      title={directory.path}
+                    >
+                      {directory.path}
+                    </span>
+                    <span className="index-status-directory-found">
+                      {directory.scanning
+                        ? "Scanning…"
+                        : describeScannedDirectory(directory)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : managedIndexScanningPath ? (
               <span
                 className="index-status-path"
                 title={managedIndexScanningPath}

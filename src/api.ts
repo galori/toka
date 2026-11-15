@@ -71,6 +71,16 @@ export const DEFAULT_SEARCH_FIELDS: SearchFields = {
 export type MediaType = "videos" | "images" | "both";
 export const DEFAULT_MEDIA_TYPE: MediaType = "videos";
 
+// A directory the indexer has visited: shown as scanning while it is being
+// read, then with what was found directly in it.
+export type ScannedDirectory = {
+  path: string;
+  scanning: boolean;
+  videos: number;
+  images: number;
+  subfolders: number;
+};
+
 export type IndexFolder = {
   id: string;
   path: string;
@@ -78,6 +88,7 @@ export type IndexFolder = {
   message?: string;
   scannedFiles?: number;
   currentPath?: string;
+  recentDirectories?: ScannedDirectory[];
 };
 
 export type IndexState = {

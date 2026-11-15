@@ -160,6 +160,8 @@ struct PersistedFolderStatus {
     scanned_images: u64,
     #[serde(default)]
     current_path: Option<PathBuf>,
+    #[serde(default)]
+    recent_directories: Vec<ScannedDirectory>,
     /// True while the scan is building this folder's first database, so its
     /// totals are not yet part of the persisted `counts`.
     #[serde(default)]
@@ -173,7 +175,115 @@ struct ScanProgress {
     videos: u64,
     images: u64,
     current: Option<PathBuf>,
+    recent_directories: Vec<ScannedDirectory>,
     first_scan: bool,
+}
+
+/// How many recently visited directories the status shows.
+const RECENT_DIRECTORIES: usize = 6;
+
+/// One directory the indexer has visited, with what it found directly in it.
+/// `scanning` is true for the directory being read right now.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannedDirectory {
+    pub path: PathBuf,
+    pub scanning: bool,
+    pub videos: u64,
+    pub images: u64,
+    pub subfolders: u64,
+}
+
+#[derive(Default)]
+struct DirectoryCounts {
+    videos: u64,
+    images: u64,
+    subfolders: u64,
+}
+
+/// Follows the files `updatedb` lists to tally, per directory, the media and
+/// subfolders found so far. Counts keep growing if `updatedb` returns to a
+/// directory or discovers more subfolders below it.
+struct DirectoryTracker {
+    root: PathBuf,
+    counts: HashMap<PathBuf, DirectoryCounts>,
+    recent: std::collections::VecDeque<PathBuf>,
+    current: Option<PathBuf>,
+}
+
+impl DirectoryTracker {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            counts: HashMap::new(),
+            recent: std::collections::VecDeque::new(),
+            current: None,
+        }
+    }
+
+    /// Records one listed file. Returns true when it is in a directory other
+    /// than the previous file's, so the status can show it straight away.
+    fn observe(&mut self, file: &Path, video: bool, image: bool) -> bool {
+        let Some(directory) = file.parent() else {
+            return false;
+        };
+        let entered = self.current.as_deref() != Some(directory);
+        if entered {
+            self.register(directory);
+            self.recent.retain(|seen| seen != directory);
+            self.recent.push_back(directory.to_path_buf());
+            while self.recent.len() > RECENT_DIRECTORIES {
+                self.recent.pop_front();
+            }
+            self.current = Some(directory.to_path_buf());
+        }
+        if let Some(counts) = self.counts.get_mut(directory) {
+            counts.videos += u64::from(video);
+            counts.images += u64::from(image);
+        }
+        entered
+    }
+
+    /// Makes a directory and its not-yet-seen ancestors known, counting each
+    /// new one as a subfolder of its parent.
+    fn register(&mut self, directory: &Path) {
+        let mut pending = Vec::new();
+        let mut cursor = directory;
+        while !self.counts.contains_key(cursor) {
+            pending.push(cursor.to_path_buf());
+            if cursor == self.root {
+                break;
+            }
+            match cursor.parent() {
+                Some(parent) if parent.starts_with(&self.root) => cursor = parent,
+                _ => break,
+            }
+        }
+        for path in pending.into_iter().rev() {
+            if path != self.root {
+                if let Some(parent) = path.parent().and_then(|p| self.counts.get_mut(p)) {
+                    parent.subfolders += 1;
+                }
+            }
+            self.counts.insert(path, DirectoryCounts::default());
+        }
+    }
+
+    fn recent(&self) -> Vec<ScannedDirectory> {
+        self.recent
+            .iter()
+            .filter_map(|path| {
+                let counts = self.counts.get(path)?;
+                Some(ScannedDirectory {
+                    path: path.clone(),
+                    scanning: self.current.as_deref() == Some(path.as_path()),
+                    videos: counts.videos,
+                    images: counts.images,
+                    subfolders: counts.subfolders,
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -200,6 +310,7 @@ pub struct IndexFolder {
     pub message: Option<String>,
     pub scanned_files: u64,
     pub current_path: Option<PathBuf>,
+    pub recent_directories: Vec<ScannedDirectory>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -300,6 +411,10 @@ impl IndexManager {
                     current_path: persisted
                         .filter(|_| folder_status == FolderStatus::Indexing)
                         .and_then(|entry| entry.current_path.clone()),
+                    recent_directories: persisted
+                        .filter(|_| folder_status == FolderStatus::Indexing)
+                        .map(|entry| entry.recent_directories.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect();
@@ -702,6 +817,7 @@ fn set_folder_progress(
     folder.scanned_videos = progress.videos;
     folder.scanned_images = progress.images;
     folder.current_path = progress.current.clone();
+    folder.recent_directories = progress.recent_directories.clone();
     folder.first_scan = progress.first_scan;
     write_json(&paths.status, &status)
 }
@@ -833,6 +949,7 @@ fn run_updatedb_with_progress(
         ..ScanProgress::default()
     };
     let mut logged_directories = HashSet::new();
+    let mut tracker = DirectoryTracker::new(&folder.path);
     let mut last_report = Instant::now() - Duration::from_secs(1);
     loop {
         line.clear();
@@ -852,14 +969,16 @@ fn run_updatedb_with_progress(
         let seen = path_from_bytes(line.strip_suffix(b"\n").unwrap_or(&line));
         // Live counts are approximate: they skip the per-file size check, and
         // the exact totals replace them when the folder becomes Ready.
+        let (mut video, mut image) = (false, false);
         if !is_under_hidden_entry(&folder.path, &seen) {
-            if is_supported_video(&seen) {
-                progress.videos = progress.videos.saturating_add(1);
-            }
-            if is_supported_image(&seen) {
-                progress.images = progress.images.saturating_add(1);
-            }
+            video = is_supported_video(&seen);
+            image = is_supported_image(&seen);
+            progress.videos = progress.videos.saturating_add(u64::from(video));
+            progress.images = progress.images.saturating_add(u64::from(image));
         }
+        // Hidden entries stay out of the totals, so keep them out of the list.
+        let hidden = is_under_hidden_entry(&folder.path, &seen);
+        let entered_directory = !hidden && tracker.observe(&seen, video, image);
         if let Some(directory) = seen.parent() {
             if progress.current.as_deref() != Some(directory) {
                 progress.current = Some(directory.to_path_buf());
@@ -875,7 +994,12 @@ fn run_updatedb_with_progress(
                 }
             }
         }
-        if last_report.elapsed() >= Duration::from_millis(500) {
+        // Show a newly entered directory within 100ms, other updates every
+        // half second.
+        if last_report.elapsed() >= Duration::from_millis(500)
+            || (entered_directory && last_report.elapsed() >= Duration::from_millis(100))
+        {
+            progress.recent_directories = tracker.recent();
             if let Err(error) = set_folder_progress(paths, &folder.id, &progress) {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -886,6 +1010,7 @@ fn run_updatedb_with_progress(
         }
     }
     // Record the final tallies the throttled reports above may have skipped.
+    progress.recent_directories = tracker.recent();
     let _ = set_folder_progress(paths, &folder.id, &progress);
     let status = match child.wait() {
         Ok(status) => status,
@@ -1436,6 +1561,123 @@ mod tests {
     }
 
     #[test]
+    fn tracker_reports_each_directory_with_its_media_and_subfolders() {
+        let root = Path::new("/m");
+        let mut tracker = DirectoryTracker::new(root);
+        assert!(tracker.observe(Path::new("/m/a/one.mp4"), true, false));
+        assert!(!tracker.observe(Path::new("/m/a/cover.png"), false, true));
+        assert!(tracker.observe(Path::new("/m/a/b/two.mp4"), true, false));
+        assert!(tracker.observe(Path::new("/m/c/x/three.mp4"), true, false));
+
+        let recent = tracker.recent();
+        let find = |p: &str| recent.iter().find(|d| d.path == Path::new(p)).cloned();
+        // /m/a has one video, one image and one subfolder (b); it is done.
+        assert_eq!(
+            find("/m/a"),
+            Some(ScannedDirectory {
+                path: "/m/a".into(),
+                scanning: false,
+                videos: 1,
+                images: 1,
+                subfolders: 1,
+            })
+        );
+        // /m/c/x is being scanned right now.
+        assert!(find("/m/c/x").unwrap().scanning);
+        // /m/c has no files of its own, so it is only counted as a subfolder.
+        assert!(find("/m/c").is_none());
+        assert_eq!(tracker.counts[root].subfolders, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_directories_are_not_listed_as_scanned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        let folder = ConfiguredFolder {
+            id: "folder".into(),
+            path: media.clone(),
+            mount: None,
+        };
+        let fake = root.path().join("updatedb");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '{m}/.git/x.mp4\\n{m}/a/y.mp4\\n'\n",
+                m = media.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        run_updatedb_with_progress(
+            &paths,
+            &folder,
+            &fake,
+            &IndexLogger::new(paths.index_log.clone()),
+        )
+        .unwrap();
+        let recent = load_json::<PersistedStatus>(&paths.status)
+            .unwrap()
+            .unwrap()
+            .folders["folder"]
+            .recent_directories
+            .clone();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].path, media.join("a"));
+    }
+
+    #[test]
+    fn tracker_keeps_only_the_most_recent_directories() {
+        let mut tracker = DirectoryTracker::new(Path::new("/m"));
+        for index in 0..RECENT_DIRECTORIES + 3 {
+            tracker.observe(Path::new(&format!("/m/d{index}/f.mp4")), true, false);
+        }
+        let recent = tracker.recent();
+        assert_eq!(recent.len(), RECENT_DIRECTORIES);
+        assert_eq!(recent[0].path, Path::new("/m/d3"));
+        assert!(recent.last().unwrap().scanning);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_shows_recent_directories_only_while_indexing() {
+        let root = tempdir().unwrap();
+        let media = root.path().join("Media");
+        fs::create_dir(&media).unwrap();
+        let paths = IndexPaths::under(root.path().join("state"));
+        let manager = IndexManager::new(paths.clone());
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
+        let directory = ScannedDirectory {
+            path: media.join("Trips"),
+            scanning: true,
+            videos: 2,
+            images: 0,
+            subfolders: 1,
+        };
+        set_folder_progress(
+            &paths,
+            &id,
+            &ScanProgress {
+                recent_directories: vec![directory.clone()],
+                ..ScanProgress::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            manager.state().unwrap().folders[0].recent_directories,
+            vec![directory]
+        );
+        set_folder_status(&paths, &id, FolderStatus::Ready, None, false).unwrap();
+        assert!(manager.state().unwrap().folders[0]
+            .recent_directories
+            .is_empty());
+    }
+
+    #[test]
     fn live_scan_progress_is_reported_in_state_until_the_index_is_ready() {
         let root = tempdir().unwrap();
         let media = root.path().join("Media");
@@ -1453,6 +1695,7 @@ mod tests {
                 videos: 3,
                 images: 1,
                 current: Some(media.join("Trips")),
+                recent_directories: Vec::new(),
                 first_scan: true,
             },
         )

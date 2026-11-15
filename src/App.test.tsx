@@ -541,6 +541,52 @@ test("shows indexing activity and managed media totals", async () => {
   expect(status).toHaveTextContent("4 images");
 });
 
+test("lists recently scanned folders with what each one held", async () => {
+  indexStateMock.mockResolvedValue({
+    supported: true,
+    revision: 1,
+    indexedVideos: 0,
+    indexedImages: 0,
+    indexingFiles: 9,
+    folders: [
+      {
+        id: "videos",
+        path: "/Videos",
+        status: "indexing",
+        currentPath: "/Videos/Trips",
+        recentDirectories: [
+          {
+            path: "/Videos/Home",
+            scanning: false,
+            videos: 1,
+            images: 3,
+            subfolders: 2,
+          },
+          {
+            path: "/Videos/Trips",
+            scanning: true,
+            videos: 0,
+            images: 0,
+            subfolders: 0,
+          },
+        ],
+      },
+    ],
+  });
+
+  render(<App />);
+
+  const status = await screen.findByRole("status", {
+    name: "Search index status",
+  });
+  const items = within(status).getAllByRole("listitem");
+  expect(items).toHaveLength(2);
+  expect(items[0]).toHaveTextContent("/Videos/Home");
+  expect(items[0]).toHaveTextContent("1 video · 3 images · 2 subfolders");
+  expect(items[1]).toHaveTextContent("/Videos/Trips");
+  expect(items[1]).toHaveTextContent("Scanning…");
+});
+
 test("does not offer refresh while the managed index is still indexing", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
