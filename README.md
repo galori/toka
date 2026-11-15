@@ -72,7 +72,9 @@ output error returns exit code `1`. A missing query returns exit code `2`. Use
 `toka search --help` for command help.
 
 `toka --help` (or `-h`) lists the available commands, and `toka --version` (or
-`-v`) prints the installed Toka version.
+`-v`) prints the installed Toka version and the Git SHA it was built from
+(the same SHA shown when the app first launches), e.g.
+`toka <version> (Git SHA 1a2b3c…)`.
 
 ### Reset Toka
 
