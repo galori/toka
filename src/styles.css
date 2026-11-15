@@ -1012,6 +1012,9 @@ button:focus-visible {
   /* A range input carries 2px of margin of its own, which would put the sliver
      back over the bottom of the picture. */
   margin: 0;
+  /* The bar ignores the pointer so the picture stays clickable, but the
+     scrubber takes it back so it can still be clicked and dragged. */
+  pointer-events: auto;
   height: var(--scrubber-sliver);
   background: linear-gradient(
     to right,

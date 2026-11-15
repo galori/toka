@@ -17,6 +17,7 @@ mod search_log;
 mod subtitles;
 mod tags;
 mod thumbnails;
+mod timestamp;
 
 use owned_index::{IndexUpdates, OwnedIndexUpdates};
 #[cfg(any(target_os = "macos", test))]

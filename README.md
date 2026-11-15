@@ -71,6 +71,9 @@ images, then writes each full file path on a separate line. It returns exit code
 output error returns exit code `1`. A missing query returns exit code `2`. Use
 `toka search --help` for command help.
 
+`toka --help` (or `-h`) lists the available commands, and `toka --version` (or
+`-v`) prints the installed Toka version.
+
 ### Reset Toka
 
 `toka reset --yes` puts Toka back to a first-run state. It removes every search
