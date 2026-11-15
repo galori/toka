@@ -991,6 +991,9 @@ fn collect_changes(
                     config_changed = true;
                     true
                 } else if is_path_change(&event.kind) {
+                    // Events under unconfigured paths (such as a removed
+                    // folder whose watch lingers) must not extend the window.
+                    let mut matched = false;
                     for folder in folders {
                         if event
                             .paths
@@ -998,9 +1001,10 @@ fn collect_changes(
                             .any(|path| path.starts_with(&folder.path))
                         {
                             dirty.insert(folder.id.clone());
+                            matched = true;
                         }
                     }
-                    true
+                    matched
                 } else {
                     false
                 };
@@ -1559,6 +1563,49 @@ mod tests {
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         reader.join().unwrap();
+        assert!(matches!(
+            collected,
+            Collected::Changes {
+                config_changed: true,
+                ..
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn events_outside_configured_folders_do_not_starve_a_pending_change() {
+        let root = tempdir().unwrap();
+        let paths = IndexPaths::under(root.path().to_path_buf());
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(event(
+                EventKind::Modify(notify::event::ModifyKind::Any),
+                &paths.config,
+            )))
+            .unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let removed = root.path().join("removed-folder/file");
+        let noise = thread::spawn(move || {
+            while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = sender.send(Ok(event(
+                    EventKind::Create(notify::event::CreateKind::File),
+                    &removed,
+                )));
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        let collected = collect_changes(
+            &receiver,
+            &paths,
+            &[],
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        noise.join().unwrap();
         assert!(matches!(
             collected,
             Collected::Changes {
