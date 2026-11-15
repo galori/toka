@@ -52,12 +52,12 @@ describe("builtArtifactPath", () => {
     ).toBe("/w/src-tauri/target/release/bundle/macos/Toka.app");
   });
 
-  it("resolves a relative CARGO_TARGET_DIR against the build root", () => {
+  it("resolves a relative CARGO_TARGET_DIR against src-tauri, where Tauri runs Cargo", () => {
     expect(
       builtArtifactPath({ target: "linux", appimage: false }, "/w", {
         CARGO_TARGET_DIR: "tgt",
       }),
-    ).toBe("/w/tgt/release/toka");
+    ).toBe("/w/src-tauri/tgt/release/toka");
   });
 
   it("honours CARGO_TARGET_DIR", () => {

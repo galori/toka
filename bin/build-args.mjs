@@ -30,11 +30,9 @@ export function builtArtifactPath(
   root,
   env = process.env,
 ) {
+  // Tauri runs Cargo from src-tauri, so a relative CARGO_TARGET_DIR resolves there.
   const releaseDir = path.join(
-    path.resolve(
-      root,
-      env.CARGO_TARGET_DIR ?? path.join("src-tauri", "target"),
-    ),
+    path.resolve(root, "src-tauri", env.CARGO_TARGET_DIR ?? "target"),
     "release",
   );
   if (target === "mac")
