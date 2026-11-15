@@ -13,6 +13,7 @@ mod player_linux;
 mod playlist;
 mod providers;
 mod reset;
+mod restart;
 mod search;
 mod search_log;
 mod subtitles;

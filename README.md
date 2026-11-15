@@ -84,6 +84,14 @@ background indexer; the next time you open Toka it starts again with no folders.
 Without `--yes`, `toka reset` only lists what it would remove and changes
 nothing. Close Toka before resetting.
 
+### Restart Toka
+
+`toka restart` (Linux) restarts the Toka app and its indexer. It only affects
+the Toka you called: the installed `toka` restarts the installed app and the
+`toka-indexer.service` user service, while a `toka` built in a worktree
+restarts only its own app and indexer processes and leaves the installed ones
+alone (and the other way round).
+
 ## Add-ons
 
 While a video plays, press `Ctrl+Shift+A` to open actions supplied by add-ons.
