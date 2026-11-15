@@ -774,4 +774,16 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn tiktok_filename_with_bracketed_title_still_matches() {
+        let registry = AddonRegistry::from_json_sources([("tiktok.json", TIKTOK)]);
+
+        let menu = registry.matching_actions(
+            "2022-03-08_@_travelguy_6072957405910338821 [travel home view].mp4",
+        );
+
+        assert_eq!(menu.errors, Vec::<String>::new());
+        assert_eq!(menu.actions.len(), 2);
+    }
 }
