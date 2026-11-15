@@ -91,7 +91,7 @@ describe("installAppImage", () => {
       "test appimage",
     );
     await expect(readFile(desktopEntry, "utf8")).resolves.toContain(
-      `Exec=${installedAppImage} %U`,
+      `Exec=${installedAppImage} %F`,
     );
   });
 });
@@ -189,7 +189,7 @@ describe("installBinary", () => {
     );
     expect((await stat(installedBinary)).mode & 0o111).toBeTruthy();
     await expect(readFile(desktopEntry, "utf8")).resolves.toContain(
-      `Exec=${installedBinary} %U`,
+      `Exec=${installedBinary} %F`,
     );
   });
 
