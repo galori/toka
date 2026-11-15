@@ -9,7 +9,7 @@ use std::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  restart         Restart this Toka and its indexer\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
@@ -18,6 +18,7 @@ pub fn is_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         argument == OsStr::new("search")
             || argument == OsStr::new("reset")
+            || argument == OsStr::new("restart")
             || argument == OsStr::new("--help")
             || argument == OsStr::new("-h")
             || argument == OsStr::new("--version")
@@ -51,6 +52,10 @@ pub fn run_command(
 
     if command == OsStr::new("reset") {
         return run_reset_command(&arguments[2..], create_reset_plan, stdout, stderr);
+    }
+
+    if command == OsStr::new("restart") {
+        return crate::restart::run(&arguments[2..], stdout, stderr);
     }
 
     if command != OsStr::new("search") {
