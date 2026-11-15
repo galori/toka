@@ -1,6 +1,7 @@
 mod addons;
 mod cli;
 mod external_players;
+mod index_stats;
 mod index_visibility;
 mod launch;
 #[cfg(target_os = "linux")]
@@ -1377,6 +1378,21 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
     Ok(plan)
 }
 
+fn read_index_stats() -> Result<index_stats::IndexStats, String> {
+    #[cfg(target_os = "linux")]
+    {
+        managed_index::IndexManager::system()?.stats()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        owned_index::OwnedIndexManager::for_inspection()?.stats()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err("The indexer is not supported on this platform.".to_owned())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
@@ -1416,6 +1432,7 @@ pub fn run() {
                     ))
                 },
                 reset_plan,
+                read_index_stats,
                 &mut stdout,
                 &mut stderr,
             )

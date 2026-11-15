@@ -1,4 +1,5 @@
 use crate::{
+    index_stats::{self, IndexStats},
     reset::{self, ResetPlan},
     search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
 };
@@ -9,8 +10,9 @@ use std::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version\n  --index-stats   Show what the indexer has found and whether it is running";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
+const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the indexer is active, the indexer service state, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const SEARCH_HELP: &str =
     "Usage: toka search <query>\n\nSearch Toka's indexed videos and images. Print one full path per result line.";
 
@@ -18,6 +20,7 @@ pub fn is_command(arguments: &[OsString]) -> bool {
     arguments.get(1).is_some_and(|argument| {
         argument == OsStr::new("search")
             || argument == OsStr::new("reset")
+            || argument == OsStr::new("--index-stats")
             || argument == OsStr::new("--help")
             || argument == OsStr::new("-h")
             || argument == OsStr::new("--version")
@@ -29,6 +32,7 @@ pub fn run_command(
     arguments: &[OsString],
     create_engine: impl FnOnce() -> Result<SearchEngine, String>,
     create_reset_plan: impl FnOnce() -> Result<ResetPlan, String>,
+    read_index_stats: impl FnOnce() -> Result<IndexStats, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -47,6 +51,34 @@ pub fn run_command(
             stdout,
             stderr,
         );
+    }
+
+    if command == OsStr::new("--index-stats") {
+        if arguments.len() == 3
+            && (arguments[2] == OsStr::new("--help") || arguments[2] == OsStr::new("-h"))
+        {
+            return print_text(INDEX_STATS_HELP, stdout, stderr);
+        }
+        if arguments.len() > 2 {
+            let _ = writeln!(stderr, "Usage: toka --index-stats");
+            return 2;
+        }
+        return match read_index_stats() {
+            Ok(stats) => {
+                let report = index_stats::render(&stats);
+                match write!(stdout, "{report}").and_then(|()| stdout.flush()) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        let _ = writeln!(stderr, "toka --index-stats: could not write: {error}");
+                        1
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(stderr, "toka --index-stats: {error}");
+                1
+            }
+        };
     }
 
     if command == OsStr::new("reset") {
@@ -232,6 +264,7 @@ fn query_from_arguments(arguments: &[OsString]) -> Result<String, &'static str> 
 mod tests {
     use super::run_command;
     use crate::{
+        index_stats::{FolderState, FolderStats, IndexStats},
         reset::ResetPlan,
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
@@ -241,6 +274,10 @@ mod tests {
 
     fn no_reset() -> Result<ResetPlan, String> {
         panic!("only reset builds a reset plan")
+    }
+
+    fn no_stats() -> Result<IndexStats, String> {
+        panic!("only --index-stats reads index stats")
     }
 
     fn no_engine() -> Result<SearchEngine, String> {
@@ -272,7 +309,14 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        let status = run_command(&args, || Ok(engine), no_reset, &mut stdout, &mut stderr);
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_reset,
+            no_stats,
+            &mut stdout,
+            &mut stderr,
+        );
 
         assert_eq!(status, 0);
         assert_eq!(
@@ -295,7 +339,14 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
 
-            let status = run_command(&args, no_engine, no_reset, &mut stdout, &mut stderr);
+            let status = run_command(
+                &args,
+                no_engine,
+                no_reset,
+                no_stats,
+                &mut stdout,
+                &mut stderr,
+            );
 
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
@@ -318,6 +369,7 @@ mod tests {
             &args,
             || panic!("help must not create the search engine"),
             no_reset,
+            no_stats,
             &mut stdout,
             &mut stderr,
         );
@@ -339,6 +391,7 @@ mod tests {
             &args,
             || Err("search index could not be opened".into()),
             no_reset,
+            no_stats,
             &mut stdout,
             &mut stderr,
         );
@@ -364,6 +417,7 @@ mod tests {
             &args,
             no_engine,
             || Ok(ResetPlan::new(vec![state.clone()])),
+            no_stats,
             &mut stdout,
             &mut stderr,
         );
@@ -389,6 +443,7 @@ mod tests {
             &args,
             no_engine,
             || Ok(ResetPlan::new(vec![state.clone()])),
+            no_stats,
             &mut stdout,
             &mut stderr,
         );
@@ -407,9 +462,78 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
 
-            let code = run_command(&args, no_engine, no_reset, &mut stdout, &mut stderr);
+            let code = run_command(
+                &args,
+                no_engine,
+                no_reset,
+                no_stats,
+                &mut stdout,
+                &mut stderr,
+            );
 
             assert_eq!(code, status);
         }
+    }
+
+    #[test]
+    fn index_stats_prints_the_report() {
+        let args = vec![OsString::from("toka"), OsString::from("--index-stats")];
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let stats = || {
+            Ok(IndexStats {
+                revision: 1,
+                videos: 4,
+                images: 1,
+                service_running: Some(true),
+                folders: vec![FolderStats {
+                    path: "/media".into(),
+                    state: FolderState::Ready,
+                    message: None,
+                    scanned_files: 0,
+                    videos: Some(4),
+                    images: Some(1),
+                }],
+            })
+        };
+        let code = run_command(&args, no_engine, no_reset, stats, &mut stdout, &mut stderr);
+        assert_eq!(code, 0);
+        let text = String::from_utf8(stdout).unwrap();
+        assert!(
+            text.contains("Videos:   4") && text.contains("/media"),
+            "{text}"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn index_stats_failure_and_extra_arguments_are_errors() {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let args = vec![OsString::from("toka"), OsString::from("--index-stats")];
+        let code = run_command(
+            &args,
+            no_engine,
+            no_reset,
+            || Err("no index".to_owned()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 1);
+        assert!(String::from_utf8(stderr).unwrap().contains("no index"));
+
+        let mut stderr = Vec::new();
+        let args = vec![
+            OsString::from("toka"),
+            OsString::from("--index-stats"),
+            OsString::from("extra"),
+        ];
+        let code = run_command(
+            &args,
+            no_engine,
+            no_reset,
+            no_stats,
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(code, 2);
     }
 }
