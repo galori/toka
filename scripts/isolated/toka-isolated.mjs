@@ -100,9 +100,7 @@ async function build(flags) {
     );
   }
   const load = (file) => import(pathToFileURL(path.join(worktree, file)).href);
-  const { buildPlocate } = await load("scripts/build-plocate.mjs");
   const { prepareBuild } = await load("bin/prepare-build.mjs");
-  await buildPlocate();
   const info = prepareBuild();
   const env = {
     ...process.env,
@@ -113,15 +111,7 @@ async function build(flags) {
   };
   const child = spawn(
     "npm",
-    [
-      "run",
-      "tauri",
-      "build",
-      "--",
-      "--no-bundle",
-      "--config",
-      "src-tauri/tauri.linux-owned-index.conf.json",
-    ],
+    ["run", "tauri", "build", "--", "--no-bundle"],
     { cwd: worktree, env, stdio: "inherit", detached: true },
   );
   child.on("error", (error) => {

@@ -1,11 +1,9 @@
-//! The Linux indexer daemon's shared pieces: starting and stopping the
-//! systemd user service, identifying mounts, logging, thumbnails, and hosting
-//! the owned-index watchers.
-//!
-//! Plocate-specific scanning stays in `managed_index` until that backend is
-//! removed; this module must not depend on it.
+//! The Linux indexer daemon: the systemd user service entry point, starting
+//! and stopping the service, identifying mounts, logging, thumbnails, and
+//! hosting the owned-index watchers.
 
 use crate::owned_index::{OwnedIndex, OwnedIndexWatcher, ScanPhase};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 #[cfg(not(feature = "e2e"))]
 use std::io;
@@ -127,6 +125,52 @@ pub fn stop_indexer() -> Result<(), String> {
         Err(format!(
             "the indexer service could not be stopped (systemctl exited with {status})"
         ))
+    }
+}
+
+/// Where the indexer daemon writes its log: beside the search log.
+fn indexer_log_path() -> Result<PathBuf, String> {
+    dirs::data_local_dir()
+        .map(|directory| directory.join("app.toka.desktop/logs/indexer.log"))
+        .ok_or_else(|| "Toka could not find a place for its indexer log.".into())
+}
+
+/// How often the daemon re-reads the roots table when nothing changes, so a
+/// missed filesystem event only delays a folder update.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Runs the Linux indexer daemon: keeping one owned-index watcher per
+/// configured root until the process stops. Each pass re-reads the roots
+/// table, so folders added or removed while the window is closed apply on the
+/// next wake-up.
+pub fn run_daemon() -> Result<(), String> {
+    let database = crate::owned_index::database_path()?;
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Toka could not create its index folder: {error}"))?;
+    }
+    let logger = Arc::new(IndexLogger::new(indexer_log_path()?));
+    logger.record("indexer started");
+    let (sender, receiver) = mpsc::channel();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
+        let _ = sender.send(event);
+    })
+    .map_err(|error| format!("Toka could not watch its search index: {error}"))?;
+    if let Some(parent) = database.parent() {
+        // Best effort: the poll below applies folder changes even when the
+        // watch fails.
+        let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+    }
+    let thumbnails = ThumbnailWorker::new(Arc::clone(&logger));
+    let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
+    loop {
+        supervisor.reconcile();
+        match receiver.recv_timeout(RECONCILE_INTERVAL) {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("Toka's folder watcher stopped unexpectedly.".into())
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
     }
 }
 

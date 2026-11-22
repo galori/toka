@@ -8,7 +8,7 @@ These instructions target Ubuntu and Debian. For another distribution, install t
 sudo apt update
 sudo apt install build-essential curl file libayatana-appindicator3-dev \
   libegl1-mesa-dev libepoxy-dev libglx-dev libgtk-3-dev libmpv2 librsvg2-dev \
-  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev libzstd-dev meson ninja-build wget
+  libssl-dev libwebkit2gtk-4.1-dev libxdo-dev wget
 ```
 
 Install [Node.js 20+](https://nodejs.org/) and [Rust stable](https://rustup.rs/) if they are not already installed.
@@ -19,8 +19,7 @@ From the repository:
 
 ```sh
 npm ci
-node scripts/build-plocate.mjs
-npm run tauri dev -- --config src-tauri/tauri.linux-owned-index.conf.json
+npm run tauri dev
 ```
 
 Toka opens its search-folder screen on first launch. Add one or more media folders;

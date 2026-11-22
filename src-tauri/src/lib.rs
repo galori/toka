@@ -6,12 +6,6 @@ mod index_visibility;
 #[cfg(any(target_os = "linux", test))]
 mod indexer_daemon;
 mod launch;
-// The plocate GUI surface is dead since the Linux flip; the whole module goes
-// away with the backend removal. This allow keeps the daemon parts compiling
-// warning-free until then.
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-mod managed_index;
 mod owned_index;
 #[cfg(target_os = "linux")]
 mod player_linux;
@@ -1307,10 +1301,6 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
     if let Some(directory) = owned_index::database_path()?.parent() {
         paths.push(directory.to_path_buf());
     }
-    // Leftover plocate state from before the Linux flip. Nothing reads it
-    // anymore; the backend removal deletes these paths for good.
-    #[cfg(target_os = "linux")]
-    paths.extend(managed_index::IndexPaths::system()?.reset_paths());
     paths.push(thumbnails::cache_output_root());
     if let Some(cache) = dirs::cache_dir() {
         paths.push(cache.join("app.toka.desktop"));
@@ -1344,11 +1334,7 @@ pub fn run() {
         .get(1)
         .is_some_and(|argument| argument == std::ffi::OsStr::new("--indexer"))
     {
-        let paths = managed_index::IndexPaths::system().unwrap_or_else(|message| {
-            eprintln!("{message}");
-            std::process::exit(1);
-        });
-        if let Err(message) = managed_index::run_daemon(paths) {
+        if let Err(message) = indexer_daemon::run_daemon() {
             eprintln!("{message}");
             std::process::exit(1);
         }

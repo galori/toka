@@ -145,9 +145,8 @@ pub struct SearchEngine {
     result_paths: Mutex<HashMap<String, PathBuf>>,
     /// Files Toka renamed since the search provider last indexed them, keyed by
     /// the name the provider knew. An index that filters out names whose file
-    /// is gone, as `plocate --existing` does, stops listing it at all. Saving
-    /// these renames lets a search find the file by its current name after a
-    /// restart.
+    /// is gone stops listing them at all. Saving these renames lets a search
+    /// find the file by its current name after a restart.
     renamed_paths: Mutex<HashMap<PathBuf, PathBuf>>,
     /// Folders Toka renamed since the provider last indexed them, keyed by the
     /// name the provider knew. Tagging a folder moves every file in it.
@@ -2766,8 +2765,8 @@ mod tests {
             .update_video_path(&first.results[0].id, tagged.clone())
             .unwrap();
 
-        // Model the managed plocate provider dropping the stale path with
-        // --existing until the background indexer has rebuilt its database.
+        // Model the search provider dropping the stale path until the
+        // background indexer has rebuilt its database.
         provider.paths.lock().unwrap().clear();
         drop(engine);
 

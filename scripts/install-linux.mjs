@@ -30,10 +30,6 @@ async function installExecutable({
   installedName,
   homeDir,
   iconPath,
-  plocatePath,
-  updatedbPath,
-  plocateSourcePath,
-  plocateLicensePath,
   runServiceCommand,
 }) {
   const installDir = path.join(homeDir, ".local", "opt", "toka");
@@ -55,39 +51,6 @@ async function installExecutable({
   await copyFile(sourcePath, temporaryPath);
   await chmod(temporaryPath, 0o755);
   await rename(temporaryPath, installedPath);
-
-  if (plocatePath && updatedbPath) {
-    const libexecDir = path.join(installDir, "libexec");
-    await mkdir(libexecDir, { recursive: true });
-    for (const [source, name] of [
-      [plocatePath, "toka-plocate"],
-      [updatedbPath, "toka-updatedb"],
-    ]) {
-      const destination = path.join(libexecDir, name);
-      await copyFile(source, `${destination}.new`);
-      await chmod(`${destination}.new`, 0o755);
-      await rename(`${destination}.new`, destination);
-    }
-  }
-
-  if (plocateSourcePath && plocateLicensePath) {
-    const documentationDir = path.join(
-      homeDir,
-      ".local",
-      "share",
-      "doc",
-      "toka",
-    );
-    await mkdir(documentationDir, { recursive: true });
-    await copyFile(
-      plocateSourcePath,
-      path.join(documentationDir, "plocate-1.1.24.tar.gz"),
-    );
-    await copyFile(
-      plocateLicensePath,
-      path.join(documentationDir, "plocate-COPYING"),
-    );
-  }
 
   const binDir = path.join(homeDir, ".local", "bin");
   await mkdir(binDir, { recursive: true });
@@ -216,12 +179,6 @@ if (
       binaryPath: path.join(releaseDir(), "toka"),
       homeDir,
       iconPath,
-      plocatePath: path.join(releaseDir(), "toka-plocate"),
-      updatedbPath: path.join(releaseDir(), "toka-updatedb"),
-      plocateSourcePath: path.resolve(
-        "src-tauri/resources/plocate-1.1.24.tar.gz",
-      ),
-      plocateLicensePath: path.resolve("src-tauri/resources/plocate-COPYING"),
       runServiceCommand,
     });
   }

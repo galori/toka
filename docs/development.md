@@ -18,7 +18,7 @@ and skips AppImage bundling, which roughly halves the build. Use `--appimage`
 when you need to check the packaged artifact; CI builds the real bundles either
 way. See [OPTIMIZE_BUILD_SPEED.md](../OPTIMIZE_BUILD_SPEED.md).
 
-The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka or plocate index.
+The native integration test uses an embedded WebDriver and a generated video fixture. It does not require a populated Toka index.
 
 ## Testing a branch without installing it (Linux)
 
@@ -120,9 +120,7 @@ network.
 
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
-- macOS search reads candidates from Toka's owned SQLite index in `src-tauri/src/owned_index.rs`. Linux uses Toka's managed plocate index by default.
-- Linux release builds bundle plocate 1.1.24 and use one private database per configured folder. Set `TOKA_SEARCH_PROVIDER=plocate` to exercise the legacy system database or `TOKA_SEARCH_PROVIDER=recoll` to use `recollq`.
-- `scripts/build-plocate.mjs` verifies the upstream source checksum, builds `plocate` and `updatedb`, and stages the GPL source and license beside the generated sidecars. Meson, Ninja, and the zstd development headers are required.
+- Both platforms search Toka's owned SQLite index in `src-tauri/src/owned_index.rs`. On Linux a `toka-indexer.service` user service runs `toka --indexer`, which hosts the index watchers so folders stay current with the window closed.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, zero-byte media is ignored, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
@@ -143,7 +141,6 @@ to see its version, build age, Git SHA, and number of commits behind
 - No results: press `Ctrl+,` and check that the folder is configured and reports Ready. A disconnected drive reports Drive disconnected and keeps its existing database.
 - Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux:install` refreshes and restarts the user service.
 - Slow indexing: the status pane reports folders in progress and files scanned; if those numbers stop changing, inspect the indexer log at `~/.local/share/app.toka.desktop/logs/indexer.log`.
-- Optional Recoll provider: install `recoll`, run `recollindex`, and launch Toka with `TOKA_SEARCH_PROVIDER=recoll`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.
 - AppImage compatibility: build on the oldest Linux base you intend to support. Newer build systems may require a newer glibc on the destination computer.

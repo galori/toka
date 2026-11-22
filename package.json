@@ -21,7 +21,6 @@
     "test:integration:native": "node scripts/run-integration.mjs native",
     "build:integration": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
     "build:integration:native": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features native-e2e --config src-tauri/tauri.e2e.conf.json",
-    "plocate:configure": "sudoedit /usr/local/sbin/update-plocate-media && printf '\\nTo rebuild the plocate index now, run: sudo systemctl start plocate-updatedb.service\\n'",
     "test:watch": "vitest",
     "check:precommit:staged": "lint-staged",
     "check:precommit": "npm run lint && npm run format:check",

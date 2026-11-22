@@ -48,8 +48,7 @@
           "libglx0",
           "libmpv2",
           "libstdc++6",
-          "liburing2",
-          "libzstd1"
+          "liburing2"
         ],
         "files": {
           "/usr/share/toka/build-info.json": "build-info.json"
