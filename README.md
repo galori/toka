@@ -45,8 +45,10 @@ match media kinds. `extension:jpg` matches an exact extension without regard to
 case.
 
 File-size predicates can be added to a search without a separate control:
-`size:36.3mb` matches that exact size, while `size:<1.5gb` and
-`size:>=100kb` express ranges. `kb`, `mb`, `gb`, and `tb` use decimal units;
+`size:18mb` matches 18.0 MB up to (not including) 19 MB, and `size:36.3mb`
+matches 36.3 up to 36.4 MB: a bare size covers one step of its last digit. A
+size in plain bytes matches exactly. Operators express ranges, such as
+`size:<1.5gb` and `size:>=100kb`. `kb`, `mb`, `gb`, and `tb` use decimal units;
 the corresponding `kib`, `mib`, `gib`, and `tib` suffixes use binary units.
 
 Creation and modification dates can be searched with the same comparison

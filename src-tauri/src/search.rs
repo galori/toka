@@ -1109,6 +1109,9 @@ enum QueryTerm {
     Size {
         comparison: Comparison,
         bytes: u64,
+        /// For a bare size such as `18mb`, the exclusive end of the range that
+        /// starts at `bytes` (18.0 MB up to, not including, 19 MB).
+        upper: Option<u64>,
     },
     Date {
         field: DateField,
@@ -1321,6 +1324,7 @@ fn parse_extension(value: &str) -> Result<String, SearchError> {
 
 fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     let (comparison, number) = split_comparison(value);
+    let bare = !value.starts_with(['<', '>', '=']);
     let number = number.to_ascii_lowercase();
     let units = [
         ("tib", 1_099_511_627_776u64),
@@ -1342,6 +1346,7 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
                 .map(|number| (number, *multiplier))
         })
         .ok_or(SearchError::InvalidQuery)?;
+    let number_text = number;
     let number = number
         .parse::<f64>()
         .ok()
@@ -1351,10 +1356,46 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     if !bytes.is_finite() || bytes > u64::MAX as f64 {
         return Err(SearchError::InvalidQuery);
     }
+    // A bare `18mb` (no operator) covers one step of its last digit. Both
+    // endpoints are computed exactly and independently, so `1.1kib` spans
+    // [1126.4, 1228.8) bytes, i.e. 1127..=1228. An explicit `=` stays exact.
+    let upper = if bare && multiplier > 1 {
+        bare_size_range(number_text, multiplier)
+    } else {
+        None
+    };
+    if let Some((lower, upper)) = upper {
+        return Ok(QueryTerm::Size {
+            comparison,
+            bytes: lower,
+            upper: Some(upper),
+        });
+    }
     Ok(QueryTerm::Size {
         comparison,
         bytes: bytes.round() as u64,
+        upper: None,
     })
+}
+
+/// The half-open byte range `[lower, upper)` that a bare decimal size such as
+/// `36.3` times `multiplier` covers, or `None` when the text is not plain
+/// digits with an optional fraction.
+fn bare_size_range(number_text: &str, multiplier: u64) -> Option<(u64, u64)> {
+    let (whole, fraction) = number_text.split_once('.').unwrap_or((number_text, ""));
+    let digits = format!("{whole}{fraction}");
+    if digits.is_empty()
+        || fraction.len() > 18
+        || !digits.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let scaled: u128 = digits.parse().ok()?;
+    let divisor = 10u128.pow(fraction.len() as u32);
+    let multiplier = multiplier as u128;
+    let lower = (scaled * multiplier).div_ceil(divisor);
+    let upper = ((scaled + 1) * multiplier).div_ceil(divisor);
+    Some((u64::try_from(lower).ok()?, u64::try_from(upper).ok()?))
 }
 
 fn parse_date_term(
@@ -1548,8 +1589,18 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
         QueryExpr::Term(QueryTerm::Extension(extension)) => path
             .extension()
             .is_some_and(|actual| actual.to_string_lossy().eq_ignore_ascii_case(extension)),
-        QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
-            .map(|metadata| compare(metadata.len(), *comparison, *bytes))
+        QueryExpr::Term(QueryTerm::Size {
+            comparison,
+            bytes,
+            upper,
+        }) => fs::metadata(path)
+            .map(|metadata| {
+                let length = metadata.len();
+                match upper {
+                    Some(upper) => length >= *bytes && length < *upper,
+                    None => compare(length, *comparison, *bytes),
+                }
+            })
             .unwrap_or(false),
         QueryExpr::Term(QueryTerm::Date {
             field,
@@ -2493,18 +2544,79 @@ mod tests {
         ] {
             fs::File::create(path).unwrap().set_len(size).unwrap();
         }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![small, target, huge])));
+        let mid = directory.path().join("mid.mp4");
+        let binary_low = directory.path().join("binary_low.mp4");
+        let binary_high = directory.path().join("binary_high.mp4");
+        fs::File::create(&binary_low)
+            .unwrap()
+            .set_len(1126)
+            .unwrap();
+        fs::File::create(&binary_high)
+            .unwrap()
+            .set_len(1228)
+            .unwrap();
+        fs::File::create(&mid).unwrap().set_len(18_500_000).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            small,
+            target,
+            huge,
+            mid,
+            binary_low,
+            binary_high,
+        ])));
 
         assert_eq!(
             names(&engine.search(request("size:36.3mb")).unwrap()),
             ["target.mp4"]
         );
+        assert_eq!(
+            names(&engine.search(request("size:18mb")).unwrap()),
+            ["mid.mp4"]
+        );
+        assert!(names(&engine.search(request("size:19mb")).unwrap()).is_empty());
+        assert!(names(&engine.search(request("size:18.6mb")).unwrap()).is_empty());
+        assert_eq!(
+            names(&engine.search(request("size:18.5mb")).unwrap()),
+            ["mid.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("size:36mb")).unwrap()),
+            ["target.mp4"]
+        );
+        assert!(names(&engine.search(request("size:36300001")).unwrap()).is_empty());
+        // 1.1kib spans [1126.4, 1228.8) bytes: 1127..=1228.
+        assert_eq!(
+            names(&engine.search(request("size:1.1kib")).unwrap()),
+            ["binary_high.mp4"]
+        );
+        // 1.0005kb spans [1000.5, 1000.6) bytes, which holds no whole byte.
+        assert!(names(&engine.search(request("size:1.0005kb")).unwrap()).is_empty());
+        // An explicit `=` stays an exact match.
+        assert!(names(&engine.search(request("size:=18mb")).unwrap()).is_empty());
+        assert_eq!(
+            names(&engine.search(request("size:=36.3mb")).unwrap()),
+            ["target.mp4"]
+        );
+        // Operators keep their plain threshold even with a fractional value.
+        assert_eq!(
+            names(&engine.search(request("size:>=18.5mb")).unwrap()).len(),
+            3
+        );
         let mut under = names(&engine.search(request("size:<1.5gb")).unwrap());
         under.sort();
-        assert_eq!(under, ["small.mp4", "target.mp4"]);
+        assert_eq!(
+            under,
+            [
+                "binary_high.mp4",
+                "binary_low.mp4",
+                "mid.mp4",
+                "small.mp4",
+                "target.mp4"
+            ]
+        );
         let mut at_least = names(&engine.search(request("size:>=100kb")).unwrap());
         at_least.sort();
-        assert_eq!(at_least, ["huge.mp4", "small.mp4", "target.mp4"]);
+        assert_eq!(at_least, ["huge.mp4", "mid.mp4", "small.mp4", "target.mp4"]);
     }
 
     #[test]
