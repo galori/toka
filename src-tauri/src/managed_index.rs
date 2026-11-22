@@ -1,20 +1,22 @@
+use crate::indexer_daemon::{
+    indexer_running, mount_identity, path_available, IndexLogger, MountIdentity, OwnedSupervisor,
+    ThumbnailWorker,
+};
 use crate::search::{is_non_empty_file, is_supported_image, is_supported_video};
+#[cfg(test)]
 use crate::thumbnails;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(not(feature = "e2e"))]
-use std::process::ExitStatus;
 
 #[derive(Clone, Debug)]
 pub struct IndexPaths {
@@ -76,47 +78,6 @@ impl IndexPaths {
     }
 }
 
-struct IndexLogger {
-    path: PathBuf,
-    write_lock: Mutex<()>,
-}
-
-impl IndexLogger {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            write_lock: Mutex::new(()),
-        }
-    }
-
-    fn record(&self, message: impl AsRef<str>) {
-        let Some(parent) = self.path.parent() else {
-            return;
-        };
-        let _guard = self.write_lock.lock().unwrap();
-        if let Err(error) = fs::create_dir_all(parent) {
-            eprintln!("Could not create Toka indexer log directory: {error}");
-            return;
-        }
-        let Ok(mut file) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        else {
-            eprintln!("Could not open Toka indexer log: {}", self.path.display());
-            return;
-        };
-        if let Err(error) = writeln!(
-            file,
-            "[{}] {}",
-            crate::timestamp::now_rfc3339(),
-            message.as_ref()
-        ) {
-            eprintln!("Could not write Toka indexer log: {error}");
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ConfiguredFolder {
     id: String,
@@ -128,13 +89,6 @@ struct ConfiguredFolder {
 struct IndexConfig {
     #[serde(default)]
     folders: Vec<ConfiguredFolder>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct MountIdentity {
-    target: PathBuf,
-    source: String,
-    uuid: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -573,73 +527,6 @@ pub fn revision(paths: &IndexPaths) -> u64 {
         .revision
 }
 
-#[cfg(not(feature = "e2e"))]
-const INDEXER_SERVICE: &str = "toka-indexer.service";
-
-#[cfg(not(feature = "e2e"))]
-fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
-where
-    F: FnMut(&[&str]) -> io::Result<ExitStatus>,
-{
-    let arguments = ["--user", "start", INDEXER_SERVICE];
-    let status = run(&arguments)
-        .map_err(|error| format!("Toka could not start its indexer service: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Toka's indexer service could not be started (systemctl exited with {status})"
-        ))
-    }
-}
-
-#[cfg(not(feature = "e2e"))]
-pub fn ensure_indexer() {
-    if let Err(message) =
-        ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
-    {
-        eprintln!("{message}");
-    }
-}
-
-/// Whether the indexer service is running right now, if systemd can say.
-#[cfg(not(feature = "e2e"))]
-fn indexer_running() -> Option<bool> {
-    Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", INDEXER_SERVICE])
-        .status()
-        .ok()
-        .and_then(|status| match status.code() {
-            Some(0) => Some(true),
-            // `is-active` reports an inactive or failed unit with status 3;
-            // anything else (no user bus, signals) means systemd can't say.
-            Some(3) => Some(false),
-            _ => None,
-        })
-}
-
-#[cfg(feature = "e2e")]
-fn indexer_running() -> Option<bool> {
-    None
-}
-
-/// Stops the indexer service so it cannot recreate state while it is deleted.
-/// The next Toka launch starts it again.
-#[cfg(not(feature = "e2e"))]
-pub fn stop_indexer() -> Result<(), String> {
-    let status = Command::new("systemctl")
-        .args(["--user", "stop", INDEXER_SERVICE])
-        .status()
-        .map_err(|error| format!("could not stop the indexer service: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the indexer service could not be stopped (systemctl exited with {status})"
-        ))
-    }
-}
-
 fn ensure_parent(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
@@ -677,54 +564,8 @@ fn now_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[derive(Deserialize)]
-struct FindmntOutput {
-    filesystems: Vec<FindmntFilesystem>,
-}
-
-#[derive(Deserialize)]
-struct FindmntFilesystem {
-    target: PathBuf,
-    source: String,
-    uuid: Option<String>,
-}
-
-fn mount_identity(path: &Path) -> Option<MountIdentity> {
-    let output = Command::new("findmnt")
-        .args(["--json", "--target"])
-        .arg(path)
-        .args(["--output", "TARGET,SOURCE,UUID"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let found: FindmntOutput = serde_json::from_slice(&output.stdout).ok()?;
-    let mount = found.filesystems.into_iter().next()?;
-    Some(MountIdentity {
-        target: mount.target,
-        source: mount.source,
-        uuid: mount.uuid.filter(|uuid| !uuid.is_empty()),
-    })
-}
-
 fn folder_available(folder: &ConfiguredFolder) -> bool {
-    if !folder.path.is_dir() {
-        return false;
-    }
-    let Some(expected) = &folder.mount else {
-        return true;
-    };
-    let Some(current) = mount_identity(&folder.path) else {
-        return false;
-    };
-    if current.target != expected.target {
-        return false;
-    }
-    match (&expected.uuid, &current.uuid) {
-        (Some(expected), Some(current)) => expected == current,
-        _ => expected.source == current.source,
-    }
+    path_available(&folder.path, folder.mount.as_ref())
 }
 
 fn updatedb_arguments(root: &Path, database: &Path) -> Vec<String> {
@@ -1027,43 +868,6 @@ fn run_updatedb_with_progress(
     Ok((status, stderr))
 }
 
-struct ThumbnailWorker {
-    sender: mpsc::Sender<PathBuf>,
-}
-
-impl ThumbnailWorker {
-    fn new(logger: Arc<IndexLogger>) -> Self {
-        Self::with_generator(move |folder| {
-            thumbnails::generate_folder_with_failures(folder, |video, message| {
-                logger.record(format!(
-                    "thumbnail generation failed for {}: {message}",
-                    video.display()
-                ));
-            });
-        })
-    }
-
-    fn with_generator<F>(generator: F) -> Self
-    where
-        F: Fn(&Path) + Send + 'static,
-    {
-        let (sender, receiver): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("toka-thumbnail-worker".into())
-            .spawn(move || {
-                while let Ok(folder) = receiver.recv() {
-                    generator(&folder);
-                }
-            })
-            .expect("Toka could not start its thumbnail worker");
-        Self { sender }
-    }
-
-    fn enqueue(&self, folder: &Path) {
-        let _ = self.sender.send(folder.to_path_buf());
-    }
-}
-
 fn refresh_folder(
     paths: &IndexPaths,
     folder: &ConfiguredFolder,
@@ -1283,11 +1087,28 @@ pub fn run_daemon(paths: IndexPaths) -> Result<(), String> {
         .watch(&paths.root, RecursiveMode::NonRecursive)
         .map_err(|error| format!("Toka could not watch its settings: {error}"))?;
     let thumbnail_worker = ThumbnailWorker::new(Arc::clone(&logger));
+    let mut owned_supervisor = match crate::owned_index::database_path() {
+        Ok(database) => Some(OwnedSupervisor::new(
+            database,
+            Arc::clone(&logger),
+            thumbnail_worker.clone(),
+        )),
+        Err(error) => {
+            logger.record(format!("owned index stays disabled: {error}"));
+            None
+        }
+    };
 
     let mut watched = HashSet::<PathBuf>::new();
     let mut first_pass = true;
     loop {
         let config = load_json::<IndexConfig>(&paths.config)?.unwrap_or_default();
+        // Keep the owned-index watchers in step with their roots table. This
+        // reads the table fresh every pass, so a wake-up picks up changes;
+        // it stays a no-op until the migration creates the database.
+        if let Some(supervisor) = owned_supervisor.as_mut() {
+            supervisor.reconcile();
+        }
         let mut reconnected = Vec::new();
         for folder in &config.folders {
             let available = folder_available(folder);
@@ -1820,32 +1641,6 @@ mod tests {
                 videos: 1,
                 images: 1,
             }
-        );
-    }
-
-    #[cfg(not(feature = "e2e"))]
-    #[test]
-    fn starts_the_user_indexer_service_when_toka_launches() {
-        let mut commands: Vec<Vec<String>> = Vec::new();
-
-        ensure_indexer_with_runner(|arguments| {
-            commands.push(
-                arguments
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect(),
-            );
-            std::process::Command::new("true").status()
-        })
-        .unwrap();
-
-        assert_eq!(
-            commands,
-            vec![vec![
-                "--user".to_owned(),
-                "start".to_owned(),
-                "toka-indexer.service".to_owned(),
-            ]]
         );
     }
 
