@@ -1429,35 +1429,35 @@ pub fn run() {
     let builder = builder.manage(
         owned_index::OwnedIndexManager::system().expect("Toka could not find its search index"),
     );
-    #[cfg(target_os = "linux")]
-    let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![
-            search_videos,
-            search_match_count,
-            search_log_settings,
-            set_search_log_settings,
-            index_state,
-            launch_intent,
-            video_thumbnail,
-            video_preview,
-            delete_video,
-            undo_delete,
-            external_players,
-            open_in_external_player,
-            open_new_window,
-            open_folder_in_new_window,
-            matching_addon_actions,
-            run_addon_action,
-            set_video_tags,
-            add_video_tags,
-            remove_video_tags,
-            add_tags_to_videos,
-            add_folder_tags,
-            remove_folder_tags,
-            prepare_video,
-            subtitle_cues
-        ])
-    } else {
+    #[cfg(all(target_os = "linux", feature = "e2e", not(feature = "native-e2e")))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        search_videos,
+        search_match_count,
+        search_log_settings,
+        set_search_log_settings,
+        index_state,
+        launch_intent,
+        video_thumbnail,
+        video_preview,
+        delete_video,
+        undo_delete,
+        external_players,
+        open_in_external_player,
+        open_new_window,
+        open_folder_in_new_window,
+        matching_addon_actions,
+        run_addon_action,
+        set_video_tags,
+        add_video_tags,
+        remove_video_tags,
+        add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
+        prepare_video,
+        subtitle_cues
+    ]);
+    #[cfg(all(target_os = "linux", any(not(feature = "e2e"), feature = "native-e2e"))))]
+    let builder = {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
         builder
