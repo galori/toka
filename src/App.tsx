@@ -1510,7 +1510,10 @@ function Player({
     return () => window.removeEventListener("keydown", onKeyDown);
   });
   const copyPath = async () => {
-    const text = prepared?.filePath ?? video.fileName;
+    // Without the prepared path only the bare name is known, which is not
+    // what "Copy file path" promises; the button is disabled for the same case.
+    if (!prepared) return;
+    const text = prepared.filePath;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);

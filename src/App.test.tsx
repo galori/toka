@@ -1694,6 +1694,38 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("does not copy a bare file name while the path is still loading", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
+  });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockReturnValueOnce(new Promise(() => {}));
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+
+  const copyButton = await screen.findByRole("button", {
+    name: "Copy file path",
+  });
+  expect(copyButton).toBeDisabled();
+  await user.keyboard("c");
+  expect(writeText).not.toHaveBeenCalled();
+});
+
 test("keeps the copy control in the design system and gives the path room", async () => {
   invokeMock
     .mockResolvedValueOnce({

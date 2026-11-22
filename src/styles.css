@@ -705,7 +705,7 @@ button:focus-visible {
 .pagination button:not(:disabled):hover,
 .back-button:hover,
 .player-controls .transport-button:not(:disabled):hover,
-.copy-button:hover,
+.copy-button:not(:disabled):hover,
 .playlist-toggle:hover,
 .player-help-toggle:hover {
   border-color: oklch(0.68 0.19 38);
@@ -1767,9 +1767,6 @@ button:focus-visible {
 }
 .player-title {
   flex: 1 1 200px;
-}
-.player-heading .addon-menu-wrap {
-  flex: none;
 }
 .player-heading > button,
 .player-heading .addon-menu-wrap > button {
