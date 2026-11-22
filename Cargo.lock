@@ -4174,7 +4174,23 @@ dependencies = [
  "tauri-plugin-wdio-webdriver",
  "tempfile",
  "thiserror 2.0.19",
+ "toka-search",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "toka-search"
+version = "0.1.1"
+dependencies = [
+ "dirs",
+ "libc",
+ "notify",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
  "uuid",
 ]
 

@@ -209,7 +209,7 @@ fn rename(path: &Path, tags: &Tags) -> Result<TagUpdate, String> {
         let sidecars = if path.is_dir() {
             Vec::new()
         } else {
-            crate::subtitles::sidecar_subtitles(path)
+            crate::sidecars::sidecar_subtitles(path)
         };
         fs::rename(path, &target)
             .map_err(|error| format!("{} could not be renamed: {error}", path.display()))?;
@@ -224,7 +224,7 @@ fn rename(path: &Path, tags: &Tags) -> Result<TagUpdate, String> {
 /// Moves a file without ever replacing what is at `to`: the hard link fails
 /// if the name is taken, even when it was taken a moment ago, which a
 /// check-then-rename cannot promise.
-pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+pub fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     match fs::hard_link(from, to) {
         Ok(()) => fs::remove_file(from),
         // exFAT and FAT32 have no hard links; fall back to check-then-rename,
@@ -254,7 +254,7 @@ fn after_stem<'a>(name: &'a str, stem_lower: &str) -> Option<&'a str> {
 /// Keeps subtitle files beside a renamed video, so `talk.srt` follows
 /// `talk.mp4` to `talk [beach].mp4`. Best effort: a sidecar that cannot move
 /// (or whose new name is taken) stays where it is.
-fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::subtitles::SidecarSubtitle>) {
+fn rename_sidecars(from: &Path, to: &Path, sidecars: Vec<crate::sidecars::SidecarSubtitle>) {
     let (Some(old_stem), Some(new_stem)) = (
         from.file_stem().and_then(|stem| stem.to_str()),
         to.file_stem().and_then(|stem| stem.to_str()),

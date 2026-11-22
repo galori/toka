@@ -146,7 +146,7 @@ CREATE TABLE repair_queue (
 "#;
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum OwnedIndexError {
+pub enum OwnedIndexError {
     #[error("Toka could not use its search index: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("Toka cannot read search index schema version {0}.")]
@@ -177,7 +177,7 @@ pub(crate) enum OwnedIndexError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ScanPhase {
+pub enum ScanPhase {
     Scanning,
     Ready,
     Error,
@@ -204,7 +204,7 @@ impl ScanPhase {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ScanProgress {
+pub struct ScanProgress {
     pub root_id: String,
     pub phase: ScanPhase,
     pub folders_discovered: u64,
@@ -322,7 +322,7 @@ impl IndexedFile {
     }
 }
 
-pub(crate) struct OwnedIndex {
+pub struct OwnedIndex {
     connection: Connection,
     path: PathBuf,
 }
@@ -337,24 +337,25 @@ pub(crate) struct StoredMount {
 }
 
 #[derive(Clone)]
-pub(crate) struct OwnedIndexUpdates {
+pub struct OwnedIndexUpdates {
     database: Option<PathBuf>,
 }
 
-pub(crate) trait IndexUpdates: Send + Sync {
+pub trait IndexUpdates: Send + Sync {
     fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError>;
     fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError>;
 }
 
 impl OwnedIndexUpdates {
-    #[cfg(test)]
-    pub(crate) fn new(database: PathBuf) -> Self {
+    // Unconditional (not just `cfg(test)`): the app's tests build updates too,
+    // and this crate compiles without `cfg(test)` when they do.
+    pub fn new(database: PathBuf) -> Self {
         Self {
             database: Some(database),
         }
     }
 
-    pub(crate) fn system() -> Self {
+    pub fn system() -> Self {
         Self {
             database: database_path().ok(),
         }
@@ -401,7 +402,7 @@ impl IndexUpdates for OwnedIndexUpdates {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum OwnedFolderStatus {
+pub enum OwnedFolderStatus {
     Pending,
     Indexing,
     Ready,
@@ -413,7 +414,7 @@ pub(crate) enum OwnedFolderStatus {
 /// `scanning` is true for the directory being read right now.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ScannedDirectory {
+pub struct ScannedDirectory {
     pub path: PathBuf,
     pub scanning: bool,
     pub videos: u64,
@@ -423,7 +424,7 @@ pub(crate) struct ScannedDirectory {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OwnedIndexFolder {
+pub struct OwnedIndexFolder {
     pub id: String,
     pub path: PathBuf,
     pub status: OwnedFolderStatus,
@@ -441,7 +442,7 @@ pub(crate) struct OwnedIndexFolder {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OwnedIndexState {
+pub struct OwnedIndexState {
     pub supported: bool,
     pub revision: u64,
     pub indexed_videos: u64,
@@ -450,7 +451,7 @@ pub(crate) struct OwnedIndexState {
     pub folders: Vec<OwnedIndexFolder>,
 }
 
-pub(crate) struct OwnedIndexManager {
+pub struct OwnedIndexManager {
     database: PathBuf,
     watch: bool,
     watchers: Mutex<HashMap<String, ManagedRootWatcher>>,
@@ -463,19 +464,20 @@ struct ManagedRootWatcher {
 
 impl OwnedIndexManager {
     #[cfg(any(target_os = "macos", test))]
-    pub(crate) fn system() -> Result<Self, String> {
+    pub fn system() -> Result<Self, String> {
         let manager = Self::new(database_path()?, true);
         manager.restore_watchers();
         Ok(manager)
     }
 
     /// A manager for reading the index without starting watchers.
-    pub(crate) fn for_inspection() -> Result<Self, String> {
+    pub fn for_inspection() -> Result<Self, String> {
         Ok(Self::new(database_path()?, false))
     }
 
-    #[cfg(test)]
-    pub(crate) fn under(database: PathBuf) -> Self {
+    // Unconditional (not just `cfg(test)`): the app's tests build managers
+    // too, and this crate compiles without `cfg(test)` when they do.
+    pub fn under(database: PathBuf) -> Self {
         Self::new(database, false)
     }
 
@@ -494,7 +496,7 @@ impl OwnedIndexManager {
         }
     }
 
-    pub(crate) fn state(&self) -> Result<OwnedIndexState, String> {
+    pub fn state(&self) -> Result<OwnedIndexState, String> {
         self.ensure_watchers()?;
         let index = self.open().map_err(|error| error.to_string())?;
         let (indexed_videos, indexed_images) =
@@ -564,7 +566,7 @@ impl OwnedIndexManager {
     }
 
     /// Everything the index knows, for `toka --index-stats`.
-    pub(crate) fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
+    pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
         // Inspecting must not create an index that does not exist yet.
         if !self.database.is_file() {
@@ -611,7 +613,7 @@ impl OwnedIndexManager {
         })
     }
 
-    pub(crate) fn add_folder(&self, requested: &Path) -> Result<OwnedIndexState, String> {
+    pub fn add_folder(&self, requested: &Path) -> Result<OwnedIndexState, String> {
         let root = requested
             .canonicalize()
             .map_err(|error| format!("Toka could not open that folder: {error}"))?;
@@ -665,7 +667,7 @@ impl OwnedIndexManager {
         self.state()
     }
 
-    pub(crate) fn remove_folder(&self, id: &str) -> Result<OwnedIndexState, String> {
+    pub fn remove_folder(&self, id: &str) -> Result<OwnedIndexState, String> {
         let mut watchers = self
             .watchers
             .lock()
@@ -748,9 +750,13 @@ impl OwnedIndexManager {
     }
 }
 
-pub(crate) fn database_path() -> Result<PathBuf, String> {
+pub fn database_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
-        .map(|directory| directory.join("toka").join("index.sqlite3"))
+        .map(|directory| {
+            directory
+                .join(crate::config::APP_DATA_DIR_NAME)
+                .join(crate::config::INDEX_FILE_NAME)
+        })
         .ok_or_else(|| "Toka could not find a place for its search index.".into())
 }
 
@@ -967,7 +973,7 @@ fn apply_notify_event(
 }
 
 impl OwnedIndex {
-    pub(crate) fn open(path: &Path) -> Result<Self, OwnedIndexError> {
+    pub fn open(path: &Path) -> Result<Self, OwnedIndexError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OwnedIndexError::Permissions {
                 path: parent.display().to_string(),
@@ -1194,7 +1200,7 @@ impl OwnedIndex {
         Ok((videos as u64, images as u64))
     }
 
-    pub(crate) fn scan_root<F>(
+    pub fn scan_root<F>(
         &mut self,
         root_id: &str,
         root: &Path,

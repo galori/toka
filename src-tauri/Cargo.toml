@@ -10,7 +10,7 @@ name = "toka_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-e2e = []
+e2e = ["toka-search/e2e"]
 native-e2e = ["e2e"]
 # Automation without fixtures: the owned-index run drives the real app
 # through the embedded WebDriver server, so it needs the wdio plugins but
@@ -40,6 +40,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-wdio = "1"
 tauri-plugin-wdio-webdriver = "1"
 thiserror = "2"
+toka-search = { version = "0.1.1", path = "../crates/toka-search" }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 

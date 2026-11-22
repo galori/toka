@@ -62,7 +62,7 @@ impl IndexLogger {
 }
 
 #[cfg(not(feature = "e2e"))]
-const INDEXER_SERVICE: &str = "toka-indexer.service";
+use crate::config::INDEXER_SERVICE_NAME as INDEXER_SERVICE;
 
 #[cfg(not(feature = "e2e"))]
 pub(crate) fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
@@ -91,7 +91,7 @@ pub fn ensure_indexer() {
 }
 
 /// Whether the indexer service is running right now, if systemd can say.
-#[cfg(not(feature = "e2e"))]
+#[cfg(all(not(feature = "e2e"), any(target_os = "linux", test)))]
 pub(crate) fn indexer_running() -> Option<bool> {
     Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", INDEXER_SERVICE])
@@ -106,7 +106,7 @@ pub(crate) fn indexer_running() -> Option<bool> {
         })
 }
 
-#[cfg(feature = "e2e")]
+#[cfg(all(feature = "e2e", any(target_os = "linux", test)))]
 pub(crate) fn indexer_running() -> Option<bool> {
     None
 }
@@ -131,7 +131,11 @@ pub fn stop_indexer() -> Result<(), String> {
 /// Where the indexer daemon writes its log: beside the search log.
 fn indexer_log_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
-        .map(|directory| directory.join("app.toka.desktop/logs/indexer.log"))
+        .map(|directory| {
+            directory
+                .join(crate::config::APP_LOG_DIR_NAME)
+                .join("logs/indexer.log")
+        })
         .ok_or_else(|| "Toka could not find a place for its indexer log.".into())
 }
 
