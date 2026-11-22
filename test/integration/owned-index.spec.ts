@@ -30,6 +30,10 @@ describe("Toka owned index", () => {
     // from there reaches the search screen.
     const startSearching = await $('button[aria-label="Start searching"]');
     await startSearching.waitForDisplayed({ timeout: 60_000 });
+    // `add_index_folder` resolves before React picks the folder up on its
+    // one-second poll, and the button stays disabled until then; clicking
+    // while disabled never leaves the setup screen.
+    await startSearching.waitForEnabled({ timeout: 60_000 });
     await startSearching.click();
 
     // `add_index_folder` returns while the folder is still pending, and a

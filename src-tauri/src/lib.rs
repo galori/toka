@@ -1233,6 +1233,9 @@ fn owned_index_platform_provider(database: PathBuf) -> Arc<dyn SearchProvider> {
 }
 
 fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
+    // Integration-test builds always serve the configured fixtures. The
+    // legacy TOKA_SEARCH_PROVIDER override used to select real providers that
+    // no longer exist; it must not fall through to the persistent index here.
     #[cfg(feature = "e2e")]
     {
         struct FixtureSearchProvider;
@@ -1249,15 +1252,13 @@ fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvide
                 Ok(std::env::split_paths(&paths).collect())
             }
         }
-        if std::env::var_os("TOKA_SEARCH_PROVIDER").is_none() {
-            return Ok(Arc::new(FixtureSearchProvider));
-        }
+        Ok(Arc::new(FixtureSearchProvider))
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), not(feature = "e2e")))]
     {
         Ok(owned_index_platform_provider(owned_index::database_path()?))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(not(any(target_os = "macos", target_os = "linux")), not(feature = "e2e")))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {

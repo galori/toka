@@ -1,17 +1,45 @@
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Options } from "@wdio/types";
 
 // A fake home directory, so the app and its indexer daemon only ever touch
 // this test's files. XDG variables are set explicitly because the test runner
-// may already export them.
-const homeDirectory = mkdtempSync(join(tmpdir(), "toka-e2e-owned-"));
+// may already export them. WebdriverIO re-evaluates this file in each worker,
+// so the launcher publishes the home for workers to reuse; otherwise each
+// worker would mint its own home and the launcher's cleanup would orphan it.
+const homeDirectory =
+  process.env.TOKA_E2E_OWNED_HOME ??
+  mkdtempSync(join(tmpdir(), "toka-e2e-owned-"));
+process.env.TOKA_E2E_OWNED_HOME = homeDirectory;
 process.env.HOME = homeDirectory;
 process.env.XDG_CONFIG_HOME = join(homeDirectory, ".config");
 process.env.XDG_DATA_HOME = join(homeDirectory, ".local", "share");
 process.env.XDG_CACHE_HOME = join(homeDirectory, ".cache");
+
+// The owned build is the real app, so it runs `systemctl --user start
+// toka-indexer.service` on launch. On a machine with Toka installed that would
+// start the real user service against the real index, while this run spawns
+// its own daemon below. Shadow systemctl on PATH so the app under test cannot
+// reach the installed service; every call succeeds without doing anything,
+// which also truthfully reports the test daemon as running.
+const shimDirectory = join(homeDirectory, "bin");
+mkdirSync(shimDirectory, { recursive: true });
+const shimPath = join(shimDirectory, "systemctl");
+const shimLog = join(homeDirectory, "systemctl-shim.log");
+writeFileSync(
+  shimPath,
+  `#!/bin/sh\nprintf '%s systemctl %s\\n' "$(date -Is)" "$*" >> '${shimLog.replaceAll("'", "'\\''")}'\nexit 0\n`,
+);
+chmodSync(shimPath, 0o755);
+process.env.PATH = `${shimDirectory}${delimiter}${process.env.PATH ?? ""}`;
 
 const videosDirectory = join(homeDirectory, "Videos");
 mkdirSync(videosDirectory, { recursive: true });
