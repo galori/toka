@@ -652,7 +652,13 @@ mod tests {
         );
 
         let mut supervisor = test_supervisor(database, quiet_thumbnails());
-        supervisor.watchers.insert(id, ActiveWatcher { path: media, watcher });
+        supervisor.watchers.insert(
+            id,
+            ActiveWatcher {
+                path: media,
+                watcher,
+            },
+        );
         supervisor.reconcile();
         assert_eq!(
             supervisor.active_count(),
