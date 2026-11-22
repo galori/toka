@@ -1258,7 +1258,10 @@ fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvide
     {
         Ok(owned_index_platform_provider(owned_index::database_path()?))
     }
-    #[cfg(all(not(any(target_os = "macos", target_os = "linux")), not(feature = "e2e")))]
+    #[cfg(all(
+        not(any(target_os = "macos", target_os = "linux")),
+        not(feature = "e2e")
+    ))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
