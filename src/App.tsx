@@ -2517,19 +2517,24 @@ function Player({
   const leaveFullscreen = () => {
     setFullscreenError(undefined);
     if (document.fullscreenElement) {
+      const request = ++fullscreenRequest.current;
       const exiting = document.exitFullscreen?.();
       if (exiting) {
         void exiting
           .then(focusPlayerShell)
-          .catch(() =>
-            getCurrentWindow()
+          .catch(() => {
+            if (request !== fullscreenRequest.current) return;
+            return getCurrentWindow()
               .setFullscreen(false)
               .then(() => {
                 setFullscreen(false);
                 focusPlayerShell();
-              }),
-          )
-          .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+              });
+          })
+          .catch((reason: unknown) => {
+            if (request === fullscreenRequest.current)
+              setFullscreenError(errorMessage(reason));
+          });
       }
       return;
     }
