@@ -1696,9 +1696,14 @@ test("opens a selected result in the player and restores the grid on back", asyn
 
 test("does not copy a bare file name while the path is still loading", async () => {
   const writeText = vi.fn().mockResolvedValue(undefined);
+  const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   Object.defineProperty(navigator, "clipboard", {
     value: { writeText },
     configurable: true,
+  });
+  onTestFinished(() => {
+    if (original) Object.defineProperty(navigator, "clipboard", original);
+    else delete (navigator as { clipboard?: unknown }).clipboard;
   });
   invokeMock
     .mockResolvedValueOnce({

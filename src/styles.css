@@ -1766,7 +1766,8 @@ button:focus-visible {
   row-gap: 10px;
 }
 .player-title {
-  flex: 1 1 200px;
+  flex: 1 1 0;
+  min-width: 120px;
 }
 .player-heading > button,
 .player-heading .addon-menu-wrap > button {
