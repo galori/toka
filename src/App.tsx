@@ -2531,13 +2531,16 @@ function Player({
       return;
     }
     if (fullscreen) {
+      // Switch the layout first: the window can take seconds to answer while a
+      // long video plays, and the layout must not lag behind the keypress.
+      setFullscreen(false);
+      focusPlayerShell();
       void getCurrentWindow()
         .setFullscreen(false)
-        .then(() => {
-          setFullscreen(false);
-          focusPlayerShell();
-        })
-        .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+        .catch((reason: unknown) => {
+          setFullscreen(true);
+          setFullscreenError(errorMessage(reason));
+        });
       return;
     }
   };
@@ -2550,13 +2553,18 @@ function Player({
     setShowFullscreenInfo(true);
     setFullscreenError(undefined);
     const shell = playerShell.current;
-    const enterWindowFullscreen = () =>
-      getCurrentWindow()
+    // The layout switches at once; see leaveFullscreen. If the window refuses,
+    // the layout goes back and the document API gets its turn.
+    const enterWindowFullscreen = () => {
+      setFullscreen(true);
+      focusPlayerShell();
+      return getCurrentWindow()
         .setFullscreen(true)
-        .then(() => {
-          setFullscreen(true);
-          focusPlayerShell();
+        .catch((reason: unknown) => {
+          setFullscreen(false);
+          throw reason;
         });
+    };
     const enterDocumentFullscreen = () => {
       if (!shell?.requestFullscreen)
         return Promise.reject(
