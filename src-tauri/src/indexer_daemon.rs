@@ -586,7 +586,10 @@ mod tests {
             settle_delay(last_pass, last_pass + Duration::from_secs(1)),
             Duration::from_secs(1)
         );
-        assert_eq!(settle_delay(last_pass, last_pass + MIN_RECONCILE_INTERVAL), Duration::ZERO);
+        assert_eq!(
+            settle_delay(last_pass, last_pass + MIN_RECONCILE_INTERVAL),
+            Duration::ZERO
+        );
 
         let (sender, receiver) = mpsc::channel();
         sender.send(1).unwrap();
