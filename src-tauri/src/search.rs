@@ -1109,6 +1109,9 @@ enum QueryTerm {
     Size {
         comparison: Comparison,
         bytes: u64,
+        /// How many bytes one step of the last typed digit spans, so an
+        /// equality such as `18mb` matches 18.0 MB up to (not including) 19 MB.
+        width: u64,
     },
     Date {
         field: DateField,
@@ -1342,6 +1345,7 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
                 .map(|number| (number, *multiplier))
         })
         .ok_or(SearchError::InvalidQuery)?;
+    let number_text = number;
     let number = number
         .parse::<f64>()
         .ok()
@@ -1351,9 +1355,21 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     if !bytes.is_finite() || bytes > u64::MAX as f64 {
         return Err(SearchError::InvalidQuery);
     }
+    let decimals = number_text
+        .split_once('.')
+        .filter(|_| number_text.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .map_or(0, |(_, fraction)| fraction.len());
+    let width = if number_text.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        (multiplier as f64 / 10f64.powi(decimals as i32))
+            .round()
+            .max(1.0) as u64
+    } else {
+        1
+    };
     Ok(QueryTerm::Size {
         comparison,
         bytes: bytes.round() as u64,
+        width,
     })
 }
 
@@ -1548,8 +1564,19 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
         QueryExpr::Term(QueryTerm::Extension(extension)) => path
             .extension()
             .is_some_and(|actual| actual.to_string_lossy().eq_ignore_ascii_case(extension)),
-        QueryExpr::Term(QueryTerm::Size { comparison, bytes }) => fs::metadata(path)
-            .map(|metadata| compare(metadata.len(), *comparison, *bytes))
+        QueryExpr::Term(QueryTerm::Size {
+            comparison,
+            bytes,
+            width,
+        }) => fs::metadata(path)
+            .map(|metadata| {
+                let length = metadata.len();
+                if *comparison == Comparison::Equal {
+                    length >= *bytes && length < bytes.saturating_add(*width)
+                } else {
+                    compare(length, *comparison, *bytes)
+                }
+            })
             .unwrap_or(false),
         QueryExpr::Term(QueryTerm::Date {
             field,
@@ -2493,18 +2520,35 @@ mod tests {
         ] {
             fs::File::create(path).unwrap().set_len(size).unwrap();
         }
-        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![small, target, huge])));
+        let mid = directory.path().join("mid.mp4");
+        fs::File::create(&mid).unwrap().set_len(18_500_000).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![small, target, huge, mid])));
 
         assert_eq!(
             names(&engine.search(request("size:36.3mb")).unwrap()),
             ["target.mp4"]
         );
+        assert_eq!(
+            names(&engine.search(request("size:18mb")).unwrap()),
+            ["mid.mp4"]
+        );
+        assert!(names(&engine.search(request("size:19mb")).unwrap()).is_empty());
+        assert!(names(&engine.search(request("size:18.6mb")).unwrap()).is_empty());
+        assert_eq!(
+            names(&engine.search(request("size:18.5mb")).unwrap()),
+            ["mid.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("size:36mb")).unwrap()),
+            ["target.mp4"]
+        );
+        assert!(names(&engine.search(request("size:36300001")).unwrap()).is_empty());
         let mut under = names(&engine.search(request("size:<1.5gb")).unwrap());
         under.sort();
-        assert_eq!(under, ["small.mp4", "target.mp4"]);
+        assert_eq!(under, ["mid.mp4", "small.mp4", "target.mp4"]);
         let mut at_least = names(&engine.search(request("size:>=100kb")).unwrap());
         at_least.sort();
-        assert_eq!(at_least, ["huge.mp4", "small.mp4", "target.mp4"]);
+        assert_eq!(at_least, ["huge.mp4", "mid.mp4", "small.mp4", "target.mp4"]);
     }
 
     #[test]
