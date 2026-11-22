@@ -16,7 +16,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(any(target_os = "macos", test))]
 use std::sync::Mutex;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -390,7 +389,6 @@ impl IndexUpdates for OwnedIndexUpdates {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OwnedFolderStatus {
@@ -401,7 +399,22 @@ pub(crate) enum OwnedFolderStatus {
     Error,
 }
 
-#[cfg(any(target_os = "macos", test))]
+/// One directory the indexer has visited, with what it found directly in it.
+/// `scanning` is true for the directory being read right now.
+///
+/// This mirrors `managed_index::ScannedDirectory` so the status panel reads
+/// identical JSON from either backend; the two structs merge when the plocate
+/// backend is removed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScannedDirectory {
+    pub path: PathBuf,
+    pub scanning: bool,
+    pub videos: u64,
+    pub images: u64,
+    pub subfolders: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OwnedIndexFolder {
@@ -410,9 +423,14 @@ pub(crate) struct OwnedIndexFolder {
     pub status: OwnedFolderStatus,
     pub message: Option<String>,
     pub scanned_files: u64,
+    /// The directory the scan is reading right now; only set while indexing.
+    pub current_path: Option<PathBuf>,
+    /// Recently visited directories. The owned scanner does not track
+    /// per-directory tallies yet, so this stays empty until that lands; the
+    /// status panel already tolerates an empty list.
+    pub recent_directories: Vec<ScannedDirectory>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OwnedIndexState {
@@ -424,20 +442,17 @@ pub(crate) struct OwnedIndexState {
     pub folders: Vec<OwnedIndexFolder>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) struct OwnedIndexManager {
     database: PathBuf,
     watch: bool,
     watchers: Mutex<HashMap<String, ManagedRootWatcher>>,
 }
 
-#[cfg(any(target_os = "macos", test))]
 struct ManagedRootWatcher {
     path: PathBuf,
     watcher: OwnedIndexWatcher,
 }
 
-#[cfg(any(target_os = "macos", test))]
 impl OwnedIndexManager {
     pub(crate) fn system() -> Result<Self, String> {
         let manager = Self::new(database_path()?, true);
@@ -500,12 +515,23 @@ impl OwnedIndexManager {
             if status == OwnedFolderStatus::Indexing {
                 indexing_files += scanned_files;
             }
+            // The panel only shows progress for folders that are indexing;
+            // anything else reports no current path, like the plocate backend.
+            let current_path = if status == OwnedFolderStatus::Indexing {
+                progress
+                    .as_ref()
+                    .and_then(|progress| progress.current_folder.clone())
+            } else {
+                None
+            };
             folders.push(OwnedIndexFolder {
                 id,
                 path,
                 status,
                 message: progress.and_then(|progress| progress.error),
                 scanned_files,
+                current_path,
+                recent_directories: Vec::new(),
             });
         }
 
@@ -706,14 +732,12 @@ pub(crate) fn database_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "Toka could not find a place for its search index.".into())
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn root_paths(database: &Path) -> Result<Vec<PathBuf>, OwnedIndexError> {
     OwnedIndex::open(database)?
         .roots()
         .map(|roots| roots.into_iter().map(|(_, path)| path).collect())
 }
 
-#[cfg(any(target_os = "macos", test))]
 pub(crate) fn index_revision(database: &Path) -> Result<u64, OwnedIndexError> {
     OwnedIndex::open(database)?.revision()
 }
@@ -952,7 +976,6 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn search_candidates(
         &self,
         terms: &[String],
@@ -1003,7 +1026,6 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    #[cfg(any(target_os = "macos", test))]
     fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
         let transaction = self.connection.transaction()?;
         transaction.execute(
@@ -1020,7 +1042,6 @@ impl OwnedIndex {
         Ok(())
     }
 
-    #[cfg(any(target_os = "macos", test))]
     fn remove_root(&mut self, id: &str) -> Result<(), OwnedIndexError> {
         let transaction = self.connection.transaction()?;
         let removed = transaction.execute("DELETE FROM roots WHERE id = ?1", [id])?;
@@ -1041,7 +1062,6 @@ impl OwnedIndex {
         Ok(())
     }
 
-    #[cfg(any(target_os = "macos", test))]
     fn revision(&self) -> Result<u64, OwnedIndexError> {
         let revision: i64 = self.connection.query_row(
             "SELECT value FROM schema_meta WHERE key = 'index_revision'",
@@ -1051,7 +1071,6 @@ impl OwnedIndex {
         Ok(revision.max(0) as u64)
     }
 
-    #[cfg(any(target_os = "macos", test))]
     fn media_counts(&self) -> Result<(u64, u64), OwnedIndexError> {
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
@@ -1064,7 +1083,6 @@ impl OwnedIndex {
         Ok((videos as u64, images as u64))
     }
 
-    #[cfg(any(target_os = "macos", test))]
     fn root_media_counts(&self, root_id: &str) -> Result<(u64, u64), OwnedIndexError> {
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
@@ -2006,7 +2024,6 @@ fn path_from_bytes(value: Vec<u8>) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&value).into_owned())
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn is_fts_candidate_term(term: &str) -> bool {
     term.len() >= 3 && term.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
@@ -2083,6 +2100,11 @@ mod tests {
 
         assert_eq!(journal_mode, "wal");
         assert_eq!(foreign_keys, 1);
+        let busy_timeout: i64 = index
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5_000);
         assert_eq!(version, 1);
         for table in [
             "schema_meta",
@@ -3191,6 +3213,92 @@ mod tests {
         assert_eq!(state.indexed_images, 1);
         assert_eq!(state.folders[0].status, OwnedFolderStatus::Ready);
         assert_eq!(state.folders[0].scanned_files, 2);
+    }
+
+    #[test]
+    fn folders_report_no_current_path_before_and_after_a_scan() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+
+        let added = manager.add_folder(&root).unwrap();
+        assert_eq!(added.folders[0].current_path, None);
+        assert!(added.folders[0].recent_directories.is_empty());
+
+        let id = added.folders[0].id.clone();
+        OwnedIndex::open(&manager.database)
+            .unwrap()
+            .scan_root(&id, &root, |_| {})
+            .unwrap();
+
+        let state = manager.state().unwrap();
+        assert_eq!(state.folders[0].status, OwnedFolderStatus::Ready);
+        assert_eq!(state.folders[0].current_path, None);
+        assert!(state.folders[0].recent_directories.is_empty());
+    }
+
+    #[test]
+    fn indexing_folders_report_the_directory_they_are_scanning() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+
+        let added = manager.add_folder(&root).unwrap();
+        let id = added.folders[0].id.clone();
+
+        let observed = std::cell::RefCell::new(Vec::new());
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root_with_batch_size(&id, &root, 1, |progress| {
+                if progress.phase == ScanPhase::Scanning && progress.current_folder.is_some() {
+                    let folder = manager.state().unwrap().folders.remove(0);
+                    observed
+                        .borrow_mut()
+                        .push((folder.status, folder.current_path));
+                }
+            })
+            .unwrap();
+
+        let observed = observed.borrow();
+        assert!(
+            !observed.is_empty(),
+            "expected to observe the scan while it was running"
+        );
+        assert!(observed
+            .iter()
+            .all(|(status, _)| *status == OwnedFolderStatus::Indexing));
+        assert!(
+            observed.iter().any(|(_, path)| *path == Some(root.clone())),
+            "expected the scanned directory to be reported, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn folder_state_uses_the_documented_json_field_names() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+
+        let state = manager.state().unwrap();
+        let folder = serde_json::to_value(&state.folders[0]).unwrap();
+
+        assert_eq!(
+            folder.get("currentPath"),
+            Some(&serde_json::Value::Null),
+            "currentPath should serialize as null while pending, saw {folder}"
+        );
+        assert_eq!(
+            folder.get("recentDirectories"),
+            Some(&serde_json::Value::Array(Vec::new())),
+            "recentDirectories should serialize as an empty list, saw {folder}"
+        );
     }
 
     #[test]

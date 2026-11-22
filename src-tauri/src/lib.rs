@@ -6,6 +6,8 @@ mod index_visibility;
 mod launch;
 #[cfg(target_os = "linux")]
 mod managed_index;
+// The owned index is not wired up on Linux until the platform flip, so most
+// of it is unused there. That PR removes this allow instead of adding more.
 #[allow(dead_code)]
 mod owned_index;
 #[cfg(target_os = "linux")]
