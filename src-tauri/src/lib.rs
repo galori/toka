@@ -131,7 +131,10 @@ struct BulkTagUpdate {
     problem: Option<String>,
 }
 
-#[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "e2e"))))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 fn index_error(message: String) -> CommandError {
     CommandError {
         kind: "Index",
@@ -188,7 +191,10 @@ fn index_state() -> UnsupportedIndexState {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 #[tauri::command]
 fn add_index_folder(
     path: String,
@@ -197,7 +203,10 @@ fn add_index_folder(
     manager.add_folder(Path::new(&path)).map_err(index_error)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 #[tauri::command]
 fn remove_index_folder(
     id: String,
