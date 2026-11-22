@@ -1296,6 +1296,9 @@ function Player({
   // Numbers each fullscreen request so a slow one that fails late cannot undo
   // or override what a newer keypress asked for.
   const fullscreenRequest = useRef(0);
+  // Whether the window itself last confirmed being fullscreen, so a refused
+  // exit only restores the fullscreen layout over a window that still is.
+  const windowFullscreen = useRef(false);
   const [controlsRevealed, setControlsRevealed] = useState(false);
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   // Fullscreen shows only the scrubber and clock until the pointer visits the
@@ -2549,9 +2552,12 @@ function Player({
       focusPlayerShell();
       void getCurrentWindow()
         .setFullscreen(false)
+        .then(() => {
+          windowFullscreen.current = false;
+        })
         .catch((reason: unknown) => {
           if (request !== fullscreenRequest.current) return;
-          setFullscreen(true);
+          if (windowFullscreen.current) setFullscreen(true);
           setFullscreenError(errorMessage(reason));
         });
       return;
@@ -2575,6 +2581,9 @@ function Player({
       focusPlayerShell();
       return getCurrentWindow()
         .setFullscreen(true)
+        .then(() => {
+          windowFullscreen.current = true;
+        })
         .catch((reason: unknown) => {
           if (superseded()) return;
           setFullscreen(false);
@@ -2592,9 +2601,13 @@ function Player({
     const entering = prefersWindowFullscreen()
       ? enterWindowFullscreen().catch(enterDocumentFullscreen)
       : enterDocumentFullscreen().catch(enterWindowFullscreen);
-    void entering.then(focusPlayerShell).catch((reason: unknown) => {
-      if (!superseded()) setFullscreenError(errorMessage(reason));
-    });
+    void entering
+      .then(() => {
+        if (!superseded()) focusPlayerShell();
+      })
+      .catch((reason: unknown) => {
+        if (!superseded()) setFullscreenError(errorMessage(reason));
+      });
   };
 
   useEffect(() => {
