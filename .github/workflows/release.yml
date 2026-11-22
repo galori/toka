@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build and release (${{ matrix.status-os }}, ${{ matrix.rust-target }}, ${{ matrix.bundles }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            status-os: macos-14
+            rust-target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: ubuntu-24.04
+            status-os: ubuntu-24.04
+            rust-target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libgtk-3-dev libepoxy-dev libegl1-mesa-dev libglx-dev librsvg2-dev libmpv2 patchelf
+      - name: Check tag version matches manifests
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          cargo="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
+          if [ "$pkg" != "$tag" ] || [ "$conf" != "$tag" ] || [ "$cargo" != "$tag" ]; then
+            echo "Tag v$tag does not match manifests (package.json $pkg, tauri.conf.json $conf, Cargo.toml $cargo)"
+            exit 1
+          fi
+          echo "Release version $tag matches all manifests."
+      - run: npm ci
+      - name: Package app
+        run: |
+          metadata=$(node bin/prepare-build.mjs)
+          export VITE_APP_VERSION=$(node -e 'console.log(JSON.parse(process.argv[1]).buildVersion)' "$metadata")
+          export VITE_BUILD_TIME=$(node -e 'console.log(JSON.parse(process.argv[1]).builtAt)' "$metadata")
+          export VITE_GIT_SHA=$(node -e 'console.log(JSON.parse(process.argv[1]).gitSha)' "$metadata")
+          npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+      - name: Archive macOS .app
+        if: runner.os == 'macOS'
+        run: |
+          cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos"
+          tar -czf "$GITHUB_WORKSPACE/toka-${{ github.ref_name }}-macos-aarch64.app.tar.gz" *.app
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+            toka-*.app.tar.gz
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage/*.AppImage
