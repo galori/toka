@@ -3336,7 +3336,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // Linux-only: only filesystems like ext4/tmpfs accept non-UTF-8 names;
+    // macOS (APFS) rejects them at creation, so this scenario cannot occur
+    // there. The lossy conversion itself is platform-neutral.
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_directories_do_not_break_folder_state() {
         use std::os::unix::ffi::OsStringExt;
