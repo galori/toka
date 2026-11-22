@@ -261,7 +261,7 @@ impl OwnedSupervisor {
     /// Starts watchers for newly configured roots and stops watchers whose
     /// root went away, reading the roots table fresh every time so a wake-up
     /// always picks up the latest configuration. Does nothing until the owned
-    /// database exists, so it stays out of the way before migration.
+    /// database exists, so it stays out of the way until folders are added.
     pub(crate) fn reconcile(&mut self) {
         if !self.database.is_file() {
             self.stop_all();
