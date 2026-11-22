@@ -14,6 +14,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[cfg(not(feature = "e2e"))]
@@ -237,6 +238,17 @@ pub(crate) struct OwnedSupervisor {
     logger: Arc<IndexLogger>,
     thumbnails: ThumbnailWorker,
     watchers: HashMap<String, ActiveWatcher>,
+    last_failure: HashMap<String, Instant>,
+}
+
+/// How long the supervisor waits before restarting a watcher whose worker
+/// exited, so a persistently failing scan cannot hot-loop the daemon.
+const FAILED_SCAN_RETRY: Duration = Duration::from_secs(60);
+
+/// Whether a watcher may (re)start now: always on a fresh root, only after
+/// the cooldown following a worker exit.
+fn retry_due(last_failure: Option<Instant>, now: Instant) -> bool {
+    last_failure.is_none_or(|failure| now.duration_since(failure) >= FAILED_SCAN_RETRY)
 }
 
 struct ActiveWatcher {
@@ -255,6 +267,7 @@ impl OwnedSupervisor {
             logger,
             thumbnails,
             watchers: HashMap::new(),
+            last_failure: HashMap::new(),
         }
     }
 
@@ -299,13 +312,15 @@ impl OwnedSupervisor {
                     ));
                 }
             }
+            self.last_failure.remove(&id);
         }
         for (id, path, stored) in roots {
+            self.reap_if_finished(&id);
             let expected = match index.mount_columns(&id) {
-                Ok((target, source, uuid)) => target.map(|target| MountIdentity {
+                Ok(stored) => stored.target.map(|target| MountIdentity {
                     target,
-                    source: source.unwrap_or_default(),
-                    uuid,
+                    source: stored.source.unwrap_or_default(),
+                    uuid: stored.uuid,
                 }),
                 Err(error) => {
                     self.logger.record(format!(
@@ -341,6 +356,11 @@ impl OwnedSupervisor {
             }
             if let Some(entry) = self.watchers.remove(&id) {
                 let _ = entry.watcher.stop();
+            }
+            // A watcher whose worker exited restarts only after a cooldown,
+            // so a persistently failing scan cannot hot-loop the daemon.
+            if !retry_due(self.last_failure.get(&id).copied(), Instant::now()) {
+                continue;
             }
             if expected.is_none() {
                 let current = mount_identity(&path);
@@ -382,6 +402,34 @@ impl OwnedSupervisor {
                         path.display()
                     ));
                 }
+            }
+        }
+    }
+
+    /// Removes the watcher for `id` when its worker thread already exited,
+    /// logging why it stopped so the next pass can restart it. A finished
+    /// watcher indexes nothing, so leaving it in place would stall the root
+    /// until the daemon restarts.
+    fn reap_if_finished(&mut self, id: &str) {
+        let finished = self
+            .watchers
+            .get(id)
+            .is_some_and(|entry| entry.watcher.is_finished());
+        if !finished {
+            return;
+        }
+        let entry = self.watchers.remove(id).expect("watcher present");
+        match entry.watcher.stop() {
+            Ok(()) => self.logger.record(format!(
+                "search watcher for {} exited unexpectedly",
+                entry.path.display()
+            )),
+            Err(error) => {
+                self.logger.record(format!(
+                    "search watcher for {} exited: {error}",
+                    entry.path.display()
+                ));
+                self.last_failure.insert(id.to_owned(), Instant::now());
             }
         }
     }
@@ -569,6 +617,71 @@ mod tests {
     }
 
     #[test]
+    fn failed_scan_retries_only_after_a_cooldown() {
+        let now = Instant::now();
+        assert!(retry_due(None, now));
+        assert!(!retry_due(Some(now), now));
+        assert!(retry_due(
+            Some(now - FAILED_SCAN_RETRY - Duration::from_secs(1)),
+            now
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finished_workers_are_reaped_with_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // The scanner only stats files, so the scan fails only where the
+        // filesystem enforces permissions. This sandbox overrides DAC, so
+        // only it skips; real CI users enforce permissions and run the test.
+        let probe = tempdir().unwrap();
+        let probe_file = probe.path().join("probe");
+        fs::write(&probe_file, b"probe").unwrap();
+        fs::set_permissions(&probe_file, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::metadata(&probe_file).is_ok() {
+            eprintln!("skipping: test environment ignores file permissions");
+            return;
+        }
+
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        let locked = media.join("clip.mp4");
+        write_media(&media, "clip.mp4");
+        // Unreadable before the scan starts, so the initial scan fails and
+        // the worker exits instead of watching. A file (not a directory):
+        // watching the tree itself must keep working.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        let mut supervisor = test_supervisor(database, quiet_thumbnails());
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 1);
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                manager.state().unwrap().folders[0].status
+                    == crate::owned_index::OwnedFolderStatus::Error
+            }),
+            "expected the failed scan to surface"
+        );
+
+        supervisor.reconcile();
+        assert_eq!(
+            supervisor.active_count(),
+            0,
+            "expected the exited worker to be reaped"
+        );
+        // Still backing off: no immediate restart loop.
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
     fn stats_reports_the_indexer_service_state() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
@@ -624,12 +737,12 @@ mod tests {
         let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
         supervisor.reconcile();
 
-        let (target, _, _) = OwnedIndex::open(&database)
+        let stored = OwnedIndex::open(&database)
             .unwrap()
             .mount_columns(&id)
             .unwrap();
         assert!(
-            target.is_some(),
+            stored.target.is_some(),
             "expected findmnt to identify the test directory's mount"
         );
     }

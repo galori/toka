@@ -327,6 +327,15 @@ pub(crate) struct OwnedIndex {
     path: PathBuf,
 }
 
+/// A root's recorded mount columns. `None` fields mean nothing was recorded
+/// yet, not that the values are empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StoredMount {
+    pub target: Option<PathBuf>,
+    pub source: Option<String>,
+    pub uuid: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct OwnedIndexUpdates {
     database: Option<PathBuf>,
@@ -826,7 +835,7 @@ impl OwnedIndexWatcher {
             .spawn(move || {
                 let _keepalive = keepalive;
                 index.scan_root(&root_id, &root, |progress| on_progress(progress))?;
-                index.repair_pending(&root_id, &root)?;
+                index.repair_pending(&root_id, &root, |progress| on_progress(progress))?;
                 let mut event_state = NotifyEventState::default();
                 let mut last_repair_scan = Instant::now();
                 loop {
@@ -841,19 +850,20 @@ impl OwnedIndexWatcher {
                                 &root,
                                 &mut event_state,
                                 event,
+                                &mut on_progress,
                             ) {
                                 eprintln!("Toka could not apply a search index event: {error}");
                             }
                         }
                         Ok(Err(error)) => {
                             eprintln!("Toka's folder watcher missed an event: {error}");
-                            repair_root(&mut index, &root_id, &root);
+                            repair_root(&mut index, &root_id, &root, &mut on_progress);
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout)
                             if last_repair_scan.elapsed() >= REPAIR_SCAN_INTERVAL =>
                         {
-                            repair_root(&mut index, &root_id, &root);
+                            repair_root(&mut index, &root_id, &root, &mut on_progress);
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -877,6 +887,14 @@ impl OwnedIndexWatcher {
             Err(_) => Err(OwnedIndexError::WorkerStopped),
         }
     }
+
+    /// Whether the worker thread already exited, for example after a failed
+    /// scan. A finished watcher indexes nothing until it is replaced.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+    }
 }
 
 impl Drop for OwnedIndexWatcher {
@@ -893,12 +911,17 @@ struct NotifyEventState {
     renames: HashMap<usize, PathBuf>,
 }
 
-fn repair_root(index: &mut OwnedIndex, root_id: &str, root: &Path) {
-    if let Err(error) = index.scan_root(root_id, root, |_| {}) {
+fn repair_root(
+    index: &mut OwnedIndex,
+    root_id: &str,
+    root: &Path,
+    on_progress: &mut impl FnMut(&ScanProgress),
+) {
+    if let Err(error) = index.scan_root(root_id, root, |progress| on_progress(progress)) {
         eprintln!("Toka could not repair its search index: {error}");
         return;
     }
-    if let Err(error) = index.repair_pending(root_id, root) {
+    if let Err(error) = index.repair_pending(root_id, root, |progress| on_progress(progress)) {
         eprintln!("Toka could not replay its search index repairs: {error}");
     }
 }
@@ -909,10 +932,11 @@ fn apply_notify_event(
     root: &Path,
     state: &mut NotifyEventState,
     event: Event,
+    on_progress: &mut impl FnMut(&ScanProgress),
 ) -> Result<(), OwnedIndexError> {
     if event.need_rescan() {
         state.renames.clear();
-        index.scan_root(root_id, root, |_| {})?;
+        index.scan_root(root_id, root, |progress| on_progress(progress))?;
         return Ok(());
     }
     match &event.kind {
@@ -1007,22 +1031,19 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    /// The recorded mount columns for a root, if the row exists. `None`
-    /// fields mean nothing was recorded yet, not that the values are empty.
-    pub(crate) fn mount_columns(
-        &self,
-        id: &str,
-    ) -> Result<(Option<PathBuf>, Option<String>, Option<String>), OwnedIndexError> {
+    /// The recorded mount columns for a root, defaulting to empty when the
+    /// row is missing.
+    pub(crate) fn mount_columns(&self, id: &str) -> Result<StoredMount, OwnedIndexError> {
         self.connection
             .query_row(
                 "SELECT mount_target, mount_source, mount_uuid FROM roots WHERE id = ?1",
                 [id],
                 |row| {
-                    Ok((
-                        row.get::<_, Option<Vec<u8>>>(0)?.map(path_from_bytes),
-                        row.get(1)?,
-                        row.get(2)?,
-                    ))
+                    Ok(StoredMount {
+                        target: row.get::<_, Option<Vec<u8>>>(0)?.map(path_from_bytes),
+                        source: row.get(1)?,
+                        uuid: row.get(2)?,
+                    })
                 },
             )
             .optional()
@@ -1359,17 +1380,14 @@ impl OwnedIndex {
         let progress = ScanProgress::new(root_id);
         let root_bytes = path_bytes(root);
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO roots (
-                id, path, display_path, state, scan_generation,
-                created_at_ns, updated_at_ns
-             ) VALUES (?1, ?2, ?3, 'scanning', 1, ?4, ?4)
-             ON CONFLICT(id) DO UPDATE SET
-                path = excluded.path,
-                display_path = excluded.display_path,
-                state = 'scanning',
-                scan_generation = roots.scan_generation + 1,
-                updated_at_ns = excluded.updated_at_ns",
+        // Update-only: a scan must never resurrect a root that was removed
+        // after the caller read the roots table.
+        let changed = transaction.execute(
+            "UPDATE roots SET
+                path = ?2, display_path = ?3, state = 'scanning',
+                scan_generation = scan_generation + 1,
+                updated_at_ns = ?4
+             WHERE id = ?1",
             params![
                 root_id,
                 root_bytes,
@@ -1377,6 +1395,9 @@ impl OwnedIndex {
                 progress.started_at_ns
             ],
         )?;
+        if changed == 0 {
+            return Err(OwnedIndexError::FolderNotConfigured);
+        }
         let generation = transaction.query_row(
             "SELECT scan_generation FROM roots WHERE id = ?1",
             [root_id],
@@ -1815,11 +1836,15 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    pub(crate) fn repair_pending(
+    pub(crate) fn repair_pending<F>(
         &mut self,
         root_id: &str,
         root: &Path,
-    ) -> Result<usize, OwnedIndexError> {
+        mut on_progress: F,
+    ) -> Result<usize, OwnedIndexError>
+    where
+        F: FnMut(&ScanProgress),
+    {
         let repairs = self.pending_repairs()?;
         let mut repaired = 0;
         for repair in repairs
@@ -1827,7 +1852,8 @@ impl OwnedIndex {
             .filter(|repair| repair.path.starts_with(root))
         {
             let result = if repair.reason == "direct rename" {
-                self.scan_root(root_id, root, |_| {}).map(|_| ())
+                self.scan_root(root_id, root, |progress| on_progress(progress))
+                    .map(|_| ())
             } else {
                 self.try_synchronize_path(root_id, root, &repair.path)
             };
@@ -2388,6 +2414,7 @@ mod tests {
         fs::write(root.join("visible.folder/photo.jpg"), b"photo").unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         let mut scanned_folders = Vec::new();
 
         let progress = index
@@ -2417,6 +2444,7 @@ mod tests {
         fs::write(root.join("photo.jpg"), b"photo").unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         assert!(std::process::Command::new("/usr/bin/chflags")
             .arg("hidden")
@@ -2461,6 +2489,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         fs::create_dir_all(root.join("new/.worktrees/nested")).unwrap();
         fs::write(root.join("new/.worktrees/nested/clip.mp4"), b"video").unwrap();
@@ -2502,6 +2531,7 @@ mod tests {
             fs::write(file, b"video").unwrap();
             let database = directory.path().join("index.sqlite3");
             let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
             index.scan_root("root", &root, |_| {}).unwrap();
             let manager = OwnedIndexManager::under(database);
 
@@ -2527,6 +2557,7 @@ mod tests {
         fs::write(root.join("clip.mp4"), b"video").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
 
+        index.insert_root("root", &root).unwrap();
         let progress = index.scan_root("root", &root, |_| {}).unwrap();
 
         assert_eq!(progress.files_indexed, 0);
@@ -2583,6 +2614,7 @@ mod tests {
         std::fs::write(nested.join("notes.txt"), b"text").unwrap();
         std::fs::File::create(nested.join("empty.mov")).unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         let mut updates = Vec::new();
 
         let finished = index
@@ -2643,6 +2675,7 @@ mod tests {
         std::fs::write(root.join("second.mp4"), b"two").unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut scanner = OwnedIndex::open(&database).unwrap();
+        scanner.insert_root("root", &root).unwrap();
         let observer = OwnedIndex::open(&database).unwrap();
         let mut partial_count = None;
 
@@ -2668,6 +2701,7 @@ mod tests {
         std::fs::write(&kept, b"keep").unwrap();
         std::fs::write(&removed, b"remove").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         std::fs::remove_file(removed).unwrap();
 
@@ -2696,6 +2730,7 @@ mod tests {
         let clip = root.join("clip.mp4");
         std::fs::write(&clip, b"clip").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
 
@@ -2719,7 +2754,9 @@ mod tests {
         std::fs::write(child.join("trip.jpg"), b"photo").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
 
+        index.insert_root("parent", &parent).unwrap();
         index.scan_root("parent", &parent, |_| {}).unwrap();
+        index.insert_root("child", &child).unwrap();
         index.scan_root("child", &child, |_| {}).unwrap();
 
         assert_eq!(indexed_file_count(&index), 1);
@@ -2739,6 +2776,7 @@ mod tests {
         let database = root.join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
 
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
 
         assert_eq!(
@@ -2808,6 +2846,7 @@ mod tests {
         std::fs::write(&clip, b"video").unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         drop(index);
         let updates = OwnedIndexUpdates::new(database.clone());
@@ -2837,13 +2876,14 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let missed = root.join("missed.mp4");
         std::fs::write(&missed, b"video").unwrap();
         let event = Event::new(EventKind::Any).set_flag(notify::event::Flag::Rescan);
         let mut state = NotifyEventState::default();
 
-        apply_notify_event(&mut index, "root", &root, &mut state, event).unwrap();
+        apply_notify_event(&mut index, "root", &root, &mut state, event, &mut |_| {}).unwrap();
 
         assert!(indexed_display_paths(&index).contains(missed.to_string_lossy().as_ref()));
     }
@@ -2856,6 +2896,10 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("existing.mp4"), b"video").unwrap();
         let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
 
         let watcher = OwnedIndexWatcher::start(&database, "root".into(), root).unwrap();
         let observer = OwnedIndex::open(&database).unwrap();
@@ -2910,6 +2954,10 @@ mod tests {
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
         let (watcher, events) = OwnedIndexWatcher::start_with_test_events(
             &database,
             "root".into(),
@@ -2973,6 +3021,7 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let added = root.join("added");
         std::fs::create_dir_all(added.join("nested")).unwrap();
@@ -3001,6 +3050,10 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("existing.mp4"), b"video").unwrap();
         let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
         let late = root.join("late.jpg");
         let late_from_scan = late.clone();
         let nested_from_scan = nested.clone();
@@ -3040,6 +3093,7 @@ mod tests {
         std::fs::write(&clip, b"video").unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
 
         assert!(index
@@ -3054,7 +3108,7 @@ mod tests {
         assert_eq!(repairs[0].reason, "direct update");
         assert!(repairs[0].last_error.is_some());
 
-        assert_eq!(reopened.repair_pending("root", &root).unwrap(), 1);
+        assert_eq!(reopened.repair_pending("root", &root, |_| {}).unwrap(), 1);
         assert!(reopened.pending_repairs().unwrap().is_empty());
     }
 
@@ -3066,6 +3120,7 @@ mod tests {
         std::fs::create_dir_all(&from).unwrap();
         std::fs::write(from.join("clip.mp4"), b"video").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let to = root.join("after");
         std::fs::rename(&from, &to).unwrap();
@@ -3076,7 +3131,15 @@ mod tests {
         )))
         .add_path(from.clone())
         .set_tracker(7);
-        apply_notify_event(&mut index, "root", &root, &mut state, from_event).unwrap();
+        apply_notify_event(
+            &mut index,
+            "root",
+            &root,
+            &mut state,
+            from_event,
+            &mut |_| {},
+        )
+        .unwrap();
         assert!(indexed_display_paths(&index)
             .contains(from.join("clip.mp4").to_string_lossy().as_ref()));
 
@@ -3085,7 +3148,7 @@ mod tests {
         )))
         .add_path(to.clone())
         .set_tracker(7);
-        apply_notify_event(&mut index, "root", &root, &mut state, to_event).unwrap();
+        apply_notify_event(&mut index, "root", &root, &mut state, to_event, &mut |_| {}).unwrap();
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.join("clip.mp4").to_string_lossy().into_owned()])
@@ -3101,6 +3164,7 @@ mod tests {
         let to = root.join("clip [home].mp4");
         std::fs::write(&from, b"video").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         std::fs::rename(&from, &to).unwrap();
 
@@ -3113,7 +3177,7 @@ mod tests {
         assert_eq!(repairs[0].path, to);
         assert_eq!(repairs[0].reason, "direct rename");
 
-        assert_eq!(index.repair_pending("root", &root).unwrap(), 1);
+        assert_eq!(index.repair_pending("root", &root, |_| {}).unwrap(), 1);
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.to_string_lossy().into_owned()])
@@ -3128,6 +3192,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let renamed = directory.path().join("media [home]");
         std::fs::rename(&root, &renamed).unwrap();
@@ -3157,6 +3222,7 @@ mod tests {
         let moved_out = outside.join("clip.mp4");
         std::fs::write(&inside, b"video").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
 
         std::fs::rename(&inside, &moved_out).unwrap();
@@ -3185,7 +3251,9 @@ mod tests {
         let to = parent.join("trip.jpg");
         std::fs::write(&from, b"photo").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("parent", &parent).unwrap();
         index.scan_root("parent", &parent, |_| {}).unwrap();
+        index.insert_root("child", &child).unwrap();
         index.scan_root("child", &child, |_| {}).unwrap();
         std::fs::rename(&from, &to).unwrap();
 
@@ -3226,6 +3294,7 @@ mod tests {
         std::fs::write(old_folder.join("one.mp4"), b"one").unwrap();
         std::fs::write(old_folder.join("nested/two.jpg"), b"two").unwrap();
         let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let new_folder = root.join("afterqzxv-folder");
 
@@ -3255,6 +3324,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let database = directory.path().join("index.sqlite3");
         let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
         index.scan_root("root", &root, |_| {}).unwrap();
         let clip = root.join("clip.mp4");
 
@@ -3303,6 +3373,15 @@ mod tests {
         assert_eq!(state.indexed_images, 1);
         assert_eq!(state.folders[0].status, OwnedFolderStatus::Ready);
         assert_eq!(state.folders[0].scanned_files, 2);
+    }
+
+    #[test]
+    fn scanning_a_removed_root_reports_it_is_not_configured() {
+        let (_directory, mut index) = open_index();
+        let error = index
+            .scan_root("gone", Path::new("/gone"), |_| {})
+            .unwrap_err();
+        assert!(matches!(error, OwnedIndexError::FolderNotConfigured));
     }
 
     #[test]
