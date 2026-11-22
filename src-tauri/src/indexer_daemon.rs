@@ -139,6 +139,23 @@ fn indexer_log_path() -> Result<PathBuf, String> {
 /// missed filesystem event only delays a folder update.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Minimum gap between reconciliations. A pass touches the watched directory
+/// itself (SQLite opens, permission fixes), and worker scan activity does too,
+/// so back-to-back events must coalesce instead of each triggering a pass.
+const MIN_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Discards every queued filesystem event. Called after each pass so events
+/// the pass itself produced never trigger another one.
+fn drain_events<T>(receiver: &mpsc::Receiver<T>) {
+    while receiver.try_recv().is_ok() {}
+}
+
+/// How much longer to wait before the next pass, so event bursts (including
+/// the daemon's own writes) settle instead of reconciling continuously.
+fn settle_delay(last_pass: Instant, now: Instant) -> Duration {
+    MIN_RECONCILE_INTERVAL.saturating_sub(now.duration_since(last_pass))
+}
+
 /// Runs the Linux indexer daemon: keeping one owned-index watcher per
 /// configured root until the process stops. Each pass re-reads the roots
 /// table, so folders added or removed while the window is closed apply on the
@@ -165,11 +182,17 @@ pub fn run_daemon() -> Result<(), String> {
     let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
     loop {
         supervisor.reconcile();
+        let last_pass = Instant::now();
+        drain_events(&receiver);
         match receiver.recv_timeout(RECONCILE_INTERVAL) {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("Toka's folder watcher stopped unexpectedly.".into())
             }
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(_) => {
+                drain_events(&receiver);
+                std::thread::sleep(settle_delay(last_pass, Instant::now()));
+            }
         }
     }
 }
@@ -553,6 +576,23 @@ mod tests {
 
     fn write_media(root: &Path, name: &str) {
         fs::write(root.join(name), b"media").unwrap();
+    }
+
+    #[test]
+    fn reconcile_wake_ups_settle_instead_of_triggering_passes() {
+        let last_pass = Instant::now();
+        assert_eq!(settle_delay(last_pass, last_pass), MIN_RECONCILE_INTERVAL);
+        assert_eq!(
+            settle_delay(last_pass, last_pass + Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(settle_delay(last_pass, last_pass + MIN_RECONCILE_INTERVAL), Duration::ZERO);
+
+        let (sender, receiver) = mpsc::channel();
+        sender.send(1).unwrap();
+        sender.send(2).unwrap();
+        drain_events(&receiver);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(not(feature = "e2e"))]
