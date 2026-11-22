@@ -2735,6 +2735,84 @@ test("switches to fullscreen layout without waiting for a slow window", async ()
   }
 });
 
+async function playClipOnMac() {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+}
+
+test("a refused fullscreen window reverts the layout and shows the error", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
+  windowApiMock.setFullscreen.mockRejectedValue(new Error("refused"));
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: vi.fn().mockRejectedValue(new Error("no document fullscreen")),
+  });
+  try {
+    await playClipOnMac();
+    fireEvent.keyDown(window, { key: "f" });
+    expect(await screen.findByText(/no document fullscreen/)).toBeVisible();
+    expect(document.querySelector(".player-shell")).not.toHaveClass(
+      "fullscreen",
+    );
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
+test("a late failure of a superseded fullscreen request is ignored", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
+  let rejectEnter: (reason: Error) => void = () => {};
+  const requestFullscreen = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: requestFullscreen,
+  });
+  windowApiMock.setFullscreen.mockImplementation((on: boolean) =>
+    on
+      ? new Promise((_, reject) => {
+          rejectEnter = reject;
+        })
+      : Promise.resolve(),
+  );
+  try {
+    await playClipOnMac();
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
+    );
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(windowApiMock.setFullscreen).toHaveBeenLastCalledWith(false),
+    );
+    await act(async () => rejectEnter(new Error("late")));
+    expect(requestFullscreen).not.toHaveBeenCalled();
+    expect(screen.queryByText(/late/)).not.toBeInTheDocument();
+    expect(document.querySelector(".player-shell")).not.toHaveClass(
+      "fullscreen",
+    );
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
 test("shows fullscreen path and time overlays and toggles them with I", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
