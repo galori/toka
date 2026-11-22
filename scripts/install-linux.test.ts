@@ -103,44 +103,22 @@ describe("installAppImage", () => {
 });
 
 describe("installBinary", () => {
-  it("installs Toka's search tools, PATH link, and background indexer", async () => {
-    const root = await mkdtemp(
-      path.join(os.tmpdir(), "toka-linux-owned-index-"),
-    );
+  it("installs the PATH link and background indexer", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-linux-install-"));
     const releaseDir = path.join(root, "release");
     const homeDir = path.join(root, "home");
     const binaryPath = path.join(releaseDir, "toka");
-    const plocatePath = path.join(releaseDir, "toka-plocate");
-    const updatedbPath = path.join(releaseDir, "toka-updatedb");
     const serviceCommands: string[][] = [];
     await mkdir(releaseDir, { recursive: true });
-    await Promise.all([
-      writeFile(binaryPath, "test binary"),
-      writeFile(plocatePath, "bundled plocate"),
-      writeFile(updatedbPath, "bundled updatedb"),
-    ]);
+    await writeFile(binaryPath, "test binary");
 
     await installBinary({
       binaryPath,
       homeDir,
       iconPath: path.join(root, "128x128.png"),
-      plocatePath,
-      updatedbPath,
       runServiceCommand: (...arguments_) => serviceCommands.push(arguments_),
     });
 
-    await expect(
-      readFile(
-        path.join(homeDir, ".local", "opt", "toka", "libexec", "toka-plocate"),
-        "utf8",
-      ),
-    ).resolves.toBe("bundled plocate");
-    await expect(
-      readFile(
-        path.join(homeDir, ".local", "opt", "toka", "libexec", "toka-updatedb"),
-        "utf8",
-      ),
-    ).resolves.toBe("bundled updatedb");
     expect(await readlink(path.join(homeDir, ".local", "bin", "toka"))).toBe(
       path.join(homeDir, ".local", "opt", "toka", "Toka"),
     );

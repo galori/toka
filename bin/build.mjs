@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareBuild } from "./prepare-build.mjs";
 import { builtArtifactPath, parseBuildArgs } from "./build-args.mjs";
-import { buildPlocate } from "../scripts/build-plocate.mjs";
 
 const root = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 const {
@@ -11,8 +10,6 @@ const {
   install,
   appimage: wantsAppImage,
 } = parseBuildArgs(process.argv.slice(2));
-
-if (target === "linux") await buildPlocate();
 
 const info = prepareBuild();
 const env = {
@@ -24,8 +21,7 @@ const env = {
 
 function bundleArguments() {
   if (target === "mac") return ["--bundles", "app,dmg"];
-  const bundle = wantsAppImage ? ["--bundles", "appimage"] : ["--no-bundle"];
-  return [...bundle, "--config", "src-tauri/tauri.linux-owned-index.conf.json"];
+  return wantsAppImage ? ["--bundles", "appimage"] : ["--no-bundle"];
 }
 
 const build = spawnSync(

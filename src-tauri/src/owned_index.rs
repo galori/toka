@@ -411,10 +411,6 @@ pub(crate) enum OwnedFolderStatus {
 
 /// One directory the indexer has visited, with what it found directly in it.
 /// `scanning` is true for the directory being read right now.
-///
-/// This mirrors `managed_index::ScannedDirectory` so the status panel reads
-/// identical JSON from either backend; the two structs merge when the plocate
-/// backend is removed.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ScannedDirectory {
@@ -534,7 +530,7 @@ impl OwnedIndexManager {
                 indexing_files += scanned_files;
             }
             // The panel only shows progress for folders that are indexing;
-            // anything else reports no current path, like the plocate backend.
+            // anything else reports no current path.
             // Lossy on purpose: see the field's doc comment.
             let current_path = if status == OwnedFolderStatus::Indexing {
                 progress.as_ref().and_then(|progress| {

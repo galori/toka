@@ -17,8 +17,8 @@ npm run build:mac:install   # macOS: builds, then installs into /Applications
 ```
 
 Build Linux artifacts on Linux and macOS bundles on macOS. Only the `:install` variants install
-anything. The Linux install puts Toka, its private indexer, and its bundled plocate tools under your home directory,
-so no system-wide plocate setup is needed. See the platform quick-start guide for details.
+anything. The Linux install puts Toka and its private indexer under your home directory,
+so no system-wide setup is needed. See the platform quick-start guide for details.
 The macOS install puts the app in `/Applications` and links the `toka` command
 in `~/.local/bin`.
 
@@ -143,7 +143,7 @@ taken.
 
 - Supported search results: MP4, MOV, MKV, AVI, WebM, M4V, MPEG, MPG, and MPE.
 - Linux playback uses the embedded libmpv/FFmpeg media engine; other platforms use the system WebKit media engine. Toka does not transcode files.
-- On both platforms, `Ctrl+,` opens the search-folder screen. Linux searches its private plocate index; macOS searches Toka's private SQLite index. On Linux, Toka updates the private index after files are created, removed, moved, or renamed, even while its window is closed.
+- On both platforms, `Ctrl+,` opens the search-folder screen. Both search Toka's private SQLite index. On Linux, Toka updates the private index after files are created, removed, moved, or renamed, even while its window is closed.
 - A disconnected external folder is shown as offline. Its index is retained and incrementally refreshed when the same drive returns at the same mount path.
 
 See [Development](docs/development.md) for tests, project structure, troubleshooting, and implementation details. The official [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) cover other Linux distributions.

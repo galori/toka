@@ -32,13 +32,13 @@ describe("toka-search-log", () => {
         kind: "command",
         timestamp: 12,
         query: "summer vacation",
-        command: "plocate --existing -- vacation",
+        command: "media-index --existing -- vacation",
       }),
       JSON.stringify({
         kind: "error",
         timestamp: 13,
         query: "broken",
-        error: "plocate failed",
+        error: "index unavailable",
       }),
     ];
     expect(parseSearchLogLines(lines)).toHaveLength(2);
@@ -46,7 +46,7 @@ describe("toka-search-log", () => {
     expect(output).toContain("QUERY");
     expect(output).toContain("COMMAND");
     expect(output).toContain("summer vacation");
-    expect(output).toContain("plocate --existing -- vacation");
-    expect(output).toContain("ERROR: plocate failed");
+    expect(output).toContain("media-index --existing -- vacation");
+    expect(output).toContain("ERROR: index unavailable");
   });
 });
