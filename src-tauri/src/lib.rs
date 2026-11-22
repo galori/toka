@@ -1456,7 +1456,7 @@ pub fn run() {
         prepare_video,
         subtitle_cues
     ]);
-    #[cfg(all(target_os = "linux", any(not(feature = "e2e"), feature = "native-e2e"))))]
+    #[cfg(all(target_os = "linux", any(not(feature = "e2e"), feature = "native-e2e")))]
     let builder = {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
