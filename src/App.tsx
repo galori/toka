@@ -1694,15 +1694,20 @@ function Player({
   const timelineShare = (time: number) =>
     duration > 0 ? Math.min(100, Math.max(0, (time / duration) * 100)) : 0;
   const elapsedShare = timelineShare(currentTime);
+  // Each end is marked as soon as it is set: a range with only one end runs to
+  // the start or the end of the file, and the marker shows where it begins.
   const rangeMarkers =
-    !isImage &&
-    rangeStart !== undefined &&
-    rangeEnd !== undefined &&
-    duration > 0
+    !isImage && duration > 0
       ? [
-          { label: "Range start marker", share: timelineShare(rangeStart) },
-          { label: "Range end marker", share: timelineShare(rangeEnd) },
-        ]
+          rangeStart !== undefined && {
+            label: "Range start marker",
+            share: timelineShare(rangeStart),
+          },
+          rangeEnd !== undefined && {
+            label: "Range end marker",
+            share: timelineShare(rangeEnd),
+          },
+        ].filter((marker) => marker !== false)
       : [];
 
   const subtitles = useMemo<SubtitleOption[]>(() => {
@@ -1925,8 +1930,8 @@ function Player({
     // A marked range that runs to the end of the file can reach it before the
     // range's own end is seen, and it still has to start over rather than
     // hand playback to the next entry.
-    if (rangeStart !== undefined && rangeEnd !== undefined) {
-      restart(rangeStart);
+    if (rangeStart !== undefined || rangeEnd !== undefined) {
+      restart(rangeStart ?? 0);
       return;
     }
     if (loop === "one") {
@@ -2047,7 +2052,6 @@ function Player({
   const markRangeEnd = () => {
     const from = rangeStart ?? 0;
     if (currentTime <= from) return;
-    if (rangeStart === undefined) setRangeStart(from);
     setRangeEnd(currentTime);
     seekTo(from);
   };
@@ -2056,8 +2060,8 @@ function Player({
   // fight an engine whose seek lands on a keyframe just before it, and a
   // viewer who scrubs back before the start is still carried into the range.
   useEffect(() => {
-    if (rangeStart === undefined || rangeEnd === undefined) return;
-    if (currentTime >= rangeEnd) seekTo(rangeStart);
+    if (rangeEnd === undefined) return;
+    if (currentTime >= rangeEnd) seekTo(rangeStart ?? 0);
   }, [currentTime, rangeEnd, rangeStart]);
 
   const selectVideo = (nextIndex: number) => {

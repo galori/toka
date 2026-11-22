@@ -6223,7 +6223,12 @@ test("marks a range with B and E and plays only that range", async () => {
   expect(
     screen.getByRole("button", { name: "Range start: 0:10" }),
   ).toHaveAttribute("aria-pressed", "true");
-  expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
+  // A start alone is marked, and loops from there to the end of the file.
+  expect(screen.getByLabelText("Range start marker")).toBeInTheDocument();
+  vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+  fireEvent.ended(video);
+  expect(video).toHaveProperty("currentTime", 10);
+  expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
   expect(screen.queryByLabelText("Range end marker")).not.toBeInTheDocument();
 
   video.currentTime = 30;
@@ -6255,6 +6260,40 @@ test("marks a range with B and E and plays only that range", async () => {
   fireEvent.ended(video);
   expect(video).toHaveProperty("currentTime", 10);
   expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+});
+
+test("an end marked alone loops from the start of the video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "v1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValue({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = (await screen.findByLabelText(/^Playing /)) as HTMLVideoElement;
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 30,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.keyDown(window, { key: "e" });
+  expect(screen.getByLabelText("Range end marker")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
+  video.currentTime = 30.2;
+  fireEvent.timeUpdate(video);
+  expect(video).toHaveProperty("currentTime", 0);
 });
 
 test("clears the range when moving to another video", async () => {
