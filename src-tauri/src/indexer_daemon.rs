@@ -632,26 +632,32 @@ mod tests {
     fn finished_workers_are_reaped_with_backoff() {
         use std::os::unix::fs::PermissionsExt;
 
-        // The scanner only stats files, so the scan fails only where the
-        // filesystem enforces permissions. This sandbox overrides DAC, so
-        // only it skips; real CI users enforce permissions and run the test.
+        // The scanner only stats files, so a locked file still scans: stat
+        // needs no permission on the file itself. A locked directory fails
+        // readdir instead, which fails the scan. Probe directory permissions;
+        // DAC-override sandboxes ignore them and skip, while real CI users
+        // enforce permissions and run the test.
         let probe = tempdir().unwrap();
-        let probe_file = probe.path().join("probe");
-        fs::write(&probe_file, b"probe").unwrap();
-        fs::set_permissions(&probe_file, fs::Permissions::from_mode(0o000)).unwrap();
-        if fs::metadata(&probe_file).is_ok() {
-            eprintln!("skipping: test environment ignores file permissions");
+        let probe_dir = probe.path().join("locked");
+        fs::create_dir(&probe_dir).unwrap();
+        fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = fs::read_dir(&probe_dir).is_err();
+        fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        if !enforced {
+            eprintln!("skipping: test environment ignores directory permissions");
             return;
         }
 
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        let locked = media.join("clip.mp4");
         write_media(&media, "clip.mp4");
         // Unreadable before the scan starts, so the initial scan fails and
-        // the worker exits instead of watching. A file (not a directory):
-        // watching the tree itself must keep working.
+        // the worker exits instead of watching. A subdirectory, not the root
+        // itself: watching the tree itself must keep working.
+        let locked = media.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("hidden.mp4"), b"media").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let database = directory.path().join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
@@ -678,7 +684,7 @@ mod tests {
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 0);
 
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
