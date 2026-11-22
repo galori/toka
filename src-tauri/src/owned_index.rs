@@ -347,6 +347,7 @@ pub(crate) trait IndexUpdates: Send + Sync {
 }
 
 impl OwnedIndexUpdates {
+    #[cfg(test)]
     pub(crate) fn new(database: PathBuf) -> Self {
         Self {
             database: Some(database),
@@ -465,6 +466,7 @@ struct ManagedRootWatcher {
 }
 
 impl OwnedIndexManager {
+    #[cfg(any(target_os = "macos", test))]
     pub(crate) fn system() -> Result<Self, String> {
         let manager = Self::new(database_path()?, true);
         manager.restore_watchers();
@@ -489,6 +491,7 @@ impl OwnedIndexManager {
         }
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn restore_watchers(&self) {
         if let Err(error) = self.ensure_watchers() {
             eprintln!("Toka could not restore search folder watchers: {error}");

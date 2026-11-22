@@ -1,12 +1,22 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
-import { join } from "node:path";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Options } from "@wdio/types";
-import { startFixtureServer, stopFixtureServer } from "./test/integration/fixture-server";
 
-const temporaryDirectory = mkdtempSync(join(tmpdir(), "toka-e2e-plocate-"));
-const fixturePath = join(temporaryDirectory, "toka-e2e-happy-path.mp4");
+// A fake home directory, so the app and its indexer daemon only ever touch
+// this test's files. XDG variables are set explicitly because the test runner
+// may already export them.
+const homeDirectory = mkdtempSync(join(tmpdir(), "toka-e2e-owned-"));
+process.env.HOME = homeDirectory;
+process.env.XDG_CONFIG_HOME = join(homeDirectory, ".config");
+process.env.XDG_DATA_HOME = join(homeDirectory, ".local", "share");
+process.env.XDG_CACHE_HOME = join(homeDirectory, ".cache");
+
+const videosDirectory = join(homeDirectory, "Videos");
+mkdirSync(videosDirectory, { recursive: true });
+const fixturePath = join(videosDirectory, "toka-e2e-happy-path.mp4");
+process.env.TOKA_E2E_OWNED_VIDEOS = videosDirectory;
 writeFileSync(
   fixturePath,
   Buffer.from(
@@ -14,25 +24,22 @@ writeFileSync(
     "base64",
   ),
 );
-process.env.TOKA_E2E_VIDEO = fixturePath;
-const databaseInput = join(temporaryDirectory, "plocate-input.txt");
-const databasePath = join(temporaryDirectory, "plocate.db");
-writeFileSync(databaseInput, fixturePath + "\n");
-execFileSync("plocate-build", ["-p", databaseInput, databasePath]);
-process.env.TOKA_SEARCH_PROVIDER = "plocate";
-process.env.LOCATE_PATH = databasePath;
 
 const binaryPath = process.env.TOKA_E2E_BINARY ?? resolve(
   `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
 );
 
+let daemon: ChildProcess | undefined;
+
 export const config: Options.Testrunner = {
   runner: "local",
-  specs: ["./test/integration/plocate-provider.spec.ts"],
+  specs: ["./test/integration/owned-index.spec.ts"],
   maxInstances: 1,
   framework: "mocha",
   reporters: ["spec"],
-  services: [["tauri", { appBinaryPath: binaryPath, driverProvider: "embedded" }]],
+  services: [
+    ["tauri", { appBinaryPath: binaryPath, driverProvider: "embedded" }],
+  ],
   capabilities: [
     {
       browserName: "tauri",
@@ -42,10 +49,25 @@ export const config: Options.Testrunner = {
   logLevel: "warn",
   waitforTimeout: 10_000,
   connectionRetryTimeout: 30_000,
-  mochaOpts: { timeout: 30_000 },
-  onPrepare: () => startFixtureServer([fixturePath]),
+  mochaOpts: { timeout: 180_000 },
+  onPrepare: () => {
+    // The app adds the fixture folder through its own UI; the indexer daemon
+    // below is what scans it, exactly like on a real machine.
+    daemon = spawn(binaryPath, ["--indexer"], {
+      env: { ...process.env },
+      stdio: "ignore",
+      detached: true,
+    });
+    daemon.unref();
+  },
   onComplete: async () => {
-    await stopFixtureServer();
-    rmSync(temporaryDirectory, { recursive: true, force: true });
+    if (daemon?.pid !== undefined) {
+      try {
+        process.kill(-daemon.pid);
+      } catch {
+        daemon.kill();
+      }
+    }
+    rmSync(homeDirectory, { recursive: true, force: true });
   },
 };

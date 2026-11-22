@@ -7,10 +7,12 @@
 
 use crate::owned_index::{OwnedIndex, OwnedIndexWatcher, ScanPhase};
 use serde::{Deserialize, Serialize};
+#[cfg(not(feature = "e2e"))]
+use std::io;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{self, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},

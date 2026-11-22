@@ -125,13 +125,10 @@ fn search_with_no_matches_succeeds_without_output() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn search_provider_error_returns_a_failure_status() {
+fn search_ignores_the_removed_provider_override() {
     let output = run_toka_with_provider(&["search", "family"], &[], Some("missing"));
 
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "toka search: Unknown Linux search provider: missing\n"
-    );
+    assert_eq!(output.status.code(), Some(0));
     assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
 }

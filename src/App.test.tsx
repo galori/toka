@@ -4293,7 +4293,7 @@ test("loads more results as the infinite list reaches its end and reports provid
     })
     .mockRejectedValueOnce({
       kind: "Provider",
-      message: "Recoll search could not start.",
+      message: "The search index is unavailable.",
     });
   const user = userEvent.setup();
   vi.stubGlobal(
@@ -4332,7 +4332,7 @@ test("loads more results as the infinite list reaches its end and reports provid
   await user.clear(screen.getByRole("searchbox"));
   await user.type(screen.getByRole("searchbox"), "broken{Enter}");
   expect(await screen.findByRole("alert")).toHaveTextContent(
-    "Recoll search could not start.",
+    "The search index is unavailable.",
   );
   await waitFor(() =>
     expect(screen.getByRole("searchbox")).toHaveValue("broken"),
