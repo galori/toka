@@ -424,7 +424,9 @@ pub(crate) struct OwnedIndexFolder {
     pub message: Option<String>,
     pub scanned_files: u64,
     /// The directory the scan is reading right now; only set while indexing.
-    pub current_path: Option<PathBuf>,
+    /// A lossy display hint on purpose: real paths can hold non-UTF-8 bytes
+    /// on Unix, and those must not break serialization of this response.
+    pub current_path: Option<String>,
     /// Recently visited directories. The owned scanner does not track
     /// per-directory tallies yet, so this stays empty until that lands; the
     /// status panel already tolerates an empty list.
@@ -517,10 +519,14 @@ impl OwnedIndexManager {
             }
             // The panel only shows progress for folders that are indexing;
             // anything else reports no current path, like the plocate backend.
+            // Lossy on purpose: see the field's doc comment.
             let current_path = if status == OwnedFolderStatus::Indexing {
-                progress
-                    .as_ref()
-                    .and_then(|progress| progress.current_folder.clone())
+                progress.as_ref().and_then(|progress| {
+                    progress
+                        .current_folder
+                        .as_deref()
+                        .map(|folder| folder.to_string_lossy().into_owned())
+                })
             } else {
                 None
             };
@@ -1152,6 +1158,11 @@ impl OwnedIndex {
             progress.current_folder = Some(directory.clone());
             progress.current_file = None;
             progress.touch();
+            // Persist here, not just at media batch commits: small trees may
+            // never fill a batch, and directories without supported media
+            // never commit one, so without this the reported directory would
+            // stay null or show a previous directory.
+            self.save_progress(&progress)?;
             on_progress(&progress);
 
             let entries = match fs::read_dir(&directory) {
@@ -1381,6 +1392,13 @@ impl OwnedIndex {
             "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
             [],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_progress(&mut self, progress: &ScanProgress) -> Result<(), OwnedIndexError> {
+        let transaction = self.connection.transaction()?;
+        persist_progress(&transaction, progress)?;
         transaction.commit()?;
         Ok(())
     }
@@ -3273,8 +3291,90 @@ mod tests {
             .iter()
             .all(|(status, _)| *status == OwnedFolderStatus::Indexing));
         assert!(
-            observed.iter().any(|(_, path)| *path == Some(root.clone())),
+            observed
+                .iter()
+                .any(|(_, path)| *path == Some(root.to_string_lossy().into_owned())),
             "expected the scanned directory to be reported, saw {observed:?}"
+        );
+    }
+
+    #[test]
+    fn indexing_folders_track_directories_without_media_batches() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let trips = root.join("Trips");
+        std::fs::create_dir_all(&trips).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        // No supported media under Trips, so no batch ever commits there.
+        std::fs::write(trips.join("notes.txt"), b"notes").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+
+        let added = manager.add_folder(&root).unwrap();
+        let id = added.folders[0].id.clone();
+
+        let observed = std::cell::RefCell::new(Vec::new());
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&id, &root, |progress| {
+                if progress.current_folder.as_deref() == Some(trips.as_path()) {
+                    let folder = manager.state().unwrap().folders.remove(0);
+                    observed
+                        .borrow_mut()
+                        .push((folder.status, folder.current_path));
+                }
+            })
+            .unwrap();
+
+        let observed = observed.borrow();
+        assert!(
+            observed
+                .iter()
+                .any(|(status, path)| *status == OwnedFolderStatus::Indexing
+                    && *path == Some(trips.to_string_lossy().into_owned())),
+            "expected Trips to be reported while scanning it, saw {observed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directories_do_not_break_folder_state() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let odd = root.join(std::ffi::OsString::from_vec(b"\xff\xfe".to_vec()));
+        std::fs::create_dir_all(&odd).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+
+        let added = manager.add_folder(&root).unwrap();
+        let id = added.folders[0].id.clone();
+
+        let mut serialized_while_inside = false;
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&id, &root, |progress| {
+                if progress.current_folder.as_deref() == Some(odd.as_path()) {
+                    let state = manager.state().unwrap();
+                    // Serialization is what the index_state command does; it
+                    // must not fail on the raw directory bytes.
+                    let folder = serde_json::to_value(&state.folders[0]).unwrap();
+                    assert_eq!(
+                        folder.get("currentPath"),
+                        Some(&serde_json::Value::String(
+                            odd.to_string_lossy().into_owned()
+                        )),
+                        "currentPath should be the lossy directory name, saw {folder}"
+                    );
+                    serialized_while_inside = true;
+                }
+            })
+            .unwrap();
+
+        assert!(
+            serialized_while_inside,
+            "expected to observe the scan inside the non-UTF-8 directory"
         );
     }
 
