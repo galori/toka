@@ -1695,6 +1695,7 @@ test("opens a selected result in the player and restores the grid on back", asyn
 });
 
 test("does not copy a bare file name while the path is still loading", async () => {
+  const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -1708,7 +1709,6 @@ test("does not copy a bare file name while the path is still loading", async () 
   // userEvent.setup() installs its own clipboard stub, so the mock goes in after.
   const user = userEvent.setup();
   const writeText = vi.fn().mockResolvedValue(undefined);
-  const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
   Object.defineProperty(navigator, "clipboard", {
     value: { writeText },
     configurable: true,
@@ -2892,10 +2892,6 @@ test("a failed exit does not restore a fullscreen layout the window never entere
     .spyOn(window.navigator, "userAgent", "get")
     .mockReturnValue("AppleWebKit Mac OS X");
   let rejectEnter: (reason: Error) => void = () => {};
-  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
-    configurable: true,
-    value: vi.fn().mockResolvedValue(undefined),
-  });
   windowApiMock.setFullscreen.mockImplementation((on: boolean) =>
     on
       ? new Promise((_, reject) => {
@@ -2918,6 +2914,28 @@ test("a failed exit does not restore a fullscreen layout the window never entere
     expect(document.querySelector(".player-shell")).not.toHaveClass(
       "fullscreen",
     );
+  } finally {
+    userAgent.mockRestore();
+  }
+});
+
+test("a refused exit restores the fullscreen layout while the window is still fullscreen", async () => {
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
+  windowApiMock.setFullscreen.mockImplementation((on: boolean) =>
+    on ? Promise.resolve() : Promise.reject(new Error("exit refused")),
+  );
+  windowApiMock.isFullscreen.mockResolvedValue(true);
+  try {
+    await playClipOnMac();
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
+    );
+    fireEvent.keyDown(window, { key: "f" });
+    expect(await screen.findByText(/exit refused/)).toBeVisible();
+    expect(document.querySelector(".player-shell")).toHaveClass("fullscreen");
   } finally {
     userAgent.mockRestore();
   }

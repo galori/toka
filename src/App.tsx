@@ -1296,9 +1296,6 @@ function Player({
   // Numbers each fullscreen request so a slow one that fails late cannot undo
   // or override what a newer keypress asked for.
   const fullscreenRequest = useRef(0);
-  // Whether the window itself last confirmed being fullscreen, so a refused
-  // exit only restores the fullscreen layout over a window that still is.
-  const windowFullscreen = useRef(false);
   const [controlsRevealed, setControlsRevealed] = useState(false);
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   // Fullscreen shows only the scrubber and clock until the pointer visits the
@@ -2552,12 +2549,15 @@ function Player({
       focusPlayerShell();
       void getCurrentWindow()
         .setFullscreen(false)
-        .then(() => {
-          windowFullscreen.current = false;
-        })
-        .catch((reason: unknown) => {
+        .catch(async (reason: unknown) => {
           if (request !== fullscreenRequest.current) return;
-          if (windowFullscreen.current) setFullscreen(true);
+          // Only put the fullscreen layout back over a window that really is
+          // fullscreen; a refused entry leaves nothing to restore.
+          const stillFullscreen = await getCurrentWindow()
+            .isFullscreen()
+            .catch(() => false);
+          if (request !== fullscreenRequest.current) return;
+          if (stillFullscreen) setFullscreen(true);
           setFullscreenError(errorMessage(reason));
         });
       return;
@@ -2581,9 +2581,6 @@ function Player({
       focusPlayerShell();
       return getCurrentWindow()
         .setFullscreen(true)
-        .then(() => {
-          windowFullscreen.current = true;
-        })
         .catch((reason: unknown) => {
           if (superseded()) return;
           setFullscreen(false);
