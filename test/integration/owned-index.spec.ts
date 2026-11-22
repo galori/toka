@@ -1,5 +1,14 @@
 const videosDirectory = process.env.TOKA_E2E_OWNED_VIDEOS as string;
 
+type OwnedIndexFolder = {
+  path: string;
+  status: "pending" | "indexing" | "ready" | "offline" | "error";
+};
+
+type OwnedIndexState = {
+  folders: OwnedIndexFolder[];
+};
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   return browser.execute(
     async (invocation: { command: string; args?: Record<string, unknown> }) => {
@@ -23,6 +32,31 @@ describe("Toka owned index", () => {
     await startSearching.waitForDisplayed({ timeout: 60_000 });
     await startSearching.click();
 
+    // `add_index_folder` returns while the folder is still pending, and a
+    // search submitted before the scan finishes keeps its empty results:
+    // later index updates only offer a refresh, they never rerun it. The
+    // isolated home holds exactly this one folder, so every reported folder
+    // being ready means the fixture is searchable.
+    let lastState = "no index state yet";
+    try {
+      await browser.waitUntil(
+        async () => {
+          const state = await invoke<OwnedIndexState>("index_state");
+          lastState = JSON.stringify(state);
+          return (
+            state.folders.length > 0 &&
+            state.folders.every((folder) => folder.status === "ready")
+          );
+        },
+        {
+          timeout: 120_000,
+          timeoutMsg: `the fixture folder never finished indexing: ${videosDirectory}`,
+        },
+      );
+    } catch (error) {
+      throw new Error(`${String(error)}\n[last index_state] ${lastState}`);
+    }
+
     const search = await $("#video-search");
     await search.click();
     await browser.keys("happy path");
@@ -32,7 +66,9 @@ describe("Toka owned index", () => {
     await result.waitForDisplayed({ timeout: 120_000 });
     await result.click();
 
-    const player = await $('video[aria-label="Playing toka-e2e-happy-path.mp4"]');
+    // The native backend renders a `div.native-video` surface rather than
+    // a `video` element; the aria label marks playback on either backend.
+    const player = await $('[aria-label="Playing toka-e2e-happy-path.mp4"]');
     await player.waitForDisplayed();
     // Playing and pausing share one control that renames itself.
     await $("button.play-button").click();

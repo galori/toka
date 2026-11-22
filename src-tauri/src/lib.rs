@@ -1387,7 +1387,9 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
-    #[cfg(feature = "e2e")]
+    // The owned-index run automates the real app, so it needs the
+    // WebDriver server without the e2e fixtures (see Cargo.toml).
+    #[cfg(any(feature = "e2e", feature = "webdriver"))]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());

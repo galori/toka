@@ -62,9 +62,23 @@ function buildOwned() {
   };
   delete ownedEnvironment.VITE_E2E;
   delete ownedEnvironment.VITE_E2E_FIXTURE_SERVER_PORT;
+  // `webdriver` registers the embedded WebDriver server without the e2e
+  // fixtures; the owned config exposes the `window.__TAURI__` global the
+  // spec invokes through, like the e2e config does.
   run(
     "npm",
-    ["run", "tauri", "build", "--", "--debug", "--no-bundle"],
+    [
+      "run",
+      "tauri",
+      "build",
+      "--",
+      "--debug",
+      "--no-bundle",
+      "--features",
+      "webdriver",
+      "--config",
+      "src-tauri/tauri.owned.conf.json",
+    ],
     ownedEnvironment,
   );
   return ownedEnvironment;
