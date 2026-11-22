@@ -2553,9 +2553,15 @@ function Player({
       focusPlayerShell();
       void getCurrentWindow()
         .setFullscreen(false)
-        .catch((reason: unknown) => {
+        .catch(async (reason: unknown) => {
           if (request !== fullscreenRequest.current) return;
-          setFullscreen(true);
+          // Only put the fullscreen layout back over a window that really is
+          // fullscreen; a refused entry leaves nothing to restore.
+          const stillFullscreen = await getCurrentWindow()
+            .isFullscreen()
+            .catch(() => false);
+          if (request !== fullscreenRequest.current) return;
+          if (stillFullscreen) setFullscreen(true);
           setFullscreenError(errorMessage(reason));
         });
       return;
@@ -2596,9 +2602,13 @@ function Player({
     const entering = prefersWindowFullscreen()
       ? enterWindowFullscreen().catch(enterDocumentFullscreen)
       : enterDocumentFullscreen().catch(enterWindowFullscreen);
-    void entering.then(focusPlayerShell).catch((reason: unknown) => {
-      if (!superseded()) setFullscreenError(errorMessage(reason));
-    });
+    void entering
+      .then(() => {
+        if (!superseded()) focusPlayerShell();
+      })
+      .catch((reason: unknown) => {
+        if (!superseded()) setFullscreenError(errorMessage(reason));
+      });
   };
 
   useEffect(() => {
