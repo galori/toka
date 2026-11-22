@@ -1726,9 +1726,13 @@ test("keeps the copy control in the design system and gives the path room", asyn
   expect(copyButton).toHaveAttribute("aria-keyshortcuts", "C");
   expect(copyButton.querySelector(".key-hint")).toHaveTextContent("C");
 
-  const playerTitle = copyButton.closest(".player-title");
-  expect(playerTitle).toBeInTheDocument();
-  expect(getComputedStyle(playerTitle!).flexGrow).toBe("1");
+  // Copy shares the heading row with the other buttons (one centre line) and
+  // the row wraps rather than letting buttons overlap when narrow.
+  expect(copyButton.closest(".player-title")).toBeNull();
+  const heading = copyButton.parentElement!;
+  expect(heading).toHaveClass("player-heading");
+  expect(getComputedStyle(heading).flexWrap).toBe("wrap");
+  expect(heading.querySelector(".player-title")).toBeInTheDocument();
 });
 
 test("uses the overlay player controls from the design", async () => {

@@ -1758,3 +1758,21 @@ button:focus-visible {
     opacity: 0.35;
   }
 }
+
+/* Copy sits in the heading row with the other buttons so they share one
+   centre line; the row wraps instead of letting buttons overlap when narrow. */
+.player-heading {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+.player-title {
+  flex: 1 1 200px;
+}
+.player-heading button,
+.player-heading .addon-menu-wrap {
+  flex: none;
+  white-space: nowrap;
+}
+.player-heading .copy-button {
+  padding: 9px 16px;
+}

@@ -2806,24 +2806,24 @@ function Player({
                 onClick={(event) => event.currentTarget.select()}
                 aria-label="File path"
               />
-              <ControlButton
-                shortcut="C"
-                className="copy-button"
-                aria-label={copyFeedback ? "Copied" : "Copy file path"}
-                onClick={() => void copyPath()}
-              >
-                {copyFeedback ? (
-                  <Label>Copied</Label>
-                ) : (
-                  <>
-                    <CopyIcon />
-                    <Label>Copy</Label>
-                  </>
-                )}
-              </ControlButton>
             </div>
           ) : null}
         </div>
+        <ControlButton
+          shortcut="C"
+          className="copy-button"
+          aria-label={copyFeedback ? "Copied" : "Copy file path"}
+          onClick={() => void copyPath()}
+        >
+          {copyFeedback ? (
+            <Label>Copied</Label>
+          ) : (
+            <>
+              <CopyIcon />
+              <Label>Copy</Label>
+            </>
+          )}
+        </ControlButton>
         <HelpButton className="player-help-toggle" onClick={onHelp} />
         <ControlButton
           shortcut="Ctrl+N"
