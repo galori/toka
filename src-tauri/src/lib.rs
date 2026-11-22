@@ -3,6 +3,8 @@ mod cli;
 mod external_players;
 mod index_stats;
 mod index_visibility;
+#[cfg(any(target_os = "linux", test))]
+mod indexer_daemon;
 mod launch;
 #[cfg(target_os = "linux")]
 mod managed_index;
@@ -1376,7 +1378,7 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
     let mut plan = reset::ResetPlan::new(paths);
     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
     {
-        plan.stop_indexer = Some(managed_index::stop_indexer);
+        plan.stop_indexer = Some(indexer_daemon::stop_indexer);
     }
     Ok(plan)
 }
@@ -1424,7 +1426,7 @@ pub fn run() {
                 &arguments,
                 || {
                     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
-                    managed_index::ensure_indexer();
+                    indexer_daemon::ensure_indexer();
                     let logger = Arc::new(SearchLogger::system());
                     let provider = platform_provider(logger.clone())?;
                     let rename_overlay_path = Some(search_rename_overlay_path()?);
@@ -1447,7 +1449,7 @@ pub fn run() {
     }
 
     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
-    managed_index::ensure_indexer();
+    indexer_daemon::ensure_indexer();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());

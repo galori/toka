@@ -492,15 +492,19 @@ impl OwnedIndexManager {
         let (indexed_videos, indexed_images) =
             index.media_counts().map_err(|error| error.to_string())?;
         let revision = index.revision().map_err(|error| error.to_string())?;
-        let roots = index.roots().map_err(|error| error.to_string())?;
+        let roots = index
+            .roots_with_state()
+            .map_err(|error| error.to_string())?;
         let mut folders = Vec::new();
         let mut indexing_files = 0;
 
-        for (id, path) in roots {
+        for (id, path, stored) in roots {
             let progress = index
                 .scan_progress(&id)
                 .map_err(|error| error.to_string())?;
-            let status = if !path.is_dir() {
+            // The daemon marks roots `offline` when their storage goes away;
+            // a missing path reports the same without waiting for the daemon.
+            let status = if !path.is_dir() || stored == "offline" {
                 OwnedFolderStatus::Offline
             } else {
                 match progress.as_ref().map(|progress| progress.phase) {
@@ -590,6 +594,10 @@ impl OwnedIndexManager {
             revision: state.revision,
             videos: state.indexed_videos,
             images: state.indexed_images,
+            // systemd only exists on Linux; elsewhere there is no service.
+            #[cfg(any(target_os = "linux", test))]
+            service_running: crate::indexer_daemon::indexer_running(),
+            #[cfg(not(any(target_os = "linux", test)))]
             service_running: None,
             folders,
         })
@@ -980,6 +988,70 @@ impl OwnedIndex {
             statement.query_map([], |row| Ok((row.get(0)?, path_from_bytes(row.get(1)?))))?;
         rows.collect::<Result<_, _>>()
             .map_err(OwnedIndexError::from)
+    }
+
+    pub(crate) fn roots_with_state(
+        &self,
+    ) -> Result<Vec<(String, PathBuf, String)>, OwnedIndexError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, state FROM roots ORDER BY id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                path_from_bytes(row.get::<_, Vec<u8>>(1)?),
+                row.get(2)?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
+    }
+
+    /// The recorded mount columns for a root, if the row exists. `None`
+    /// fields mean nothing was recorded yet, not that the values are empty.
+    pub(crate) fn mount_columns(
+        &self,
+        id: &str,
+    ) -> Result<(Option<PathBuf>, Option<String>, Option<String>), OwnedIndexError> {
+        self.connection
+            .query_row(
+                "SELECT mount_target, mount_source, mount_uuid FROM roots WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?.map(path_from_bytes),
+                        row.get(1)?,
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map(|row| row.unwrap_or_default())
+            .map_err(OwnedIndexError::from)
+    }
+
+    pub(crate) fn record_mount(
+        &mut self,
+        id: &str,
+        target: Option<&Path>,
+        source: Option<&str>,
+        uuid: Option<&str>,
+    ) -> Result<(), OwnedIndexError> {
+        let target = target.map(path_bytes);
+        self.connection.execute(
+            "UPDATE roots SET mount_target = ?2, mount_source = ?3, mount_uuid = ?4,
+                updated_at_ns = ?5 WHERE id = ?1",
+            params![id, target, source, uuid, now_ns()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn set_root_state(&mut self, id: &str, state: &str) -> Result<(), OwnedIndexError> {
+        self.connection.execute(
+            "UPDATE roots SET state = ?2, updated_at_ns = ?3 WHERE id = ?1",
+            params![id, state, now_ns()],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn search_candidates(
