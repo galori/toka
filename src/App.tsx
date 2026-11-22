@@ -1000,7 +1000,7 @@ const HELP_SECTIONS: HelpSection[] = [
       {
         shortcut: "B E",
         description:
-          "Mark the start and end of a range to play; cleared on the next video",
+          "Mark the start and end of a range to play; either alone runs to the start or end of the video; cleared on the next video",
       },
       { shortcut: "- =", description: "Decrease or increase playback speed" },
       {
