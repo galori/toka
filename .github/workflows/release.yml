@@ -64,12 +64,31 @@ jobs:
         run: |
           cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos"
           tar -czf "$GITHUB_WORKSPACE/toka-${{ github.ref_name }}-macos-aarch64.app.tar.gz" *.app
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: toka-release-${{ matrix.rust-target }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+            toka-*.app.tar.gz
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/deb/*.deb
+            src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage/*.AppImage
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
-            toka-*.app.tar.gz
-            src-tauri/target/${{ matrix.rust-target }}/release/bundle/deb/*.deb
-            src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage/*.AppImage
+            dist/*.dmg
+            dist/*.app.tar.gz
+            dist/*.deb
+            dist/*.AppImage
