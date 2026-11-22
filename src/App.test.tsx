@@ -1725,6 +1725,7 @@ test("keeps the copy control in the design system and gives the path room", asyn
   expect(getComputedStyle(copyButton).minHeight).toBe("38px");
   expect(copyButton).toHaveAttribute("aria-keyshortcuts", "C");
   expect(copyButton.querySelector(".key-hint")).toHaveTextContent("C");
+  expect(copyButton).toBeEnabled();
 
   // Copy shares the heading row with the other buttons (one centre line) and
   // the row wraps rather than letting buttons overlap when narrow.

@@ -1768,8 +1768,11 @@ button:focus-visible {
 .player-title {
   flex: 1 1 200px;
 }
-.player-heading button,
 .player-heading .addon-menu-wrap {
+  flex: none;
+}
+.player-heading > button,
+.player-heading .addon-menu-wrap > button {
   flex: none;
   white-space: nowrap;
 }

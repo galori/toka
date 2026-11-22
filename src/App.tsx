@@ -2813,6 +2813,7 @@ function Player({
           shortcut="C"
           className="copy-button"
           aria-label={copyFeedback ? "Copied" : "Copy file path"}
+          disabled={!prepared}
           onClick={() => void copyPath()}
         >
           {copyFeedback ? (
