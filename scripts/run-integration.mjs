@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const task = process.argv[2];
-const supportedTasks = new Set(["all", "standard", "plocate", "native"]);
+const supportedTasks = new Set(["all", "standard", "owned", "native"]);
 
 if (!supportedTasks.has(task)) {
   throw new Error(
@@ -11,7 +11,7 @@ if (!supportedTasks.has(task)) {
   );
 }
 
-if (process.platform !== "linux" && (task === "plocate" || task === "native")) {
+if (process.platform !== "linux" && (task === "owned" || task === "native")) {
   process.exit(0);
 }
 
@@ -34,10 +34,10 @@ const environment = {
 };
 const wdio = resolve("node_modules/.bin/wdio");
 
-function run(command, args) {
+function run(command, args, environmentOverride) {
   const result = spawnSync(command, args, {
     stdio: "inherit",
-    env: environment,
+    env: environmentOverride ?? environment,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) process.exit(result.status ?? 1);
@@ -47,23 +47,59 @@ function buildE2e() {
   run("npm", ["run", "build:integration"]);
 }
 
-function runWdio(config) {
-  run(wdio, ["run", config]);
+function runWdio(config, environmentOverride) {
+  run(wdio, ["run", config], environmentOverride);
+}
+
+// The owned-index spec drives the real app and its real indexer daemon, so
+// it needs a non-e2e build in its own target directory.
+function buildOwned() {
+  const targetDirectory = resolve("src-tauri", "target", `owned-${fixturePort}`);
+  const ownedEnvironment = {
+    ...environment,
+    CARGO_TARGET_DIR: targetDirectory,
+    TOKA_E2E_BINARY: resolve(targetDirectory, "debug", "toka"),
+  };
+  delete ownedEnvironment.VITE_E2E;
+  delete ownedEnvironment.VITE_E2E_FIXTURE_SERVER_PORT;
+  // `webdriver` registers the embedded WebDriver server without the e2e
+  // fixtures; the owned config exposes the `window.__TAURI__` global the
+  // spec invokes through, like the e2e config does.
+  run(
+    "npm",
+    [
+      "run",
+      "tauri",
+      "build",
+      "--",
+      "--debug",
+      "--no-bundle",
+      "--features",
+      "webdriver",
+      "--config",
+      "src-tauri/tauri.owned.conf.json",
+    ],
+    ownedEnvironment,
+  );
+  return ownedEnvironment;
 }
 
 if (task === "standard") {
   buildE2e();
   runWdio("wdio.conf.ts");
-} else if (task === "plocate") {
-  buildE2e();
-  runWdio("wdio.plocate.conf.ts");
+} else if (task === "owned") {
+  const ownedEnvironment = buildOwned();
+  runWdio("wdio.owned.conf.ts", ownedEnvironment);
 } else if (task === "native") {
   run("npm", ["run", "build:integration:native"]);
   runWdio("wdio.native.conf.ts");
 } else {
   buildE2e();
   runWdio("wdio.conf.ts");
-  if (process.platform === "linux") runWdio("wdio.plocate.conf.ts");
+  if (process.platform === "linux") {
+    const ownedEnvironment = buildOwned();
+    runWdio("wdio.owned.conf.ts", ownedEnvironment);
+  }
   if (process.platform === "linux") {
     run("npm", ["run", "build:integration:native"]);
     runWdio("wdio.native.conf.ts");

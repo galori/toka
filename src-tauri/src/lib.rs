@@ -6,11 +6,12 @@ mod index_visibility;
 #[cfg(any(target_os = "linux", test))]
 mod indexer_daemon;
 mod launch;
+// The plocate GUI surface is dead since the Linux flip; the whole module goes
+// away with the backend removal. This allow keeps the daemon parts compiling
+// warning-free until then.
 #[cfg(target_os = "linux")]
-mod managed_index;
-// The owned index is not wired up on Linux until the platform flip, so most
-// of it is unused there. That PR removes this allow instead of adding more.
 #[allow(dead_code)]
+mod managed_index;
 mod owned_index;
 #[cfg(target_os = "linux")]
 mod player_linux;
@@ -26,10 +27,7 @@ mod thumbnails;
 mod timestamp;
 
 use owned_index::{IndexUpdates, OwnedIndexUpdates};
-#[cfg(any(target_os = "macos", test))]
 use providers::OwnedIndexSearchProvider;
-#[cfg(target_os = "linux")]
-use providers::{ManagedPlocateSearchProvider, PlocateSearchProvider, RecollSearchProvider};
 use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
 use search_log::{SearchLogSettings, SearchLogger};
 use serde::Serialize;
@@ -133,7 +131,10 @@ struct BulkTagUpdate {
     problem: Option<String>,
 }
 
-#[cfg(any(target_os = "linux", all(target_os = "macos", not(feature = "e2e"))))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 fn index_error(message: String) -> CommandError {
     CommandError {
         kind: "Index",
@@ -141,11 +142,11 @@ fn index_error(message: String) -> CommandError {
     }
 }
 
-#[cfg(all(target_os = "linux", not(feature = "e2e")))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
 #[tauri::command]
 fn index_state(
-    manager: State<'_, managed_index::IndexManager>,
-) -> Result<managed_index::IndexState, CommandError> {
+    manager: State<'_, owned_index::OwnedIndexManager>,
+) -> Result<owned_index::OwnedIndexState, CommandError> {
     manager.state().map_err(index_error)
 }
 
@@ -153,10 +154,10 @@ fn index_state(
 // index. Reporting that index management is unsupported keeps the fixture's
 // search screen deterministic and prevents tests from writing the developer's
 // real folder configuration.
-#[cfg(all(target_os = "linux", feature = "e2e"))]
+#[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "e2e"))]
 #[tauri::command]
-fn index_state() -> managed_index::IndexState {
-    managed_index::IndexState {
+fn index_state() -> owned_index::OwnedIndexState {
+    owned_index::OwnedIndexState {
         supported: false,
         revision: 0,
         indexed_videos: 0,
@@ -190,46 +191,10 @@ fn index_state() -> UnsupportedIndexState {
     }
 }
 
-#[cfg(target_os = "linux")]
-#[tauri::command]
-fn add_index_folder(
-    path: String,
-    manager: State<'_, managed_index::IndexManager>,
-) -> Result<managed_index::IndexState, CommandError> {
-    manager.add_folder(Path::new(&path)).map_err(index_error)
-}
-
-#[cfg(target_os = "linux")]
-#[tauri::command]
-fn remove_index_folder(
-    id: String,
-    manager: State<'_, managed_index::IndexManager>,
-) -> Result<managed_index::IndexState, CommandError> {
-    manager.remove_folder(&id).map_err(index_error)
-}
-
-#[cfg(all(target_os = "macos", not(feature = "e2e")))]
-#[tauri::command]
-fn index_state(
-    manager: State<'_, owned_index::OwnedIndexManager>,
-) -> Result<owned_index::OwnedIndexState, CommandError> {
-    manager.state().map_err(index_error)
-}
-
-#[cfg(all(target_os = "macos", feature = "e2e"))]
-#[tauri::command]
-fn index_state() -> owned_index::OwnedIndexState {
-    owned_index::OwnedIndexState {
-        supported: false,
-        revision: 0,
-        indexed_videos: 0,
-        indexed_images: 0,
-        indexing_files: 0,
-        folders: Vec::new(),
-    }
-}
-
-#[cfg(all(target_os = "macos", not(feature = "e2e")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 #[tauri::command]
 fn add_index_folder(
     path: String,
@@ -238,7 +203,10 @@ fn add_index_folder(
     manager.add_folder(Path::new(&path)).map_err(index_error)
 }
 
-#[cfg(all(target_os = "macos", not(feature = "e2e")))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(not(feature = "e2e"), feature = "native-e2e")
+))]
 #[tauri::command]
 fn remove_index_folder(
     id: String,
@@ -1260,12 +1228,14 @@ fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: boo
     player_linux::set_bounds(x, y, width, height, visible);
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn macos_platform_provider(database: PathBuf) -> Arc<dyn SearchProvider> {
+fn owned_index_platform_provider(database: PathBuf) -> Arc<dyn SearchProvider> {
     Arc::new(OwnedIndexSearchProvider::new(database))
 }
 
 fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
+    // Integration-test builds always serve the configured fixtures. The
+    // legacy TOKA_SEARCH_PROVIDER override used to select real providers that
+    // no longer exist; it must not fall through to the persistent index here.
     #[cfg(feature = "e2e")]
     {
         struct FixtureSearchProvider;
@@ -1282,29 +1252,16 @@ fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvide
                 Ok(std::env::split_paths(&paths).collect())
             }
         }
-        if std::env::var_os("TOKA_SEARCH_PROVIDER").is_none() {
-            return Ok(Arc::new(FixtureSearchProvider));
-        }
+        Ok(Arc::new(FixtureSearchProvider))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), not(feature = "e2e")))]
     {
-        Ok(macos_platform_provider(owned_index::database_path()?))
+        Ok(owned_index_platform_provider(owned_index::database_path()?))
     }
-    #[cfg(target_os = "linux")]
-    {
-        match std::env::var("TOKA_SEARCH_PROVIDER").as_deref() {
-            Ok("recoll") => Ok(Arc::new(RecollSearchProvider::system(_logger))),
-            Ok("plocate") => Ok(Arc::new(PlocateSearchProvider::system(_logger))),
-            Err(_) => Ok(Arc::new(ManagedPlocateSearchProvider::system(
-                managed_index::IndexPaths::system()?,
-                _logger,
-            ))),
-            Ok(name) => Ok(Arc::new(InvalidProvider(format!(
-                "Unknown Linux search provider: {name}"
-            )))),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(
+        not(any(target_os = "macos", target_os = "linux")),
+        not(feature = "e2e")
+    ))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
@@ -1320,21 +1277,6 @@ fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvide
             }
         }
         Ok(Arc::new(UnsupportedProvider))
-    }
-}
-
-#[cfg(target_os = "linux")]
-struct InvalidProvider(String);
-
-#[cfg(target_os = "linux")]
-impl SearchProvider for InvalidProvider {
-    fn candidates(
-        &self,
-        _query: &str,
-        _whole_path: bool,
-        _context: &search_log::SearchLogContext,
-    ) -> Result<Vec<std::path::PathBuf>, SearchError> {
-        Err(SearchError::Provider(self.0.clone()))
     }
 }
 
@@ -1360,15 +1302,15 @@ fn search_rename_overlay_path() -> Result<PathBuf, String> {
 #[cfg(not(mobile))]
 fn reset_plan() -> Result<reset::ResetPlan, String> {
     let mut paths = Vec::new();
-    #[cfg(target_os = "linux")]
-    let index_paths = managed_index::IndexPaths::system()?;
-    #[cfg(target_os = "linux")]
-    paths.extend(index_paths.reset_paths());
-    // The macOS index, the search rename overlay, and on Linux the same
-    // folder the indexer keeps its state in.
+    // The owned index, the search rename overlay, and the folder the indexer
+    // keeps its state in.
     if let Some(directory) = owned_index::database_path()?.parent() {
         paths.push(directory.to_path_buf());
     }
+    // Leftover plocate state from before the Linux flip. Nothing reads it
+    // anymore; the backend removal deletes these paths for good.
+    #[cfg(target_os = "linux")]
+    paths.extend(managed_index::IndexPaths::system()?.reset_paths());
     paths.push(thumbnails::cache_output_root());
     if let Some(cache) = dirs::cache_dir() {
         paths.push(cache.join("app.toka.desktop"));
@@ -1384,11 +1326,7 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
 }
 
 fn read_index_stats() -> Result<index_stats::IndexStats, String> {
-    #[cfg(target_os = "linux")]
-    {
-        managed_index::IndexManager::system()?.stats()
-    }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         owned_index::OwnedIndexManager::for_inspection()?.stats()
     }
@@ -1453,7 +1391,9 @@ pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
-    #[cfg(feature = "e2e")]
+    // The owned-index run automates the real app, so it needs the
+    // WebDriver server without the e2e fixtures (see Cargo.toml).
+    #[cfg(any(feature = "e2e", feature = "webdriver"))]
     let builder = builder
         .plugin(tauri_plugin_wdio::init())
         .plugin(tauri_plugin_wdio_webdriver::init());
@@ -1484,46 +1424,46 @@ pub fn run() {
         .manage(registry)
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
+    // The daemon owns the watchers on Linux, so the GUI opens the index
+    // without starting its own.
     #[cfg(target_os = "linux")]
     let builder = builder.manage(
-        managed_index::IndexManager::system()
-            .expect("Toka could not find its private index settings"),
+        owned_index::OwnedIndexManager::for_inspection()
+            .expect("Toka could not find its search index"),
     );
     #[cfg(all(target_os = "macos", not(feature = "e2e")))]
     let builder = builder.manage(
         owned_index::OwnedIndexManager::system().expect("Toka could not find its search index"),
     );
-    #[cfg(target_os = "linux")]
-    let builder = if cfg!(all(feature = "e2e", not(feature = "native-e2e"))) {
-        builder.invoke_handler(tauri::generate_handler![
-            search_videos,
-            search_match_count,
-            search_log_settings,
-            set_search_log_settings,
-            index_state,
-            add_index_folder,
-            remove_index_folder,
-            launch_intent,
-            video_thumbnail,
-            video_preview,
-            delete_video,
-            undo_delete,
-            external_players,
-            open_in_external_player,
-            open_new_window,
-            open_folder_in_new_window,
-            matching_addon_actions,
-            run_addon_action,
-            set_video_tags,
-            add_video_tags,
-            remove_video_tags,
-            add_tags_to_videos,
-            add_folder_tags,
-            remove_folder_tags,
-            prepare_video,
-            subtitle_cues
-        ])
-    } else {
+    #[cfg(all(target_os = "linux", feature = "e2e", not(feature = "native-e2e")))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        search_videos,
+        search_match_count,
+        search_log_settings,
+        set_search_log_settings,
+        index_state,
+        launch_intent,
+        video_thumbnail,
+        video_preview,
+        delete_video,
+        undo_delete,
+        external_players,
+        open_in_external_player,
+        open_new_window,
+        open_folder_in_new_window,
+        matching_addon_actions,
+        run_addon_action,
+        set_video_tags,
+        add_video_tags,
+        remove_video_tags,
+        add_tags_to_videos,
+        add_folder_tags,
+        remove_folder_tags,
+        prepare_video,
+        subtitle_cues
+    ]);
+    #[cfg(all(target_os = "linux", any(not(feature = "e2e"), feature = "native-e2e")))]
+    let builder = {
         let player = player_linux::NativePlayer::new();
         let setup_player = player.clone();
         builder
@@ -1807,7 +1747,7 @@ mod tests {
 
         let log_path = directory.path().join("search.jsonl");
         let logger = Arc::new(SearchLogger::new(log_path.clone()));
-        let provider = macos_platform_provider(database);
+        let provider = owned_index_platform_provider(database);
         let engine = SearchEngine::new_with_logger(provider, logger);
 
         let page = engine

@@ -17,7 +17,7 @@
     "test": "vitest run",
     "gen:test-data": "node scripts/generate-test-data.mjs",
     "test:integration": "node scripts/run-integration.mjs all",
-    "test:integration:real-provider": "node scripts/run-integration.mjs plocate",
+    "test:integration:real-provider": "node scripts/run-integration.mjs owned",
     "test:integration:native": "node scripts/run-integration.mjs native",
     "build:integration": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features e2e --config src-tauri/tauri.e2e.conf.json",
     "build:integration:native": "VITE_E2E=1 npm run tauri build -- --debug --no-bundle --features native-e2e --config src-tauri/tauri.e2e.conf.json",
