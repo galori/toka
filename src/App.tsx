@@ -1293,6 +1293,9 @@ function Player({
   const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
   const [fullscreen, setFullscreen] = useState(false);
+  // Numbers each fullscreen request so a slow one that fails late cannot undo
+  // or override what a newer keypress asked for.
+  const fullscreenRequest = useRef(0);
   const [controlsRevealed, setControlsRevealed] = useState(false);
   const [showFullscreenInfo, setShowFullscreenInfo] = useState(true);
   // Fullscreen shows only the scrubber and clock until the pointer visits the
@@ -2517,30 +2520,40 @@ function Player({
   const leaveFullscreen = () => {
     setFullscreenError(undefined);
     if (document.fullscreenElement) {
+      const request = ++fullscreenRequest.current;
       const exiting = document.exitFullscreen?.();
       if (exiting) {
         void exiting
           .then(focusPlayerShell)
-          .catch(() =>
-            getCurrentWindow()
+          .catch(() => {
+            if (request !== fullscreenRequest.current) return;
+            return getCurrentWindow()
               .setFullscreen(false)
               .then(() => {
                 setFullscreen(false);
                 focusPlayerShell();
-              }),
-          )
-          .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+              });
+          })
+          .catch((reason: unknown) => {
+            if (request === fullscreenRequest.current)
+              setFullscreenError(errorMessage(reason));
+          });
       }
       return;
     }
     if (fullscreen) {
+      // Switch the layout first: the window can take seconds to answer while a
+      // long video plays, and the layout must not lag behind the keypress.
+      const request = ++fullscreenRequest.current;
+      setFullscreen(false);
+      focusPlayerShell();
       void getCurrentWindow()
         .setFullscreen(false)
-        .then(() => {
-          setFullscreen(false);
-          focusPlayerShell();
-        })
-        .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+        .catch((reason: unknown) => {
+          if (request !== fullscreenRequest.current) return;
+          setFullscreen(true);
+          setFullscreenError(errorMessage(reason));
+        });
       return;
     }
   };
@@ -2553,14 +2566,23 @@ function Player({
     setShowFullscreenInfo(true);
     setFullscreenError(undefined);
     const shell = playerShell.current;
-    const enterWindowFullscreen = () =>
-      getCurrentWindow()
+    // The layout switches at once; see leaveFullscreen. If the window refuses,
+    // the layout goes back and the document API gets its turn.
+    const request = ++fullscreenRequest.current;
+    const superseded = () => request !== fullscreenRequest.current;
+    const enterWindowFullscreen = () => {
+      setFullscreen(true);
+      focusPlayerShell();
+      return getCurrentWindow()
         .setFullscreen(true)
-        .then(() => {
-          setFullscreen(true);
-          focusPlayerShell();
+        .catch((reason: unknown) => {
+          if (superseded()) return;
+          setFullscreen(false);
+          throw reason;
         });
+    };
     const enterDocumentFullscreen = () => {
+      if (superseded()) return Promise.resolve();
       if (!shell?.requestFullscreen)
         return Promise.reject(
           new Error("Fullscreen mode is not supported by this system."),
@@ -2570,9 +2592,9 @@ function Player({
     const entering = prefersWindowFullscreen()
       ? enterWindowFullscreen().catch(enterDocumentFullscreen)
       : enterDocumentFullscreen().catch(enterWindowFullscreen);
-    void entering
-      .then(focusPlayerShell)
-      .catch((reason: unknown) => setFullscreenError(errorMessage(reason)));
+    void entering.then(focusPlayerShell).catch((reason: unknown) => {
+      if (!superseded()) setFullscreenError(errorMessage(reason));
+    });
   };
 
   useEffect(() => {
