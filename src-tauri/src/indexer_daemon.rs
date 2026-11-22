@@ -627,53 +627,32 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn finished_workers_are_reaped_with_backoff() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // The scanner only stats files, so a locked file still scans: stat
-        // needs no permission on the file itself. A locked directory fails
-        // readdir instead, which fails the scan. Probe directory permissions;
-        // DAC-override sandboxes ignore them and skip, while real CI users
-        // enforce permissions and run the test.
-        let probe = tempdir().unwrap();
-        let probe_dir = probe.path().join("locked");
-        fs::create_dir(&probe_dir).unwrap();
-        fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o000)).unwrap();
-        let enforced = fs::read_dir(&probe_dir).is_err();
-        fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o755)).unwrap();
-        if !enforced {
-            eprintln!("skipping: test environment ignores directory permissions");
-            return;
-        }
-
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        // Unreadable before the scan starts, so the initial scan fails and
-        // the worker exits instead of watching. A subdirectory, not the root
-        // itself: watching the tree itself must keep working.
-        let locked = media.join("locked");
-        fs::create_dir(&locked).unwrap();
-        fs::write(locked.join("hidden.mp4"), b"media").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let database = directory.path().join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
-        manager.add_folder(&media).unwrap();
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
-        let mut supervisor = test_supervisor(database, quiet_thumbnails());
-        supervisor.reconcile();
-        assert_eq!(supervisor.active_count(), 1);
+        // A watcher whose worker already exited. It scans a database with no
+        // row for this root, so begin_scan fails closed and the worker exits.
+        // Permission fixtures cannot produce this: the stat-only scanner
+        // reads a locked file fine, and an unreadable subdirectory fails
+        // recursive watch startup before any scan runs.
+        let ghost = directory.path().join("ghost.sqlite3");
+        let watcher =
+            OwnedIndexWatcher::start_with_progress(&ghost, id.clone(), media.clone(), |_| {})
+                .unwrap();
         assert!(
-            poll_until(Duration::from_secs(10), || {
-                manager.state().unwrap().folders[0].status
-                    == crate::owned_index::OwnedFolderStatus::Error
-            }),
-            "expected the failed scan to surface"
+            poll_until(Duration::from_secs(10), || watcher.is_finished()),
+            "expected the worker to exit on its missing root row"
         );
 
+        let mut supervisor = test_supervisor(database, quiet_thumbnails());
+        supervisor.watchers.insert(id, ActiveWatcher { path: media, watcher });
         supervisor.reconcile();
         assert_eq!(
             supervisor.active_count(),
@@ -683,8 +662,6 @@ mod tests {
         // Still backing off: no immediate restart loop.
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 0);
-
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
