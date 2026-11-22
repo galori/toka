@@ -1694,6 +1694,43 @@ test("opens a selected result in the player and restores the grid on back", asyn
   expect(screen.getByRole("button", { name: "Play clip.mp4" })).toBeVisible();
 });
 
+test("does not copy a bare file name while the path is still loading", async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  Object.defineProperty(navigator, "clipboard", {
+    value: { writeText },
+    configurable: true,
+  });
+  onTestFinished(() => {
+    if (original) Object.defineProperty(navigator, "clipboard", original);
+    else delete (navigator as { clipboard?: unknown }).clipboard;
+  });
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockReturnValueOnce(new Promise(() => {}));
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+
+  const copyButton = await screen.findByRole("button", {
+    name: "Copy file path",
+  });
+  expect(copyButton).toBeDisabled();
+  await user.keyboard("c");
+  expect(writeText).not.toHaveBeenCalled();
+});
+
 test("keeps the copy control in the design system and gives the path room", async () => {
   invokeMock
     .mockResolvedValueOnce({
@@ -1725,10 +1762,15 @@ test("keeps the copy control in the design system and gives the path room", asyn
   expect(getComputedStyle(copyButton).minHeight).toBe("38px");
   expect(copyButton).toHaveAttribute("aria-keyshortcuts", "C");
   expect(copyButton.querySelector(".key-hint")).toHaveTextContent("C");
+  expect(copyButton).toBeEnabled();
 
-  const playerTitle = copyButton.closest(".player-title");
-  expect(playerTitle).toBeInTheDocument();
-  expect(getComputedStyle(playerTitle!).flexGrow).toBe("1");
+  // Copy shares the heading row with the other buttons (one centre line) and
+  // the row wraps rather than letting buttons overlap when narrow.
+  expect(copyButton.closest(".player-title")).toBeNull();
+  const heading = copyButton.parentElement!;
+  expect(heading).toHaveClass("player-heading");
+  expect(getComputedStyle(heading).flexWrap).toBe("wrap");
+  expect(heading.querySelector(".player-title")).toBeInTheDocument();
 });
 
 test("uses the overlay player controls from the design", async () => {

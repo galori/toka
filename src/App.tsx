@@ -1510,7 +1510,10 @@ function Player({
     return () => window.removeEventListener("keydown", onKeyDown);
   });
   const copyPath = async () => {
-    const text = prepared?.filePath ?? video.fileName;
+    // Without the prepared path only the bare name is known, which is not
+    // what "Copy file path" promises; the button is disabled for the same case.
+    if (!prepared) return;
+    const text = prepared.filePath;
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(text);
@@ -2806,24 +2809,25 @@ function Player({
                 onClick={(event) => event.currentTarget.select()}
                 aria-label="File path"
               />
-              <ControlButton
-                shortcut="C"
-                className="copy-button"
-                aria-label={copyFeedback ? "Copied" : "Copy file path"}
-                onClick={() => void copyPath()}
-              >
-                {copyFeedback ? (
-                  <Label>Copied</Label>
-                ) : (
-                  <>
-                    <CopyIcon />
-                    <Label>Copy</Label>
-                  </>
-                )}
-              </ControlButton>
             </div>
           ) : null}
         </div>
+        <ControlButton
+          shortcut="C"
+          className="copy-button"
+          aria-label={copyFeedback ? "Copied" : "Copy file path"}
+          disabled={!prepared}
+          onClick={() => void copyPath()}
+        >
+          {copyFeedback ? (
+            <Label>Copied</Label>
+          ) : (
+            <>
+              <CopyIcon />
+              <Label>Copy</Label>
+            </>
+          )}
+        </ControlButton>
         <HelpButton className="player-help-toggle" onClick={onHelp} />
         <ControlButton
           shortcut="Ctrl+N"
