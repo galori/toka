@@ -477,6 +477,8 @@ impl OwnedIndexManager {
 
     // Unconditional (not just `cfg(test)`): the app's tests build managers
     // too, and this crate compiles without `cfg(test)` when they do.
+    /// A manager rooted at an explicit database, without watchers. Exists
+    /// for tests and inspection flows; prefer `for_inspection`/`system`.
     pub fn under(database: PathBuf) -> Self {
         Self::new(database, false)
     }
