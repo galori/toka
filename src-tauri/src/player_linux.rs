@@ -911,7 +911,9 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     video_area.add_events(gtk::gdk::EventMask::BUTTON_PRESS_MASK);
     let clicked = app.handle().clone();
     video_area.connect_button_press_event(move |_, event| {
-        if event.button() == gtk::gdk::BUTTON_PRIMARY {
+        if event.event_type() == gtk::gdk::EventType::ButtonPress
+            && event.button() == gtk::gdk::BUTTON_PRIMARY
+        {
             let _ = clicked.emit("native-video-click", ());
         }
         gtk::glib::Propagation::Proceed
