@@ -139,6 +139,10 @@ pub trait Host {
     fn config_dir(&self) -> PathBuf;
     /// The `ts` executable the service files point at.
     fn executable(&self) -> PathBuf;
+    /// The temp directory: an executable under it is an ephemeral copy —
+    /// an AppImage mount, a deleted-while-running binary staged in tmp —
+    /// that `install` refuses to register as the service executable.
+    fn temp_dir(&self) -> PathBuf;
     /// The login user id, for `launchctl`'s `gui/<uid>` domain.
     fn uid(&self) -> u32;
     /// The login name, for `loginctl enable-linger`.
@@ -207,6 +211,10 @@ impl Host for SystemHost {
 
     fn executable(&self) -> PathBuf {
         self.executable.clone()
+    }
+
+    fn temp_dir(&self) -> PathBuf {
+        std::env::temp_dir()
     }
 
     fn uid(&self) -> u32 {
@@ -725,30 +733,91 @@ fn systemctl_error(args: &[&str], result: &CommandResult) -> String {
     }
 }
 
+/// Whether `executable` is an ephemeral copy no service file may point
+/// at: under the temp directory, inside an AppImage mount, or deleted
+/// while running (Linux suffixes `current_exe` with ` (deleted)`). The
+/// mount pattern doubles the temp-dir check for AppImages launched with
+/// a custom `TMPDIR`.
+fn is_ephemeral_executable(executable: &Path, temp_dir: &Path) -> bool {
+    if !temp_dir.as_os_str().is_empty() && executable.starts_with(temp_dir) {
+        return true;
+    }
+    let text = executable.to_string_lossy();
+    text.starts_with("/tmp/.mount_") || text.ends_with(" (deleted)")
+}
+
+/// Refuses an `install` from an ephemeral executable: a service pointing
+/// at an AppImage mount dies with the unmount, silently. Startup treats
+/// the failure as degraded, so bare mounts run service-less but working.
+fn refuse_ephemeral_executable(host: &impl Host) -> Result<(), String> {
+    let executable = host.executable();
+    if !is_ephemeral_executable(&executable, &host.temp_dir()) {
+        return Ok(());
+    }
+    Err(format!(
+        "cannot install a service from a temporary copy of ts ({}): install Toka first, then run `ts install` from the installed copy.",
+        executable.display()
+    ))
+}
+
+/// Attempts the `--link` step after the service setup, whatever its
+/// outcome: a failed setup must not swallow the link, and a failed link
+/// warns instead of failing an installed service — the link is the
+/// explicitly optional part, and the installer restarts only on success.
+/// Returns the service error (if any) with the combined outcome.
+fn finish_install(
+    host: &mut impl Host,
+    outcome: &mut Outcome,
+    service_error: Option<String>,
+    link: bool,
+) -> Result<Outcome, (String, Outcome)> {
+    if link {
+        if let Err(link_error) = link_ts(host, outcome) {
+            outcome.already(format!("warning: {link_error}"));
+        }
+    }
+    if let Some(error) = service_error {
+        return Err((error, std::mem::take(outcome)));
+    }
+    Ok(std::mem::take(outcome))
+}
+
 fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
+    with_outcome(refuse_ephemeral_executable(host), &mut outcome)?;
+    // Held for the whole install, link included: a second installer waits
+    // here, then sees this one's converged state instead of interleaving
+    // marker set/clear with it (see [`InstallLock`]).
+    let _install_lock = with_outcome(
+        acquire_install_lock(&unit_path(&host.config_dir())),
+        &mut outcome,
+    )?;
+    // The service setup runs to its first error; the link below still
+    // runs after a failure (see [`finish_install`]).
+    let service_error = install_systemd_service(host, &mut outcome).err();
+    finish_install(host, &mut outcome, service_error, link)
+}
+
+/// The systemd unit setup behind [`install_systemd`]: everything but the
+/// ephemeral check, the install lock (held by the caller across the link
+/// too), and the link itself. Stops at the first error; the caller still
+/// attempts the link afterwards.
+fn install_systemd_service(host: &mut impl Host, outcome: &mut Outcome) -> Result<(), String> {
     let home = host.home();
     let unit = unit_path(&host.config_dir());
     let name = crate::config::TS_SERVICE_NAME;
-    // Held for the whole install: a second installer waits here, then sees
-    // this one's converged state instead of interleaving marker set/clear
-    // with it (see [`InstallLock`]).
-    let _install_lock = with_outcome(acquire_install_lock(&unit), &mut outcome)?;
 
     // Read before the rewrite: the manager still reports the installed
     // executable, which the takeover note below compares against.
     let previous = previous_unit_executable(host, &unit, name);
-    let rendered = with_outcome(
-        render_unit(&host.executable(), &host.service_env()),
-        &mut outcome,
-    )?;
+    let rendered = render_unit(&host.executable(), &host.service_env())?;
     // The marker goes down before the write, so a crash anywhere past
     // here still retries the reload: file current plus marker set means
     // the manager may not have the file yet.
-    let differs = with_outcome(service_file_differs(&unit, &rendered), &mut outcome)?;
+    let differs = service_file_differs(&unit, &rendered)?;
     if differs {
-        with_outcome(set_reload_marker(&marker_path(&unit)), &mut outcome)?;
-        with_outcome(write_service_file(&unit, &rendered), &mut outcome)?;
+        set_reload_marker(&marker_path(&unit))?;
+        write_service_file(&unit, &rendered)?;
         outcome.did(format!("wrote {}", display_path(&home, &unit)));
     } else {
         outcome.already("service file already up to date".to_owned());
@@ -765,7 +834,7 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     // The old service stops before anything new starts: it holds the
     // legacy daemon lock, and a new daemon started first would yield to
     // it and crash-loop under `Restart=on-failure`.
-    let legacy_removed = with_outcome(migrate_legacy_service(host, &mut outcome), &mut outcome)?;
+    let legacy_removed = migrate_legacy_service(host, outcome)?;
 
     // A changed, removed, or not-yet-loaded file needs a reload before
     // the stop below: stopping a unit the manager never loaded fails,
@@ -774,7 +843,7 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     let marker = marker_path(&unit);
     let marker_set = marker.is_file();
     if differs || legacy_removed || marker_set {
-        with_outcome(systemd_command(host, &["daemon-reload"]), &mut outcome)?;
+        systemd_command(host, &["daemon-reload"])?;
         outcome.did("reloaded systemd".to_owned());
     }
 
@@ -783,7 +852,7 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     if systemd_enablement(host, name) == Enablement::Enabled {
         outcome.already(format!("{name} is already enabled"));
     } else {
-        with_outcome(systemd_command(host, &["enable", name]), &mut outcome)?;
+        systemd_command(host, &["enable", name])?;
         outcome.did(format!("enabled {name}"));
     }
 
@@ -796,35 +865,31 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     if marker_set || liveness == Liveness::Deactivating {
         let stopped = liveness == Liveness::Stopped;
         if !stopped {
-            with_outcome(systemd_command(host, &["stop", name]), &mut outcome)?;
+            systemd_command(host, &["stop", name])?;
         }
-        with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
+        systemd_command(host, &["start", name])?;
         if stopped {
             outcome.did(format!("started {name}"));
         } else {
             outcome.did(format!("restarted {name}"));
         }
-        with_outcome(verify_unit_loaded(host, name, &unit), &mut outcome)?;
-        with_outcome(clear_reload_marker(&marker), &mut outcome)?;
+        verify_unit_loaded(host, name, &unit)?;
+        clear_reload_marker(&marker)?;
     } else if liveness == Liveness::Active {
         outcome.already(format!("{name} is already running"));
     } else if liveness == Liveness::Stopped {
-        with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
+        systemd_command(host, &["start", name])?;
         outcome.did(format!("started {name}"));
     } else {
         // Unreadable probe: the start is still requested, but no state
         // change is claimed — the probe may have been interrupted while
         // active, in which case systemd accepts the request as a no-op.
-        with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
+        systemd_command(host, &["start", name])?;
         outcome.already(format!("systemd accepted the start request for {name}"));
     }
 
-    ensure_linger(host, &mut outcome);
-
-    if link {
-        with_outcome(link_ts(host, &mut outcome), &mut outcome)?;
-    }
-    Ok(outcome)
+    ensure_linger(host, outcome);
+    Ok(())
 }
 
 /// The executable the installed unit runs: the manager-side `ExecStart`,
@@ -1504,11 +1569,27 @@ fn launchd_command(host: &mut impl Host, args: &[&str]) -> Result<(), String> {
 
 fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
+    with_outcome(refuse_ephemeral_executable(host), &mut outcome)?;
+    // Held for the whole install, link included, as on systemd (see
+    // [`InstallLock`]).
+    let _install_lock = with_outcome(
+        acquire_install_lock(&plist_path(&host.home())),
+        &mut outcome,
+    )?;
+    // The agent setup runs to its first error; the link below still runs
+    // after a failure (see [`finish_install`]).
+    let service_error = install_launchd_service(host, &mut outcome).err();
+    finish_install(host, &mut outcome, service_error, link)
+}
+
+/// The LaunchAgent setup behind [`install_launchd`]: everything but the
+/// ephemeral check, the install lock (held by the caller across the link
+/// too), and the link itself. Stops at the first error; the caller still
+/// attempts the link afterwards.
+fn install_launchd_service(host: &mut impl Host, outcome: &mut Outcome) -> Result<(), String> {
     let home = host.home();
     let plist = plist_path(&home);
     let label = crate::config::TS_LAUNCHD_LABEL;
-    // Held for the whole install, as on systemd (see [`InstallLock`]).
-    let _install_lock = with_outcome(acquire_install_lock(&plist), &mut outcome)?;
 
     // Read before the rewrite: the installed executable, which the
     // takeover note below compares against.
@@ -1518,10 +1599,10 @@ fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     let rendered = render_plist(&host.executable(), &host.service_env());
     // The marker goes down before the write, as on systemd, so a crash
     // anywhere past here still retries the reload.
-    let differs = with_outcome(service_file_differs(&plist, &rendered), &mut outcome)?;
+    let differs = service_file_differs(&plist, &rendered)?;
     if differs {
-        with_outcome(set_reload_marker(&marker_path(&plist)), &mut outcome)?;
-        with_outcome(write_service_file(&plist, &rendered), &mut outcome)?;
+        set_reload_marker(&marker_path(&plist))?;
+        write_service_file(&plist, &rendered)?;
         outcome.did(format!("wrote {}", display_path(&home, &plist)));
     } else {
         outcome.already("service file already up to date".to_owned());
@@ -1535,10 +1616,7 @@ fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     }
 
     let Some(state) = launchd_probe(host) else {
-        return Err((
-            "could not ask launchd about the service.".to_owned(),
-            std::mem::take(&mut outcome),
-        ));
+        return Err("could not ask launchd about the service.".to_owned());
     };
     let bootstrapped = state.bootstrapped;
     let running = state.running;
@@ -1549,44 +1627,31 @@ fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     // is already running, kickstarted, or already loaded.
     if marker.is_file() || !bootstrapped {
         if bootstrapped {
-            with_outcome(
-                launchd_command(host, &["bootout", &launchd_target(host)]),
-                &mut outcome,
-            )?;
+            launchd_command(host, &["bootout", &launchd_target(host)])?;
             outcome.did(format!("stopped {label}"));
         }
-        with_outcome(
-            launchd_command(
-                host,
-                &[
-                    "bootstrap",
-                    &format!("gui/{}", host.uid()),
-                    &plist_display(&plist),
-                ],
-            ),
-            &mut outcome,
+        launchd_command(
+            host,
+            &[
+                "bootstrap",
+                &format!("gui/{}", host.uid()),
+                &plist_display(&plist),
+            ],
         )?;
         outcome.did(format!("started {label}"));
-        with_outcome(verify_agent_bootstrapped(host, label), &mut outcome)?;
-        with_outcome(clear_reload_marker(&marker), &mut outcome)?;
+        verify_agent_bootstrapped(host, label)?;
+        clear_reload_marker(&marker)?;
     } else {
         match running {
             Some(true) => outcome.already(format!("{label} is already running")),
             Some(false) => {
-                with_outcome(
-                    launchd_command(host, &["kickstart", "-k", &launchd_target(host)]),
-                    &mut outcome,
-                )?;
+                launchd_command(host, &["kickstart", "-k", &launchd_target(host)])?;
                 outcome.did(format!("started {label}"));
             }
             None => outcome.already(format!("{label} is already loaded")),
         }
     }
-
-    if link {
-        with_outcome(link_ts(host, &mut outcome), &mut outcome)?;
-    }
-    Ok(outcome)
+    Ok(())
 }
 
 /// The executable a LaunchAgent plist runs: the first `ProgramArguments`
@@ -2232,6 +2297,7 @@ mod tests {
     struct Fake {
         temp: tempfile::TempDir,
         executable: PathBuf,
+        temp_dir: PathBuf,
         config: PathBuf,
         uid: u32,
         user: Option<String>,
@@ -2251,10 +2317,15 @@ mod tests {
             let executable = temp.path().join("bin").join("ts");
             std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
             std::fs::write(&executable, b"ts").unwrap();
+            // A scratch temp dir beside the executable, mirroring the CLI
+            // harness (TMPDIR under the scratch home, binary elsewhere):
+            // installs from the default executable are not ephemeral.
+            let temp_dir = temp.path().join("tmp");
             let config = temp.path().join(".config");
             Self {
                 temp,
                 executable,
+                temp_dir,
                 config,
                 uid: 501,
                 user: Some("tester".to_owned()),
@@ -2313,6 +2384,10 @@ mod tests {
 
         fn executable(&self) -> PathBuf {
             self.executable.clone()
+        }
+
+        fn temp_dir(&self) -> PathBuf {
+            self.temp_dir.clone()
         }
 
         fn uid(&self) -> u32 {
@@ -3109,26 +3184,166 @@ mod tests {
     }
 
     #[test]
-    fn install_with_link_refuses_a_directory_in_the_way() {
+    fn install_with_link_warns_when_a_directory_is_in_the_way() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            std::fs::create_dir_all(link_path(&host.home())).unwrap();
+
+            // The link is the explicitly optional `--link` part: a blocked
+            // link warns while the installed service still exits 0, so the
+            // installer restarts onto the new binary instead of skipping it.
+            let outcome = perform_on(&mut host, manager, ServiceOp::Install { link: true })
+                .unwrap_or_else(|(error, _)| {
+                    panic!("{manager:?}: a blocked link must warn, not fail: {error}")
+                });
+
+            assert!(
+                host.unchanged(&outcome)
+                    .iter()
+                    .any(|action| action.contains("warning")
+                        && action.contains("a directory is in the way")),
+                "{manager:?}: {}",
+                host.unchanged(&outcome).join("\n")
+            );
+            // The service installed before the link warned, and the report
+            // says so.
+            assert!(
+                !host.changed(&outcome).is_empty(),
+                "{manager:?}: {}",
+                host.changed(&outcome).join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn install_refuses_an_executable_under_the_temp_dir() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            std::fs::create_dir_all(&host.temp_dir).unwrap();
+            let ephemeral = host.temp_dir.join("ts");
+            std::fs::write(&ephemeral, b"ts").unwrap();
+            host.executable = ephemeral;
+            let home = host.home();
+            let config = host.config();
+
+            let (error, partial) =
+                perform_on(&mut host, manager, ServiceOp::Install { link: false }).unwrap_err();
+
+            assert!(
+                error.contains("temporary copy") && error.contains("install Toka first"),
+                "{manager:?}: {error}"
+            );
+            assert!(partial.actions.is_empty());
+            assert!(!unit_path(&config).exists(), "{manager:?}");
+            assert!(!plist_path(&home).exists(), "{manager:?}");
+            assert!(host.calls.is_empty(), "{manager:?}: {:?}", host.calls);
+        }
+    }
+
+    #[test]
+    fn install_refuses_an_appimage_mount_executable() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            // A bare AppImage mount: outside the temp dir on purpose, so
+            // only the mount pattern refuses it.
+            host.executable = PathBuf::from("/tmp/.mount_ABC123/ts");
+
+            let (error, _) =
+                perform_on(&mut host, manager, ServiceOp::Install { link: false }).unwrap_err();
+
+            assert!(error.contains("temporary copy"), "{manager:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn install_refuses_a_deleted_executable() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            host.executable = PathBuf::from("/opt/toka/ts (deleted)");
+
+            let (error, _) =
+                perform_on(&mut host, manager, ServiceOp::Install { link: false }).unwrap_err();
+
+            assert!(error.contains("temporary copy"), "{manager:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn ephemeral_executables_are_temp_mounted_or_deleted() {
+        let temp = Path::new("/tmp");
+        assert!(is_ephemeral_executable(Path::new("/tmp/ts"), temp));
+        assert!(is_ephemeral_executable(
+            Path::new("/tmp/.mount_ABC123/usr/bin/ts"),
+            Path::new("/var/tmp")
+        ));
+        assert!(is_ephemeral_executable(
+            Path::new("/opt/toka/ts (deleted)"),
+            temp
+        ));
+        assert!(!is_ephemeral_executable(Path::new("/tmpfoo/ts"), temp));
+        assert!(!is_ephemeral_executable(Path::new("/usr/bin/ts"), temp));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn install_with_link_still_links_when_the_manager_is_unreachable() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            let program = match manager {
+                ServiceManager::Systemd => "systemctl",
+                ServiceManager::Launchd => "launchctl",
+            };
+            host.script.borrow_mut().missing.insert(program.to_owned());
+
+            // The service setup fails, so the install still exits
+            // non-zero — but the link rides along when it succeeds.
+            let (error, partial) =
+                perform_on(&mut host, manager, ServiceOp::Install { link: true }).unwrap_err();
+
+            assert!(error.contains("could not ask"), "{manager:?}: {error}");
+            assert_eq!(
+                std::fs::read_link(link_path(&host.home())).unwrap(),
+                host.executable,
+                "{manager:?}"
+            );
+            assert!(
+                host.changed(&partial)
+                    .iter()
+                    .any(|action| action == "linked ~/.local/bin/ts"),
+                "{manager:?}: {}",
+                host.changed(&partial).join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn install_reports_the_service_error_when_both_service_and_link_fail() {
         let mut host = Fake::new();
-        std::fs::create_dir_all(link_path(&host.home())).unwrap();
+        host.script
+            .borrow_mut()
+            .missing
+            .insert("systemctl".to_owned());
+        let link = link_path(&host.home());
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(&link, b"a real copied binary").unwrap();
 
         let (error, partial) = perform_on(
             &mut host,
-            ServiceManager::Launchd,
+            ServiceManager::Systemd,
             ServiceOp::Install { link: true },
         )
         .unwrap_err();
 
-        assert!(error.contains("a directory is in the way"), "{error}");
-        // The service installed before the link failed, and the failure
-        // says so.
+        // The service error stays primary; the link failure rides along
+        // as a warning instead of replacing it.
+        assert!(error.contains("could not ask"), "{error}");
         assert!(
-            host.changed(&partial)
+            host.unchanged(&partial)
                 .iter()
-                .any(|action| action == "started app.toka.ts"),
+                .any(|action| action.contains("warning")
+                    && action.contains("a regular file is in the way")),
             "{}",
-            host.changed(&partial).join("\n")
+            host.unchanged(&partial).join("\n")
         );
     }
 
@@ -4587,19 +4802,28 @@ mod tests {
     }
 
     #[test]
-    fn install_with_link_refuses_a_regular_file_in_the_way() {
+    fn install_with_link_warns_when_a_regular_file_is_in_the_way() {
         for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
             let mut host = Fake::new();
             let link = link_path(&host.home());
             std::fs::create_dir_all(link.parent().unwrap()).unwrap();
             std::fs::write(&link, b"a real copied binary").unwrap();
 
-            let (error, _) =
-                perform_on(&mut host, manager, ServiceOp::Install { link: true }).unwrap_err();
+            // The link is the explicitly optional `--link` part: a blocked
+            // link warns while the installed service still exits 0, so the
+            // installer restarts onto the new binary instead of skipping it.
+            let outcome = perform_on(&mut host, manager, ServiceOp::Install { link: true })
+                .unwrap_or_else(|(error, _)| {
+                    panic!("{manager:?}: a blocked link must warn, not fail: {error}")
+                });
 
             assert!(
-                error.contains("a regular file is in the way"),
-                "{manager:?}: {error}"
+                host.unchanged(&outcome)
+                    .iter()
+                    .any(|action| action.contains("warning")
+                        && action.contains("a regular file is in the way")),
+                "{manager:?}: {}",
+                host.unchanged(&outcome).join("\n")
             );
             assert_eq!(
                 std::fs::read(&link).unwrap(),

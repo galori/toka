@@ -301,6 +301,32 @@ test("says on screen when the index state cannot be read at startup", async () =
   );
 });
 
+test("keeps a failed startup index check visible during launched playback", async () => {
+  launchIntentMock.mockResolvedValue({
+    page: {
+      query: "summer.m3u8",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "summer.mp4", extension: "mp4" }],
+    },
+  });
+  indexStateMock.mockRejectedValue(
+    new Error("Toka could not find the `ts` search helper."),
+  );
+  invokeMock.mockResolvedValue({ filePath: "/Videos/summer.mp4" });
+
+  render(<App />);
+
+  // Playback starts despite the broken index, and the failure stays
+  // visible instead of hiding behind the player.
+  expect(await screen.findByLabelText("Playing summer.mp4")).toBeVisible();
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Toka could not find the `ts` search helper.",
+  );
+});
+
 test("adds a search folder and makes the setup completable", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,

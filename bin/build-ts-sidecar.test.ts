@@ -1,15 +1,19 @@
+import { spawnSync } from "node:child_process";
 import {
   chmod,
   mkdir,
   mkdtemp,
   readFile,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   buildTsSidecar,
+  isDirectExecution,
   parseSidecarArgs,
   resolveTriple,
   sidecarStagePath,
@@ -198,6 +202,42 @@ describe("buildTsSidecar", () => {
   });
 });
 
+describe("direct execution guard", () => {
+  it("runs the script when invoked through a symlinked path", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "toka-ts-sidecar-guard-"),
+    );
+    const link = path.join(root, "build-ts-sidecar.mjs");
+    await symlink(path.resolve("bin/build-ts-sidecar.mjs"), link);
+
+    // Invalid args exercise the guard without building: a reached main
+    // rejects them, while a missed guard exits 0 staging nothing.
+    for (const invoked of [link, path.resolve("bin/build-ts-sidecar.mjs")]) {
+      const run = spawnSync("node", [invoked, "--bogus"], {
+        encoding: "utf8",
+      });
+      expect(run.status).not.toBe(0);
+      expect(run.stderr).toMatch(/Usage/);
+    }
+  });
+
+  it("compares real paths, not spellings", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "toka-ts-sidecar-guard-"),
+    );
+    const real = path.join(root, "real.mjs");
+    await writeFile(real, "");
+    const link = path.join(root, "link.mjs");
+    await symlink(real, link);
+
+    expect(isDirectExecution(pathToFileURL(real).href, link)).toBe(true);
+    expect(
+      isDirectExecution(pathToFileURL(real).href, path.join(root, "other.mjs")),
+    ).toBe(false);
+    expect(isDirectExecution(pathToFileURL(real).href, undefined)).toBe(false);
+  });
+});
+
 // Compile and bundle stay split on purpose: the bundle overlay (which
 // carries the sidecar) reaches only `tauri bundle`, never a compile whose
 // build script would mis-copy the sidecar under cargo's nested per-package
@@ -293,6 +333,19 @@ describe("tauri sidecar bundling", () => {
     // fails any compile whose sidecar file is missing, so only bundle
     // builds merge it in — plain cargo builds never need a staged ts.
     expect(base.bundle.externalBin).toBeUndefined();
+  });
+
+  it("declares the moreutils conflict on the deb that ships /usr/bin/ts", async () => {
+    const base = JSON.parse(
+      await readFile(path.resolve("src-tauri/tauri.conf.json"), "utf8"),
+    );
+
+    // The bundler copies external binaries beside the app binary, so the
+    // deb installs the ts sidecar as /usr/bin/ts — colliding with
+    // moreutils' /usr/bin/ts. Without Conflicts, dpkg fails both install
+    // orders; the AppImage and dmg carry no such control field and keep
+    // their sidecar inside the bundle.
+    expect(base.bundle.linux.deb.conflicts).toContain("moreutils");
   });
 
   it("merges the bundle overlay in every flow that packages the app", async () => {

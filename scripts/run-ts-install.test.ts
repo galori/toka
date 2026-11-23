@@ -30,6 +30,20 @@ describe("runTsInstall", () => {
     expect(await calls(logPath)).toEqual(["install --link", "restart"]);
   });
 
+  it("still restarts when install succeeds with a link warning", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-ts-restart-"));
+    const { tsPath, logPath } = await writeFakeTs(
+      root,
+      'if [ "$1" = install ]; then echo "warning: could not link ~/.local/bin/ts: a regular file is in the way"; fi\nexit 0',
+    );
+
+    runTsInstall(tsPath);
+
+    // A blocked link warns but exits 0: the service installed, so the
+    // restart still moves a running daemon onto the new binary.
+    expect(await calls(logPath)).toEqual(["install --link", "restart"]);
+  });
+
   it("skips the restart when the install itself failed", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "toka-ts-restart-"));
     const { tsPath, logPath } = await writeFakeTs(

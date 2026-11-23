@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { chmod, copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -104,7 +105,20 @@ export async function buildTsSidecar({
   await chmod(staged, 0o755);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Whether this module is the executed script: a realpath comparison, so
+// an invocation through a symlinked parent (macOS /tmp → /private/tmp)
+// still counts. argv[1] is undefined under some loaders, which never
+// counts as direct execution; an unresolvable path cannot be this file.
+export function isDirectExecution(metaUrl, argv1) {
+  if (argv1 === undefined) return false;
+  try {
+    return realpathSync(fileURLToPath(metaUrl)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   const { target } = parseSidecarArgs(process.argv.slice(2));
   const info = prepareBuild();
   await buildTsSidecar({

@@ -4681,6 +4681,11 @@ export default function App() {
     return (
       <main className="app playback-mode">
         {showHelp ? <HelpPane onClose={() => setShowHelp(false)} /> : null}
+        {error ? (
+          <p role="alert" className="message error">
+            {error}
+          </p>
+        ) : null}
         <Player
           videos={playing.videos}
           startIndex={playing.startIndex}

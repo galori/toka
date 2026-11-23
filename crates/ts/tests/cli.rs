@@ -3985,6 +3985,28 @@ fn status_reports_the_agent_matrix() {
 
 #[cfg(unix)]
 #[test]
+fn install_refuses_a_binary_running_from_the_temp_dir() {
+    // A bare AppImage mount (or any temp-staged copy): the binary runs
+    // from under TMPDIR, so registering it as the service executable
+    // would die with the unmount. Staged under the harness TMPDIR —
+    // `home/tmp` — on purpose.
+    let home = shim_home();
+    let binary = staged_binary(&home, "tmp/staged");
+
+    let output = spawn_and_wait(shimmed_command(&home, &binary, &["install"], None, &[]));
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("temporary copy"), "{stderr}");
+    assert!(stderr.contains("install Toka first"), "{stderr}");
+    #[cfg(target_os = "linux")]
+    assert!(!shim_unit_file(&home).exists());
+    #[cfg(target_os = "macos")]
+    assert!(!shim_plist_file(&home).exists());
+}
+
+#[cfg(unix)]
+#[test]
 fn install_with_link_links_and_uninstall_removes_it() {
     let home = shim_home();
 

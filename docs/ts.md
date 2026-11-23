@@ -227,10 +227,16 @@ bundler signs sidecars with the app).
 ### Linking
 
 `ts install --link` links the running `ts` into `~/.local/bin/ts`,
-creating `~/.local/bin` if needed. It refuses to clobber a real file or a
-directory in the way (naming what blocks it), replaces a stale symlink, and
-reports already-linked when the link — or a copy of the binary itself —
-is already there. `ts uninstall` removes the link it owns.
+creating `~/.local/bin` if needed. The link is attempted even when the
+service setup fails, and a link that cannot be created warns instead of
+failing an installed service: a real file or a directory in the way is
+named but never clobbered. A stale symlink is replaced, and an
+already-linked path — or a copy of the binary itself — reports so.
+`ts uninstall` removes the link it owns.
+
+`ts install` refuses a temporary copy — an AppImage mount or anything
+under the temp directory — since the service would die with it: install
+Toka first, then run `ts install` from the installed copy.
 
 ## Files
 
@@ -268,8 +274,13 @@ the daemon running when its pid is alive and the heartbeat is under
   read the indexer log above.
 - **`ts install` fails under sudo.** Install as your own user: under sudo
   the service would be registered for root instead of you.
-- **`ts install --link` reports a file in the way.** `~/.local/bin/ts` is a
-  real file `ts` will not clobber — move it aside and re-run.
+- **`ts install --link` warns about a file in the way.** `~/.local/bin/ts`
+  is a real file `ts` will not clobber — the service still installs, and
+  moving the file aside plus a re-run adds the link.
+- **`ts install` refuses a temporary copy.** The `ts` runs from an AppImage
+  mount or under the temp directory, where a service registration would die
+  with it. Install Toka first, then run `ts install` from the installed
+  copy.
 - **Service points at the wrong copy.** The last `ts` to install wins; run
   `~/.local/bin/ts install` (or the copy you want) to take it over — it
   says so when it does.
