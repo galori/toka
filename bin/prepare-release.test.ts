@@ -2,7 +2,6 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   assertStampAllowed,
   deriveRelease,
@@ -150,9 +149,7 @@ describe("release environment", () => {
 
 describe("release CLI", () => {
   test("prints matching version and tag lines for the current checkout", () => {
-    const script = fileURLToPath(
-      new URL("./prepare-release.mjs", import.meta.url),
-    );
+    const script = join(process.cwd(), "bin", "prepare-release.mjs");
     const output = execFileSync(process.execPath, [script], {
       encoding: "utf8",
     });
