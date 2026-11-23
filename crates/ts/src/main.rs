@@ -7,6 +7,7 @@ use std::{
 #[cfg(not(feature = "fixtures"))]
 use toka_search::providers::OwnedIndexSearchProvider;
 use toka_search::{
+    daemon_state::DaemonStatus,
     index_stats::IndexStats,
     owned_index::{
         self, IndexUpdates, OwnedIndexFolder, OwnedIndexManager, OwnedIndexState,
@@ -103,6 +104,16 @@ fn read_index_stats() -> Result<IndexStats, String> {
     OwnedIndexManager::for_inspection()?.stats()
 }
 
+fn read_status() -> Result<DaemonStatus, String> {
+    toka_search::daemon_state::read_status(&owned_index::database_path()?)
+}
+
+/// Runs the indexer daemon in the foreground: the same supervisor loop
+/// `toka --indexer` runs, so either entry point keeps the index fresh.
+fn run_daemon() -> Result<(), String> {
+    toka_search::indexer_daemon::run_daemon()
+}
+
 fn read_folders() -> Result<Vec<OwnedIndexFolder>, String> {
     OwnedIndexManager::for_inspection()?.folders()
 }
@@ -196,6 +207,8 @@ fn main() {
         sync_rename,
         make_thumbnail,
         make_preview,
+        read_status,
+        run_daemon,
         &mut stdout,
         &mut stderr,
     );

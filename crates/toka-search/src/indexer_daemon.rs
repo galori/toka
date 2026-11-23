@@ -1,8 +1,11 @@
-//! The Linux indexer daemon: the systemd user service entry point, starting
-//! and stopping the service, identifying mounts, logging, thumbnails, and
-//! hosting the owned-index watchers.
+//! The indexer daemon: watching one owned-index root per configured folder,
+//! generating thumbnails, and publishing a liveness heartbeat for
+//! `ts status`. Runs as `toka --indexer` under the Linux systemd user
+//! service, and as `ts daemon run` on either platform; this module also
+//! holds the Linux-only service helpers.
 
-use crate::owned_index::{OwnedIndex, OwnedIndexWatcher, ScanPhase};
+use crate::daemon_state::DaemonActivity;
+use crate::owned_index::{OwnedIndex, OwnedIndexWatcher, ScanPhase, WatcherLive, WorkerStage};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 #[cfg(not(feature = "e2e"))]
@@ -13,7 +16,10 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -160,16 +166,54 @@ fn settle_delay(last_pass: Instant, now: Instant) -> Duration {
     MIN_RECONCILE_INTERVAL.saturating_sub(now.duration_since(last_pass))
 }
 
-/// Runs the Linux indexer daemon: keeping one owned-index watcher per
-/// configured root until the process stops. Each pass re-reads the roots
-/// table, so folders added or removed while the window is closed apply on the
-/// next wake-up.
+/// What ended a wait between reconciliations.
+#[derive(Debug, PartialEq, Eq)]
+enum ReconcileWake {
+    /// A filesystem event arrived: reconcile now.
+    Event,
+    /// The interval elapsed with no events: reconcile anyway.
+    Elapsed,
+    /// The event sender is gone: the watcher died.
+    Gone,
+}
+
+/// Waits up to `interval` for a filesystem event, running `heartbeat`
+/// every [`crate::daemon_state::HEARTBEAT_INTERVAL`] so liveness stays
+/// fresh while nothing changes. Returns what ended the wait.
+fn await_reconcile<T>(
+    receiver: &mpsc::Receiver<T>,
+    interval: Duration,
+    mut heartbeat: impl FnMut(),
+) -> ReconcileWake {
+    let start = Instant::now();
+    loop {
+        let remaining = interval.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return ReconcileWake::Elapsed;
+        }
+        match receiver.recv_timeout(remaining.min(crate::daemon_state::HEARTBEAT_INTERVAL)) {
+            Ok(_) => return ReconcileWake::Event,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                heartbeat();
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return ReconcileWake::Gone,
+        }
+    }
+}
+
+/// Runs the indexer daemon: keeping one owned-index watcher per configured
+/// root until the process stops, and publishing a liveness heartbeat for
+/// `ts status`. Each pass re-reads the roots table, so folders added or
+/// removed while the window is closed apply on the next wake-up.
 pub fn run_daemon() -> Result<(), String> {
     let database = crate::owned_index::database_path()?;
     if let Some(parent) = database.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Toka could not create its index folder: {error}"))?;
     }
+    // One daemon per index: a second supervisor would interleave scan
+    // generations with the first and mark partial scans ready.
+    let _daemon_lock = acquire_daemon_lock(&database)?;
     let logger = Arc::new(IndexLogger::new(indexer_log_path()?));
     logger.record("indexer started");
     let (sender, receiver) = mpsc::channel();
@@ -186,19 +230,62 @@ pub fn run_daemon() -> Result<(), String> {
     let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
     loop {
         supervisor.reconcile();
+        // An activity change publishes immediately; the wait below keeps
+        // the heartbeat fresh while nothing changes.
+        supervisor.publish_heartbeat();
         let last_pass = Instant::now();
         drain_events(&receiver);
-        match receiver.recv_timeout(RECONCILE_INTERVAL) {
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("Toka's folder watcher stopped unexpectedly.".into())
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(_) => {
+        match await_reconcile(&receiver, RECONCILE_INTERVAL, || {
+            supervisor.publish_heartbeat()
+        }) {
+            ReconcileWake::Gone => return Err("Toka's folder watcher stopped unexpectedly.".into()),
+            ReconcileWake::Elapsed => {}
+            ReconcileWake::Event => {
                 drain_events(&receiver);
                 std::thread::sleep(settle_delay(last_pass, Instant::now()));
             }
         }
     }
+}
+
+/// The lock file guarding against a second daemon on the same index. Held
+/// open (and locked) for the daemon's whole run; dropping it releases the
+/// lock, and the operating system releases it on a crash, so the lock can
+/// never go stale.
+#[cfg(unix)]
+struct DaemonLock {
+    _file: fs::File,
+}
+
+#[cfg(not(unix))]
+struct DaemonLock;
+
+/// Refuses to start when another daemon already runs on this index.
+#[cfg(unix)]
+fn acquire_daemon_lock(database: &Path) -> Result<DaemonLock, String> {
+    let path = database.with_file_name("daemon.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    use std::os::fd::AsRawFd;
+    // Non-blocking: a second daemon exits with an error instead of
+    // queueing behind the first one forever.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err("Another Toka indexer daemon is already running.".into());
+        }
+        return Err(format!("Toka could not lock its indexer daemon: {error}"));
+    }
+    Ok(DaemonLock { _file: file })
+}
+
+#[cfg(not(unix))]
+fn acquire_daemon_lock(_database: &Path) -> Result<DaemonLock, String> {
+    Ok(DaemonLock)
 }
 
 #[derive(Deserialize)]
@@ -268,6 +355,7 @@ pub(crate) fn path_available(path: &Path, expected: Option<&MountIdentity>) -> b
 #[derive(Clone)]
 pub(crate) struct ThumbnailWorker {
     sender: mpsc::Sender<PathBuf>,
+    pending: Arc<AtomicU64>,
 }
 
 impl ThumbnailWorker {
@@ -287,19 +375,52 @@ impl ThumbnailWorker {
         F: Fn(&Path) + Send + 'static,
     {
         let (sender, receiver): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
+        let pending = Arc::new(AtomicU64::new(0));
+        let worker_pending = Arc::clone(&pending);
         std::thread::Builder::new()
             .name("toka-thumbnail-worker".into())
             .spawn(move || {
                 while let Ok(folder) = receiver.recv() {
                     generator(&folder);
+                    worker_pending.fetch_sub(1, Ordering::Relaxed);
                 }
             })
             .expect("Toka could not start its thumbnail worker");
-        Self { sender }
+        Self { sender, pending }
     }
 
     pub(crate) fn enqueue(&self, folder: &Path) {
-        let _ = self.sender.send(folder.to_path_buf());
+        // Reserve first: the worker's matching decrement runs only after
+        // this folder is received, so the count can never dip below zero.
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.sender.send(folder.to_path_buf()).is_err() {
+            // The worker is gone; the folder will never generate.
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Folders still waiting for (or undergoing) thumbnail generation.
+    pub(crate) fn pending_count(&self) -> u64 {
+        self.pending.load(Ordering::Relaxed)
+    }
+}
+
+/// Publishes the daemon liveness row: identity fixed at startup, activity
+/// and queue recomputed from the watchers and the database on every beat.
+#[derive(Clone)]
+pub(crate) struct DaemonHeartbeat {
+    database: PathBuf,
+    pid: u32,
+    started_at_ns: i64,
+}
+
+impl DaemonHeartbeat {
+    fn new(database: PathBuf) -> Self {
+        Self {
+            database,
+            pid: std::process::id(),
+            started_at_ns: crate::timestamp::now_ns(),
+        }
     }
 }
 
@@ -312,6 +433,7 @@ pub(crate) struct OwnedSupervisor {
     thumbnails: ThumbnailWorker,
     watchers: HashMap<String, ActiveWatcher>,
     last_failure: HashMap<String, Instant>,
+    heartbeat: DaemonHeartbeat,
 }
 
 /// How long the supervisor waits before restarting a watcher whose worker
@@ -322,6 +444,26 @@ const FAILED_SCAN_RETRY: Duration = Duration::from_secs(60);
 /// the cooldown following a worker exit.
 fn retry_due(last_failure: Option<Instant>, now: Instant) -> bool {
     last_failure.is_none_or(|failure| now.duration_since(failure) >= FAILED_SCAN_RETRY)
+}
+
+/// The path a watcher last reported: the file under the cursor, or the
+/// folder being listed while no file is open.
+fn current_path(live: &WatcherLive) -> Option<PathBuf> {
+    live.last_progress.as_ref().and_then(|progress| {
+        progress
+            .current_file
+            .clone()
+            .or_else(|| progress.current_folder.clone())
+    })
+}
+
+/// Whether every configured root is offline. An unreadable roots table
+/// reads as "not all offline" so the heartbeat still publishes.
+fn all_roots_offline(index: &OwnedIndex) -> bool {
+    match index.roots_with_state() {
+        Ok(roots) => !roots.is_empty() && roots.iter().all(|(_, _, state)| state == "offline"),
+        Err(_) => false,
+    }
 }
 
 struct ActiveWatcher {
@@ -336,12 +478,96 @@ impl OwnedSupervisor {
         thumbnails: ThumbnailWorker,
     ) -> Self {
         Self {
+            heartbeat: DaemonHeartbeat::new(database.clone()),
             database,
             logger,
             thumbnails,
             watchers: HashMap::new(),
             last_failure: HashMap::new(),
         }
+    }
+
+    /// Republishes the daemon liveness row from the watchers' live states
+    /// and the database's queued work. Best-effort: a transient failure
+    /// (a locked database mid-scan) is logged, never fatal, and the next
+    /// beat retries. Publishing creates the database when no folder was
+    /// ever added, so a running daemon always has a row to read.
+    pub(crate) fn publish_heartbeat(&self) {
+        let index = match OwnedIndex::open(&self.heartbeat.database) {
+            Ok(index) => index,
+            Err(error) => {
+                self.logger
+                    .record(format!("could not publish the daemon heartbeat: {error}"));
+                return;
+            }
+        };
+        let (activity, current_root, current_path) = self.current_activity(&index);
+        let queue = match index.daemon_queue_counts(self.thumbnails.pending_count()) {
+            Ok(queue) => queue,
+            Err(error) => {
+                self.logger
+                    .record(format!("could not publish the daemon heartbeat: {error}"));
+                return;
+            }
+        };
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: crate::timestamp::now_ns(),
+            activity,
+            current_root,
+            current_path,
+            queue,
+        };
+        if let Err(error) =
+            index.publish_daemon_state(self.heartbeat.pid, self.heartbeat.started_at_ns, &beat)
+        {
+            self.logger
+                .record(format!("could not publish the daemon heartbeat: {error}"));
+        }
+    }
+
+    /// What the daemon is doing right now: a scanning watcher wins over a
+    /// repairing one, thumbnails over idleness, and configured-but-missing
+    /// roots report waiting rather than idle. With several roots active at
+    /// once, any one of them may be reported; the queue totals still cover
+    /// all of them.
+    fn current_activity(
+        &self,
+        index: &OwnedIndex,
+    ) -> (DaemonActivity, Option<PathBuf>, Option<PathBuf>) {
+        let mut repairing = None;
+        for entry in self.watchers.values() {
+            // A worker that already exited reports nothing: the next pass
+            // reaps it, but this beat must not claim its stale stage.
+            if entry.watcher.is_finished() {
+                continue;
+            }
+            let live = entry.watcher.live();
+            match live.stage {
+                WorkerStage::Scanning => {
+                    return (
+                        DaemonActivity::Scanning,
+                        Some(entry.path.clone()),
+                        current_path(&live),
+                    );
+                }
+                WorkerStage::Repairing => {
+                    if repairing.is_none() {
+                        repairing = Some((entry.path.clone(), current_path(&live)));
+                    }
+                }
+                WorkerStage::Watching => {}
+            }
+        }
+        if let Some((root, path)) = repairing {
+            return (DaemonActivity::Repairing, Some(root), path);
+        }
+        if self.thumbnails.pending_count() > 0 {
+            return (DaemonActivity::Thumbnails, None, None);
+        }
+        if all_roots_offline(index) {
+            return (DaemonActivity::OfflineWaiting, None, None);
+        }
+        (DaemonActivity::Idle, None, None)
     }
 
     /// Starts watchers for newly configured roots and stops watchers whose
@@ -761,6 +987,281 @@ mod tests {
         // Still backing off: no immediate restart loop.
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 0);
+    }
+
+    #[test]
+    fn waiting_for_reconcile_returns_on_events_timeouts_and_disconnects() {
+        // An event ends the wait immediately, with no heartbeat due yet.
+        let (sender, receiver) = mpsc::channel();
+        sender.send(1).unwrap();
+        let mut beats = 0;
+        assert_eq!(
+            await_reconcile(&receiver, Duration::from_secs(10), || beats += 1),
+            ReconcileWake::Event
+        );
+        assert_eq!(beats, 0);
+
+        // Silence heartbeats while waiting, then reports the elapsed
+        // interval.
+        let (_sender, receiver): (mpsc::Sender<u8>, _) = mpsc::channel();
+        let mut beats = 0;
+        assert_eq!(
+            await_reconcile(&receiver, Duration::from_millis(100), || beats += 1),
+            ReconcileWake::Elapsed
+        );
+        assert_eq!(beats, 1);
+
+        // A dead sender ends the wait without blocking for the interval.
+        let (sender, receiver) = mpsc::channel::<u8>();
+        drop(sender);
+        assert_eq!(
+            await_reconcile(&receiver, Duration::from_secs(10), || {}),
+            ReconcileWake::Gone
+        );
+    }
+
+    #[test]
+    fn thumbnail_backlog_counts_folders_until_they_generate() {
+        let (started, started_receiver) = mpsc::channel();
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |folder| {
+            let _ = started.send(folder.to_path_buf());
+            let _ = release_receiver.recv();
+        });
+        assert_eq!(thumbnails.pending_count(), 0);
+
+        thumbnails.enqueue(Path::new("/media/one"));
+        thumbnails.enqueue(Path::new("/media/two"));
+        assert_eq!(thumbnails.pending_count(), 2);
+
+        // The first folder is generating (blocked on release); both count.
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            PathBuf::from("/media/one")
+        );
+        assert_eq!(thumbnails.pending_count(), 2);
+
+        release.send(()).unwrap();
+        assert_eq!(
+            started_receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            PathBuf::from("/media/two")
+        );
+        assert!(
+            poll_until(Duration::from_secs(10), || thumbnails.pending_count() == 1),
+            "expected the finished folder to leave the backlog"
+        );
+        release.send(()).unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || thumbnails.pending_count() == 0),
+            "expected the backlog to drain"
+        );
+    }
+
+    #[test]
+    fn heartbeat_publishes_liveness_and_follows_a_scan_to_idle() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        // No watchers yet: idle with one folder still to index.
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert!(status.running);
+        assert_eq!(status.pid, Some(std::process::id()));
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
+        assert!(status.uptime_secs.unwrap() <= 2);
+        assert!(status.heartbeat_age_secs.unwrap() <= 2);
+        assert_eq!(status.queue.pending_roots, 1);
+
+        supervisor.reconcile();
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                manager.state().unwrap().indexed_videos == 1
+            }),
+            "expected the watcher to index the new folder"
+        );
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
+        assert!(status.queue.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_reports_a_scan_in_progress() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        for number in 0..2000 {
+            write_media(&media, &format!("clip-{number:05}.mp4"));
+        }
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 1);
+        // Catch the scan early in its single directory: past the first
+        // file (so a current path is latched) but far from done.
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                supervisor.watchers.values().next().is_some_and(|entry| {
+                    let live = entry.watcher.live();
+                    live.stage == WorkerStage::Scanning
+                        && live.last_progress.as_ref().is_some_and(|progress| {
+                            progress.current_file.is_some() && progress.files_discovered < 500
+                        })
+                })
+            }),
+            "the scan never got underway"
+        );
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert!(status.running);
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Scanning)
+        );
+        assert_eq!(status.current_root, Some(media.canonicalize().unwrap()));
+        let current = status.current_path.expect("current file");
+        assert!(current.starts_with(media.canonicalize().unwrap()));
+        assert_eq!(status.queue.pending_roots, 1);
+    }
+
+    #[test]
+    fn heartbeat_ignores_watchers_whose_workers_exited() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
+
+        // A watcher whose worker already exited on its missing root row,
+        // stuck reporting the scan stage it died in.
+        let ghost = directory.path().join("ghost.sqlite3");
+        let watcher =
+            OwnedIndexWatcher::start_with_progress(&ghost, id.clone(), media.clone(), |_| {})
+                .unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || watcher.is_finished()),
+            "expected the worker to exit on its missing root row"
+        );
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        supervisor.watchers.insert(
+            id,
+            ActiveWatcher {
+                path: media,
+                watcher,
+            },
+        );
+        supervisor.publish_heartbeat();
+
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
+        assert_eq!(status.queue.pending_roots, 1);
+    }
+
+    #[test]
+    fn heartbeat_reports_waiting_when_every_root_is_offline() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 1);
+        fs::remove_dir_all(&media).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert!(status.running);
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
+        );
+        assert_eq!(status.queue.pending_roots, 1);
+    }
+
+    #[test]
+    fn heartbeat_reports_thumbnail_work_while_scans_are_idle() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |_| {
+            let _ = release_receiver.recv();
+        });
+        let mut supervisor = test_supervisor(database.clone(), thumbnails);
+        supervisor.reconcile();
+        // The scan completes and enqueues thumbnails while the generator
+        // stays blocked: scans idle, backlog outstanding.
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+                    && supervisor.thumbnails.pending_count() == 1
+            }),
+            "expected the scan to finish with thumbnails pending"
+        );
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Thumbnails)
+        );
+        assert_eq!(status.queue.pending_thumbnails, 1);
+
+        release.send(()).unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain"
+        );
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! output's `display()` does.
 
 use serde::Serializer;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Serialize a path as lossy UTF-8, for `#[serde(serialize_with = ...)]`.
 /// Valid UTF-8 serializes exactly as `PathBuf` would.
@@ -16,6 +16,19 @@ where
     S: Serializer,
 {
     serializer.serialize_str(&path.to_string_lossy())
+}
+
+/// Serialize an optional path the same way, for `#[serde(serialize_with =
+/// ...)]` on `Option<PathBuf>`: `None` stays JSON null, never an empty
+/// string a reader could mistake for a real path.
+pub fn serialize_option<S>(path: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match path {
+        Some(path) => serializer.serialize_some(&path.to_string_lossy()),
+        None => serializer.serialize_none(),
+    }
 }
 
 #[cfg(test)]
@@ -38,6 +51,23 @@ mod tests {
             serde_json::to_value(&document).unwrap()["path"],
             "/media/movies/family-trip.mp4"
         );
+    }
+
+    #[test]
+    fn missing_optional_paths_serialize_as_null() {
+        #[derive(Serialize)]
+        struct MaybeDocument {
+            #[serde(serialize_with = "super::serialize_option")]
+            path: Option<PathBuf>,
+        }
+
+        let json = serde_json::to_value(MaybeDocument { path: None }).unwrap();
+        assert!(json["path"].is_null());
+        let json = serde_json::to_value(MaybeDocument {
+            path: Some(PathBuf::from("/media/movies")),
+        })
+        .unwrap();
+        assert_eq!(json["path"], "/media/movies");
     }
 
     #[test]

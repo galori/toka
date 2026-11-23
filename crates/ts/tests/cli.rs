@@ -24,13 +24,13 @@ fn run_ts_with_fixture_env(arguments: &[&str], fixture_videos: Option<OsString>)
     run_ts_with_home(arguments, home.path(), &data_home, fixture_videos, None)
 }
 
-fn run_ts_with_home(
+fn ts_command(
     arguments: &[&str],
     home: &Path,
     data_home: &Path,
     fixture_videos: Option<OsString>,
     cwd: Option<&Path>,
-) -> Output {
+) -> Command {
     // A scratch temp space too, so even cache reads cannot escape the
     // test's directories.
     let scratch = home.join("tmp");
@@ -53,14 +53,77 @@ fn run_ts_with_home(
             command.env_remove("TS_FIXTURE_VIDEOS");
         }
     }
+    command
+}
 
-    let child = command
+fn run_ts_with_home(
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    fixture_videos: Option<OsString>,
+    cwd: Option<&Path>,
+) -> Output {
+    let child = ts_command(arguments, home, data_home, fixture_videos, cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
     wait_for_exit(child)
+}
+
+/// Starts `ts daemon run` against a scratch home and returns the live
+/// child. The caller must kill it: tests wrap their body so a failure
+/// cannot orphan a watcher on the test directories.
+fn spawn_daemon(home: &ScratchHome) -> Child {
+    ts_command(
+        &["daemon", "run"],
+        home.home.path(),
+        &home.data_home,
+        None,
+        None,
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap()
+}
+
+/// Runs a daemon test body against a live daemon, killing the daemon
+/// afterwards even when the body panics, then re-raising the failure.
+fn with_daemon(home: &ScratchHome, body: impl FnOnce() + std::panic::UnwindSafe) {
+    let mut daemon = spawn_daemon(home);
+    let result = std::panic::catch_unwind(body);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Polls `ts status --json` until `ready` accepts it or the timeout
+/// lapses. A stopped daemon still prints a document (with exit 3), so
+/// every poll either parses or fails the wait, never the test.
+fn wait_for_status(
+    home: &ScratchHome,
+    timeout: Duration,
+    mut ready: impl FnMut(&serde_json::Value) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = run_at(home, &["status", "--json"]);
+        if let Ok(document) =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout))
+        {
+            if ready(&document) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 fn wait_for_exit(mut child: Child) -> Output {
@@ -1450,4 +1513,231 @@ fn folders_add_through_a_symlink_echoes_the_stored_spelling() {
     let folders = document["folders"].as_array().unwrap();
     assert_eq!(folders.len(), 1);
     assert_eq!(folders[0]["path"], canonical.to_string_lossy().into_owned());
+}
+
+#[test]
+fn status_with_no_index_reports_a_stopped_daemon_with_exit_3() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status"]);
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Daemon:   not running\n"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn status_json_with_no_index_is_a_stopped_document() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status", "--json"]);
+
+    assert_eq!(output.status.code(), Some(3));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["running"], false);
+    assert!(document["activity"].is_null());
+    assert_eq!(document["queue"]["pendingRoots"], 0);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn status_creates_no_state_without_an_index() {
+    let home = scratch_home();
+
+    for arguments in [
+        &["status"][..],
+        &["status", "--json"][..],
+        &["status", "--watch"][..],
+    ] {
+        let output = run_ts_with_home(arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+    assert!(files_under(home.home.path()).is_empty());
+}
+
+#[test]
+fn status_with_an_unknown_option_prints_usage() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status", "--verbose"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Usage: ts status [--json] [--watch]\n"
+    );
+}
+
+#[test]
+fn daemon_help_prints_without_starting_anything() {
+    for arguments in [&["daemon", "--help"][..], &["daemon", "run", "--help"][..]] {
+        let output = run_ts(arguments, &[]);
+        assert_eq!(output.status.code(), Some(0), "{arguments:?}");
+        assert!(!output.stdout.is_empty(), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn daemon_without_a_subcommand_prints_usage() {
+    let output = run_ts(&["daemon"], &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("Usage: ts daemon"));
+}
+
+#[test]
+fn daemon_run_indexes_added_folders_until_stopped() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    create_video(&media, 0);
+    create_video(&media, 1);
+
+    // Managed inline (rather than `with_daemon`) so a timeout can report
+    // whether the daemon is still alive and what it logged before the
+    // kill discards the evidence.
+    let mut daemon = spawn_daemon(&home);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The daemon publishes its first heartbeat within seconds.
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+
+        let media_argument = media.to_string_lossy().into_owned();
+        let output = run_at(&home, &["folders", "add", &media_argument]);
+        assert_eq!(output.status.code(), Some(0));
+
+        // The daemon picks the folder up and drains its queue to idle.
+        // The wait pairs status with stats: an idle report alone could
+        // predate the add, but idle plus two indexed videos proves the
+        // daemon saw the folder and scanned it.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (finished, last_status, last_videos) = loop {
+            let output = run_at(&home, &["status", "--json"]);
+            let status_text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let idle = serde_json::from_str::<serde_json::Value>(&status_text)
+                .map(|document| {
+                    document["running"] == true
+                        && document["activity"] == "idle"
+                        && document["queue"]["pendingRoots"] == 0
+                })
+                .unwrap_or(false);
+            let videos_text = if idle {
+                let output = run_at(&home, &["stats", "--json"]);
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                None
+            };
+            let videos = videos_text
+                .as_ref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|document| document["videos"].as_u64());
+            if videos == Some(2) {
+                break (true, status_text, videos_text);
+            }
+            if Instant::now() >= deadline {
+                break (false, status_text, videos_text);
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert!(
+            finished,
+            "the daemon never finished indexing; last status: {last_status} last stats: {}",
+            last_videos.as_deref().unwrap_or("<stats never read>"),
+        );
+
+        // The heartbeat stays fresh while the daemon runs.
+        let output = run_at(&home, &["status", "--json"]);
+        assert_eq!(output.status.code(), Some(0));
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert!(document["heartbeatAgeSecs"].as_u64().unwrap() < 10);
+        assert!(document["uptimeSecs"].as_u64().is_some());
+
+        let output = run_at(&home, &["status"]);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("Daemon:   running"), "{stdout}");
+        assert!(stdout.contains("Activity: idle"), "{stdout}");
+    }));
+    // Whether the body passed or failed: is the daemon still alive, what
+    // did it say on stderr, and what did it log?
+    let daemon_state = match daemon.try_wait() {
+        Ok(None) => "alive".to_owned(),
+        status => format!("exited: {status:?}"),
+    };
+    let _ = daemon.kill();
+    let daemon_output = daemon.wait_with_output();
+    let daemon_stderr = daemon_output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+        .unwrap_or_else(|error| format!("<could not reap the daemon: {error}>"));
+    let indexer_log = indexer_log_path(&home);
+    let indexer_log_tail = fs::read_to_string(&indexer_log)
+        .map(|log| {
+            let mut lines: Vec<&str> = log.lines().collect();
+            if lines.len() > 20 {
+                lines = lines[lines.len() - 20..].to_vec();
+            }
+            lines.join("\n")
+        })
+        .unwrap_or_else(|_| "<no indexer log>".to_owned());
+    if let Err(payload) = result {
+        eprintln!("daemon state at failure: {daemon_state}");
+        eprintln!("daemon stderr at failure: {daemon_stderr}");
+        eprintln!("indexer log at failure:\n{indexer_log_tail}");
+        std::panic::resume_unwind(payload);
+    }
+
+    // A dead daemon reads as stopped: the pid is gone even though its
+    // last heartbeat is seconds old.
+    let output = run_at(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Daemon:   not running"), "{stdout}");
+}
+
+/// Where a scratch home's daemon writes its log: dirs honors
+/// XDG_DATA_HOME on Linux but derives it from HOME on macOS.
+fn indexer_log_path(home: &ScratchHome) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = home.home.path().join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = home.data_home.clone();
+    base.join(toka_search::config::APP_LOG_DIR_NAME)
+        .join("logs/indexer.log")
+}
+
+#[test]
+fn a_second_daemon_on_the_same_index_exits_with_an_error() {
+    let home = scratch_home();
+
+    with_daemon(&home, || {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the first daemon never started"
+        );
+
+        let output = run_at(&home, &["daemon", "run"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "ts daemon run: Another Toka indexer daemon is already running.\n"
+        );
+    });
 }

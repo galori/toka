@@ -2,6 +2,7 @@ use crate::{
     index_visibility,
     search::{is_supported_image, is_supported_video},
     tags,
+    timestamp::{now_ns, time_ns},
 };
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -11,15 +12,20 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const REPAIR_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Media files committed per scan transaction.
+const SCAN_BATCH_SIZE: usize = 128;
 
 const SCHEMA: &str = r#"
 CREATE TABLE schema_meta (
@@ -28,7 +34,7 @@ CREATE TABLE schema_meta (
 ) WITHOUT ROWID;
 
 INSERT INTO schema_meta (key, value) VALUES
-    ('schema_version', 1),
+    ('schema_version', 2),
     ('index_revision', 0);
 
 CREATE TABLE roots (
@@ -143,6 +149,41 @@ CREATE TABLE repair_queue (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
 ) WITHOUT ROWID;
+
+CREATE TABLE daemon_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pid INTEGER NOT NULL,
+    started_at_ns INTEGER NOT NULL,
+    heartbeat_at_ns INTEGER NOT NULL,
+    activity TEXT NOT NULL CHECK (activity IN ('idle', 'scanning', 'repairing', 'thumbnails', 'offline-waiting')),
+    current_root BLOB,
+    current_path BLOB,
+    pending_roots INTEGER NOT NULL DEFAULT 0,
+    files_remaining INTEGER NOT NULL DEFAULT 0,
+    pending_repairs INTEGER NOT NULL DEFAULT 0,
+    pending_thumbnails INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+/// Version 1 databases predate the daemon liveness row; the migration only
+/// adds the table, so existing roots, files, and scan progress survive
+/// untouched and no re-index is required.
+const MIGRATION_1_TO_2: &str = r#"
+CREATE TABLE daemon_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pid INTEGER NOT NULL,
+    started_at_ns INTEGER NOT NULL,
+    heartbeat_at_ns INTEGER NOT NULL,
+    activity TEXT NOT NULL CHECK (activity IN ('idle', 'scanning', 'repairing', 'thumbnails', 'offline-waiting')),
+    current_root BLOB,
+    current_path BLOB,
+    pending_roots INTEGER NOT NULL DEFAULT 0,
+    files_remaining INTEGER NOT NULL DEFAULT 0,
+    pending_repairs INTEGER NOT NULL DEFAULT 0,
+    pending_thumbnails INTEGER NOT NULL DEFAULT 0
+);
+
+UPDATE schema_meta SET value = 2 WHERE key = 'schema_version';
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +214,8 @@ pub enum OwnedIndexError {
     WorkerStopped,
     #[error("Toka could not fully scan {path}: {failures} path read failed.")]
     IncompleteScan { path: String, failures: u64 },
+    #[error("Toka stopped indexing {path} early.")]
+    Cancelled { path: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1035,9 +1078,99 @@ pub(crate) fn index_revision(database: &Path) -> Result<u64, OwnedIndexError> {
     OwnedIndex::open(database)?.revision()
 }
 
+/// Opens a write transaction, taking the write lock up front. Deferred
+/// transactions read first and upgrade on their first write — and when
+/// that upgrade collides with another writer's commit (the daemon
+/// heartbeat, a concurrent scan), the upgrade dies of BUSY_SNAPSHOT
+/// instead of waiting out the busy timeout. Writers queue behind each
+/// other here instead, which is what the timeout is for.
+fn write_transaction(connection: &mut Connection) -> Result<Transaction<'_>, OwnedIndexError> {
+    connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(OwnedIndexError::from)
+}
+
+/// What a watcher's worker thread is doing between filesystem events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerStage {
+    Scanning,
+    Repairing,
+    Watching,
+}
+
+/// A watcher's live state for the daemon heartbeat: its current stage plus
+/// the latest scan progress it reported.
+#[derive(Clone, Debug)]
+pub(crate) struct WatcherLive {
+    pub stage: WorkerStage,
+    pub last_progress: Option<ScanProgress>,
+}
+
+impl Default for WatcherLive {
+    fn default() -> Self {
+        Self {
+            stage: WorkerStage::Watching,
+            last_progress: None,
+        }
+    }
+}
+
+/// What a watcher shares with its worker thread: the flag `stop` sets so
+/// a scan or repair in progress aborts promptly, and the live snapshot
+/// the daemon heartbeat reads.
+#[derive(Clone)]
+pub(crate) struct WorkerShared {
+    cancel: Arc<AtomicBool>,
+    live: Arc<Mutex<WatcherLive>>,
+}
+
+impl WorkerShared {
+    fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(Mutex::new(WatcherLive::default())),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The flag to hand to cancellable scan and repair calls.
+    fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    fn set_stage(&self, stage: WorkerStage) {
+        set_stage(&self.live, stage);
+    }
+
+    fn record_progress(&self, progress: &ScanProgress) {
+        if let Ok(mut live) = self.live.lock() {
+            live.last_progress = Some(progress.clone());
+        }
+    }
+
+    fn snapshot(&self) -> WatcherLive {
+        self.live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default()
+    }
+}
+
 pub(crate) struct OwnedIndexWatcher {
     stop: mpsc::Sender<()>,
     worker: Option<JoinHandle<Result<(), OwnedIndexError>>>,
+    shared: WorkerShared,
+}
+
+/// Records a worker stage transition. Advisory only: a poisoned lock keeps
+/// the last-known stage rather than crashing the worker.
+fn set_stage(live: &Mutex<WatcherLive>, stage: WorkerStage) {
+    if let Ok(mut live) = live.lock() {
+        live.stage = stage;
+    }
 }
 
 impl OwnedIndexWatcher {
@@ -1100,12 +1233,47 @@ impl OwnedIndexWatcher {
         K: Send + 'static,
     {
         let (stop, stop_receiver) = mpsc::channel();
+        let shared = WorkerShared::new();
+        let worker_shared = shared.clone();
+        // Every progress report updates the live snapshot first, so the
+        // daemon heartbeat always shows what the scan last saw.
+        let progress_shared = shared.clone();
+        let mut on_progress = move |progress: &ScanProgress| {
+            progress_shared.record_progress(progress);
+            on_progress(progress);
+        };
         let worker = thread::Builder::new()
             .name(format!("toka-index-{root_id}"))
             .spawn(move || {
                 let _keepalive = keepalive;
-                index.scan_root(&root_id, &root, |progress| on_progress(progress))?;
-                index.repair_pending(&root_id, &root, |progress| on_progress(progress))?;
+                worker_shared.set_stage(WorkerStage::Scanning);
+                match index.scan_root_in_batches(
+                    &root_id,
+                    &root,
+                    SCAN_BATCH_SIZE,
+                    worker_shared.cancel_flag(),
+                    |progress| on_progress(progress),
+                ) {
+                    // A cancelled scan is a stop request honored, not a
+                    // failure: exit quietly and let `stop` join promptly.
+                    Err(OwnedIndexError::Cancelled { .. }) => return Ok(()),
+                    result => {
+                        result?;
+                    }
+                }
+                worker_shared.set_stage(WorkerStage::Repairing);
+                match index.repair_pending(
+                    &root_id,
+                    &root,
+                    worker_shared.cancel_flag(),
+                    |progress| on_progress(progress),
+                ) {
+                    Err(OwnedIndexError::Cancelled { .. }) => return Ok(()),
+                    result => {
+                        result?;
+                    }
+                }
+                worker_shared.set_stage(WorkerStage::Watching);
                 let mut event_state = NotifyEventState::default();
                 let mut last_repair_scan = Instant::now();
                 loop {
@@ -1118,22 +1286,38 @@ impl OwnedIndexWatcher {
                                 &mut index,
                                 &root_id,
                                 &root,
+                                &worker_shared,
                                 &mut event_state,
                                 event,
                                 &mut on_progress,
                             ) {
+                                if matches!(error, OwnedIndexError::Cancelled { .. }) {
+                                    return Ok(());
+                                }
                                 eprintln!("Toka could not apply a search index event: {error}");
                             }
                         }
                         Ok(Err(error)) => {
                             eprintln!("Toka's folder watcher missed an event: {error}");
-                            repair_root(&mut index, &root_id, &root, &mut on_progress);
+                            repair_root(
+                                &mut index,
+                                &root_id,
+                                &root,
+                                &worker_shared,
+                                &mut on_progress,
+                            );
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout)
                             if last_repair_scan.elapsed() >= REPAIR_SCAN_INTERVAL =>
                         {
-                            repair_root(&mut index, &root_id, &root, &mut on_progress);
+                            repair_root(
+                                &mut index,
+                                &root_id,
+                                &root,
+                                &worker_shared,
+                                &mut on_progress,
+                            );
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1147,10 +1331,14 @@ impl OwnedIndexWatcher {
         Ok(Self {
             stop,
             worker: Some(worker),
+            shared,
         })
     }
 
     pub(crate) fn stop(mut self) -> Result<(), OwnedIndexError> {
+        // The flag first: a worker mid-scan aborts on it, and one already
+        // in its event loop exits on the message below.
+        self.shared.cancel();
         let _ = self.stop.send(());
         match self.worker.take().expect("watcher worker missing").join() {
             Ok(result) => result,
@@ -1165,10 +1353,16 @@ impl OwnedIndexWatcher {
             .as_ref()
             .is_some_and(|worker| worker.is_finished())
     }
+
+    /// The worker's latest reported state, for the daemon heartbeat.
+    pub(crate) fn live(&self) -> WatcherLive {
+        self.shared.snapshot()
+    }
 }
 
 impl Drop for OwnedIndexWatcher {
     fn drop(&mut self) {
+        self.shared.cancel();
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1185,28 +1379,59 @@ fn repair_root(
     index: &mut OwnedIndex,
     root_id: &str,
     root: &Path,
+    shared: &WorkerShared,
     on_progress: &mut impl FnMut(&ScanProgress),
 ) {
-    if let Err(error) = index.scan_root(root_id, root, |progress| on_progress(progress)) {
-        eprintln!("Toka could not repair its search index: {error}");
+    // A cancelled repair is a stop request being honored, not a failure:
+    // stay silent and let the worker loop observe the stop message.
+    shared.set_stage(WorkerStage::Scanning);
+    if let Err(error) = index.scan_root_in_batches(
+        root_id,
+        root,
+        SCAN_BATCH_SIZE,
+        shared.cancel_flag(),
+        |progress| on_progress(progress),
+    ) {
+        shared.set_stage(WorkerStage::Watching);
+        if !matches!(error, OwnedIndexError::Cancelled { .. }) {
+            eprintln!("Toka could not repair its search index: {error}");
+        }
         return;
     }
-    if let Err(error) = index.repair_pending(root_id, root, |progress| on_progress(progress)) {
-        eprintln!("Toka could not replay its search index repairs: {error}");
+    shared.set_stage(WorkerStage::Repairing);
+    if let Err(error) = index.repair_pending(root_id, root, shared.cancel_flag(), |progress| {
+        on_progress(progress)
+    }) {
+        shared.set_stage(WorkerStage::Watching);
+        if !matches!(error, OwnedIndexError::Cancelled { .. }) {
+            eprintln!("Toka could not replay its search index repairs: {error}");
+        }
+        return;
     }
+    shared.set_stage(WorkerStage::Watching);
 }
 
 fn apply_notify_event(
     index: &mut OwnedIndex,
     root_id: &str,
     root: &Path,
+    shared: &WorkerShared,
     state: &mut NotifyEventState,
     event: Event,
     on_progress: &mut impl FnMut(&ScanProgress),
 ) -> Result<(), OwnedIndexError> {
     if event.need_rescan() {
         state.renames.clear();
-        index.scan_root(root_id, root, |progress| on_progress(progress))?;
+        shared.set_stage(WorkerStage::Scanning);
+        let result = index.scan_root_in_batches(
+            root_id,
+            root,
+            SCAN_BATCH_SIZE,
+            shared.cancel_flag(),
+            |progress| on_progress(progress),
+        );
+        shared.set_stage(WorkerStage::Watching);
+        result?;
         return Ok(());
     }
     match &event.kind {
@@ -1261,6 +1486,12 @@ impl OwnedIndex {
             0 => {
                 let transaction = connection.transaction()?;
                 transaction.execute_batch(SCHEMA)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            1 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(MIGRATION_1_TO_2)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 transaction.commit()?;
             }
@@ -1396,7 +1627,7 @@ impl OwnedIndex {
     }
 
     fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "INSERT INTO roots (
                 id, path, display_path, state, created_at_ns, updated_at_ns
@@ -1427,14 +1658,12 @@ impl OwnedIndex {
         recorded: &Path,
         canonical: &Path,
     ) -> Result<(), OwnedIndexError> {
-        // IMMEDIATE first, then SELECT inside: the file list and generation
-        // must be read under the write lock, or a concurrent scan can slip
-        // rows in between. One-time per legacy root, so no chunking; a very
-        // large legacy root holds the lock until the migration commits,
-        // bounded by the connection's busy_timeout.
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The file list and generation must be read under the write
+        // lock, or a concurrent scan can slip rows in between. One-time
+        // per legacy root, so no chunking; a very large legacy root holds
+        // the lock until the migration commits, bounded by the
+        // connection's busy_timeout.
+        let transaction = write_transaction(&mut self.connection)?;
         if another_root_holds(&transaction, root_id, canonical)? {
             return Ok(());
         }
@@ -1546,7 +1775,7 @@ impl OwnedIndex {
     }
 
     fn remove_root(&mut self, id: &str) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let removed = transaction.execute("DELETE FROM roots WHERE id = ?1", [id])?;
         if removed == 0 {
             return Err(OwnedIndexError::FolderNotConfigured);
@@ -1599,6 +1828,8 @@ impl OwnedIndex {
         Ok((videos as u64, images as u64))
     }
 
+    /// Scans one root to completion. Watchers run the cancellable batch
+    /// form below instead, so `stop` aborts a scan in progress.
     pub fn scan_root<F>(
         &mut self,
         root_id: &str,
@@ -1608,7 +1839,13 @@ impl OwnedIndex {
     where
         F: FnMut(&ScanProgress),
     {
-        self.scan_root_in_batches(root_id, root, 128, on_progress)
+        self.scan_root_in_batches(
+            root_id,
+            root,
+            SCAN_BATCH_SIZE,
+            &AtomicBool::new(false),
+            on_progress,
+        )
     }
 
     #[cfg(test)]
@@ -1622,7 +1859,13 @@ impl OwnedIndex {
     where
         F: FnMut(&ScanProgress),
     {
-        self.scan_root_in_batches(root_id, root, batch_size.max(1), on_progress)
+        self.scan_root_in_batches(
+            root_id,
+            root,
+            batch_size.max(1),
+            &AtomicBool::new(false),
+            on_progress,
+        )
     }
 
     fn scan_root_in_batches<F>(
@@ -1630,6 +1873,7 @@ impl OwnedIndex {
         root_id: &str,
         root: &Path,
         batch_size: usize,
+        cancel: &AtomicBool,
         mut on_progress: F,
     ) -> Result<ScanProgress, OwnedIndexError>
     where
@@ -1655,6 +1899,9 @@ impl OwnedIndex {
         let mut batch = Vec::with_capacity(batch_size);
 
         while let Some(directory) = pending.pop_front() {
+            if cancel.load(Ordering::Relaxed) {
+                return self.finish_cancelled_scan(&mut progress, root);
+            }
             match index_visibility::is_hidden(&directory) {
                 Ok(true) => {
                     progress.skipped_paths = progress.skipped_paths.saturating_add(1);
@@ -1697,6 +1944,12 @@ impl OwnedIndex {
                         continue;
                     }
                 };
+                // A directory can hold thousands of files, so each one is a
+                // cancellation point too: stopping a root never waits out a
+                // whole directory listing.
+                if cancel.load(Ordering::Relaxed) {
+                    return self.finish_cancelled_scan(&mut progress, root);
+                }
                 let path = entry.path();
                 match index_visibility::is_hidden(&path) {
                     Ok(true) => {
@@ -1797,7 +2050,7 @@ impl OwnedIndex {
     ) -> Result<(i64, ScanProgress), OwnedIndexError> {
         let progress = ScanProgress::new(root_id);
         let root_bytes = path_bytes(root);
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         // Update-only: a scan must never resurrect a root that was removed
         // after the caller read the roots table.
         let changed = transaction.execute(
@@ -1839,7 +2092,7 @@ impl OwnedIndex {
         batch: &mut Vec<IndexedFile>,
         progress: &mut ScanProgress,
     ) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let mut videos = 0u64;
         let mut images = 0u64;
         for file in batch.drain(..) {
@@ -1908,10 +2161,26 @@ impl OwnedIndex {
     }
 
     fn save_progress(&mut self, progress: &ScanProgress) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         persist_progress(&transaction, progress)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Aborts a scan without recording it as finished: the roots row and
+    /// the scan run stay `scanning` with partial counts, committed batches
+    /// keep their generation, and the next scan supersedes all of it — an
+    /// incomplete scan is never trusted as successful.
+    fn finish_cancelled_scan(
+        &mut self,
+        progress: &mut ScanProgress,
+        root: &Path,
+    ) -> Result<ScanProgress, OwnedIndexError> {
+        progress.touch();
+        self.save_progress(progress)?;
+        Err(OwnedIndexError::Cancelled {
+            path: root.display().to_string(),
+        })
     }
 
     fn finish_failed_scan(
@@ -1924,7 +2193,7 @@ impl OwnedIndex {
         progress.current_file = None;
         progress.error = Some(message.to_owned());
         progress.touch();
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         persist_progress(&transaction, progress)?;
         transaction.execute(
             "UPDATE roots SET state = 'error', updated_at_ns = ?2 WHERE id = ?1",
@@ -1944,7 +2213,7 @@ impl OwnedIndex {
         progress.current_file = None;
         progress.error = None;
         progress.touch();
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "DELETE FROM root_files
              WHERE root_id = ?1 AND scan_generation != ?2",
@@ -2018,6 +2287,122 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
+    /// Replaces the single daemon liveness row with this heartbeat. The
+    /// daemon is the only writer; `ts status` only reads.
+    pub(crate) fn publish_daemon_state(
+        &self,
+        pid: u32,
+        started_at_ns: i64,
+        beat: &crate::daemon_state::DaemonBeat,
+    ) -> Result<(), OwnedIndexError> {
+        self.connection.execute(
+            "INSERT INTO daemon_state (
+                id, pid, started_at_ns, heartbeat_at_ns, activity,
+                current_root, current_path,
+                pending_roots, files_remaining, pending_repairs, pending_thumbnails
+             ) VALUES (
+                1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                pid = excluded.pid,
+                started_at_ns = excluded.started_at_ns,
+                heartbeat_at_ns = excluded.heartbeat_at_ns,
+                activity = excluded.activity,
+                current_root = excluded.current_root,
+                current_path = excluded.current_path,
+                pending_roots = excluded.pending_roots,
+                files_remaining = excluded.files_remaining,
+                pending_repairs = excluded.pending_repairs,
+                pending_thumbnails = excluded.pending_thumbnails",
+            params![
+                i64::from(pid),
+                started_at_ns,
+                beat.heartbeat_at_ns,
+                beat.activity.as_database(),
+                beat.current_root.as_deref().map(path_bytes),
+                beat.current_path.as_deref().map(path_bytes),
+                database_count(beat.queue.pending_roots),
+                database_count(beat.queue.files_remaining),
+                database_count(beat.queue.pending_repairs),
+                database_count(beat.queue.pending_thumbnails),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn read_daemon_state(
+        &self,
+    ) -> Result<Option<crate::daemon_state::DaemonStateRow>, OwnedIndexError> {
+        self.connection
+            .query_row(
+                "SELECT pid, started_at_ns, heartbeat_at_ns, activity,
+                    current_root, current_path,
+                    pending_roots, files_remaining, pending_repairs, pending_thumbnails
+                 FROM daemon_state
+                 WHERE id = 1",
+                [],
+                |row| {
+                    let pid: i64 = row.get(0)?;
+                    Ok(crate::daemon_state::DaemonStateRow {
+                        // A pid that does not fit (or zero, which signals a
+                        // process group rather than a process) can never be
+                        // alive, so it reads as unknown.
+                        pid: u32::try_from(pid).ok().filter(|pid| *pid != 0),
+                        started_at_ns: row.get(1)?,
+                        heartbeat_at_ns: row.get(2)?,
+                        activity: crate::daemon_state::DaemonActivity::from_database(
+                            &row.get::<_, String>(3)?,
+                        )?,
+                        current_root: row.get::<_, Option<Vec<u8>>>(4)?.map(path_from_bytes),
+                        current_path: row.get::<_, Option<Vec<u8>>>(5)?.map(path_from_bytes),
+                        queue: crate::daemon_state::DaemonQueue {
+                            pending_roots: row.get::<_, i64>(6)? as u64,
+                            files_remaining: row.get::<_, i64>(7)?.max(0) as u64,
+                            pending_repairs: row.get::<_, i64>(8)? as u64,
+                            pending_thumbnails: row.get::<_, i64>(9)? as u64,
+                        },
+                    })
+                },
+            )
+            .optional()
+            .map_err(OwnedIndexError::from)
+    }
+
+    /// The queued work the daemon publishes with its heartbeat: roots not
+    /// fully indexed, files seen but uncommitted by scans in progress, and
+    /// queued repairs, plus the thumbnail backlog the caller counts live.
+    pub(crate) fn daemon_queue_counts(
+        &self,
+        pending_thumbnails: u64,
+    ) -> Result<crate::daemon_state::DaemonQueue, OwnedIndexError> {
+        let pending_roots: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM roots WHERE state != 'ready'",
+            [],
+            |row| row.get(0),
+        )?;
+        // Only each root's latest run counts: an older 'scanning' row is
+        // history from a generation a later scan superseded.
+        let files_remaining: Option<i64> = self.connection.query_row(
+            "SELECT SUM(files_discovered - files_indexed)
+             FROM scan_runs
+             WHERE state = 'scanning'
+               AND generation = (
+                    SELECT scan_generation FROM roots WHERE id = scan_runs.root_id
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_repairs: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM repair_queue", [], |row| row.get(0))?;
+        Ok(crate::daemon_state::DaemonQueue {
+            pending_roots: pending_roots as u64,
+            files_remaining: files_remaining.unwrap_or(0).max(0) as u64,
+            pending_repairs: pending_repairs as u64,
+            pending_thumbnails,
+        })
+    }
+
     pub(crate) fn synchronize_path(
         &mut self,
         root_id: &str,
@@ -2074,7 +2459,7 @@ impl OwnedIndex {
         else {
             return self.remove_indexed_path(root_id, path);
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let generation: i64 = transaction.query_row(
             "SELECT scan_generation FROM roots WHERE id = ?1",
             [root_id],
@@ -2194,7 +2579,7 @@ impl OwnedIndex {
             }
             file_ids
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         for file_id in file_ids {
             transaction.execute(
                 "DELETE FROM root_files WHERE root_id = ?1 AND file_id = ?2",
@@ -2258,6 +2643,7 @@ impl OwnedIndex {
         &mut self,
         root_id: &str,
         root: &Path,
+        cancel: &AtomicBool,
         mut on_progress: F,
     ) -> Result<usize, OwnedIndexError>
     where
@@ -2269,9 +2655,16 @@ impl OwnedIndex {
             .into_iter()
             .filter(|repair| repair.path.starts_with(root))
         {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(OwnedIndexError::Cancelled {
+                    path: root.display().to_string(),
+                });
+            }
             let result = if repair.reason == "direct rename" {
-                self.scan_root(root_id, root, |progress| on_progress(progress))
-                    .map(|_| ())
+                self.scan_root_in_batches(root_id, root, SCAN_BATCH_SIZE, cancel, |progress| {
+                    on_progress(progress)
+                })
+                .map(|_| ())
             } else {
                 self.try_synchronize_path(root_id, root, &repair.path)
             };
@@ -2282,6 +2675,11 @@ impl OwnedIndex {
                         [path_bytes(&repair.path)],
                     )?;
                     repaired += 1;
+                }
+                // A cancelled repair stays queued for the next run; only a
+                // genuine failure is re-queued with its error.
+                Err(error) if matches!(error, OwnedIndexError::Cancelled { .. }) => {
+                    return Err(error);
                 }
                 Err(error) => {
                     self.queue_repair(&repair.path, &repair.reason, &error.to_string())?;
@@ -2369,7 +2767,7 @@ impl OwnedIndex {
             }
             moved_files
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.query_row(
             "SELECT scan_generation FROM roots WHERE id = ?1",
             [root_id],
@@ -2519,19 +2917,6 @@ fn folders_search_text(path: &Path) -> String {
         .to_lowercase()
 }
 
-fn now_ns() -> i64 {
-    time_ns(SystemTime::now()).unwrap_or_default()
-}
-
-fn time_ns(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
-        Err(error) => i64::try_from(error.duration().as_nanos())
-            .ok()
-            .and_then(i64::checked_neg),
-    }
-}
-
 #[cfg(unix)]
 fn path_bytes(path: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -2649,7 +3034,7 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         for table in [
             "schema_meta",
             "roots",
@@ -2658,6 +3043,7 @@ mod tests {
             "search_docs",
             "scan_runs",
             "repair_queue",
+            "daemon_state",
         ] {
             assert!(tables.contains(table), "missing table {table}");
         }
@@ -4330,7 +4716,17 @@ mod tests {
         let event = Event::new(EventKind::Any).set_flag(notify::event::Flag::Rescan);
         let mut state = NotifyEventState::default();
 
-        apply_notify_event(&mut index, "root", &root, &mut state, event, &mut |_| {}).unwrap();
+        let shared = WorkerShared::new();
+        apply_notify_event(
+            &mut index,
+            "root",
+            &root,
+            &shared,
+            &mut state,
+            event,
+            &mut |_| {},
+        )
+        .unwrap();
 
         assert!(indexed_display_paths(&index).contains(missed.to_string_lossy().as_ref()));
     }
@@ -4557,7 +4953,13 @@ mod tests {
         assert_eq!(repairs[0].reason, "direct update");
         assert!(repairs[0].last_error.is_some());
 
-        assert_eq!(reopened.repair_pending("root", &root, |_| {}).unwrap(), 1);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            reopened
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
         assert!(reopened.pending_repairs().unwrap().is_empty());
     }
 
@@ -4582,10 +4984,12 @@ mod tests {
         )))
         .add_path(from.clone())
         .set_tracker(7);
+        let shared = WorkerShared::new();
         apply_notify_event(
             &mut index,
             "root",
             &root,
+            &shared,
             &mut state,
             from_event,
             &mut |_| {},
@@ -4599,7 +5003,16 @@ mod tests {
         )))
         .add_path(to.clone())
         .set_tracker(7);
-        apply_notify_event(&mut index, "root", &root, &mut state, to_event, &mut |_| {}).unwrap();
+        apply_notify_event(
+            &mut index,
+            "root",
+            &root,
+            &shared,
+            &mut state,
+            to_event,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.join("clip.mp4").to_string_lossy().into_owned()])
@@ -4629,7 +5042,13 @@ mod tests {
         assert_eq!(repairs[0].path, to);
         assert_eq!(repairs[0].reason, "direct rename");
 
-        assert_eq!(index.repair_pending("root", &root, |_| {}).unwrap(), 1);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            index
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.to_string_lossy().into_owned()])
@@ -5200,5 +5619,318 @@ mod tests {
             let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} was not private", entry.path().display());
         }
+    }
+
+    #[test]
+    fn opening_a_version_1_database_migrates_it_without_touching_roots() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 1: drop the liveness table and both
+            // version markers.
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open(&database).unwrap();
+
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let meta: i64 = index
+            .connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta, 2);
+        // Roots, files, and progress survive; nothing needs rescanning.
+        let roots = index.roots_with_state().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].2, "ready");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+        assert!(index.read_daemon_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn daemon_heartbeat_round_trips_through_the_liveness_row() {
+        let (_directory, index) = open_index();
+        assert!(index.read_daemon_state().unwrap().is_none());
+
+        let queue = crate::daemon_state::DaemonQueue {
+            pending_roots: 2,
+            files_remaining: 40,
+            pending_repairs: 1,
+            pending_thumbnails: 3,
+        };
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 2_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Scanning,
+            current_root: Some(PathBuf::from("/media")),
+            current_path: Some(PathBuf::from("/media/a.mp4")),
+            queue: queue.clone(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+        assert_eq!(row.pid, Some(1234));
+        assert_eq!(row.started_at_ns, 1_000_000_000);
+        assert_eq!(row.heartbeat_at_ns, 2_000_000_000);
+        assert_eq!(row.activity, crate::daemon_state::DaemonActivity::Scanning);
+        assert_eq!(row.current_root, Some(PathBuf::from("/media")));
+        assert_eq!(row.current_path, Some(PathBuf::from("/media/a.mp4")));
+        assert_eq!(row.queue, queue);
+
+        // A second heartbeat replaces the row instead of adding one.
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 3_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Idle,
+            current_root: None,
+            current_path: None,
+            queue: crate::daemon_state::DaemonQueue::default(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+        assert_eq!(row.heartbeat_at_ns, 3_000_000_000);
+        assert_eq!(row.activity, crate::daemon_state::DaemonActivity::Idle);
+        assert_eq!(row.current_root, None);
+        let count: i64 = index
+            .connection
+            .query_row("SELECT COUNT(*) FROM daemon_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn daemon_queue_counts_pending_roots_files_and_repairs() {
+        let directory = tempdir().unwrap();
+        let ready_root = directory.path().join("ready");
+        let busy_root = directory.path().join("busy");
+        std::fs::create_dir(&ready_root).unwrap();
+        std::fs::create_dir(&busy_root).unwrap();
+        let ready_root = ready_root.canonicalize().unwrap();
+        let busy_root = busy_root.canonicalize().unwrap();
+        std::fs::write(ready_root.join("clip.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("ready", &ready_root).unwrap();
+        index.scan_root("ready", &ready_root, |_| {}).unwrap();
+        index.insert_root("busy", &busy_root).unwrap();
+        // A scan generation in progress: fifty files seen, thirty indexed.
+        index
+            .connection
+            .execute(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'busy'",
+                [],
+            )
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('busy', 1, 'scanning', 3, 50, 30, 0, 0)",
+                [],
+            )
+            .unwrap();
+        index
+            .queue_repair(&busy_root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+
+        let queue = index.daemon_queue_counts(7).unwrap();
+
+        assert_eq!(queue.pending_roots, 1);
+        assert_eq!(queue.files_remaining, 20);
+        assert_eq!(queue.pending_repairs, 1);
+        assert_eq!(queue.pending_thumbnails, 7);
+
+        // A superseded generation's stale 'scanning' row does not count.
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('busy', 0, 'scanning', 1, 1000, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(index.daemon_queue_counts(0).unwrap().files_remaining, 20);
+    }
+
+    #[test]
+    fn a_cancelled_scan_is_not_recorded_as_successful() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let error = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap_err();
+        assert!(
+            matches!(error, OwnedIndexError::Cancelled { .. }),
+            "expected Cancelled, got {error}"
+        );
+
+        // The roots row and the run stay 'scanning': nothing claims the
+        // aborted scan finished.
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+        let progress = index.scan_progress("root").unwrap().expect("partial run");
+        assert_eq!(progress.phase, ScanPhase::Scanning);
+
+        // A fresh scan completes honestly afterwards.
+        let cancel = AtomicBool::new(false);
+        let progress = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "ready");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+    }
+
+    #[test]
+    fn cancelling_mid_scan_keeps_finished_writes_and_rescans_cleanly() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip-a.mp4"), b"video").unwrap();
+        std::fs::write(root.join("clip-b.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+
+        // Abort right after the first batch commits: the write must stand
+        // while the scan itself must not count as finished.
+        let cancel = AtomicBool::new(false);
+        let mut indexed = 0u64;
+        let result = index.scan_root_in_batches("root", &root, 1, &cancel, |progress| {
+            if progress.files_indexed > indexed {
+                indexed = progress.files_indexed;
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+
+        assert_eq!(indexed, 1);
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+
+        let cancel = AtomicBool::new(false);
+        let progress = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(indexed_display_paths(&index).len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_repair_stays_queued_for_the_next_run() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index
+            .queue_repair(&root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let result = index.repair_pending("root", &root, &cancel, |_| {});
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(index.pending_repairs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stopping_a_watcher_mid_scan_cancels_promptly() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        // Enough files that the scan is provably still early when the
+        // stop lands: cancelling below file 500 of 2000 leaves the bulk
+        // of the walk unvisited, so 'ready' afterwards is impossible
+        // without the cancellation working.
+        for number in 0..2000 {
+            // Long names keep each file's index work well above the
+            // stop latency, so the race below always resolves to cancel.
+            let name = format!("clip-{number:05}-with-a-long-name-to-index-properly.mp4");
+            std::fs::write(root.join(name), b"video").unwrap();
+        }
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+
+        let watcher =
+            OwnedIndexWatcher::start_with_progress(&database, "root".into(), root, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let live = watcher.live();
+            let early = live.last_progress.as_ref().is_some_and(|progress| {
+                live.stage == WorkerStage::Scanning && progress.files_discovered < 500
+            });
+            if early {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scan never got underway: {live:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = Instant::now();
+        watcher.stop().unwrap();
+        // An anti-hang bound, not a performance claim: aborting is instant,
+        // waiting out the scan would take the tens of seconds a full walk
+        // of 2000 files needs.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "stop waited out the scan"
+        );
+
+        let index = OwnedIndex::open(&database).unwrap();
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+        let progress = index.scan_progress("root").unwrap().expect("partial run");
+        assert_eq!(progress.phase, ScanPhase::Scanning);
     }
 }

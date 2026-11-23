@@ -3,8 +3,10 @@ use std::{
     ffi::{OsStr, OsString},
     io::Write,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use toka_search::{
+    daemon_state::{self, DaemonActivity, DaemonStatus},
     index_stats::{self, IndexStats},
     owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
     search::{MediaType, SearchEngine, SearchFields, SearchRequest, VideoResult, PAGE_SIZE},
@@ -14,11 +16,17 @@ use toka_search::{
 /// before parsing.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
+const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
+const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether the indexer daemon is running and what it is doing: its process, uptime, current activity (idle, scanning, repairing, thumbnails, or offline-waiting), the folder and file under the cursor, and the work still queued. Exits 3 when the daemon is not running, so scripts can branch on it. Changes nothing.\n\n  --json       Print one JSON document (schema 1) instead of the report\n  --watch      Re-render in place every second until the daemon turns idle";
+const DAEMON_HELP: &str =
+    "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
+const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
+const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command; a second daemon on the same index exits with an error instead of starting. Do not run it alongside the Toka app on macOS: the app still keeps its own watchers there until it switches to ts, and two supervisors must never share one index.";
 const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]      Add a folder to the index\n  remove <path> [--json]   Remove a folder from the index\n  list [--json]            List the folders the index watches";
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing.";
@@ -78,6 +86,8 @@ pub fn run_command(
     sync_rename: impl FnOnce(&Path, &Path) -> Result<(), String>,
     make_thumbnail: impl FnOnce(&Path) -> Result<PathBuf, String>,
     make_preview: impl FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
+    read_status: impl FnMut() -> Result<DaemonStatus, String>,
+    run_daemon: impl FnOnce() -> Result<(), String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -137,6 +147,16 @@ pub fn run_command(
 
     if command == OsStr::new("preview") {
         return run_preview_command(&arguments[2..], make_preview, stdout, stderr);
+    }
+
+    if command == OsStr::new("status") {
+        return run_status_command(&arguments[2..], read_status, stdout, stderr);
+    }
+
+    // Hidden on purpose: `daemon run` is the service manager's entry
+    // point, not an interactive command, so it stays out of the help.
+    if command == OsStr::new("daemon") {
+        return run_daemon_command(&arguments[2..], run_daemon, stdout, stderr);
     }
 
     let _ = writeln!(stderr, "{GENERAL_HELP}");
@@ -602,6 +622,179 @@ fn run_preview_command(
     0
 }
 
+fn run_status_command(
+    arguments: &[OsString],
+    mut read_status: impl FnMut() -> Result<DaemonStatus, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(STATUS_HELP, stdout, stderr);
+    }
+    let Some((json, watch)) = parse_status_arguments(arguments) else {
+        let _ = writeln!(stderr, "{STATUS_USAGE}");
+        return 2;
+    };
+    if watch {
+        return run_status_watch(
+            read_status,
+            json,
+            || std::thread::sleep(Duration::from_secs(1)),
+            stdout,
+            stderr,
+        );
+    }
+
+    let status = match read_status() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts status: {error}");
+            return 1;
+        }
+    };
+    print_status(&status, json, stdout, stderr)
+}
+
+/// Nothing, `--json`, `--watch`, or both: the whole argument language of
+/// `status`. `None` is a usage error for the caller to report.
+fn parse_status_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
+    let mut json = false;
+    let mut watch = false;
+    for argument in arguments {
+        if argument == OsStr::new("--json") {
+            json = true;
+        } else if argument == OsStr::new("--watch") {
+            watch = true;
+        } else {
+            return None;
+        }
+    }
+    Some((json, watch))
+}
+
+/// Prints one status snapshot. Exit 3 when the daemon is not running, so
+/// scripts can branch on it; the report itself still prints.
+fn print_status(
+    status: &DaemonStatus,
+    json: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let stopped = if status.running { 0 } else { 3 };
+    if json {
+        // The struct already serializes to this document's shape; only the
+        // schema version is the CLI's own. Paths inside serialize lossy, so
+        // non-UTF-8 names cannot break encoding.
+        let mut document = match serde_json::to_value(status) {
+            Ok(document) => document,
+            Err(error) => {
+                let _ = writeln!(stderr, "ts status: could not encode results: {error}");
+                return 1;
+            }
+        };
+        document["schema"] = serde_json::json!(JSON_SCHEMA_VERSION);
+        return match print_json(&document, "ts status", stdout, stderr) {
+            0 => stopped,
+            code => code,
+        };
+    }
+    let report = daemon_state::render(status);
+    match write!(stdout, "{report}").and_then(|()| stdout.flush()) {
+        Ok(()) => stopped,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts status: could not write: {error}");
+            1
+        }
+    }
+}
+
+/// Re-reads the daemon status until it turns idle or stops: `--watch`.
+/// Human output clears the screen between renders; `--json` streams one
+/// document per line instead, so it stays machine-readable.
+fn run_status_watch(
+    mut read_status: impl FnMut() -> Result<DaemonStatus, String>,
+    json: bool,
+    mut wait: impl FnMut(),
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let mut first = true;
+    loop {
+        let status = match read_status() {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = writeln!(stderr, "ts status: {error}");
+                return 1;
+            }
+        };
+        if !json && !first {
+            // Re-render in place; plain `ts status` stays pipe-safe.
+            if write!(stdout, "\x1b[2J\x1b[H").is_err() {
+                let _ = writeln!(stderr, "ts status: could not write");
+                return 1;
+            }
+        }
+        first = false;
+        let code = print_status(&status, json, stdout, stderr);
+        if code != 0 {
+            // A write or encode error (1), or a stopped daemon (3).
+            return code;
+        }
+        if status.activity == Some(DaemonActivity::Idle) {
+            return 0;
+        }
+        wait();
+    }
+}
+
+fn run_daemon_command(
+    arguments: &[OsString],
+    run_daemon: impl FnOnce() -> Result<(), String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(DAEMON_HELP, stdout, stderr);
+    }
+    let Some((subcommand, rest)) = arguments.split_first() else {
+        let _ = writeln!(stderr, "{DAEMON_HELP}");
+        return 2;
+    };
+    if subcommand == OsStr::new("run") {
+        return run_daemon_run_command(rest, run_daemon, stdout, stderr);
+    }
+    let _ = writeln!(stderr, "{DAEMON_HELP}");
+    2
+}
+
+fn run_daemon_run_command(
+    arguments: &[OsString],
+    run_daemon: impl FnOnce() -> Result<(), String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(DAEMON_RUN_HELP, stdout, stderr);
+    }
+    if !arguments.is_empty() {
+        let _ = writeln!(stderr, "{DAEMON_RUN_USAGE}");
+        return 2;
+    }
+    match run_daemon() {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts daemon run: {error}");
+            1
+        }
+    }
+}
+
 /// Paths plus an optional `--json`: the argument language of the small
 /// path-taking commands. `--` ends option parsing so a path starting with
 /// a dash stays addressable, exactly as in search. The caller checks the
@@ -1048,6 +1241,7 @@ mod tests {
     };
     use tempfile::tempdir;
     use toka_search::{
+        daemon_state::{DaemonActivity, DaemonQueue, DaemonStatus},
         index_stats::{FolderState, FolderStats, IndexStats},
         owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState, ScannedDirectory},
         search::{SearchEngine, SearchError, SearchProvider},
@@ -1092,6 +1286,14 @@ mod tests {
 
     fn no_preview(_path: &Path) -> Result<Vec<PathBuf>, String> {
         panic!("this command must not make previews")
+    }
+
+    fn no_status() -> Result<DaemonStatus, String> {
+        panic!("this command must not read the daemon status")
+    }
+
+    fn no_daemon_run() -> Result<(), String> {
+        panic!("this command must not run the daemon")
     }
 
     #[test]
@@ -1139,6 +1341,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1149,6 +1353,7 @@ mod tests {
             for command in [
                 "search",
                 "stats",
+                "status",
                 "folders",
                 "sync-path",
                 "sync-rename",
@@ -1158,6 +1363,9 @@ mod tests {
             ] {
                 assert!(output.contains(command), "{output}");
             }
+            // The service manager's entry point stays hidden: no
+            // command row of its own (the status row still names it).
+            assert!(!output.contains("\n  daemon"), "{output}");
             assert!(stderr.is_empty());
         }
     }
@@ -1219,6 +1427,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1249,6 +1459,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1280,6 +1492,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1310,6 +1524,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1356,6 +1572,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1402,6 +1620,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1450,6 +1670,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1508,6 +1730,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1555,6 +1779,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1582,6 +1808,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1636,6 +1864,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1679,6 +1909,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1710,6 +1942,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1752,6 +1986,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1811,6 +2047,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1867,6 +2105,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1911,6 +2151,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1950,6 +2192,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -1992,6 +2236,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2030,6 +2276,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2076,6 +2324,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2112,6 +2362,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2153,6 +2405,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2186,6 +2440,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2218,6 +2474,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2249,6 +2507,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2287,6 +2547,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2322,6 +2584,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2358,6 +2622,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2405,6 +2671,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2436,6 +2704,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2479,6 +2749,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2510,6 +2782,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2539,6 +2813,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2560,6 +2836,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2612,6 +2890,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2642,6 +2922,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2685,6 +2967,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2746,6 +3030,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2797,6 +3083,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2833,6 +3121,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2861,6 +3151,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2907,6 +3199,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2942,6 +3236,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -2971,6 +3267,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3009,6 +3307,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3044,6 +3344,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3079,6 +3381,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3129,6 +3433,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3166,6 +3472,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3223,6 +3531,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3255,6 +3565,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3287,6 +3599,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3323,6 +3637,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3358,6 +3674,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3390,6 +3708,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3423,6 +3743,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3457,6 +3779,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3495,6 +3819,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3528,6 +3854,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3563,6 +3891,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3594,6 +3924,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3633,6 +3965,8 @@ mod tests {
             },
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3672,6 +4006,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3709,6 +4045,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3744,6 +4082,8 @@ mod tests {
             |_, _| Err("Toka could not use its search index: bad database".to_owned()),
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3775,6 +4115,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3813,6 +4155,8 @@ mod tests {
                 Ok(PathBuf::from("/tmp/toka-thumbnails/abc123.jpg"))
             },
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3845,6 +4189,8 @@ mod tests {
             no_sync_rename,
             |_| Ok(PathBuf::from("/tmp/toka-thumbnails/abc123.jpg")),
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3882,6 +4228,8 @@ mod tests {
             no_sync_rename,
             |_| Ok(generated.clone()),
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3921,6 +4269,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3956,6 +4306,8 @@ mod tests {
             no_sync_rename,
             |_| Err("Toka could not make a thumbnail for /media/movies/clip.mp4.".to_owned()),
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -3987,6 +4339,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4028,6 +4382,8 @@ mod tests {
                     PathBuf::from("/tmp/toka-thumbnails/abc-preview-1.jpg"),
                 ])
             },
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -4065,6 +4421,8 @@ mod tests {
                     PathBuf::from("/tmp/toka-thumbnails/abc-preview-1.jpg"),
                 ])
             },
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -4107,6 +4465,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4140,6 +4500,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             no_preview,
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -4171,6 +4533,8 @@ mod tests {
             no_sync_rename,
             no_thumbnail,
             |_| Err("Toka could not make a preview for /media/movies/clip.mp4.".to_owned()),
+            no_status,
+            no_daemon_run,
             &mut stdout,
             &mut stderr,
         );
@@ -4202,6 +4566,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4238,6 +4604,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4269,6 +4637,8 @@ mod tests {
                 no_sync_rename,
                 no_thumbnail,
                 no_preview,
+                no_status,
+                no_daemon_run,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4285,6 +4655,574 @@ mod tests {
                 option_env!("TOKA_GIT_SHA").or(Some("development"))
             );
             assert!(stderr.is_empty());
+        }
+    }
+
+    fn running_daemon() -> DaemonStatus {
+        DaemonStatus {
+            running: true,
+            pid: Some(1234),
+            uptime_secs: Some(65),
+            heartbeat_age_secs: Some(1),
+            activity: Some(DaemonActivity::Scanning),
+            current_root: Some(PathBuf::from("/media")),
+            current_path: Some(PathBuf::from("/media/a.mp4")),
+            queue: DaemonQueue {
+                pending_roots: 1,
+                files_remaining: 12,
+                pending_repairs: 0,
+                pending_thumbnails: 0,
+            },
+            service_running: Some(true),
+        }
+    }
+
+    fn stopped_daemon() -> DaemonStatus {
+        DaemonStatus {
+            running: false,
+            pid: Some(1234),
+            uptime_secs: Some(90),
+            heartbeat_age_secs: Some(30),
+            activity: None,
+            current_root: None,
+            current_path: None,
+            queue: DaemonQueue::default(),
+            service_running: Some(false),
+        }
+    }
+
+    fn idle_daemon() -> DaemonStatus {
+        DaemonStatus {
+            running: true,
+            pid: Some(1234),
+            uptime_secs: Some(65),
+            heartbeat_age_secs: Some(1),
+            activity: Some(DaemonActivity::Idle),
+            current_root: None,
+            current_path: None,
+            queue: DaemonQueue::default(),
+            service_running: None,
+        }
+    }
+
+    #[test]
+    fn status_help_prints_without_reading_anything() {
+        for flag in ["-h", "--help"] {
+            let args = ["ts", "status", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                no_status,
+                no_daemon_run,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            let output = String::from_utf8(stdout).unwrap();
+            assert!(output.contains(super::STATUS_USAGE), "{output}");
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn status_reports_a_running_daemon_and_succeeds() {
+        let args = ["ts", "status"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Ok(running_daemon()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Daemon:   running"), "{output}");
+        assert!(output.contains("Activity: scanning"), "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn status_reports_a_stopped_daemon_with_exit_3() {
+        let args = ["ts", "status"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Ok(stopped_daemon()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 3);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Daemon:   not running"), "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn status_json_is_a_versioned_document_and_keeps_exit_3() {
+        for stopped in [false, true] {
+            let args = ["ts", "status", "--json"].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let snapshot = if stopped {
+                stopped_daemon()
+            } else {
+                running_daemon()
+            };
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                || Ok(snapshot.clone()),
+                no_daemon_run,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, if stopped { 3 } else { 0 });
+            let output = String::from_utf8(stdout).unwrap();
+            let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(document["schema"], 1);
+            assert_eq!(document["running"], !stopped);
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn status_rejects_unknown_options_with_usage() {
+        let args = ["ts", "status", "--verbose"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("{}\n", super::STATUS_USAGE)
+        );
+    }
+
+    #[test]
+    fn status_read_failure_returns_a_failure_status() {
+        let args = ["ts", "status"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Err::<DaemonStatus, _>("the index is locked".to_owned()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts status: the index is locked\n"
+        );
+    }
+
+    #[test]
+    fn status_watch_on_an_idle_daemon_renders_once_without_waiting() {
+        let args = ["ts", "status", "--watch"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Ok(idle_daemon()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn status_watch_on_a_stopped_daemon_exits_3_without_waiting() {
+        let args = ["ts", "status", "--watch"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Ok(stopped_daemon()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 3);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Daemon:   not running"), "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_rerenders_until_idle_and_waits_between() {
+        let mut reads = [running_daemon(), running_daemon(), idle_daemon()].into_iter();
+        let waits = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(waits.get(), 2);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: scanning").count(), 2, "{output}");
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
+        // The first render prints plainly; later ones clear the screen.
+        assert!(!output.starts_with("\x1b[2J\x1b[H"), "{output:?}");
+        assert_eq!(output.matches("\x1b[2J\x1b[H").count(), 2, "{output:?}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_streams_json_documents_without_clearing() {
+        let mut reads = [running_daemon(), idle_daemon()].into_iter();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            true,
+            || {},
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(!output.contains('\x1b'), "{output:?}");
+        assert_eq!(output.matches("\"schema\": 1").count(), 2, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_stops_with_exit_3_when_the_daemon_stops() {
+        let mut reads = [running_daemon(), stopped_daemon()].into_iter();
+        let waits = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 3);
+        assert_eq!(waits.get(), 1);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Activity: scanning"), "{output}");
+        assert!(output.contains("Daemon:   not running"), "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_read_failure_returns_a_failure_status() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Err::<DaemonStatus, _>("the index is locked".to_owned()),
+            false,
+            || {},
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts status: the index is locked\n"
+        );
+    }
+
+    #[test]
+    fn daemon_help_prints_without_running_anything() {
+        for args in [
+            &["ts", "daemon", "--help"][..],
+            &["ts", "daemon", "run", "--help"][..],
+        ] {
+            let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                no_status,
+                no_daemon_run,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{args:?}");
+            assert!(!stdout.is_empty());
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn daemon_without_a_subcommand_prints_usage() {
+        let args = ["ts", "daemon"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("{}\n", super::DAEMON_HELP)
+        );
+    }
+
+    #[test]
+    fn daemon_unknown_subcommand_prints_usage() {
+        let args = ["ts", "daemon", "stop"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .unwrap()
+            .contains(super::DAEMON_HELP));
+    }
+
+    #[test]
+    fn daemon_run_rejects_arguments_with_usage() {
+        let args = ["ts", "daemon", "run", "--foreground"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("{}\n", super::DAEMON_RUN_USAGE)
+        );
+    }
+
+    #[test]
+    fn daemon_run_reports_the_daemon_result() {
+        for result in [
+            Ok(()),
+            Err("Another Toka indexer daemon is already running.".to_owned()),
+        ] {
+            let args = ["ts", "daemon", "run"].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                no_status,
+                || result.clone(),
+                &mut stdout,
+                &mut stderr,
+            );
+
+            if result.is_ok() {
+                assert_eq!(status, 0);
+                assert!(stdout.is_empty());
+                assert!(stderr.is_empty());
+            } else {
+                assert_eq!(status, 1);
+                assert!(stdout.is_empty());
+                assert_eq!(
+                    String::from_utf8(stderr).unwrap(),
+                    "ts daemon run: Another Toka indexer daemon is already running.\n"
+                );
+            }
         }
     }
 }

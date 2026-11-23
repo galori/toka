@@ -579,7 +579,7 @@ fn has_live_session(directory: &Path) -> bool {
     })
 }
 
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
