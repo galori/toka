@@ -92,7 +92,7 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/*.dmg
-            dist/*.app.tar.gz
-            dist/*.deb
-            dist/*.AppImage
+            dist/**/*.dmg
+            dist/**/*.app.tar.gz
+            dist/**/*.deb
+            dist/**/*.AppImage
