@@ -3371,6 +3371,16 @@ impl OwnedIndex {
                 }
             }
         }
+        // Recheck after the last row: a stop landing between the final
+        // per-row check and the commit below must still roll everything
+        // back — otherwise the rename commits while the destination sync
+        // reports it cancelled.
+        if cancel.load(Ordering::Relaxed) {
+            drop(transaction);
+            return Err(OwnedIndexError::Cancelled {
+                path: to.display().to_string(),
+            });
+        }
         transaction.execute(
             "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
             [],
@@ -7590,13 +7600,17 @@ mod tests {
         assert_eq!(before.len(), 3);
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancel);
+        let planned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&planned);
 
         // The stop arrives while planning is still reading rows: the
         // first planned row raises it, the next row's check honors it —
-        // long before the rewrite transaction opens.
+        // long before the rewrite transaction opens. The count proves
+        // the per-row check fired, not just the post-planning one.
         let result = with_sync_step_probe(
             move |site| {
                 if site == SyncProbeSite::RenamePlanned {
+                    counted.fetch_add(1, Ordering::Relaxed);
                     stop.store(true, Ordering::Relaxed);
                 }
             },
@@ -7607,6 +7621,7 @@ mod tests {
             matches!(result, Err(OwnedIndexError::Cancelled { .. })),
             "expected Cancelled, got {result:?}"
         );
+        assert_eq!(planned.load(Ordering::Relaxed), 1);
         assert_eq!(indexed_display_paths(&index), before);
         let repairs = index.pending_repairs().unwrap();
         assert_eq!(repairs.len(), 1);
@@ -7653,6 +7668,41 @@ mod tests {
             "the rewrite transaction must never open"
         );
         assert_eq!(indexed_display_paths(&index), before);
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+    }
+
+    #[test]
+    fn a_rename_cancelled_on_its_only_row_rolls_back_before_commit() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(1);
+        let before = indexed_display_paths(&index);
+        let revision = index_revision(&index);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+
+        // A single moved file: the stop lands on its only rewrite, past
+        // every per-row check, so only the pre-commit recheck can still
+        // roll the transaction back.
+        let result = with_sync_step_probe(
+            move |site| {
+                if site == SyncProbeSite::RenameRewritten {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            || index.synchronize_rename("root", &root, &from, &to, &cancel),
+        );
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(indexed_display_paths(&index), before);
+        assert_eq!(
+            index_revision(&index),
+            revision,
+            "the revision bump must roll back with the rewrite"
+        );
         let repairs = index.pending_repairs().unwrap();
         assert_eq!(repairs.len(), 1);
         assert_eq!(repairs[0].path, to);
