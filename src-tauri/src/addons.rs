@@ -762,13 +762,13 @@ mod tests {
                 AddonActionSummary {
                     addon_id: "tiktok".into(),
                     action_id: "creator-search".into(),
-                    label: "Show this creator in Toka".into(),
+                    label: "Toka search".into(),
                     effects: vec!["New Toka window".into()],
                 },
                 AddonActionSummary {
                     addon_id: "tiktok".into(),
                     action_id: "creator-profile".into(),
-                    label: "Open this creator on TikTok".into(),
+                    label: "Tiktok profile".into(),
                     effects: vec!["tiktok.com".into()],
                 },
             ]
