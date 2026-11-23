@@ -173,21 +173,10 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         offline_roots,
         service_running,
     };
-    // A missing index is a stopped daemon, not an error — but any other
-    // metadata failure (permissions, I/O) must surface as one, and a
-    // non-file at the index path is a broken setup, not a stopped daemon.
-    // (`is_file` answers false for all three, which used to report every
-    // metadata failure as a stopped daemon with exit 3 instead of exit 1.)
-    match std::fs::metadata(database) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stopped(0)),
-        Err(error) => return Err(format!("Toka could not read its search index: {error}")),
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(format!(
-                "Toka's search index path is not a file: {}",
-                database.display()
-            ))
-        }
-        Ok(_) => {}
+    // A missing index is a stopped daemon, not an error; anything else
+    // uses the shared read taxonomy so the exit codes cannot drift.
+    if !crate::owned_index::index_file_for_inspection(database)? {
+        return Ok(stopped(0));
     }
     let index = crate::owned_index::OwnedIndex::open_read_only(database)
         .map_err(|error| error.to_string())?;

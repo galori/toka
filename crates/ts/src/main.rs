@@ -82,23 +82,11 @@ fn create_engine_with_logger(logger: SearchLogger) -> Result<SearchEngine, Strin
     #[cfg(not(feature = "fixtures"))]
     {
         let database = owned_index::database_path()?;
-        match std::fs::metadata(&database) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(SearchEngine::new_with_logger(
-                    Arc::new(EmptyProvider),
-                    Arc::new(logger),
-                ));
-            }
-            Err(error) => {
-                return Err(format!("Toka could not read its search index: {error}"));
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(format!(
-                    "Toka's search index path is not a file: {}",
-                    database.display()
-                ));
-            }
-            Ok(_) => {}
+        if !owned_index::index_file_for_inspection(&database)? {
+            return Ok(SearchEngine::new_with_logger(
+                Arc::new(EmptyProvider),
+                Arc::new(logger),
+            ));
         }
     }
     let provider = search_provider()?;

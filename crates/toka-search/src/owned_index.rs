@@ -760,7 +760,9 @@ struct ManagedRootWatcher {
 /// error, and a non-file at the index path is a broken setup, not an
 /// empty index — `is_file` answers false for all three, which used to
 /// report every metadata failure as a healthy-empty index with exit 0.
-fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
+/// The single taxonomy for every read command (`ts` and status alike),
+/// so the exit codes cannot drift apart again.
+pub fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
     match fs::metadata(database) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("Toka could not read its search index: {error}")),
@@ -777,7 +779,7 @@ fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
 /// startup acquisition and a yielded manager's re-acquisition go through
 /// here: the lock file lives beside the index, and either path can run
 /// with the whole folder gone.
-fn ensure_index_parent(database: &Path) -> Result<(), String> {
+pub(crate) fn ensure_index_parent(database: &Path) -> Result<(), String> {
     if let Some(parent) = database.parent() {
         fs::create_dir_all(parent).map_err(|source| {
             OwnedIndexError::Permissions {
@@ -1690,8 +1692,35 @@ fn apply_notify_event(
     Ok(())
 }
 
+/// Reads SQLite's `user_version` from raw header bytes (offset 60) without
+/// opening the database, so refusing an unknown schema cannot mutate
+/// anything — not even WAL sidecars or a hot-journal rollback, both of
+/// which a `Connection::open` performs. Returns `None` when the file is
+/// missing or too short to hold a header, or when the magic is wrong;
+/// all three fall through to the normal open path below, which handles
+/// creation and corrupt files exactly as before.
+fn pre_open_user_version(path: &Path) -> Option<i64> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header).ok()?;
+    if header[0..16] != *b"SQLite format 3\0" {
+        return None;
+    }
+    Some(i64::from(u32::from_be_bytes([
+        header[60], header[61], header[62], header[63],
+    ])))
+}
+
 impl OwnedIndex {
     pub fn open(path: &Path) -> Result<Self, OwnedIndexError> {
+        // Refuse unknown schemas before opening at all: even opening can
+        // create -shm sidecars or roll back a hot journal.
+        if let Some(version) = pre_open_user_version(path) {
+            if version != 0 && version != 1 && version != SCHEMA_VERSION {
+                return Err(OwnedIndexError::UnsupportedSchema(version));
+            }
+        }
         // The parent must exist before SQLite can open inside it; creating
         // it is the only filesystem effect before the version check below.
         if let Some(parent) = path.parent() {
@@ -6974,6 +7003,71 @@ mod tests {
             .pragma_update(None, "user_version", 2)
             .unwrap();
         OwnedIndex::open(&database).unwrap();
+    }
+
+    fn dir_listing(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn refusing_a_newer_wal_database_touches_neither_bytes_nor_sidecars() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // A newer app's index: version 999, WAL mode with live sidecars.
+        // Refusal happens from raw header bytes before any open, so it
+        // cannot create -shm, roll back a hot journal, or touch modes —
+        // by construction, not just by ordering inside open().
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 999)
+            .unwrap();
+        let held = Connection::open(&database).unwrap();
+        held.execute_batch("CREATE TABLE probe(x); INSERT INTO probe VALUES (1);")
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let wal_before =
+            std::fs::read(PathBuf::from(format!("{}-wal", database.display()))).unwrap();
+        let listing_before = dir_listing(directory.path());
+
+        let result = OwnedIndex::open(&database);
+
+        assert!(matches!(
+            result,
+            Err(OwnedIndexError::UnsupportedSchema(999))
+        ));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert_eq!(
+            std::fs::read(PathBuf::from(format!("{}-wal", database.display()))).unwrap(),
+            wal_before
+        );
+        assert_eq!(dir_listing(directory.path()), listing_before);
+        drop(held);
+    }
+
+    #[test]
+    fn open_retries_the_wal_flip_past_a_reserved_lock() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // RESERVED lets the version probe read but blocks the WAL flip's
+        // EXCLUSIVE lock — and PRAGMA bypasses busy_timeout, so without
+        // the application-level retry this open fails instantly with BUSY.
+        let blocker = Connection::open(&database).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        OwnedIndex::open(&database).unwrap();
+
+        releaser.join().unwrap();
     }
 
     #[test]

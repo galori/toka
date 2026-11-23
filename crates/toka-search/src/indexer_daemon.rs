@@ -209,10 +209,7 @@ fn await_reconcile<T>(
 /// removed while the window is closed apply on the next wake-up.
 pub fn run_daemon() -> Result<(), String> {
     let database = crate::owned_index::database_path()?;
-    if let Some(parent) = database.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Toka could not create its index folder: {error}"))?;
-    }
+    crate::owned_index::ensure_index_parent(&database)?;
     // One supervisor per index: a second one would interleave scan
     // generations with the first and mark partial scans ready.
     let _daemon_lock = try_acquire_daemon_lock(&database)?
@@ -599,9 +596,27 @@ impl OwnedSupervisor {
     /// always picks up the latest configuration. Does nothing until the owned
     /// database exists, so it stays out of the way until folders are added.
     pub(crate) fn reconcile(&mut self) {
-        if !self.database.is_file() {
-            self.stop_all();
-            return;
+        match std::fs::metadata(&self.database) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.stop_all();
+                return;
+            }
+            Err(error) => {
+                self.logger.record(format!(
+                    "owned index watcher pass failed: cannot read index metadata: {error}"
+                ));
+                self.stop_all();
+                return;
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                self.logger.record(format!(
+                    "owned index watcher pass failed: index path is not a file: {}",
+                    self.database.display()
+                ));
+                self.stop_all();
+                return;
+            }
+            Ok(_) => {}
         }
         let index = match OwnedIndex::open(&self.database) {
             Ok(index) => index,
@@ -942,6 +957,56 @@ mod tests {
         assert_eq!(
             state.folders[0].status,
             crate::owned_index::OwnedFolderStatus::Offline
+        );
+    }
+
+    #[test]
+    fn reconcile_stops_watchers_and_logs_when_the_database_is_unreadable() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+        let log = directory.path().join("indexer.log");
+        let mut supervisor = OwnedSupervisor::new(
+            database.clone(),
+            Arc::new(IndexLogger::new(log.clone())),
+            quiet_thumbnails(),
+        );
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 1);
+
+        // A directory at the database path is a broken setup, not a
+        // missing index: watchers stop and the pass is logged.
+        fs::remove_file(&database).unwrap();
+        fs::create_dir(&database).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("index path is not a file"), "{log_text}");
+    }
+
+    #[test]
+    fn reconcile_logs_metadata_failures_instead_of_reading_them_as_missing() {
+        let directory = tempdir().unwrap();
+        // Overlong names fail metadata deterministically, even as root.
+        let database = directory.path().join("x".repeat(300));
+        let log = directory.path().join("indexer.log");
+        let mut supervisor = OwnedSupervisor::new(
+            database,
+            Arc::new(IndexLogger::new(log.clone())),
+            quiet_thumbnails(),
+        );
+
+        supervisor.reconcile();
+
+        assert_eq!(supervisor.active_count(), 0);
+        let log_text = fs::read_to_string(&log).unwrap();
+        assert!(
+            log_text.contains("cannot read index metadata"),
+            "{log_text}"
         );
     }
 

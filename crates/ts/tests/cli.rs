@@ -539,17 +539,33 @@ fn search_on_a_newer_schema_errors_instead_of_searching() {
     let home = scratch_home();
     write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
 
-    let output = run_ts_with_home(
-        &["search", "family"],
-        home.home.path(),
-        &home.data_home,
-        None,
-        None,
-    );
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("schema version 999"), "{stderr}");
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_on_a_corrupt_index_errors_instead_of_listing() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -557,14 +573,16 @@ fn stats_on_a_corrupt_index_errors_instead_of_reporting() {
     let home = scratch_home();
     write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
 
-    let output = run_ts_with_home(&["stats"], home.home.path(), &home.data_home, None, None);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("could not use its search index"),
-        "{stderr}"
-    );
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
 }
 
 #[cfg(not(feature = "fixtures"))]
@@ -573,20 +591,16 @@ fn search_on_a_corrupt_index_errors_instead_of_searching() {
     let home = scratch_home();
     write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
 
-    let output = run_ts_with_home(
-        &["search", "family"],
-        home.home.path(),
-        &home.data_home,
-        None,
-        None,
-    );
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("could not use its search index"),
-        "{stderr}"
-    );
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
 }
 
 #[cfg(feature = "fixtures")]
@@ -1820,6 +1834,71 @@ fn status_creates_no_state_without_an_index() {
         assert!(output.stderr.is_empty(), "{arguments:?}");
     }
     assert!(files_under(home.home.path()).is_empty());
+}
+
+#[test]
+fn status_on_a_newer_schema_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_on_a_corrupt_index_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_with_an_unreadable_index_errors_instead_of_reporting_stopped() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_with_a_directory_at_the_index_path_errors_instead_of_reporting_stopped() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
 }
 
 #[test]
