@@ -3688,6 +3688,43 @@ mod tests {
     }
 
     #[test]
+    fn sync_rename_with_an_empty_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "sync-rename", "", "/media/new.mp4"],
+            vec!["ts", "sync-rename", "/media/old.mp4", ""],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(
+                stderr.contains("A path must not be empty."),
+                "{arguments:?}"
+            );
+            assert!(stderr.contains(super::SYNC_RENAME_USAGE), "{arguments:?}");
+        }
+    }
+
+    #[test]
     fn sync_rename_failure_returns_a_failure_status() {
         let args = ["ts", "sync-rename", "/media/old.mp4", "/media/new.mp4"]
             .map(OsString::from)
@@ -4083,6 +4120,35 @@ mod tests {
                 "{arguments:?}"
             );
         }
+    }
+
+    #[test]
+    fn preview_with_an_empty_path_is_a_usage_error() {
+        let args = ["ts", "preview", ""].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("A path must not be empty."));
+        assert!(stderr.contains(super::PREVIEW_USAGE));
     }
 
     #[test]
