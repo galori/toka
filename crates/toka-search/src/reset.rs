@@ -138,6 +138,23 @@ fn remove(target: &ResetTarget) -> Result<bool, String> {
     if let Some(refusal) = refuse_unless_removable(target) {
         return Err(refusal);
     }
+    // The operation follows the target KIND, never the observed metadata:
+    // a file-only target always removes with `remove_file`, so a directory
+    // swapped in after the check above fails cleanly instead of being
+    // deleted recursively. Only declared-directory targets may remove
+    // recursively — and they still dispatch on metadata, so a file at a
+    // directory target's path removes as a file.
+    if !target.recursive {
+        return match fs::remove_file(&target.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(_) if is_dir_now(&target.path) => Err(refusal(&target.path)),
+            Err(error) => Err(format!(
+                "could not remove {}: {error}",
+                target.path.display()
+            )),
+        };
+    }
     let metadata = match fs::symlink_metadata(&target.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -158,9 +175,16 @@ fn remove(target: &ResetTarget) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Whether `path` reads as a directory right now: message selection only,
+/// after a file-only removal already failed — the failure itself is what
+/// keeps the directory intact.
+fn is_dir_now(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply, ResetPlan, ResetTarget};
+    use super::{apply, remove, ResetPlan, ResetTarget};
     use std::fs;
     use tempfile::tempdir;
 
@@ -267,5 +291,47 @@ mod tests {
         assert!(report.removed.is_empty());
         assert!(media.is_file(), "media inside survives");
         assert!(sibling.is_file(), "the sibling survives too");
+    }
+
+    #[test]
+    fn removal_of_a_file_target_never_deletes_a_directory() {
+        // Straight at `remove`, past the pre-check: a directory sitting at
+        // a file-only artifact's path — as a swap after the check would
+        // leave it — refuses with its contents intact, because file-only
+        // targets always remove with `remove_file`.
+        let root = tempdir().unwrap();
+        let artifact = root.path().join("index.sqlite3");
+        fs::create_dir(&artifact).unwrap();
+        let media = artifact.join("clip.mp4");
+        fs::write(&media, b"video").unwrap();
+
+        let error = remove(&ResetTarget::file(artifact.clone())).unwrap_err();
+
+        assert!(
+            error.contains("refusing to remove") && error.contains("index.sqlite3"),
+            "{error}"
+        );
+        assert!(media.is_file(), "contents survive the refusal");
+        assert!(artifact.is_dir(), "the directory itself survives");
+    }
+
+    #[test]
+    fn removal_of_a_file_target_unlinks_without_following_symlinks() {
+        // A symlink at a file-only target's path unlinks the link itself —
+        // `remove_file` never follows it into the target.
+        let root = tempdir().unwrap();
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("clip.mp4"), b"video").unwrap();
+        let link = root.path().join("search.log");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&target, &link).unwrap();
+
+        assert!(remove(&ResetTarget::file(link.clone())).unwrap());
+
+        assert!(!link.exists() && fs::symlink_metadata(&link).is_err());
+        assert!(target.join("clip.mp4").is_file());
     }
 }

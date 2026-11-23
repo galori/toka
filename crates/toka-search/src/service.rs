@@ -262,6 +262,13 @@ fn purge_data_paths() -> Result<Vec<crate::reset::ResetTarget>, String> {
         .map(ResetTarget::file)
         .collect();
     paths.extend(crate::search_log::reset_paths());
+    // The daemon's own log: on macOS it sits outside the search-log folder
+    // removed wholesale above, so it needs its own file-only target —
+    // file-only, so unrelated files beside it survive. Where the wholesale
+    // folder already covers it the plan drops this as nested, a no-op.
+    if let Ok(log) = crate::indexer_daemon::indexer_log_path() {
+        paths.push(ResetTarget::file(log));
+    }
     paths.push(ResetTarget::dir(crate::thumbnails::cache_output_root()));
     paths.push(ResetTarget::dir(
         crate::thumbnails::legacy_cache_output_root(),
@@ -269,14 +276,16 @@ fn purge_data_paths() -> Result<Vec<crate::reset::ResetTarget>, String> {
     Ok(paths)
 }
 
-/// The XDG assignments a service file pins: every base directory the
-/// installing shell set to a non-default absolute location. A daemon
+/// The XDG assignments a service file pins: the EFFECTIVE base
+/// directories the installing shell resolves, defaults included. A daemon
 /// inherits its manager's environment, not the installing shell's, so
-/// without the pinning an `XDG_DATA_HOME` set only in the shell would
-/// leave the daemon watching the default index while the CLI used the
-/// custom one. Unset, default-equal, relative, and empty values pin
-/// nothing: `dirs` ignores the last three (falls back to the default),
-/// and an unset variable resolves identically on both sides.
+/// pinning only non-default values splits the brain whenever the two
+/// sides disagree about the default: a manager with
+/// `XDG_DATA_HOME=/srv/toka-data` and a shell that leaves it unset (or
+/// sets it explicitly to `~/.local/share`) would otherwise open two
+/// different indexes. An unset, relative, or empty value resolves to the
+/// default — `dirs` ignores the last two — so the default pins; only a
+/// non-empty absolute value pins itself.
 fn pinned_service_env(
     home: &Path,
     xdg_data_home: Option<&str>,
@@ -287,11 +296,12 @@ fn pinned_service_env(
         ("XDG_CONFIG_HOME", ".config", xdg_config_home),
     ]
     .into_iter()
-    .filter_map(|(name, default, value)| {
-        let value = value.filter(|value| !value.is_empty())?;
-        let path = Path::new(value);
-        (path.is_absolute() && path != home.join(default))
-            .then(|| (name.to_owned(), value.to_owned()))
+    .map(|(name, default, value)| {
+        let effective = value
+            .filter(|value| !value.is_empty() && Path::new(value).is_absolute())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| home.join(default).to_string_lossy().into_owned());
+        (name.to_owned(), effective)
     })
     .collect()
 }
@@ -335,10 +345,10 @@ fn link_path(home: &Path) -> PathBuf {
 /// `ts daemon run` instead of `toka --indexer`. `Type=exec` waits for the
 /// daemon's execve before reporting started, so a missing binary fails
 /// the start instead of silently running nothing. `env` pins the XDG
-/// locations the installing shell set (see [`pinned_service_env`]), one
-/// `Environment=` line each, so the daemon resolves the same index the
-/// CLI used. Fails when the executable path — or a pinned value — cannot
-/// survive its line.
+/// locations the installing shell resolves (see [`pinned_service_env`]),
+/// one `Environment=` line each, so the daemon resolves the same index
+/// the CLI used. Fails when the executable path — or a pinned value —
+/// cannot survive its line.
 pub fn render_unit(executable: &Path, env: &[(String, String)]) -> Result<String, String> {
     let mut environment = String::new();
     for (name, value) in env {
@@ -378,7 +388,7 @@ fn systemd_escape(text: &str, what: &str) -> Result<String, String> {
 /// invisible and background thumbnail generation would silently fail. A
 /// fixed `PATH` stays correct when Homebrew is installed later, which
 /// resolving absolute tool paths at install time would not. `env` pins
-/// the XDG locations the installing shell set (see
+/// the XDG locations the installing shell resolves (see
 /// [`pinned_service_env`]) beside that `PATH`, so the agent resolves
 /// the same index the CLI used.
 pub fn render_plist(executable: &Path, env: &[(String, String)]) -> String {
@@ -719,6 +729,10 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     let home = host.home();
     let unit = unit_path(&host.config_dir());
     let name = crate::config::TS_SERVICE_NAME;
+    // Held for the whole install: a second installer waits here, then sees
+    // this one's converged state instead of interleaving marker set/clear
+    // with it (see [`InstallLock`]).
+    let _install_lock = with_outcome(acquire_install_lock(&unit), &mut outcome)?;
 
     // Read before the rewrite: the manager still reports the installed
     // executable, which the takeover note below compares against.
@@ -775,7 +789,8 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     // A pending marker — or a stop that would land after the report —
     // reloads: stop (unless provably stopped) plus start, verified loaded
     // before the marker clears. Anything else converges cheaply: running
-    // is already-held state, stopped or unreadable just starts.
+    // is already-held state, stopped starts, and unreadable starts
+    // without claiming a state change.
     let liveness = systemd_liveness(host, name, unit.is_file());
     if marker_set || liveness == Liveness::Deactivating {
         let stopped = liveness == Liveness::Stopped;
@@ -792,9 +807,15 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
         with_outcome(clear_reload_marker(&marker), &mut outcome)?;
     } else if liveness == Liveness::Active {
         outcome.already(format!("{name} is already running"));
-    } else {
+    } else if liveness == Liveness::Stopped {
         with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
         outcome.did(format!("started {name}"));
+    } else {
+        // Unreadable probe: the start is still requested, but no state
+        // change is claimed — the probe may have been interrupted while
+        // active, in which case systemd accepts the request as a no-op.
+        with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
+        outcome.already(format!("systemd accepted the start request for {name}"));
     }
 
     ensure_linger(host, &mut outcome);
@@ -870,6 +891,95 @@ fn clear_reload_marker(marker: &Path) -> Result<(), String> {
     }
 }
 
+/// The inter-process install lock beside a service file: held for the
+/// whole install, from the first read to the last write. The marker alone
+/// cannot serialize two installers — one sets it and writes its revision,
+/// the other sets it and writes a newer one, then exits before its reload
+/// succeeds, and the first clears the marker afterwards: the file holds
+/// the new revision, the marker is gone, the service still runs the old
+/// one, and a retry sees matching bytes with no marker and reports
+/// convergence. With the lock a second installer waits here instead, then
+/// sees the first installer's converged state. The lock file itself stays
+/// behind, empty and inert; dropping the guard releases the lock.
+#[cfg(unix)]
+struct InstallLock {
+    _file: std::fs::File,
+}
+
+/// No mutual exclusion where `flock` does not exist: service management
+/// only ships on Unix, so this guard is a compile-time stand-in.
+#[cfg(not(unix))]
+struct InstallLock;
+
+/// The lock file [`acquire_install_lock`] holds: beside the service file,
+/// so installers for one service meet on one lock.
+#[cfg(unix)]
+fn install_lock_path(service_file: &Path) -> PathBuf {
+    let name = service_file
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "service".to_owned());
+    service_file.with_file_name(format!("{name}.install.lock"))
+}
+
+/// Takes the install lock for `service_file`, waiting while another
+/// installer holds it.
+#[cfg(unix)]
+fn acquire_install_lock(service_file: &Path) -> Result<InstallLock, String> {
+    let path = install_lock_path(service_file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
+    use std::os::fd::AsRawFd;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(InstallLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(format!("could not lock {}: {error}", path.display()));
+        }
+    }
+}
+
+/// Takes the install lock for `service_file` without waiting: `Ok(None)`
+/// while another installer holds it. The serialization test's probe.
+#[cfg(all(unix, test))]
+fn try_acquire_install_lock(service_file: &Path) -> Result<Option<InstallLock>, String> {
+    let path = install_lock_path(service_file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|error| format!("could not lock {}: {error}", path.display()))?;
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(None);
+        }
+        return Err(format!("could not lock {}: {error}", path.display()));
+    }
+    Ok(Some(InstallLock { _file: file }))
+}
+
+#[cfg(not(unix))]
+fn acquire_install_lock(_service_file: &Path) -> Result<InstallLock, String> {
+    Ok(InstallLock)
+}
+
 /// Confirms the reloaded unit landed in the manager: anything but an
 /// unreadable answer. Loaded-but-stopped counts — the manager has the
 /// current file, and running-ness is runtime state `ts status` reports.
@@ -893,11 +1003,23 @@ fn migrate_legacy_service(host: &mut impl Host, outcome: &mut Outcome) -> Result
     let legacy = crate::config::INDEXER_SERVICE_NAME;
     let file = legacy_unit_path(&host.home());
     let present = file.is_file();
-    let liveness = systemd_liveness(host, legacy, present);
-    // No file and no confirmed daemon: nothing to migrate. An unreadable
-    // answer proceeds like launchd's fileless uninstall — there is no
-    // legacy file to remove, so a stop can only fail the install.
-    if !present && !matches!(liveness, Liveness::Active | Liveness::Deactivating) {
+    let mut liveness = systemd_liveness(host, legacy, present);
+    // An unreadable probe is indeterminate, never absence: the legacy file
+    // may be gone while its daemon stays loaded, and skipping migration
+    // would start the new service beside a daemon that still owns the lock
+    // the new one needs. Retry once for a transient interruption, then
+    // refuse before starting anything new.
+    if liveness == Liveness::Unknown {
+        liveness = systemd_liveness(host, legacy, present);
+    }
+    if liveness == Liveness::Unknown {
+        return Err(format!(
+            "could not ask systemd about the old {legacy}, and it may still be running: \
+             refusing to install the new service beside it."
+        ));
+    }
+    // No file and a confirmed stop: nothing to migrate.
+    if !present && liveness == Liveness::Stopped {
         outcome.already(format!("no old {legacy} to migrate"));
         return Ok(false);
     }
@@ -1085,57 +1207,66 @@ impl PreStop {
 /// Stops, disables, and removes one unit, returning whether its file was
 /// removed. The daemon stops whenever it might run — including when
 /// systemd cannot say about an installed file — and a stop failure aborts
-/// before anything is deleted. With no file installed and no answer from
-/// the manager there is nothing to remove, so the uninstall proceeds like
-/// launchd's instead of failing on a stop. The `ts` unit reports its own
-/// absence; the legacy one stays silent when there was never anything to
-/// migrate. The probe is threaded in from the uninstall's single pass,
-/// never re-read: a unit the pre-stop already stopped is not stopped
-/// again.
+/// before anything is deleted. A fileless unit keeps its own path (see
+/// [`remove_fileless_systemd_service`]). The probe is threaded in from the
+/// uninstall's single pass, never re-read: a unit the pre-stop already
+/// stopped is not stopped again.
 fn remove_systemd_service(
     host: &mut impl Host,
     outcome: &mut Outcome,
     probed: &PreStop,
 ) -> Result<bool, String> {
+    if !probed.present {
+        return remove_fileless_systemd_service(host, outcome, probed);
+    }
     let unit = probed.unit;
     let file = &probed.file;
-    let present = probed.present;
-    let liveness = probed.liveness;
-    if liveness == Liveness::Stopped && !present {
-        if probed.report_absent {
-            outcome.already(format!("{unit} is not installed"));
-        }
-        return Ok(false);
-    }
-    // No file and the manager cannot say: proceed, like launchd — there
-    // is nothing installed to remove, and a purge's lock check still
-    // refuses while a live daemon holds the lock.
-    if liveness == Liveness::Unknown && !present {
-        if probed.report_absent {
-            outcome.already(format!("{unit} is not installed"));
-        }
-        return Ok(false);
-    }
-    if liveness.might_run() && !probed.stopped {
+    if probed.liveness.might_run() && !probed.stopped {
         systemd_command(host, &["stop", unit])?;
         outcome.did(format!("stopped {unit}"));
     }
-    if present {
-        systemd_command(host, &["disable", unit])?;
-        outcome.did(format!("disabled {unit}"));
-        std::fs::remove_file(file)
-            .map_err(|error| format!("could not remove {}: {error}", file.display()))?;
-        outcome.did(format!("removed {}", display_path(&host.home(), file)));
-        // A failed install's leftover marker goes with the unit: without
-        // the service it is inert litter, and the next install sets its
-        // own. Best effort — the uninstall already converged.
-        let _ = std::fs::remove_file(marker_path(file));
-        return Ok(true);
+    systemd_command(host, &["disable", unit])?;
+    outcome.did(format!("disabled {unit}"));
+    std::fs::remove_file(file)
+        .map_err(|error| format!("could not remove {}: {error}", file.display()))?;
+    outcome.did(format!("removed {}", display_path(&host.home(), file)));
+    // A failed install's leftover marker goes with the unit: without
+    // the service it is inert litter, and the next install sets its
+    // own. Best effort — the uninstall already converged.
+    let _ = std::fs::remove_file(marker_path(file));
+    Ok(true)
+}
+
+/// Stops and disables one unit with no file under the config dir,
+/// returning false — there is never a file to remove. The daemon stops
+/// from the FIRST probe whenever it might run, unless the purge pre-stop
+/// already stopped it; with no file installed and no answer from the
+/// manager there is nothing to stop, so the uninstall proceeds like
+/// launchd's instead of failing on a stop. Enablement is then decided on
+/// its own probe, independently of the stop: a unit the manager loads
+/// from outside the config dir (say its `$XDG_DATA_HOME`) is fileless
+/// here yet enabled, and skipping the disable would restart it at the
+/// next login. The `ts` unit reports its own absence; the legacy one
+/// stays silent when there was never anything to migrate.
+fn remove_fileless_systemd_service(
+    host: &mut impl Host,
+    outcome: &mut Outcome,
+    probed: &PreStop,
+) -> Result<bool, String> {
+    let unit = probed.unit;
+    let liveness = probed.liveness;
+    if liveness != Liveness::Unknown && liveness.might_run() && !probed.stopped {
+        systemd_command(host, &["stop", unit])?;
+        outcome.did(format!("stopped {unit}"));
     }
-    // No file, but the daemon ran: drop the dangling enablement, gated
-    // on `is-enabled` (see [`disable_if_enabled`]).
     if disable_if_enabled(host, unit)? {
         outcome.did(format!("disabled {unit}"));
+        return Ok(false);
+    }
+    if liveness == Liveness::Stopped || liveness == Liveness::Unknown {
+        if probed.report_absent {
+            outcome.already(format!("{unit} is not installed"));
+        }
     } else {
         outcome.already(format!("{unit} is not enabled"));
     }
@@ -1375,6 +1506,8 @@ fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     let home = host.home();
     let plist = plist_path(&home);
     let label = crate::config::TS_LAUNCHD_LABEL;
+    // Held for the whole install, as on systemd (see [`InstallLock`]).
+    let _install_lock = with_outcome(acquire_install_lock(&plist), &mut outcome)?;
 
     // Read before the rewrite: the installed executable, which the
     // takeover note below compares against.
@@ -3905,6 +4038,40 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_purge_disables_a_stopped_but_enabled_fileless_unit() {
+        // A unit the manager loads from outside the config dir reads as
+        // fileless here; confirmed stopped, it still must be disabled —
+        // deciding the disable from the stop would leave it restarting at
+        // the next login.
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .enabled
+            .insert("toka-search.service".into(), true);
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert!(
+            !host.calls_to("disable toka-search.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action == "disabled toka-search.service"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(!host.script.borrow().enabled["toka-search.service"]);
+    }
+
+    #[test]
     fn an_activating_daemon_is_stopped_not_skipped() {
         let mut host = Fake::new();
         perform_on(
@@ -4338,7 +4505,11 @@ mod tests {
     }
 
     #[test]
-    fn install_stops_a_legacy_daemon_it_cannot_confirm_stopped() {
+    fn install_refuses_a_legacy_daemon_it_cannot_probe() {
+        // An unreadable legacy probe is indeterminate even with the legacy
+        // file present: stopping blind could fail the install, and skipping
+        // could strand a live legacy daemon — so the install refuses after
+        // one retry, removing nothing.
         let mut host = Fake::new();
         let legacy = legacy_unit_path(&host.home());
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
@@ -4348,25 +4519,30 @@ mod tests {
             .active_unknown
             .insert("toka-indexer.service".into());
 
-        let outcome = perform_on(
+        let (error, _) = perform_on(
             &mut host,
             ServiceManager::Systemd,
             ServiceOp::Install { link: false },
         )
-        .unwrap();
+        .unwrap_err();
 
+        assert!(error.contains("refusing to install"), "{error}");
+        assert_eq!(
+            host.calls_to("is-active toka-indexer.service").len(),
+            2,
+            "one probe plus one retry: {:?}",
+            host.calls
+        );
         assert!(
-            !host.calls_to("stop toka-indexer.service").is_empty(),
+            host.calls_to("stop toka-indexer").is_empty(),
             "{:?}",
             host.calls
         );
-        assert!(!legacy.exists());
+        assert!(legacy.exists(), "a refused migration removes nothing");
         assert!(
-            host.changed(&outcome)
-                .iter()
-                .any(|action| action == "stopped the old toka-indexer.service"),
-            "{}",
-            host.changed(&outcome).join("\n")
+            host.calls_to("start toka-search").is_empty(),
+            "{:?}",
+            host.calls
         );
     }
 
@@ -4978,32 +5154,99 @@ mod tests {
     }
 
     #[test]
-    fn install_migration_proceeds_when_the_manager_is_unreachable() {
-        // The legacy check cannot stop what it cannot see — and with no
-        // legacy file there is nothing to migrate — so the install fails
-        // later, at the reload, having attempted no legacy stop.
+    fn install_migration_refuses_when_the_manager_is_unreachable() {
+        // No manager answer means no confirmed absence: the install refuses
+        // at the migration — before any reload, enable, or start — having
+        // attempted no legacy stop.
         let mut host = Fake::new();
         host.script.borrow_mut().missing.insert("systemctl".into());
 
-        let (error, partial) = perform_on(
+        let (error, _) = perform_on(
             &mut host,
             ServiceManager::Systemd,
             ServiceOp::Install { link: false },
         )
         .unwrap_err();
 
-        assert!(error.contains("could not run systemctl"), "{error}");
+        assert!(error.contains("refusing to install"), "{error}");
         assert!(
             host.calls_to("stop toka-indexer").is_empty(),
             "{:?}",
             host.calls
         );
         assert!(
-            host.unchanged(&partial)
+            host.calls_to("daemon-reload").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.calls_to("start toka-search").is_empty(),
+            "{:?}",
+            host.calls
+        );
+    }
+
+    #[test]
+    fn install_migration_refuses_after_an_interrupted_probe() {
+        // The legacy file is gone but its daemon may stay loaded: an
+        // interrupted probe retries once, then refuses instead of starting
+        // the new service beside a daemon that still owns its lock.
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .active_unknown
+            .insert("toka-indexer.service".into());
+
+        let (error, _) = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("refusing to install"), "{error}");
+        assert_eq!(
+            host.calls_to("is-active toka-indexer.service").len(),
+            2,
+            "one probe plus one retry: {:?}",
+            host.calls
+        );
+        assert!(
+            host.calls_to("stop toka-indexer").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.calls_to("start toka-search").is_empty(),
+            "{:?}",
+            host.calls
+        );
+    }
+
+    #[test]
+    fn install_migration_skips_a_confirmed_absent_legacy_service() {
+        // No legacy file and the manager confirms nothing loaded (exit-4
+        // `inactive`): migration skips cleanly and the install converges.
+        let mut host = Fake::new();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(
+            host.unchanged(&outcome)
                 .iter()
                 .any(|action| action == "no old toka-indexer.service to migrate"),
             "{}",
-            host.unchanged(&partial).join("\n")
+            host.unchanged(&outcome).join("\n")
+        );
+        assert!(
+            host.calls_to("stop toka-indexer").is_empty(),
+            "{:?}",
+            host.calls
         );
     }
 
@@ -5229,9 +5472,20 @@ mod tests {
     }
 
     #[test]
-    fn pinned_service_env_pins_only_set_non_default_locations() {
+    fn pinned_service_env_pins_the_effective_locations() {
         let home = Path::new("/home/tester");
-        assert!(pinned_service_env(home, None, None).is_empty());
+        let data_default = "/home/tester/.local/share".to_owned();
+        let config_default = "/home/tester/.config".to_owned();
+        // Unset: the defaults pin, so a manager-side XDG_DATA_HOME (say
+        // /srv/toka-data) cannot split the daemon off the shell's index.
+        assert_eq!(
+            pinned_service_env(home, None, None),
+            vec![
+                ("XDG_DATA_HOME".to_owned(), data_default.clone()),
+                ("XDG_CONFIG_HOME".to_owned(), config_default.clone()),
+            ]
+        );
+        // Explicit non-defaults are preserved as-is.
         assert_eq!(
             pinned_service_env(home, Some("/data"), Some("/cfg")),
             vec![
@@ -5239,20 +5493,35 @@ mod tests {
                 ("XDG_CONFIG_HOME".to_owned(), "/cfg".to_owned()),
             ]
         );
-        // Set but default-equal: both sides resolve there anyway.
-        assert!(pinned_service_env(
-            home,
-            Some("/home/tester/.local/share"),
-            Some("/home/tester/.config"),
-        )
-        .is_empty());
-        // Relative and empty values: `dirs` ignores them too, so pinning
-        // them would only add noise.
-        assert!(pinned_service_env(home, Some("relative"), Some("")).is_empty());
-        // Mixed: only the non-default one pins.
+        // Set but default-equal: still pinned, since the manager may
+        // resolve its own default elsewhere.
+        assert_eq!(
+            pinned_service_env(
+                home,
+                Some("/home/tester/.local/share"),
+                Some("/home/tester/.config"),
+            ),
+            vec![
+                ("XDG_DATA_HOME".to_owned(), data_default.clone()),
+                ("XDG_CONFIG_HOME".to_owned(), config_default.clone()),
+            ]
+        );
+        // Relative and empty values resolve to the default — `dirs` ignores
+        // them — so the default pins.
+        assert_eq!(
+            pinned_service_env(home, Some("relative"), Some("")),
+            vec![
+                ("XDG_DATA_HOME".to_owned(), data_default.clone()),
+                ("XDG_CONFIG_HOME".to_owned(), config_default.clone()),
+            ]
+        );
+        // Mixed: the custom value pins beside the default.
         assert_eq!(
             pinned_service_env(home, Some("/data"), None),
-            vec![("XDG_DATA_HOME".to_owned(), "/data".to_owned())]
+            vec![
+                ("XDG_DATA_HOME".to_owned(), "/data".to_owned()),
+                ("XDG_CONFIG_HOME".to_owned(), config_default.clone()),
+            ]
         );
     }
 
@@ -5343,6 +5612,37 @@ mod tests {
     }
 
     #[test]
+    fn install_pins_the_default_data_dir() {
+        // The mismatch scenario: the installing shell leaves XDG_DATA_HOME
+        // unset (so it resolves the default) while the manager would
+        // resolve its own elsewhere. The install pins the shell's
+        // effective default, converging both sides on one index.
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            let mut host = Fake::new();
+            let home = host.home();
+            host.env = pinned_service_env(&home, None, None);
+            perform_on(&mut host, manager, ServiceOp::Install { link: false }).unwrap();
+            let file = match manager {
+                ServiceManager::Systemd => unit_path(&host.config_dir()),
+                ServiceManager::Launchd => plist_path(&host.home()),
+            };
+            let contents = std::fs::read_to_string(&file).unwrap();
+            let pinned = home.join(".local/share").to_string_lossy().into_owned();
+            match manager {
+                ServiceManager::Systemd => assert!(
+                    contents.contains(&format!("Environment=\"XDG_DATA_HOME={pinned}\"")),
+                    "{manager:?}: {contents}"
+                ),
+                ServiceManager::Launchd => assert!(
+                    contents.contains("<key>XDG_DATA_HOME</key>")
+                        && contents.contains(&format!("<string>{pinned}</string>")),
+                    "{manager:?}: {contents}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn start_pushes_through_a_deactivating_service() {
         // Mid-stop is actionable for stop but never skips start: skipping
         // as "already running" would leave the service stopped once the
@@ -5427,6 +5727,109 @@ mod tests {
                 .all(|action| !action.contains("already running")),
             "{}",
             host.unchanged(&outcome).join("\n")
+        );
+    }
+
+    #[test]
+    fn install_claims_a_change_only_for_a_confirmed_stopped_start() {
+        // A probe that confirmed stopped plus a successful start is a real
+        // state change.
+        let mut host = Fake::new();
+        perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+        host.script
+            .borrow_mut()
+            .active
+            .insert("toka-search.service".into(), false);
+        host.calls.clear();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(
+            !host.calls_to("start toka-search.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action == "started toka-search.service"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+    }
+
+    #[test]
+    fn install_reports_an_unverified_start_without_claiming_a_change() {
+        // An unreadable probe may hide an already-active service, in which
+        // case the start no-ops: the request is still sent, but no state
+        // change is claimed.
+        let mut host = Fake::new();
+        perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+        host.script
+            .borrow_mut()
+            .active_unknown
+            .insert("toka-search.service".into());
+        host.calls.clear();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(
+            !host.calls_to("start toka-search.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.unchanged(&outcome).iter().any(
+                |action| action == "systemd accepted the start request for toka-search.service"
+            ),
+            "{}",
+            host.unchanged(&outcome).join("\n")
+        );
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .all(|action| action != "started toka-search.service"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_install_lock_is_held_while_an_installer_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let service = root.path().join("toka-search.service");
+
+        let held = acquire_install_lock(&service).unwrap();
+
+        assert!(
+            try_acquire_install_lock(&service).unwrap().is_none(),
+            "a second installer waits while the first holds the lock"
+        );
+        drop(held);
+        assert!(
+            try_acquire_install_lock(&service).unwrap().is_some(),
+            "releasing the lock admits the waiter"
         );
     }
 

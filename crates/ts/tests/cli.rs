@@ -31,12 +31,32 @@ fn ts_command(
     fixture_videos: Option<OsString>,
     cwd: Option<&Path>,
 ) -> Command {
+    ts_command_for_binary(
+        Path::new(env!("CARGO_BIN_EXE_ts")),
+        arguments,
+        home,
+        data_home,
+        fixture_videos,
+        cwd,
+    )
+}
+
+/// [`ts_command`] running a staged copy of the binary instead of the test
+/// target itself, so installs from metacharacter paths are testable.
+fn ts_command_for_binary(
+    binary: &Path,
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    fixture_videos: Option<OsString>,
+    cwd: Option<&Path>,
+) -> Command {
     // A scratch temp space too, so even cache reads cannot escape the
     // test's directories.
     let scratch = home.join("tmp");
     fs::create_dir_all(&scratch).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ts"));
+    let mut command = Command::new(binary);
     command
         .args(arguments)
         .env("HOME", home)
@@ -2453,6 +2473,9 @@ case "$verb" in
   show)
     line=$(grep '^ExecStart=' "$unitdir/$unit" 2>/dev/null | head -n 1)
     exe=$(printf '%s' "$line" | sed -n 's/^ExecStart="\(.*\)" daemon run$/\1/p')
+    # Real systemctl reports the decoded path, as the unit-test fake's
+    # show_exec_start does: unescape first, then fold %% to %.
+    exe=$(printf '%s' "$exe" | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g' -e 's/%%/%/g')
     if [ -n "$exe" ]; then echo "ExecStart={ path=$exe ; argv[]=$exe daemon run ; ignore_errors=no }";
     else echo "ExecStart="; fi;;
   start) echo 1 > "$active"; rm -f "$TS_SHIM_STATE/activating_$unit";;
@@ -2487,6 +2510,9 @@ case "$1" in
   bootstrap)
     echo 1 > "$TS_SHIM_STATE/bootstrapped"; echo 1 > "$TS_SHIM_STATE/job_running"
     exe=$(grep -A3 '<key>ProgramArguments</key>' "$3" 2>/dev/null | grep '<string>' | head -n 1 | sed 's/.*<string>//;s/<\/string>.*//')
+    # Real launchd reports the decoded path: entities unescaped (&lt;
+    # and &gt; first, &amp; last), as xml_unescape does.
+    exe=$(printf '%s' "$exe" | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g')
     if [ -n "$exe" ]; then printf '%s' "$exe" > "$TS_SHIM_STATE/program"; else rm -f "$TS_SHIM_STATE/program"; fi;;
   bootout) echo 0 > "$TS_SHIM_STATE/bootstrapped"; echo 0 > "$TS_SHIM_STATE/job_running";;
   kickstart)
@@ -2564,7 +2590,28 @@ fn run_shimmed_with_fail(
     fail: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> Output {
-    let mut command = ts_command(
+    spawn_and_wait(shimmed_command(
+        home,
+        Path::new(env!("CARGO_BIN_EXE_ts")),
+        arguments,
+        fail,
+        extra_env,
+    ))
+}
+
+/// The shimmed [`Command`] behind [`run_shimmed_with_fail`], split out so
+/// tests can stage another binary in place of the test target, or spawn
+/// overlapping installs from threads.
+#[cfg(unix)]
+fn shimmed_command(
+    home: &ShimHome,
+    binary: &Path,
+    arguments: &[&str],
+    fail: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Command {
+    let mut command = ts_command_for_binary(
+        binary,
         arguments,
         home.scratch.home.path(),
         &home.scratch.data_home,
@@ -2578,10 +2625,10 @@ fn run_shimmed_with_fail(
     // A fixture login name: lingering flows must not depend on the
     // developer's own USER.
     command.env("USER", "tester");
-    // A scratch config home, default-equal so installs pin nothing for
-    // it: without this the child inherits the developer's own
-    // XDG_CONFIG_HOME and can write its unit file into the real config.
-    // Explicit per-run overrides still win: they apply after.
+    // A scratch config home under the scratch home itself: without this
+    // the child inherits the developer's own XDG_CONFIG_HOME and can
+    // write its unit file into the real config. Explicit per-run
+    // overrides still win: they apply after.
     command.env("XDG_CONFIG_HOME", home.home().join(".config"));
     for (key, value) in extra_env {
         command.env(key, value);
@@ -2594,12 +2641,29 @@ fn run_shimmed_with_fail(
             command.env_remove("TS_SHIM_FAIL");
         }
     }
+    command
+}
+
+/// Spawns a built [`Command`] with piped output and waits for it.
+#[cfg(unix)]
+fn spawn_and_wait(mut command: Command) -> Output {
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     wait_for_exit(child)
+}
+
+/// A copy of the test target staged under `dir_name` in the scratch home,
+/// so installs run from paths the shell and the service files escape.
+#[cfg(unix)]
+fn staged_binary(home: &ShimHome, dir_name: &str) -> PathBuf {
+    let dir = home.home().join(dir_name);
+    fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("ts");
+    fs::copy(env!("CARGO_BIN_EXE_ts"), &binary).unwrap();
+    binary
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -2738,6 +2802,40 @@ fn install_is_idempotent() {
     assert_eq!(calls.matches("start toka-search").count(), 1, "{calls}");
     assert_eq!(calls.matches("daemon-reload").count(), 1, "{calls}");
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn repeat_install_from_a_percent_dir_reports_already_installed() {
+    // The unit escapes the executable's `%` as `%%`; the manager reports
+    // the decoded path back, so a repeat install sees the same executable
+    // — no takeover, no restart.
+    let home = shim_home();
+    let binary = staged_binary(&home, "100%");
+    let install = || spawn_and_wait(shimmed_command(&home, &binary, &["install"], None, &[]));
+
+    let output = install();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = install();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("taking over"), "{stdout}");
+    assert!(stdout.contains("already"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("start toka-search").count(), 1, "{calls}");
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -3097,6 +3195,46 @@ fn install_without_a_reported_program_reports_already_running() {
 
 #[cfg(all(unix, target_os = "macos"))]
 #[test]
+fn repeat_install_from_an_ampersand_dir_stays_converged() {
+    // The plist escapes the executable's `&` as `&amp;`; the manager
+    // reports the decoded path back, so a repeat install sees the same
+    // executable and never reloads an unchanged agent.
+    let home = shim_home();
+    let binary = staged_binary(&home, "A&B");
+    let install = || spawn_and_wait(shimmed_command(&home, &binary, &["install"], None, &[]));
+
+    let output = install();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.state.join("program")).unwrap(),
+        binary.to_string_lossy().into_owned(),
+        "the shim records the decoded loaded program"
+    );
+
+    let output = install();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("taking over"), "{stdout}");
+    assert!(stdout.contains("already running"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("bootout").count(), 0, "{calls}");
+    assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
 fn retry_without_a_reported_program_completes_the_pending_reload() {
     // Old `launchctl print` output names no program, and the executable
     // never moves — only a pinned `XDG_DATA_HOME` changes the plist. A
@@ -3136,8 +3274,8 @@ fn retry_without_a_reported_program_completes_the_pending_reload() {
     assert!(!stdout.contains("already running"), "{stdout}");
     let plist = fs::read_to_string(shim_plist_file(&home)).unwrap();
     assert!(
-        plist.contains("<key>XDG_DATA_HOME</key>"),
-        "the retry keeps the pinned location:\n{plist}"
+        plist.contains(&format!("<string>{data}</string>")),
+        "the retry pins data-two's absolute path, not the old value:\n{plist}"
     );
 }
 
@@ -3469,6 +3607,112 @@ fn uninstall_purge_refuses_a_directory_at_an_index_file_path() {
     assert!(stderr.contains("search-renames.json"), "{stderr}");
     assert!(media.is_file(), "media inside survives");
     assert!(sibling.is_file(), "the index file survives too");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_purge_reports_nothing_to_do() {
+    // The purge's own lock check must not plant the legacy lock it checks:
+    // through the real CLI, a second purge reports nothing to do instead
+    // of deleting and reporting a file the purge created.
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("no index data to remove"), "{stdout}");
+    assert!(!stdout.contains("daemon.lock"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_purge_removes_the_daemon_log() {
+    let home = shim_home();
+    #[cfg(target_os = "macos")]
+    let log = home
+        .home()
+        .join("Library/Application Support/app.toka.desktop/logs/indexer.log");
+    #[cfg(not(target_os = "macos"))]
+    let log = home
+        .scratch
+        .data_home
+        .join("app.toka.desktop/logs/indexer.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, b"log").unwrap();
+    // A neighbor the file-only target must leave alone: on macOS the
+    // daemon log sits outside the wholesale search-log folder, so only the
+    // log itself goes.
+    #[cfg(target_os = "macos")]
+    let neighbor = log.parent().unwrap().join("other.log");
+    #[cfg(target_os = "macos")]
+    fs::write(&neighbor, b"other").unwrap();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!log.exists(), "the daemon log is purged");
+    #[cfg(target_os = "macos")]
+    assert!(neighbor.is_file(), "neighbors of the daemon log survive");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_installs_serialize_and_converge() {
+    // Two installers at once: the second waits on the install lock, then
+    // sees the first installer's converged state — exactly one writes the
+    // service file, and the other reports it already up to date.
+    let home = shim_home();
+    let binary = Path::new(env!("CARGO_BIN_EXE_ts"));
+    let first = shimmed_command(&home, binary, &["install"], None, &[]);
+    let second = shimmed_command(&home, binary, &["install"], None, &[]);
+    let (first, second) = thread::scope(|scope| {
+        let running = scope.spawn(|| spawn_and_wait(first));
+        let waiting = scope.spawn(|| spawn_and_wait(second));
+        (running.join().unwrap(), waiting.join().unwrap())
+    });
+
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let combined =
+        String::from_utf8(first.stdout).unwrap() + &String::from_utf8(second.stdout).unwrap();
+    assert_eq!(
+        combined.matches("wrote ~/").count(),
+        1,
+        "exactly one installer writes:\n{combined}"
+    );
+    assert!(
+        combined.contains("service file already up to date"),
+        "the other sees converged state:\n{combined}"
+    );
 }
 
 #[cfg(unix)]

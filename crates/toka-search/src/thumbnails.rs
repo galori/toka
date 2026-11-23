@@ -13,8 +13,17 @@ pub const PREVIEW_FRAMES: usize = 8;
 /// A thumbnail already made by the indexer's background worker, if one is in
 /// the shared cache. Reading this never starts ffmpeg, which keeps search
 /// results cheap even when the cache is still catching up with a folder.
+/// The cache root is secured before every read, not just before writes: a
+/// planted file must never be served as a cached thumbnail.
 pub(crate) fn cached(video: &Path) -> Option<PathBuf> {
-    let output = cache_output(video);
+    cached_in(video, &cache_output_root(), current_uid())
+}
+
+/// [`cached`] against an explicit root and owner, so the trust checks are
+/// testable without touching the real cache.
+fn cached_in(video: &Path, root: &Path, uid: u32) -> Option<PathBuf> {
+    secure_cache_dir(root, uid)?;
+    let output = root.join(format!("{}.jpg", fingerprint(video)));
     output.is_file().then_some(output)
 }
 
@@ -143,12 +152,59 @@ fn preview_offsets(duration: f64, count: usize) -> Vec<f64> {
 
 fn cache_dir() -> Option<PathBuf> {
     let cache = cache_output_root();
-    fs::create_dir_all(&cache).ok()?;
+    secure_cache_dir(&cache, current_uid())?;
     Some(cache)
 }
 
-fn cache_output(video: &Path) -> PathBuf {
-    cache_output_root().join(format!("{}.jpg", fingerprint(video)))
+/// Creates the cache directory pinned to this user — mode 0700, never a
+/// symlink, owned by `uid` — mirroring the daemon runtime directory's
+/// checks. The shared temporary parent lets another local user pre-create
+/// the predictable uid-suffixed name and plant a JPEG at a known video
+/// fingerprint, which an unsecured read would then serve as that video's
+/// thumbnail. `None` when the directory cannot be secured; callers then
+/// behave as if the cache were unavailable.
+///
+/// Residual TOCTOU, documented as there: a rename-swap after the final
+/// verification still redirects the reads taken next. It needs a
+/// world-writable temporary parent, a local attacker, and microsecond
+/// timing — and it only serves a wrong picture, never grants access — so
+/// fd-pinning was judged disproportionate. Unexploitable deterministically
+/// in-test, hence no test.
+#[cfg(unix)]
+fn secure_cache_dir(dir: &Path, uid: u32) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return None;
+    }
+    fs::create_dir_all(dir).ok()?;
+    // Verified AFTER creation, as in the runtime dir: a link planted
+    // between the pre-check and the creation must not be trusted.
+    verified_cache_metadata(dir, uid)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).ok()?;
+    // And once more after the chmod, so a swap between the chmod and the
+    // first verification cannot hand back a link with trusted contents.
+    let metadata = verified_cache_metadata(dir, uid)?;
+    (metadata.permissions().mode() & 0o777 == 0o700).then_some(())
+}
+
+/// The cache directory this instant: a real directory (never a link)
+/// owned by `uid`.
+#[cfg(unix)]
+fn verified_cache_metadata(dir: &Path, uid: u32) -> Option<fs::Metadata> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(dir).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return None;
+    }
+    (metadata.uid() == uid).then_some(metadata)
+}
+
+/// No owner to check against where `getuid` does not exist: creation is
+/// the whole check.
+#[cfg(not(unix))]
+fn secure_cache_dir(dir: &Path, _uid: u32) -> Option<()> {
+    fs::create_dir_all(dir).ok()?;
+    Some(())
 }
 
 pub fn cache_output_root() -> PathBuf {
@@ -318,6 +374,77 @@ mod tests {
             cache_output_root(),
             std::env::temp_dir().join(cache_dir_name_for(current_uid()))
         );
+    }
+
+    #[test]
+    fn securing_a_cache_dir_creates_it_for_this_user_only() {
+        let root = tempdir().unwrap();
+        let cache = root.path().join("toka-thumbnails-501");
+
+        assert_eq!(secure_cache_dir(&cache, current_uid()), Some(()));
+
+        assert!(cache.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(&cache).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        // Re-securing the same directory is a no-op success.
+        assert_eq!(secure_cache_dir(&cache, current_uid()), Some(()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_cache_dir_is_refused() {
+        let root = tempdir().unwrap();
+        let target = root.path().join("real");
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("toka-thumbnails-501");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(secure_cache_dir(&link, current_uid()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_created_foreign_cache_dir_is_refused() {
+        // Another user's directory at our predictable cache name: owned by
+        // anyone but us, it must never be trusted — simulated with an owner
+        // id that is provably not ours.
+        let root = tempdir().unwrap();
+        let cache = root.path().join("toka-thumbnails-501");
+        fs::create_dir(&cache).unwrap();
+        let foreign = current_uid().wrapping_add(1);
+
+        assert_eq!(secure_cache_dir(&cache, foreign), None);
+    }
+
+    #[test]
+    fn cached_reads_serve_only_a_trusted_cache_root() {
+        let root = tempdir().unwrap();
+        let video = root.path().join("clip.mp4");
+        fs::write(&video, b"video").unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let planted = cache.join(format!("{}.jpg", fingerprint(&video)));
+        fs::write(&planted, b"planted").unwrap();
+
+        // The normal path serves the planted file.
+        assert_eq!(cached_in(&video, &cache, current_uid()), Some(planted));
+
+        #[cfg(unix)]
+        {
+            // A symlink or a foreign owner refuses it, even though the file
+            // sits exactly where the fingerprint says it should.
+            let link = root.path().join("linked-cache");
+            std::os::unix::fs::symlink(&cache, &link).unwrap();
+            assert_eq!(cached_in(&video, &link, current_uid()), None);
+            let foreign = current_uid().wrapping_add(1);
+            assert_eq!(cached_in(&video, &cache, foreign), None);
+        }
     }
 
     #[test]

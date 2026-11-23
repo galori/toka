@@ -141,8 +141,10 @@ pub(crate) fn indexer_running() -> Option<bool> {
     None
 }
 
-/// Where the indexer daemon writes its log: beside the search log.
-fn indexer_log_path() -> Result<PathBuf, String> {
+/// Where the indexer daemon writes its log: beside the search log on Linux,
+/// under `~/Library/Application Support` on macOS — outside the search-log
+/// folder purge removes wholesale there, so purge names it separately.
+pub(crate) fn indexer_log_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|directory| {
             directory
@@ -482,8 +484,58 @@ pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLo
 /// one, since an old supervisor takes only the legacy lock. Purge and
 /// reset refuse while either is held, so a live supervisor — managed or
 /// hand-started — never watches its index vanish.
+///
+/// The probe creates nothing: only a supervisor that actually takes the
+/// lock creates its file. A probe that created the legacy lock would plant
+/// a `daemon.lock` that purge then deletes and reports, so a second purge
+/// could never report nothing-to-do.
+#[cfg(unix)]
 pub(crate) fn daemon_lock_held(database: &Path) -> Result<bool, String> {
-    Ok(try_acquire_daemon_lock(database)?.is_none())
+    let path = daemon_lock_path(database);
+    if let Some(runtime) = path.parent() {
+        ensure_runtime_dir(runtime, current_uid())?;
+    }
+    if lock_held_existing(&path)? {
+        return Ok(true);
+    }
+    crate::owned_index::ensure_index_parent(database)?;
+    lock_held_existing(&database.with_file_name(LEGACY_DAEMON_LOCK_FILE_NAME))
+}
+
+/// No-op lock where `flock` does not exist (see
+/// [`try_acquire_daemon_lock`]): nothing can hold it.
+#[cfg(not(unix))]
+pub(crate) fn daemon_lock_held(_database: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Whether `path`'s lock is held right now, without creating the file: a
+/// missing lock file is never held.
+#[cfg(unix)]
+fn lock_held_existing(path: &Path) -> Result<bool, String> {
+    let file = match fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!("Toka could not lock its indexer daemon: {error}"));
+        }
+    };
+    flock_held(&file)
+}
+
+/// Whether `file` is locked by another supervisor: a non-blocking
+/// exclusive `flock` that reports contention instead of waiting for it.
+#[cfg(unix)]
+fn flock_held(file: &fs::File) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(true);
+        }
+        return Err(format!("Toka could not lock its indexer daemon: {error}"));
+    }
+    Ok(false)
 }
 
 /// Opens and exclusively locks one lock file without blocking: `Ok(None)`
@@ -496,13 +548,8 @@ fn lock_file(path: &Path) -> Result<Option<fs::File>, String> {
         .write(true)
         .open(path)
         .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
-    use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(None);
-        }
-        return Err(format!("Toka could not lock its indexer daemon: {error}"));
+    if flock_held(&file)? {
+        return Ok(None);
     }
     Ok(Some(file))
 }
@@ -2366,6 +2413,28 @@ mod tests {
             .unwrap()
             .expect("test holds the daemon lock");
         assert!(daemon_lock_held(&database).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_creates_no_lock_files() {
+        // The probe must not plant the legacy lock it checks: purge would
+        // then delete and report a file the purge itself created, and a
+        // second purge could never report nothing-to-do.
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        assert!(!daemon_lock_held(&database).unwrap());
+
+        assert!(
+            !database.with_file_name("daemon.lock").exists(),
+            "probing must not create the legacy lock"
+        );
+        assert!(
+            !daemon_lock_path(&database).exists(),
+            "probing must not create the primary lock either"
+        );
     }
 
     #[cfg(unix)]
