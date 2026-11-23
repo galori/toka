@@ -567,6 +567,15 @@ impl OwnedIndexManager {
         })
     }
 
+    /// The search folders and their indexing state. Inspecting must not
+    /// create an index that does not exist yet.
+    pub fn folders(&self) -> Result<Vec<OwnedIndexFolder>, String> {
+        if !self.database.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(self.state()?.folders)
+    }
+
     /// Everything the index knows, for `toka --index-stats`.
     pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
@@ -3588,6 +3597,34 @@ mod tests {
 
         let state = manager.state().unwrap();
         assert_eq!(state.folders[0].status, OwnedFolderStatus::Offline);
+    }
+
+    #[test]
+    fn folders_lists_managed_roots_with_their_state() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+
+        let folders = manager.folders().unwrap();
+
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].path, root);
+        assert_eq!(folders[0].status, OwnedFolderStatus::Pending);
+    }
+
+    #[test]
+    fn folders_without_a_database_is_empty_and_creates_nothing() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+
+        let folders = manager.folders().unwrap();
+
+        assert!(folders.is_empty());
+        assert!(!database.exists());
     }
 
     #[test]

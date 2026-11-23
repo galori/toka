@@ -26,7 +26,7 @@
     "check:precommit": "npm run lint && npm run format:check",
     "check:pr": "npm run check:precommit && npm run build && npm test && npm run rust:test && npm run rust:clippy",
     "rust:fmt": "cargo fmt --all -- --check",
-    "rust:test": "cargo test --workspace --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml --features e2e --test cli",
+    "rust:test": "cargo test --workspace --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml --features e2e --test cli && cargo test --manifest-path src-tauri/Cargo.toml -p ts --features fixtures --test cli",
     "rust:clippy": "cargo clippy --workspace --manifest-path src-tauri/Cargo.toml -- -D warnings",
     "tauri": "tauri"
   },

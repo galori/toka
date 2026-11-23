@@ -439,6 +439,13 @@ impl SearchEngine {
         self.search_filtered_with_context(request, context, filter)
     }
 
+    /// The verbose per-search trace recorded since the last call, from
+    /// searches and match counts alike. Empty unless the engine's logger
+    /// was built with `SearchLogger::with_verbose_capture`.
+    pub fn take_verbose_trace(&self) -> String {
+        self.logger.take_verbose_trace()
+    }
+
     fn search_filtered_with_context(
         &self,
         request: SearchRequest,
@@ -1800,6 +1807,63 @@ mod tests {
         assert_eq!(entry["fields"]["path"], true);
         assert_eq!(entry["mediaType"], "both");
         assert_eq!(entry["error"], "backend unavailable");
+    }
+
+    #[test]
+    fn verbose_trace_captures_filtered_paths_and_returned_results() {
+        let directory = tempdir().unwrap();
+        let matched = directory.path().join("summer-trip.mp4");
+        fs::write(&matched, b"video").unwrap();
+        let skipped = directory.path().join("winter-trip.mp4");
+        let engine = SearchEngine::new_with_logger(
+            Arc::new(FakeProvider::new(vec![matched.clone(), skipped.clone()])),
+            Arc::new(SearchLogger::with_verbose_capture()),
+        );
+
+        let page = engine.search(request("summer")).unwrap();
+
+        assert_eq!(page.total_results, 1);
+        let trace = engine.take_verbose_trace();
+        assert!(
+            trace.contains(&format!(
+                "FILTERED OUT: {} (query did not match)",
+                skipped.display()
+            )),
+            "{trace}"
+        );
+        assert!(trace.contains("RESULTS RETURNED TO APP:"), "{trace}");
+        assert!(trace.contains(&matched.display().to_string()), "{trace}");
+        assert!(engine.take_verbose_trace().is_empty());
+    }
+
+    #[test]
+    fn match_count_captures_filtered_paths() {
+        let directory = tempdir().unwrap();
+        let matched = directory.path().join("summer-trip.mp4");
+        fs::write(&matched, b"video").unwrap();
+        let skipped = directory.path().join("winter-trip.mp4");
+        let engine = SearchEngine::new_with_logger(
+            Arc::new(FakeProvider::new(vec![matched, skipped.clone()])),
+            Arc::new(SearchLogger::with_verbose_capture()),
+        );
+
+        assert_eq!(engine.match_count(request("summer")).unwrap(), 1);
+
+        assert!(engine
+            .take_verbose_trace()
+            .contains(&format!("FILTERED OUT: {}", skipped.display())));
+    }
+
+    #[test]
+    fn verbose_trace_is_empty_unless_the_logger_captures() {
+        let directory = tempdir().unwrap();
+        let matched = directory.path().join("summer-trip.mp4");
+        fs::write(&matched, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![matched])));
+
+        engine.search(request("summer")).unwrap();
+
+        assert!(engine.take_verbose_trace().is_empty());
     }
 
     #[test]

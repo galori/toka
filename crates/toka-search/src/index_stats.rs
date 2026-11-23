@@ -1,9 +1,11 @@
 //! `toka --index-stats`: a plain-text report of what the indexer knows.
 
+use serde::Serialize;
 use std::{fmt::Write as _, path::PathBuf};
 
 /// Where one search folder stands in the indexer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FolderState {
     Pending,
     Indexing,
@@ -24,7 +26,8 @@ impl FolderState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FolderStats {
     pub path: PathBuf,
     pub state: FolderState,
@@ -37,7 +40,8 @@ pub struct FolderStats {
     pub images: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IndexStats {
     pub revision: u64,
     pub videos: u64,
@@ -145,6 +149,45 @@ mod tests {
             text.contains("/media/movies  [ready]  5 files (3 videos, 2 images)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn folder_states_serialize_to_their_report_labels() {
+        for (state, label) in [
+            (FolderState::Pending, "pending"),
+            (FolderState::Indexing, "indexing"),
+            (FolderState::Ready, "ready"),
+            (FolderState::Offline, "offline"),
+            (FolderState::Error, "error"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), label);
+        }
+    }
+
+    #[test]
+    fn stats_serialize_to_the_json_contract() {
+        let mut movies = folder("/media/movies", FolderState::Ready);
+        movies.videos = Some(3);
+        movies.images = Some(2);
+        let stats = IndexStats {
+            revision: 7,
+            videos: 3,
+            images: 2,
+            service_running: Some(true),
+            folders: vec![movies],
+        };
+
+        let json = serde_json::to_value(&stats).unwrap();
+
+        assert_eq!(json["revision"], 7);
+        assert_eq!(json["videos"], 3);
+        assert_eq!(json["images"], 2);
+        assert_eq!(json["serviceRunning"], true);
+        assert_eq!(json["folders"][0]["path"], "/media/movies");
+        assert_eq!(json["folders"][0]["state"], "ready");
+        assert_eq!(json["folders"][0]["scannedFiles"], 0);
+        assert_eq!(json["folders"][0]["videos"], 3);
+        assert_eq!(json["folders"][0]["images"], 2);
     }
 
     #[test]
