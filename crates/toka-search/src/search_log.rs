@@ -51,6 +51,7 @@ pub struct SearchLogger {
     settings_path: Option<PathBuf>,
     settings: Mutex<SearchLogSettings>,
     write_lock: Mutex<()>,
+    verbose_capture: Option<Arc<Mutex<Vec<u8>>>>,
     // Dropping this marker is what lets the last Toka process clean up the
     // session's JSON log without disturbing another open process.
     _session: Option<SessionMarker>,
@@ -63,8 +64,37 @@ impl SearchLogger {
         Self::with_settings(path, None, SearchLogSettings::default(), None)
     }
 
-    pub(crate) fn disabled() -> Self {
+    /// A logger that records nothing: no search log, no verbose logs. For
+    /// callers that surface search errors themselves, like CLIs.
+    pub fn disabled() -> Self {
         Self::new(PathBuf::new())
+    }
+
+    /// A logger that writes no files and instead captures every search's
+    /// verbose trace in memory, for callers that stream it elsewhere (the
+    /// `ts` CLI prints it to stderr). Drain with `take_verbose_trace`,
+    /// usually through the search engine.
+    pub fn with_verbose_capture() -> Self {
+        Self {
+            path: PathBuf::new(),
+            settings_path: None,
+            settings: Mutex::new(SearchLogSettings::default()),
+            write_lock: Mutex::new(()),
+            verbose_capture: Some(Arc::new(Mutex::new(Vec::new()))),
+            _session: None,
+        }
+    }
+
+    /// The verbose trace recorded since the last call. Empty unless this
+    /// logger was built with `with_verbose_capture`.
+    pub(crate) fn take_verbose_trace(&self) -> String {
+        let Some(capture) = &self.verbose_capture else {
+            return String::new();
+        };
+        let mut buffer = capture.lock().unwrap();
+        let trace = String::from_utf8_lossy(&buffer).into_owned();
+        buffer.clear();
+        trace
     }
 
     fn system_path() -> PathBuf {
@@ -111,6 +141,7 @@ impl SearchLogger {
             settings_path,
             settings: Mutex::new(settings),
             write_lock: Mutex::new(()),
+            verbose_capture: None,
             _session: session,
         }
     }
@@ -168,7 +199,14 @@ impl SearchLogger {
             context.addon_id = Some(addon_id.to_owned());
             context.addon_capture = Some(addon_capture.to_owned());
         }
-        if with_verbose_log {
+        if let Some(capture) = &self.verbose_capture {
+            // A capturing logger records every search, including match
+            // counts, which never ask for a verbose log file.
+            context.verbose = Some(Arc::new(VerboseSearchLog::capturing(
+                capture.clone(),
+                &context,
+            )));
+        } else if with_verbose_log {
             let settings = self.settings();
             if settings.verbose {
                 context.verbose = settings
@@ -349,9 +387,14 @@ fn validate_log_directory(path: &Path) -> Result<(), String> {
 
 static VERBOSE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug)]
 struct VerboseSearchLog {
-    file: Mutex<fs::File>,
+    sink: Mutex<Box<dyn Write + Send>>,
+}
+
+impl std::fmt::Debug for VerboseSearchLog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("VerboseSearchLog").finish()
+    }
 }
 
 fn create_verbose_log(
@@ -377,7 +420,7 @@ fn create_verbose_log(
             continue;
         }
         return Some(Arc::new(VerboseSearchLog {
-            file: Mutex::new(file),
+            sink: Mutex::new(Box::new(file)),
         }));
     }
     eprintln!(
@@ -387,47 +430,69 @@ fn create_verbose_log(
     None
 }
 
-fn write_verbose_header(file: &mut fs::File, context: &SearchLogContext) -> std::io::Result<()> {
-    writeln!(file, "Toka verbose search log")?;
-    writeln!(file, "Started: {}", crate::timestamp::now_rfc3339())?;
-    writeln!(file, "Query: {}", context.query)?;
-    writeln!(file, "Page: {}", context.page)?;
-    writeln!(file, "Page size: {}", context.page_size)?;
-    writeln!(file, "Media type: {:?}", context.media_type)?;
+fn write_verbose_header(sink: &mut dyn Write, context: &SearchLogContext) -> std::io::Result<()> {
+    writeln!(sink, "Toka verbose search log")?;
+    writeln!(sink, "Started: {}", crate::timestamp::now_rfc3339())?;
+    writeln!(sink, "Query: {}", context.query)?;
+    writeln!(sink, "Page: {}", context.page)?;
+    writeln!(sink, "Page size: {}", context.page_size)?;
+    writeln!(sink, "Media type: {:?}", context.media_type)?;
     if let (Some(addon_id), Some(capture)) = (&context.addon_id, &context.addon_capture) {
-        writeln!(file, "Add-on: {addon_id} ({capture})")?;
+        writeln!(sink, "Add-on: {addon_id} ({capture})")?;
     }
     writeln!(
-        file,
+        sink,
         "Fields: tags={}, file name={}, path={}",
         context.fields.tags, context.fields.file_name, context.fields.path
     )?;
-    writeln!(file)?;
+    writeln!(sink)?;
     Ok(())
 }
 
+/// The shared bytes a capturing logger's searches append their trace to.
+struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CaptureWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl VerboseSearchLog {
+    fn capturing(capture: Arc<Mutex<Vec<u8>>>, context: &SearchLogContext) -> Self {
+        let log = Self {
+            sink: Mutex::new(Box::new(CaptureWriter(capture)) as Box<dyn Write + Send>),
+        };
+        let _ = write_verbose_header(&mut *log.sink.lock().unwrap(), context);
+        log
+    }
+
     fn record_filtered(&self, path: &Path, reason: &str) {
-        let mut file = self.file.lock().unwrap();
-        let _ = writeln!(file, "FILTERED OUT: {} ({reason})", path.display());
+        let mut sink = self.sink.lock().unwrap();
+        let _ = writeln!(sink, "FILTERED OUT: {} ({reason})", path.display());
     }
 
     fn record_returned(&self, paths: &[PathBuf]) {
-        let mut file = self.file.lock().unwrap();
-        let _ = writeln!(file, "RESULTS RETURNED TO APP:");
+        let mut sink = self.sink.lock().unwrap();
+        let _ = writeln!(sink, "RESULTS RETURNED TO APP:");
         if paths.is_empty() {
-            let _ = writeln!(file, "(none)");
+            let _ = writeln!(sink, "(none)");
         } else {
             for path in paths {
-                let _ = writeln!(file, "{}", path.display());
+                let _ = writeln!(sink, "{}", path.display());
             }
         }
-        let _ = writeln!(file);
+        let _ = writeln!(sink);
     }
 
     fn record_error(&self, error: &str) {
-        let mut file = self.file.lock().unwrap();
-        let _ = writeln!(file, "SEARCH ERROR: {error}");
+        let mut sink = self.sink.lock().unwrap();
+        let _ = writeln!(sink, "SEARCH ERROR: {error}");
     }
 }
 
@@ -613,6 +678,76 @@ mod tests {
         assert!(body.contains("/Videos/summer.mp4"));
         assert!(body.contains("FILTERED OUT: /Videos/empty.mp4 (empty file)"));
         assert!(body.contains("RESULTS RETURNED TO APP:"));
+    }
+
+    #[test]
+    fn verbose_capture_collects_the_trace_in_memory() {
+        let logger = SearchLogger::with_verbose_capture();
+        let context = logger.context(
+            &SearchRequest {
+                query: "summer".into(),
+                page: 1,
+                page_size: 24,
+                search_id: None,
+                fields: SearchFields::default(),
+                media_type: MediaType::Videos,
+            },
+            true,
+        );
+        logger.record_filtered(&context, Path::new("/Videos/empty.mp4"), "empty file");
+        logger.record_returned(&context, &[PathBuf::from("/Videos/summer.mp4")]);
+
+        let trace = logger.take_verbose_trace();
+
+        assert!(
+            trace.contains("FILTERED OUT: /Videos/empty.mp4 (empty file)"),
+            "{trace}"
+        );
+        assert!(trace.contains("RESULTS RETURNED TO APP:"), "{trace}");
+        assert!(trace.contains("/Videos/summer.mp4"), "{trace}");
+        assert!(logger.take_verbose_trace().is_empty());
+    }
+
+    #[test]
+    fn verbose_capture_records_even_when_no_verbose_log_was_requested() {
+        let logger = SearchLogger::with_verbose_capture();
+        let context = logger.context(
+            &SearchRequest {
+                query: "summer".into(),
+                page: 1,
+                page_size: 24,
+                search_id: None,
+                fields: SearchFields::default(),
+                media_type: MediaType::Videos,
+            },
+            false,
+        );
+
+        logger.record_filtered(&context, Path::new("/Videos/empty.mp4"), "empty file");
+
+        assert!(logger
+            .take_verbose_trace()
+            .contains("FILTERED OUT: /Videos/empty.mp4 (empty file)"));
+    }
+
+    #[test]
+    fn take_verbose_trace_is_empty_without_a_capture() {
+        let logger = SearchLogger::new(PathBuf::new());
+        let context = logger.context(
+            &SearchRequest {
+                query: "summer".into(),
+                page: 1,
+                page_size: 24,
+                search_id: None,
+                fields: SearchFields::default(),
+                media_type: MediaType::Videos,
+            },
+            true,
+        );
+
+        logger.record_filtered(&context, Path::new("/Videos/empty.mp4"), "empty file");
+
+        assert!(logger.take_verbose_trace().is_empty());
     }
 
     #[test]

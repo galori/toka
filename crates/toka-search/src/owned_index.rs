@@ -415,6 +415,7 @@ pub enum OwnedFolderStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannedDirectory {
+    #[serde(serialize_with = "crate::lossy_path::serialize")]
     pub path: PathBuf,
     pub scanning: bool,
     pub videos: u64,
@@ -426,6 +427,9 @@ pub struct ScannedDirectory {
 #[serde(rename_all = "camelCase")]
 pub struct OwnedIndexFolder {
     pub id: String,
+    // Lossy on purpose: real paths can hold non-UTF-8 bytes on Unix, and
+    // those must not break serialization of this response.
+    #[serde(serialize_with = "crate::lossy_path::serialize")]
     pub path: PathBuf,
     pub status: OwnedFolderStatus,
     pub message: Option<String>,
@@ -565,6 +569,15 @@ impl OwnedIndexManager {
             indexing_files,
             folders,
         })
+    }
+
+    /// The search folders and their indexing state. Inspecting must not
+    /// create an index that does not exist yet.
+    pub fn folders(&self) -> Result<Vec<OwnedIndexFolder>, String> {
+        if !self.database.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(self.state()?.folders)
     }
 
     /// Everything the index knows, for `toka --index-stats`.
@@ -760,6 +773,13 @@ pub fn database_path() -> Result<PathBuf, String> {
                 .join(crate::config::INDEX_FILE_NAME)
         })
         .ok_or_else(|| "Toka could not find a place for its search index.".into())
+}
+
+/// The overlay file recording files Toka renamed since the index last saw
+/// them, so searches find them by their current name. It lives beside the
+/// index database; the one helper both the app and `ts` use.
+pub fn search_rename_overlay_path() -> Result<PathBuf, String> {
+    Ok(database_path()?.with_file_name("search-renames.json"))
 }
 
 pub(crate) fn root_paths(database: &Path) -> Result<Vec<PathBuf>, OwnedIndexError> {
@@ -3539,6 +3559,43 @@ mod tests {
         );
     }
 
+    // Linux-only: only filesystems like ext4/tmpfs accept non-UTF-8 names;
+    // macOS (APFS) rejects them at creation, so this scenario cannot occur
+    // there. The lossy conversion itself is platform-neutral.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_roots_serialize_lossy_in_folder_state_and_stats() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempdir().unwrap();
+        let root = directory
+            .path()
+            .join(std::ffi::OsString::from_vec(b"media-\xff".to_vec()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database);
+
+        manager.add_folder(&root).unwrap();
+
+        let state = manager.state().unwrap();
+        let folder = serde_json::to_value(&state.folders[0]).unwrap();
+        assert_eq!(
+            folder.get("path"),
+            Some(&serde_json::Value::String(
+                root.to_string_lossy().into_owned()
+            )),
+            "a non-UTF-8 root must serialize lossy, saw {folder}"
+        );
+
+        let stats = manager.stats().unwrap();
+        let stats = serde_json::to_value(&stats).unwrap();
+        assert_eq!(
+            stats["folders"][0]["path"],
+            root.to_string_lossy().into_owned()
+        );
+    }
+
     #[test]
     fn folder_state_uses_the_documented_json_field_names() {
         let directory = tempdir().unwrap();
@@ -3588,6 +3645,34 @@ mod tests {
 
         let state = manager.state().unwrap();
         assert_eq!(state.folders[0].status, OwnedFolderStatus::Offline);
+    }
+
+    #[test]
+    fn folders_lists_managed_roots_with_their_state() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+
+        let folders = manager.folders().unwrap();
+
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].path, root);
+        assert_eq!(folders[0].status, OwnedFolderStatus::Pending);
+    }
+
+    #[test]
+    fn folders_without_a_database_is_empty_and_creates_nothing() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+
+        let folders = manager.folders().unwrap();
+
+        assert!(folders.is_empty());
+        assert!(!database.exists());
     }
 
     #[test]

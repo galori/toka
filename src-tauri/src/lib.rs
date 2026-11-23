@@ -1286,10 +1286,6 @@ fn addon_directory(
     }
 }
 
-fn search_rename_overlay_path() -> Result<PathBuf, String> {
-    Ok(owned_index::database_path()?.with_file_name("search-renames.json"))
-}
-
 /// Everything Toka stores: its search folders and index (and their caches),
 /// thumbnail and web caches, and log files. Never the user's media, tags, or
 /// add-ons.
@@ -1353,7 +1349,7 @@ pub fn run() {
                     indexer_daemon::ensure_indexer();
                     let logger = Arc::new(SearchLogger::system());
                     let provider = platform_provider(logger.clone())?;
-                    let rename_overlay_path = Some(search_rename_overlay_path()?);
+                    let rename_overlay_path = Some(owned_index::search_rename_overlay_path()?);
                     Ok(SearchEngine::new_with_logger_and_rename_store(
                         provider,
                         logger,
@@ -1408,7 +1404,7 @@ pub fn run() {
     let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
     let rename_overlay_path = Some(
-        search_rename_overlay_path()
+        owned_index::search_rename_overlay_path()
             .expect("Toka could not find a place for its search rename state."),
     );
     let engine = Arc::new(SearchEngine::new_with_logger_and_rename_store(

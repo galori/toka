@@ -1,0 +1,17 @@
+[package]
+name = "ts"
+version = "0.1.1"
+description = "Toka search and indexing as a standalone shell utility"
+authors = ["Toka contributors"]
+edition = "2021"
+
+[features]
+fixtures = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toka-search = { version = "0.1.1", path = "../toka-search" }
+
+[dev-dependencies]
+tempfile = "3"
