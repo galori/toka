@@ -304,16 +304,23 @@ fn now_seconds() -> u64 {
 
 /// Every log file Toka writes: its log folder (the search log, its settings and
 /// session markers, and on Linux the indexer log) and any verbose search logs
-/// saved to the folder the user chose.
-pub fn reset_paths() -> Vec<PathBuf> {
+/// saved to the folder the user chose. The folder goes wholesale; the verbose
+/// logs are file-only targets, so a directory at one of their paths refuses
+/// instead of deleting.
+pub fn reset_paths() -> Vec<crate::reset::ResetTarget> {
+    use crate::reset::ResetTarget;
     let path = SearchLogger::system_path();
     let Some(directory) = path.parent() else {
         return Vec::new();
     };
     let settings = load_settings(&directory.join("search-log-settings.json"));
-    let mut paths = vec![directory.to_path_buf()];
+    let mut paths = vec![ResetTarget::dir(directory.to_path_buf())];
     if let Some(verbose) = settings.path {
-        paths.extend(verbose_log_files(&verbose));
+        paths.extend(
+            verbose_log_files(&verbose)
+                .into_iter()
+                .map(ResetTarget::file),
+        );
     }
     paths
 }

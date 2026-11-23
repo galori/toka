@@ -1352,11 +1352,16 @@ fn addon_directory(
 #[cfg(not(mobile))]
 fn reset_plan() -> Result<reset::ResetPlan, String> {
     // The index's known files — never the directory itself, so foreign
-    // content stored there always survives.
-    let mut paths = owned_index::index_data_files(&owned_index::database_path()?);
-    paths.push(thumbnails::cache_output_root());
+    // content stored there always survives. File-only targets, so a
+    // directory at one of their paths refuses instead of deleting.
+    let mut paths: Vec<reset::ResetTarget> =
+        owned_index::index_data_files(&owned_index::database_path()?)
+            .into_iter()
+            .map(reset::ResetTarget::file)
+            .collect();
+    paths.push(reset::ResetTarget::dir(thumbnails::cache_output_root()));
     if let Some(cache) = dirs::cache_dir() {
-        paths.push(cache.join("app.toka.desktop"));
+        paths.push(reset::ResetTarget::dir(cache.join("app.toka.desktop")));
     }
     paths.extend(search_log::reset_paths());
     #[allow(unused_mut)]

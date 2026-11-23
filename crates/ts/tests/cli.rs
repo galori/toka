@@ -2445,7 +2445,7 @@ case "$verb" in
     if [ -f "$TS_SHIM_STATE/word_$unit" ]; then cat "$TS_SHIM_STATE/word_$unit"; exit 3;
     elif [ "$(cat "$active" 2>/dev/null)" = "1" ]; then echo "active"; exit 0;
     elif [ "$(cat "$TS_SHIM_STATE/activating_$unit" 2>/dev/null)" = "1" ]; then echo "activating"; exit 3;
-    elif [ ! -f "$unitdir/$unit" ] && [ ! -f "$HOME/.config/systemd/user/$unit" ]; then echo "unknown"; exit 3;
+    elif [ ! -f "$unitdir/$unit" ] && [ ! -f "$HOME/.config/systemd/user/$unit" ]; then echo "inactive"; exit 4;
     else echo "inactive"; exit 3; fi;;
   is-enabled)
     if [ "$(cat "$enabled" 2>/dev/null)" = "1" ]; then echo "enabled"; exit 0;
@@ -2578,6 +2578,11 @@ fn run_shimmed_with_fail(
     // A fixture login name: lingering flows must not depend on the
     // developer's own USER.
     command.env("USER", "tester");
+    // A scratch config home, default-equal so installs pin nothing for
+    // it: without this the child inherits the developer's own
+    // XDG_CONFIG_HOME and can write its unit file into the real config.
+    // Explicit per-run overrides still win: they apply after.
+    command.env("XDG_CONFIG_HOME", home.home().join(".config"));
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -2620,10 +2625,11 @@ fn shim_link(home: &ShimHome) -> PathBuf {
 
 #[cfg(unix)]
 #[test]
-fn the_systemctl_shim_answers_unknown_for_never_loaded_units() {
-    // Pins the shim's never-loaded answers without a `ts` run: exit-3
-    // `unknown` from `is-active`, an empty `ExecStart=` from `show` — the
-    // words real systemctl uses for a unit it never loaded.
+fn the_systemctl_shim_answers_absent_for_never_loaded_units() {
+    // Pins the shim's never-loaded answers without a `ts` run: exit-4
+    // `inactive` from `is-active`, an empty `ExecStart=` from `show` — the
+    // words real systemctl uses for a unit it never loaded since systemd
+    // 258.
     let dir = tempdir().unwrap();
     let shim = dir.path().join("systemctl");
     fs::write(&shim, SYSTEMCTL_SHIM).unwrap();
@@ -2648,8 +2654,8 @@ fn the_systemctl_shim_answers_unknown_for_never_loaded_units() {
     };
 
     let probe = run(&["--user", "is-active", "toka-search.service"]);
-    assert_eq!(probe.status.code(), Some(3));
-    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "unknown\n");
+    assert_eq!(probe.status.code(), Some(4));
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inactive\n");
 
     let show = run(&["--user", "show", "-p", "ExecStart", "toka-search.service"]);
     assert_eq!(String::from_utf8(show.stdout).unwrap(), "ExecStart=\n");
@@ -2831,9 +2837,9 @@ fn install_fails_when_the_manager_refuses_to_start() {
 #[cfg(all(unix, target_os = "linux"))]
 #[test]
 fn fresh_install_with_never_loaded_units_starts_without_bogus_stops() {
-    // The shim answers real systemctl's exit-3 `unknown` for units it
+    // The shim answers real systemctl's exit-4 `inactive` for units it
     // never loaded: a fresh install starts the service without stopping
-    // the unknown first.
+    // the absent first.
     let home = shim_home();
 
     let output = run_shimmed(&home, &["install"]);
@@ -3070,10 +3076,10 @@ fn install_is_idempotent() {
 
 #[cfg(all(unix, target_os = "macos"))]
 #[test]
-fn install_without_a_reported_program_reloads_the_agent() {
+fn install_without_a_reported_program_reports_already_running() {
     // Old `launchctl print` output names no program: with the plist
-    // current but the loaded binary unconfirmable, the install reloads
-    // instead of reporting "already running".
+    // current and no marker set, the install takes the fast path — the
+    // program line is never consulted.
     let home = shim_home();
     let output = run_shimmed(&home, &["install"]);
     assert_eq!(output.status.code(), Some(0));
@@ -3083,8 +3089,97 @@ fn install_without_a_reported_program_reloads_the_agent() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("reloaded app.toka.ts"), "{stdout}");
+    assert!(stdout.contains("already running"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("bootout").count(), 0, "{calls}");
+    assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn retry_without_a_reported_program_completes_the_pending_reload() {
+    // Old `launchctl print` output names no program, and the executable
+    // never moves — only a pinned `XDG_DATA_HOME` changes the plist. A
+    // bootout failure leaves the marker set; the program-less retry still
+    // reloads, driven by the marker alone.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let data = home.home().join("data-two").to_string_lossy().into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        Some("bootout"),
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // Old launchctl from here on: the retry's `print` names no program.
+    fs::remove_file(home.state.join("program")).unwrap();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
     assert!(!stdout.contains("already running"), "{stdout}");
+    let plist = fs::read_to_string(shim_plist_file(&home)).unwrap();
+    assert!(
+        plist.contains("<key>XDG_DATA_HOME</key>"),
+        "the retry keeps the pinned location:\n{plist}"
+    );
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_failing_at_bootstrap_reports_the_bootout() {
+    // The bootout succeeds, then the bootstrap fails: the partial report
+    // names the stop instead of omitting it, and a retry completes the
+    // pending reload.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let data = home.home().join("data-two").to_string_lossy().into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        Some("bootstrap"),
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ts install: launchctl"), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
 }
 
 #[cfg(all(unix, target_os = "macos"))]
@@ -3345,6 +3440,35 @@ fn uninstall_purge_removes_data_but_keeps_media() {
     assert!(clip.is_file(), "media is never purged");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("removed ~/"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_purge_refuses_a_directory_at_an_index_file_path() {
+    // A directory sitting at an index-artifact path, holding media: the
+    // purge refuses it with a clear error and removes nothing else
+    // either — not even the legitimate index file beside it.
+    let home = shim_home();
+    #[cfg(target_os = "macos")]
+    let index_dir = home.home().join("Library/Application Support/toka");
+    #[cfg(not(target_os = "macos"))]
+    let index_dir = home.scratch.data_home.join("toka");
+    fs::create_dir_all(&index_dir).unwrap();
+    let sibling = index_dir.join("index.sqlite3");
+    fs::write(&sibling, b"db").unwrap();
+    let artifact = index_dir.join("search-renames.json");
+    fs::create_dir(&artifact).unwrap();
+    let media = artifact.join("clip.mp4");
+    fs::write(&media, b"video").unwrap();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("refusing to remove"), "{stderr}");
+    assert!(stderr.contains("search-renames.json"), "{stderr}");
+    assert!(media.is_file(), "media inside survives");
+    assert!(sibling.is_file(), "the index file survives too");
 }
 
 #[cfg(unix)]

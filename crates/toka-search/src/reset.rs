@@ -6,37 +6,68 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// One reset target: a path plus whether it may be removed recursively.
+/// Targets naming a file Toka owns (index artifacts, logs) are file-only:
+/// a directory sitting at such a path is foreign content — a directory
+/// named `search-renames.json` holding media, say — and must never be
+/// deleted. Only targets explicitly declared directories are removed
+/// wholesale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResetTarget {
+    pub path: PathBuf,
+    pub recursive: bool,
+}
+
+impl ResetTarget {
+    /// A file Toka owns: removed when it is a file, refused with a clear
+    /// error when a directory occupies its path.
+    pub fn file(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: false,
+        }
+    }
+
+    /// A directory Toka owns: removed wholesale, like a reset always has.
+    pub fn dir(path: PathBuf) -> Self {
+        Self {
+            path,
+            recursive: true,
+        }
+    }
+}
+
 /// What a reset removes, worked out before anything is touched so the same
 /// list can be shown to the user and then acted on.
 pub struct ResetPlan {
     /// Files and folders to delete. Ones that do not exist are skipped.
-    pub paths: Vec<PathBuf>,
+    pub targets: Vec<ResetTarget>,
     /// Stops the background indexer first, so it cannot rewrite what is being
     /// deleted. `None` where there is no such process.
     pub stop_indexer: Option<fn() -> Result<(), String>>,
 }
 
 impl ResetPlan {
-    pub fn new(paths: Vec<PathBuf>) -> Self {
-        let mut unique = Vec::new();
-        for path in paths {
-            if !unique.contains(&path) {
-                unique.push(path);
+    pub fn new(targets: Vec<ResetTarget>) -> Self {
+        let mut unique: Vec<ResetTarget> = Vec::new();
+        for target in targets {
+            if !unique.iter().any(|known| known.path == target.path) {
+                unique.push(target);
             }
         }
         // A path inside another listed path goes with its parent; listing it
         // separately would report a removal that already happened.
-        let paths = unique
+        let targets = unique
             .iter()
-            .filter(|path| {
+            .filter(|target| {
                 !unique
                     .iter()
-                    .any(|other| other != *path && path.starts_with(other))
+                    .any(|other| other.path != target.path && target.path.starts_with(&other.path))
             })
             .cloned()
             .collect();
         Self {
-            paths,
+            targets,
             stop_indexer: None,
         }
     }
@@ -62,35 +93,74 @@ pub fn apply(plan: &ResetPlan) -> ResetReport {
             return report;
         }
     }
-    for path in &plan.paths {
-        match remove(path) {
-            Ok(true) => report.removed.push(path.clone()),
+    // Fail closed like the stop above: when a directory occupies a
+    // file-only target's path, nothing is removed at all.
+    for target in &plan.targets {
+        if let Some(refusal) = refuse_unless_removable(target) {
+            report.failures.push(refusal);
+            return report;
+        }
+    }
+    for target in &plan.targets {
+        match remove(target) {
+            Ok(true) => report.removed.push(target.path.clone()),
             Ok(false) => {}
-            Err(error) => report
-                .failures
-                .push(format!("could not remove {}: {error}", path.display())),
+            Err(error) => report.failures.push(error),
         }
     }
     report
 }
 
-fn remove(path: &Path) -> io::Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
+/// Refuses a file-only target occupied by a directory: foreign content
+/// that a recursive removal must never touch. `None` means removable —
+/// anything but a real directory, since the removal below never follows
+/// symlinks.
+fn refuse_unless_removable(target: &ResetTarget) -> Option<String> {
+    if target.recursive {
+        return None;
+    }
+    match fs::symlink_metadata(&target.path) {
+        Ok(metadata) if metadata.is_dir() => Some(refusal(&target.path)),
+        _ => None,
+    }
+}
+
+fn refusal(path: &Path) -> String {
+    format!(
+        "refusing to remove {}: a directory occupies this file's path",
+        path.display()
+    )
+}
+
+fn remove(target: &ResetTarget) -> Result<bool, String> {
+    // Re-checked at removal time, so a directory swapped in after the
+    // pre-check still refuses instead of deleting.
+    if let Some(refusal) = refuse_unless_removable(target) {
+        return Err(refusal);
+    }
+    let metadata = match fs::symlink_metadata(&target.path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(format!(
+                "could not remove {}: {error}",
+                target.path.display()
+            ));
+        }
     };
     if metadata.is_dir() {
-        fs::remove_dir_all(path)?;
+        fs::remove_dir_all(&target.path)
+            .map_err(|error| format!("could not remove {}: {error}", target.path.display()))?;
     } else {
-        fs::remove_file(path)?;
+        fs::remove_file(&target.path)
+            .map_err(|error| format!("could not remove {}: {error}", target.path.display()))?;
     }
     Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, ResetPlan};
+    use super::{apply, ResetPlan, ResetTarget};
     use std::fs;
     use tempfile::tempdir;
 
@@ -106,7 +176,11 @@ mod tests {
         let kept = root.path().join("keep.txt");
         fs::write(&kept, b"mine").unwrap();
 
-        let plan = ResetPlan::new(vec![folder.clone(), file.clone(), missing]);
+        let plan = ResetPlan::new(vec![
+            ResetTarget::dir(folder.clone()),
+            ResetTarget::file(file.clone()),
+            ResetTarget::file(missing),
+        ]);
         let report = apply(&plan);
 
         assert!(report.failures.is_empty());
@@ -119,17 +193,17 @@ mod tests {
     #[test]
     fn plan_drops_duplicates_and_paths_inside_other_listed_paths() {
         let plan = ResetPlan::new(vec![
-            "/a/toka".into(),
-            "/a/toka/indexes".into(),
-            "/a/toka".into(),
-            "/a/tokaish".into(),
+            ResetTarget::dir("/a/toka".into()),
+            ResetTarget::dir("/a/toka/indexes".into()),
+            ResetTarget::dir("/a/toka".into()),
+            ResetTarget::dir("/a/tokaish".into()),
         ]);
 
         assert_eq!(
-            plan.paths,
+            plan.targets,
             vec![
-                std::path::PathBuf::from("/a/toka"),
-                std::path::PathBuf::from("/a/tokaish")
+                ResetTarget::dir("/a/toka".into()),
+                ResetTarget::dir("/a/tokaish".into()),
             ]
         );
     }
@@ -139,7 +213,7 @@ mod tests {
         let root = tempdir().unwrap();
         let file = root.path().join("index-status.json");
         fs::write(&file, b"{}").unwrap();
-        let mut plan = ResetPlan::new(vec![file.clone()]);
+        let mut plan = ResetPlan::new(vec![ResetTarget::file(file.clone())]);
         plan.stop_indexer = Some(|| Err("systemctl failed".into()));
 
         let report = apply(&plan);
@@ -154,7 +228,7 @@ mod tests {
         let root = tempdir().unwrap();
         let file = root.path().join("index-status.json");
         fs::write(&file, b"{}").unwrap();
-        let mut plan = ResetPlan::new(vec![file.clone()]);
+        let mut plan = ResetPlan::new(vec![ResetTarget::file(file.clone())]);
         plan.stop_indexer = Some(|| Ok(()));
 
         let report = apply(&plan);
@@ -162,5 +236,36 @@ mod tests {
         assert!(report.failures.is_empty());
         assert_eq!(report.removed, vec![file.clone()]);
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_directory_at_a_file_target_refuses_and_removes_nothing() {
+        // A directory named like an index artifact, holding media: the
+        // reset refuses it with a clear error and removes nothing else
+        // either — not even the legitimate sibling file.
+        let root = tempdir().unwrap();
+        let artifact = root.path().join("search-renames.json");
+        fs::create_dir(&artifact).unwrap();
+        let media = artifact.join("clip.mp4");
+        fs::write(&media, b"video").unwrap();
+        let sibling = root.path().join("index.sqlite3");
+        fs::write(&sibling, b"db").unwrap();
+
+        let plan = ResetPlan::new(vec![
+            ResetTarget::file(sibling.clone()),
+            ResetTarget::file(artifact.clone()),
+        ]);
+        let report = apply(&plan);
+
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].contains("refusing to remove")
+                && report.failures[0].contains("search-renames.json"),
+            "{}",
+            report.failures.join("\n")
+        );
+        assert!(report.removed.is_empty());
+        assert!(media.is_file(), "media inside survives");
+        assert!(sibling.is_file(), "the sibling survives too");
     }
 }

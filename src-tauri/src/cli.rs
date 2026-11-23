@@ -182,8 +182,8 @@ fn run_reset_command(
 
     if !confirmed {
         let _ = writeln!(stdout, "Reset would remove these, if present:");
-        for path in &plan.paths {
-            let _ = writeln!(stdout, "  {}", path.display());
+        for target in &plan.targets {
+            let _ = writeln!(stdout, "  {}", target.path.display());
         }
         let _ = writeln!(
             stderr,
@@ -293,7 +293,7 @@ mod tests {
     use super::run_command;
     use crate::{
         index_stats::{FolderState, FolderStats, IndexStats},
-        reset::ResetPlan,
+        reset::{ResetPlan, ResetTarget},
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
     };
@@ -480,7 +480,7 @@ mod tests {
         let status = run_command(
             &args,
             no_engine,
-            || Ok(ResetPlan::new(vec![state.clone()])),
+            || Ok(ResetPlan::new(vec![ResetTarget::dir(state.clone())])),
             no_stats,
             &mut stdout,
             &mut stderr,
@@ -506,7 +506,7 @@ mod tests {
         let status = run_command(
             &args,
             no_engine,
-            || Ok(ResetPlan::new(vec![state.clone()])),
+            || Ok(ResetPlan::new(vec![ResetTarget::dir(state.clone())])),
             no_stats,
             &mut stdout,
             &mut stderr,
