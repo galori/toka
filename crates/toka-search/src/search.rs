@@ -100,6 +100,18 @@ pub struct SearchPage {
     pub results: Vec<VideoResult>,
 }
 
+/// Every match of one search in a single answer, for callers that sort and
+/// page the complete set themselves (the `ts` CLI). Unlike walking pages,
+/// this matches once and clones no snapshot per page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchAllResults {
+    pub query: String,
+    pub total_results: usize,
+    pub total_pages: usize,
+    pub index_revision: u64,
+    pub results: Vec<VideoResult>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("Enter at least one search term.")]
@@ -439,11 +451,65 @@ impl SearchEngine {
         self.search_filtered_with_context(request, context, filter)
     }
 
+    /// Every match of one search in a single answer, without paging. The
+    /// results arrive in provider order for the caller to sort; each keeps
+    /// a registered id, so `video_path` resolves them exactly as it does
+    /// paged results. No snapshot is stored or cloned.
+    pub fn search_all(
+        &self,
+        query: String,
+        fields: SearchFields,
+        media_type: MediaType,
+    ) -> Result<SearchAllResults, SearchError> {
+        let request = SearchRequest {
+            query,
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields,
+            media_type,
+        };
+        let context = self.logger.context(&request, true);
+        let result = self.search_all_with_context(request, &context);
+        if let Err(error) = &result {
+            self.logger.record_error(&context, &error.to_string());
+        }
+        result
+    }
+
     /// The verbose per-search trace recorded since the last call, from
     /// searches and match counts alike. Empty unless the engine's logger
     /// was built with `SearchLogger::with_verbose_capture`.
     pub fn take_verbose_trace(&self) -> String {
         self.logger.take_verbose_trace()
+    }
+
+    fn search_all_with_context(
+        &self,
+        request: SearchRequest,
+        context: &SearchLogContext,
+    ) -> Result<SearchAllResults, SearchError> {
+        let filter = |_: &Path| true;
+        let (query, paths) = self.matching_paths(&request, context, &filter)?;
+        self.logger.record_returned(context, &paths);
+        let mut known_paths = self.result_paths.lock().unwrap();
+        let results = paths
+            .into_iter()
+            .map(|path| {
+                let result = video_result(&path);
+                known_paths.insert(result.id.clone(), path);
+                result
+            })
+            .collect::<Vec<_>>();
+
+        let total_results = results.len();
+        Ok(SearchAllResults {
+            query,
+            total_results,
+            total_pages: total_results.div_ceil(PAGE_SIZE),
+            index_revision: self.provider.revision(),
+            results,
+        })
     }
 
     fn search_filtered_with_context(
@@ -2059,6 +2125,57 @@ mod tests {
         let mut every_name = [names(&first), names(&second)].concat();
         every_name.sort();
         assert_eq!(every_name, every_clip_name(25));
+    }
+
+    #[test]
+    fn search_all_returns_every_match_in_one_answer() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = engine
+            .search_all("clip".into(), SearchFields::default(), MediaType::default())
+            .unwrap();
+
+        assert_eq!(found.query, "clip");
+        assert_eq!(found.total_results, 30);
+        assert_eq!(found.total_pages, 2);
+        let mut every_name = found
+            .results
+            .iter()
+            .map(|result| result.file_name.clone())
+            .collect::<Vec<_>>();
+        every_name.sort();
+        assert_eq!(every_name, every_clip_name(30));
+        for result in &found.results {
+            assert!(engine.video_path(&result.id).is_ok());
+        }
+    }
+
+    #[test]
+    fn search_all_stores_no_snapshot() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        engine
+            .search_all("clip".into(), SearchFields::default(), MediaType::default())
+            .unwrap();
+
+        assert!(engine.snapshots.lock().unwrap().by_id.is_empty());
+    }
+
+    #[test]
+    fn search_all_rejects_an_empty_query() {
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+
+        assert_eq!(
+            engine
+                .search_all("   ".into(), SearchFields::default(), MediaType::default())
+                .unwrap_err()
+                .to_string(),
+            SearchError::InvalidQuery.to_string()
+        );
     }
 
     #[test]

@@ -1,15 +1,14 @@
 mod cli;
 
 use std::sync::Arc;
+#[cfg(not(feature = "fixtures"))]
+use toka_search::providers::OwnedIndexSearchProvider;
 use toka_search::{
     index_stats::IndexStats,
     owned_index::{self, OwnedIndexFolder, OwnedIndexManager},
-    providers::OwnedIndexSearchProvider,
-    search::{SearchEngine, SearchProvider},
-    search_log::SearchLogger,
+    search::{SearchEngine, SearchError, SearchProvider},
+    search_log::{SearchLogContext, SearchLogger},
 };
-#[cfg(feature = "fixtures")]
-use toka_search::{search::SearchError, search_log::SearchLogContext};
 
 /// Fixture media for integration tests, replacing `TOKA_E2E_VIDEOS` for this
 /// binary. Honored only in builds with the `fixtures` feature.
@@ -31,6 +30,25 @@ impl SearchProvider for FixtureSearchProvider {
     }
 }
 
+/// A provider that answers every search with no candidates and touches
+/// nothing on disk, for `ts` runs against a missing index. Searching must
+/// not create an index that does not exist yet, exactly as `stats` and
+/// `folders list` already refuse to. Fixture builds never construct it:
+/// they always search the configured fixture videos instead.
+#[cfg_attr(feature = "fixtures", allow(dead_code))]
+struct EmptyProvider;
+
+impl SearchProvider for EmptyProvider {
+    fn candidates(
+        &self,
+        _query: &str,
+        _whole_path: bool,
+        _context: &SearchLogContext,
+    ) -> Result<Vec<std::path::PathBuf>, SearchError> {
+        Ok(Vec::new())
+    }
+}
+
 fn search_provider() -> Result<Arc<dyn SearchProvider>, String> {
     #[cfg(feature = "fixtures")]
     {
@@ -44,13 +62,20 @@ fn search_provider() -> Result<Arc<dyn SearchProvider>, String> {
     }
 }
 
-fn search_rename_overlay_path() -> Result<std::path::PathBuf, String> {
-    Ok(owned_index::database_path()?.with_file_name("search-renames.json"))
-}
-
 fn create_engine_with_logger(logger: SearchLogger) -> Result<SearchEngine, String> {
+    // A missing index searches empty instead of being created: opening it
+    // would write a database and locking the rename overlay would write a
+    // lock file, and a read-only command must leave no state behind. No
+    // overlay path either, so nothing is ever locked or persisted.
+    #[cfg(not(feature = "fixtures"))]
+    if !owned_index::database_path()?.is_file() {
+        return Ok(SearchEngine::new_with_logger(
+            Arc::new(EmptyProvider),
+            Arc::new(logger),
+        ));
+    }
     let provider = search_provider()?;
-    let rename_overlay_path = Some(search_rename_overlay_path()?);
+    let rename_overlay_path = Some(owned_index::search_rename_overlay_path()?);
     Ok(SearchEngine::new_with_logger_and_rename_store(
         provider,
         Arc::new(logger),

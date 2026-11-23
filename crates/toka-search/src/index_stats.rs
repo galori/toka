@@ -29,6 +29,9 @@ impl FolderState {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderStats {
+    // Lossy on purpose: real paths can hold non-UTF-8 bytes on Unix, and
+    // those must not break serialization of this report.
+    #[serde(serialize_with = "crate::lossy_path::serialize")]
     pub path: PathBuf,
     pub state: FolderState,
     pub message: Option<String>,

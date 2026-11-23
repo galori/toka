@@ -25,7 +25,7 @@ const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the fol
 
 fn search_help() -> String {
     format!(
-        "{SEARCH_USAGE}\n\nSearch Toka's indexed videos and images. Print one full path per result line.\n\n  --json       Print one JSON document (schema 1) instead of paths\n  --limit N    Print at most N results\n  --page N     Print page N of the results ({PAGE_SIZE} per page)\n  --type T     Only video, image, or all results (default all)\n  --count      Print only how many results matched\n  --verbose    Stream the per-search trace to stderr\n\nUse -- to search for text starting with a dash."
+        "{SEARCH_USAGE}\n\nSearch Toka's indexed videos and images. Print one full path per result line, sorted by path so pages stay stable across runs.\n\n  --json       Print one JSON document (schema 1) instead of paths\n  --limit N    Print at most N results (applied after --page)\n  --page N     Print page N of the results ({PAGE_SIZE} per page)\n  --type T     Only video, image, or all results (default all)\n  --count      Print only how many results matched\n  --verbose    Stream the per-search trace to stderr\n\nUse -- to search for text starting with a dash."
     )
 }
 
@@ -218,14 +218,17 @@ fn run_stats_command(
         }
     };
     if json {
-        let document = serde_json::json!({
-            "schema": JSON_SCHEMA_VERSION,
-            "revision": stats.revision,
-            "videos": stats.videos,
-            "images": stats.images,
-            "serviceRunning": stats.service_running,
-            "folders": stats.folders,
-        });
+        // The struct already serializes to this document's shape; only the
+        // schema version is the CLI's own. Paths inside serialize lossy, so
+        // non-UTF-8 folder names cannot break encoding.
+        let mut document = match serde_json::to_value(&stats) {
+            Ok(document) => document,
+            Err(error) => {
+                let _ = writeln!(stderr, "ts stats: could not encode results: {error}");
+                return 1;
+            }
+        };
+        document["schema"] = serde_json::json!(JSON_SCHEMA_VERSION);
         return print_json(&document, "ts stats", stdout, stderr);
     }
     let report = index_stats::render(&stats);
@@ -251,7 +254,10 @@ struct SearchOptions {
 /// A search hit with the full path the engine resolved it to. The rest is
 /// the engine's own result shape, so the JSON contract stays one shape.
 #[derive(Serialize)]
-struct JsonSearchHit {
+struct SearchHit {
+    // Lossy on purpose: real paths can hold non-UTF-8 bytes on Unix, and
+    // those must not break serialization of this document.
+    #[serde(serialize_with = "toka_search::lossy_path::serialize")]
     path: PathBuf,
     #[serde(flatten)]
     hit: VideoResult,
@@ -384,82 +390,64 @@ fn run_search(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
-    // The engine only serves a page from an earlier one, so a requested page
-    // is walked to from the first; pages past the last are empty, so asking
-    // beyond the end stops at the end.
-    let mut current_page = 1;
-    let mut summary = None;
-    let mut search_id = None;
+    // One call fetches every match; the CLI sorts the complete set by
+    // path and only then slices the requested page, which keeps every
+    // page stable across invocations. Pages past the last slice to
+    // nothing.
+    let found = match engine.search_all(
+        options.query.clone(),
+        SearchFields::default(),
+        options.media_type,
+    ) {
+        Ok(found) => found,
+        Err(error) => {
+            if options.verbose {
+                let _ = write_verbose_trace(engine, stderr);
+            }
+            let _ = writeln!(stderr, "ts search: {error}");
+            return 1;
+        }
+    };
+    if options.verbose {
+        if let Err(error) = write_verbose_trace(engine, stderr) {
+            let _ = writeln!(
+                stderr,
+                "ts search: could not write the search trace: {error}"
+            );
+            return 1;
+        }
+    }
+    let summary = SearchSummary {
+        total_results: found.total_results,
+        total_pages: found.total_pages,
+        index_revision: found.index_revision,
+    };
+
     let mut hits = Vec::new();
-
-    loop {
-        let request = SearchRequest {
-            query: options.query.clone(),
-            page: current_page,
-            page_size: PAGE_SIZE,
-            search_id: search_id.clone(),
-            fields: SearchFields::default(),
-            media_type: options.media_type,
-        };
-        let page = match engine.search(request) {
-            Ok(page) => page,
-            Err(error) => {
-                if options.verbose {
-                    let _ = write_verbose_trace(engine, stderr);
-                }
-                let _ = writeln!(stderr, "ts search: {error}");
-                return 1;
-            }
-        };
-        if options.verbose {
-            if let Err(error) = write_verbose_trace(engine, stderr) {
-                let _ = writeln!(
-                    stderr,
-                    "ts search: could not write the search trace: {error}"
-                );
-                return 1;
-            }
+    for result in found.results {
+        if let Ok(path) = engine.video_path(&result.id) {
+            hits.push(SearchHit { path, hit: result });
         }
-        if search_id.is_none() {
-            search_id = Some(page.search_id.clone());
-        }
-        // Every page of one walk shares a snapshot, so the first page's
-        // totals describe them all.
-        let summary = summary.get_or_insert(SearchSummary {
-            total_results: page.total_results,
-            total_pages: page.total_pages,
-            index_revision: page.index_revision,
-        });
-
-        if options.page.is_none_or(|wanted| wanted == current_page) {
-            for result in page.results {
-                if let Ok(path) = engine.video_path(&result.id) {
-                    hits.push(JsonSearchHit { path, hit: result });
-                }
-            }
-        }
-
-        if options.page.is_some_and(|wanted| current_page >= wanted)
-            || current_page >= summary.total_pages
-        {
-            break;
-        }
-        current_page += 1;
     }
 
     hits.sort_by(|left, right| left.path.cmp(&right.path));
     hits.dedup_by(|left, right| left.path == right.path);
+    if let Some(wanted) = options.page {
+        let start = (wanted - 1).saturating_mul(PAGE_SIZE);
+        hits = hits.into_iter().skip(start).take(PAGE_SIZE).collect();
+    }
     if let Some(limit) = options.limit {
         hits.truncate(limit);
     }
     if options.json {
         // The totals describe the whole search; the page fields describe
-        // this document, which holds one requested page or every hit.
-        let summary = summary.expect("a search walk fetches at least one page");
-        let (page, page_size, total_pages) = match options.page {
-            Some(wanted) => (wanted, PAGE_SIZE, summary.total_pages),
-            None => (1, hits.len(), 1),
+        // this document, which holds one requested page or every hit, and
+        // pageSize counts the hits this document actually holds.
+        let (page, total_pages) = match options.page {
+            Some(wanted) => (wanted, summary.total_pages),
+            None => (1, 1),
         };
+        let page_size = hits.len();
         let document = serde_json::json!({
             "schema": JSON_SCHEMA_VERSION,
             "query": options.query,
@@ -582,7 +570,7 @@ mod tests {
     use tempfile::tempdir;
     use toka_search::{
         index_stats::{FolderState, FolderStats, IndexStats},
-        owned_index::{OwnedFolderStatus, OwnedIndexFolder},
+        owned_index::{OwnedFolderStatus, OwnedIndexFolder, ScannedDirectory},
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
     };
@@ -923,6 +911,162 @@ mod tests {
     }
 
     #[test]
+    fn search_pages_come_from_the_globally_sorted_set() {
+        let directory = tempdir().unwrap();
+        let mut videos = (0..25)
+            .map(|number| {
+                let path = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&path, b"video").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        videos.sort();
+        // Candidates arrive least-sorted first, so the pages can only be
+        // right if the CLI sorts the complete set before slicing.
+        let candidates = videos.iter().rev().cloned().collect::<Vec<_>>();
+        let mut pages = Vec::new();
+        for page in ["1", "2"] {
+            // A fresh engine per page, as separate invocations would have.
+            let engine = SearchEngine::new(Arc::new(FixtureProvider(candidates.clone())));
+            let args = ["ts", "search", "family", "--page", page]
+                .map(OsString::from)
+                .to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                || Ok(engine),
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "page {page}");
+            assert!(stderr.is_empty());
+            pages.push(String::from_utf8(stdout).unwrap());
+        }
+        let paths = videos
+            .iter()
+            .map(|video| video.display().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(pages[0], paths[..24].join("\n") + "\n", "page 1");
+        assert_eq!(pages[1], format!("{}\n", paths[24]), "page 2");
+    }
+
+    #[test]
+    fn search_page_past_the_last_page_prints_nothing() {
+        let directory = tempdir().unwrap();
+        let videos = (0..2)
+            .map(|number| {
+                let path = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&path, b"video").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(videos.clone())));
+        let args = ["ts", "search", "family", "--page", "5"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(videos)));
+        let args = ["ts", "search", "family", "--page", "5", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["page"], 5);
+        assert_eq!(document["pageSize"], 0);
+        assert_eq!(document["totalResults"], 2);
+        assert_eq!(document["results"].as_array().unwrap().len(), 0);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn search_limit_applies_after_page_selection() {
+        let directory = tempdir().unwrap();
+        let mut videos = (0..25)
+            .map(|number| {
+                let path = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&path, b"video").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        videos.sort();
+        let paths = videos
+            .iter()
+            .map(|video| video.display().to_string())
+            .collect::<Vec<_>>();
+        for (page, limit, expected) in [
+            ("1", "2", paths[..2].join("\n") + "\n"),
+            ("2", "5", format!("{}\n", paths[24])),
+        ] {
+            let engine = SearchEngine::new(Arc::new(FixtureProvider(videos.clone())));
+            let args = ["ts", "search", "family", "--page", page, "--limit", limit]
+                .map(OsString::from)
+                .to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                || Ok(engine),
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "page {page} limit {limit}");
+            assert_eq!(
+                String::from_utf8(stdout).unwrap(),
+                expected,
+                "page {page} limit {limit}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
     fn search_count_prints_only_the_match_count() {
         let directory = tempdir().unwrap();
         let videos = ["family-one.mp4", "family-two.mp4", "unrelated.mp4"]
@@ -1068,14 +1212,100 @@ mod tests {
         let document: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(document["schema"], 1);
         assert_eq!(document["page"], 2);
-        assert_eq!(document["pageSize"], toka_search::search::PAGE_SIZE as u64);
+        // pageSize counts this document's hits, not the engine's page.
+        assert_eq!(document["pageSize"], 1);
         assert_eq!(document["totalResults"], 25);
         assert_eq!(document["totalPages"], 2);
         let results = document["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
-        assert!(videos
-            .iter()
-            .any(|video| results[0]["path"] == video.display().to_string()));
+        let mut videos = videos.clone();
+        videos.sort();
+        assert_eq!(
+            results[0]["path"],
+            videos[24].display().to_string(),
+            "page 2 holds the last path of the sorted set"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn search_json_page_size_counts_the_hits_in_the_document() {
+        let directory = tempdir().unwrap();
+        let videos = (0..3)
+            .map(|number| {
+                let path = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&path, b"video").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(videos)));
+        let args = ["ts", "search", "family", "--json", "--limit", "2"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["page"], 1);
+        assert_eq!(document["pageSize"], 2);
+        assert_eq!(document["totalResults"], 3);
+        assert_eq!(document["results"].as_array().unwrap().len(), 2);
+        assert!(stderr.is_empty());
+    }
+
+    // Linux-only: only filesystems like ext4/tmpfs accept non-UTF-8 names;
+    // macOS (APFS) rejects them at creation, so this scenario cannot occur
+    // there. The lossy conversion itself is platform-neutral.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn search_json_with_non_utf8_names_prints_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempdir().unwrap();
+        let name = OsString::from_vec(b"family-\xff-trip.mp4".to_vec());
+        let video = directory.path().join(&name);
+        fs::write(&video, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![video.clone()])));
+        let args = ["ts", "search", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["totalResults"], 1);
+        let results = document["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["path"], video.to_string_lossy().into_owned());
+        assert_eq!(
+            results[0]["fileName"],
+            video.file_name().unwrap().to_string_lossy().into_owned()
+        );
         assert!(stderr.is_empty());
     }
 
@@ -1211,6 +1441,45 @@ mod tests {
         assert!(String::from_utf8(stderr)
             .unwrap()
             .contains(&format!("FILTERED OUT: {}", skipped.display())));
+    }
+
+    #[test]
+    fn search_verbose_json_keeps_the_trace_on_stderr() {
+        let directory = tempdir().unwrap();
+        let matched = directory.path().join("summer-trip.mp4");
+        fs::write(&matched, b"video").unwrap();
+        let skipped = directory.path().join("winter-trip.mp4");
+        let engine = verbose_engine(FixtureProvider(vec![matched.clone(), skipped.clone()]));
+        let args = ["ts", "search", "summer", "--verbose", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || panic!("verbose search must not create the plain engine"),
+            || Ok(engine),
+            no_stats,
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["totalResults"], 1);
+        let results = document["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["path"], matched.display().to_string());
+        let trace = String::from_utf8(stderr).unwrap();
+        assert!(
+            trace.contains(&format!("FILTERED OUT: {}", skipped.display())),
+            "{trace}"
+        );
+        assert!(trace.contains("RESULTS RETURNED TO APP:"), "{trace}");
     }
 
     #[test]
@@ -1477,6 +1746,38 @@ mod tests {
         assert_eq!(document["serviceRunning"], true);
         assert_eq!(document["folders"][0]["path"], "/media");
         assert_eq!(document["folders"][0]["state"], "ready");
+        // The serialized struct carries exactly the documented keys.
+        assert_eq!(document.as_object().unwrap().len(), 6);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stats_json_with_non_utf8_folder_prints_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(b"/media/movies-\xff".to_vec());
+        let mut stats = sample_stats();
+        stats.folders[0].path = PathBuf::from(raw);
+        let expected = stats.folders[0].path.to_string_lossy().into_owned();
+        let args = ["ts", "stats", "--json"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            || Ok(stats),
+            no_folders,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["folders"][0]["path"], expected);
         assert!(stderr.is_empty());
     }
 
@@ -1653,6 +1954,61 @@ mod tests {
         assert_eq!(folders[0]["status"], "ready");
         assert_eq!(folders[1]["status"], "offline");
         assert_eq!(folders[1]["message"], "not mounted");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn folders_list_json_with_non_utf8_paths_prints_lossy() {
+        use std::os::unix::ffi::OsStringExt;
+        // The configured root itself carries invalid UTF-8, as does one
+        // recently visited directory beneath it.
+        let root = PathBuf::from(OsString::from_vec(b"/media/movies-\xff".to_vec()));
+        let visited = PathBuf::from(OsString::from_vec(
+            b"/media/movies-\xff/trips-\xfe".to_vec(),
+        ));
+        let folders = vec![OwnedIndexFolder {
+            id: "abc".into(),
+            path: root.clone(),
+            status: OwnedFolderStatus::Ready,
+            message: None,
+            scanned_files: 0,
+            current_path: None,
+            recent_directories: vec![ScannedDirectory {
+                path: visited.clone(),
+                scanning: false,
+                videos: 1,
+                images: 0,
+                subfolders: 0,
+            }],
+        }];
+        let args = ["ts", "folders", "list", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(folders),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        let folders = document["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0]["path"], root.to_string_lossy().into_owned());
+        assert_eq!(
+            folders[0]["recentDirectories"][0]["path"],
+            visited.to_string_lossy().into_owned()
+        );
         assert!(stderr.is_empty());
     }
 
