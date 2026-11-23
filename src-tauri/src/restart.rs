@@ -54,7 +54,15 @@ pub fn restart(host: &mut impl Host) -> Result<Vec<String>, String> {
         Ok(report) => {
             actions.extend(report.actions.into_iter().map(|action| action.message));
             if let Some(error) = report.error {
-                failures.push(error);
+                // No `ts` service on this machine (a worktree build, a
+                // fresh install): there is nothing to restart, so the
+                // indexer half is a note and the app restart still exits 0,
+                // as it did before `ts`.
+                if error.contains("is not installed") {
+                    actions.push(format!("indexer service is not installed: {error}"));
+                } else {
+                    failures.push(error);
+                }
             }
         }
         Err(error) => failures.push(error),
@@ -355,6 +363,29 @@ mod tests {
         // The partial actions ran; only the error joins the failure.
         assert_eq!(error, "could not start it again");
         assert_eq!(host.calls, ["terminate 40", "restart-indexer", "spawn-app"]);
+    }
+
+    #[test]
+    fn an_uninstalled_indexer_service_is_a_note_not_a_failure() {
+        // A worktree build or a fresh machine has no `ts` service: `ts
+        // restart` reports "is not installed", the app restart still
+        // succeeded, and the command exits 0 as it did before `ts`.
+        let mut host = Fake::new(vec![40]);
+        host.indexer = Ok(ts_client::ServiceReport {
+            actions: Vec::new(),
+            error: Some("toka-ts.service is not installed; run `ts install` first.".to_owned()),
+        });
+
+        let actions = restart(&mut host).unwrap();
+
+        assert_eq!(host.calls, ["terminate 40", "restart-indexer", "spawn-app"]);
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.contains("is not installed")),
+            "{actions:?}"
+        );
+        assert!(actions.iter().any(|action| action == "started Toka"));
     }
 
     #[test]

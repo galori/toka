@@ -9,24 +9,10 @@ type OwnedIndexState = {
   folders: OwnedIndexFolder[];
 };
 
-async function invoke<T>(
-  command: string,
-  args?: Record<string, unknown>,
-): Promise<T> {
+async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   return browser.execute(
     async (invocation: { command: string; args?: Record<string, unknown> }) => {
-      const tauri = (
-        window as unknown as {
-          __TAURI__: {
-            core: {
-              invoke: <R>(
-                command: string,
-                args?: Record<string, unknown>,
-              ) => Promise<R>;
-            };
-          };
-        }
-      ).__TAURI__;
+      const tauri = (window as unknown as { __TAURI__: { core: { invoke: <R>(command: string, args?: Record<string, unknown>) => Promise<R> } } }).__TAURI__;
       return tauri.core.invoke<T>(invocation.command, invocation.args);
     },
     { command, args },
@@ -78,9 +64,7 @@ describe("Toka owned index", () => {
     const search = await $("#video-search");
     await search.click();
     await browser.keys("happy path");
-    await browser.execute(() =>
-      document.querySelector("form")?.requestSubmit(),
-    );
+    await browser.execute(() => document.querySelector("form")?.requestSubmit());
 
     const result = await $('button[aria-label="Play toka-e2e-happy-path.mp4"]');
     await result.waitForDisplayed({ timeout: 120_000 });
@@ -95,8 +79,6 @@ describe("Toka owned index", () => {
     await $("button.play-button").click();
     await $('button[aria-label="Back to results"]').click();
 
-    await expect(
-      await $('button[aria-label="Play toka-e2e-happy-path.mp4"]'),
-    ).toBeDisplayed();
+    await expect(await $('button[aria-label="Play toka-e2e-happy-path.mp4"]')).toBeDisplayed();
   });
 });

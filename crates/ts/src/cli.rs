@@ -30,14 +30,14 @@ const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether t
 const DAEMON_HELP: &str =
     "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
 const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
-const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command. One supervisor owns each index: whichever starts first wins, so a second `ts daemon run` on the same index exits 1 instead of starting. The Toka app takes the same lock, so running a daemon alongside it is safe: the app yields its own watchers with a warning and keeps reading the index.";
-const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]      Add a folder to the index\n  remove <path> [--json]   Remove a folder from the index\n  list [--json]            List the folders the index watches";
+const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command. One supervisor owns each index: only `ts daemon run` holds the supervisor lock, so a second one on the same index exits 1 instead of starting. The Toka app supervises nothing — it reaches the index only through `ts` — so running a daemon alongside it is safe.";
+const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]       Add a folder to the index\n  remove <path|id> [--json] Remove a folder from the index\n  list [--json]             List the folders the index watches";
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing in the index.";
 const FOLDERS_ADD_USAGE: &str = "Usage: ts folders add <path> [--json]";
 const FOLDERS_ADD_HELP: &str = "Usage: ts folders add <path> [--json]\n\nAdd a folder to the index, exactly as adding it in the app does. The running indexer picks it up and starts scanning on its own; on macOS with the app quit, the folder waits for the next launch. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to add a path starting with a dash.";
-const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path> [--json]";
-const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
+const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path|id> [--json]";
+const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path|id> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Names the folder by path or by the id `ts folders list --json` reports; the id removes folders whose paths are not valid UTF-8, which no shell spelling can name. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
 const SYNC_PATH_USAGE: &str = "Usage: ts sync-path <path>";
 const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. The path must sit under a watched folder; anything else is an error. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
 const SYNC_RENAME_USAGE: &str = "Usage: ts sync-rename <from> <to>";
@@ -578,7 +578,7 @@ fn run_folders_remove_command(
             return 1;
         }
     };
-    // The app removes by id; the shell names a path, so resolve it to the
+    // The shell names a path or a folder id, so resolve it to the
     // configured folder first. Unlike the app's remove flow — which opens
     // (and thereby creates) the database — a missing index errors here
     // instead: `read_folders` reports no folders when the database file is
@@ -610,12 +610,14 @@ fn run_folders_remove_command(
     }
 }
 
-/// The configured folder `requested` names. The normalized spelling
-/// matches first: recorded entries are canonical absolute paths, and the
-/// normalization also resolves a typed spelling against the current
-/// directory, so a folder deleted from disk — often the very reason to
-/// remove it — still matches what the same shell spelling added. The
-/// spelling as typed only matches when nothing normalized does, so one
+/// The configured folder `requested` names. A folder id matches first:
+/// ids are minted UUIDs no shell spelling collides with, and the id is the
+/// only spelling that can name a folder whose path is not valid UTF-8. The
+/// normalized path matches next: recorded entries are canonical absolute
+/// paths, and the normalization also resolves a typed spelling against the
+/// current directory, so a folder deleted from disk — often the very
+/// reason to remove it — still matches what the same shell spelling added.
+/// The spelling as typed only matches when nothing else does, so one
 /// request can never ambiguously name two rows.
 fn resolve_folder<'a>(
     folders: &'a [OwnedIndexFolder],
@@ -624,7 +626,8 @@ fn resolve_folder<'a>(
     let spelling = toka_search::owned_index::canonical_spelling(requested);
     folders
         .iter()
-        .find(|folder| folder.path == spelling)
+        .find(|folder| OsStr::new(folder.id.as_str()) == requested.as_os_str())
+        .or_else(|| folders.iter().find(|folder| folder.path == spelling))
         .or_else(|| folders.iter().find(|folder| folder.path == requested))
 }
 
@@ -3910,6 +3913,45 @@ mod tests {
     #[test]
     fn folders_remove_prints_a_confirmation() {
         let args = ["ts", "folders", "remove", "/media/movies"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "abc");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Removed /media/movies\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_accepts_a_folder_id() {
+        let args = ["ts", "folders", "remove", "abc"]
             .map(OsString::from)
             .to_vec();
         let mut stdout = Vec::new();

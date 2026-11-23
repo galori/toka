@@ -583,6 +583,266 @@ fn search_json_matches_the_direct_engine_on_the_same_index() {
     assert_eq!(document["indexRevision"], found.index_revision);
 }
 
+#[test]
+fn folders_add_and_remove_match_the_direct_manager() {
+    use toka_search::owned_index::OwnedIndexManager;
+
+    // One real index under a scratch home, mutated through the CLI and read
+    // back through the direct manager: any drift in state shape,
+    // canonicalization, or validation messages shows up as a mismatch.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let manager = OwnedIndexManager::under(database);
+
+    let output = run_at(&home, &["folders", "add", &media_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct = manager.state().unwrap();
+    assert_eq!(document["revision"], direct.revision);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_eq!(document["folders"][0]["id"], direct.folders[0].id);
+    assert_eq!(
+        document["folders"][0]["path"],
+        direct.folders[0].path.to_string_lossy().into_owned()
+    );
+    assert_eq!(document["folders"][0]["status"], "pending");
+    let id = direct.folders[0].id.clone();
+
+    // Validation errors read identically on both sides: re-adding the same
+    // folder, and adding a file instead of a folder.
+    let file = media.join("not-a-folder.mp4");
+    fs::write(&file, b"fixture video").unwrap();
+    let file_argument = file.to_string_lossy().into_owned();
+    for target in [&media_argument, &file_argument] {
+        let output = run_at(&home, &["folders", "add", target]);
+        assert_eq!(output.status.code(), Some(1), "{target}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let cli_error = stderr
+            .strip_prefix("ts folders add: ")
+            .unwrap_or(&stderr)
+            .trim_end()
+            .to_owned();
+        let direct_error = manager.add_folder(Path::new(target)).unwrap_err();
+        assert_eq!(cli_error, direct_error, "{target}");
+    }
+
+    // Remove by path through the CLI; the direct manager reads it back.
+    let output = run_at(&home, &["folders", "remove", &media_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct = manager.state().unwrap();
+    assert!(document["folders"].as_array().unwrap().is_empty());
+    assert!(direct.folders.is_empty());
+    assert_eq!(document["revision"], direct.revision);
+
+    // Removing what is gone: the direct side reports the configured error,
+    // the CLI names the path it cannot resolve.
+    let output = run_at(&home, &["folders", "remove", &media_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("is not one of Toka's search folders"),
+        "{stderr}"
+    );
+    assert_eq!(
+        manager.remove_folder(&id).unwrap_err(),
+        toka_search::owned_index::OwnedIndexError::FolderNotConfigured.to_string()
+    );
+
+    // And back again by id: re-add through the CLI, remove by the id from
+    // its own document, read back through the direct manager.
+    let output = run_at(&home, &["folders", "add", &media_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let id = document["folders"][0]["id"].as_str().unwrap().to_owned();
+    let output = run_at(&home, &["folders", "remove", &id, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(manager.state().unwrap().folders.is_empty());
+}
+
+/// Like `run_at`, but with argv that need not be UTF-8: real folder paths on
+/// Linux can hold bytes no `&str` can carry.
+#[cfg(target_os = "linux")]
+fn run_at_os(home: &ScratchHome, arguments: &[OsString]) -> Output {
+    let scratch = home.home.path().join("tmp");
+    fs::create_dir_all(&scratch).unwrap();
+    let mut command = Command::new(Path::new(env!("CARGO_BIN_EXE_ts")));
+    command
+        .args(arguments)
+        .env("HOME", home.home.path())
+        .env("XDG_DATA_HOME", &home.data_home)
+        .env("TMPDIR", &scratch)
+        .env("TOKA_RUNTIME_DIR", scratch.join("runtime"));
+    command.env_remove("TS_FIXTURE_VIDEOS");
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_exit(child)
+}
+
+/// A folder whose path is not valid UTF-8 still removes: the list document
+/// can only carry its lossy spelling, but the id round-trips exactly.
+/// Linux-only: macOS filesystems reject non-UTF-8 names outright, so the
+/// setup itself cannot run there.
+#[cfg(target_os = "linux")]
+#[test]
+fn folders_remove_by_id_covers_non_utf8_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    use toka_search::owned_index::OwnedIndexManager;
+
+    let home = scratch_home();
+    let raw = home
+        .home
+        .path()
+        .join(OsString::from_vec(b"media-\xff".to_vec()));
+    fs::create_dir_all(&raw).unwrap();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let manager = OwnedIndexManager::under(database);
+
+    let output = run_at_os(
+        &home,
+        &[
+            OsString::from("folders"),
+            OsString::from("add"),
+            OsString::from("--json"),
+            OsString::from("--"),
+            raw.as_os_str().to_os_string(),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let id = document["folders"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(manager.state().unwrap().folders.len(), 1);
+
+    let output = run_at_os(
+        &home,
+        &[
+            OsString::from("folders"),
+            OsString::from("remove"),
+            OsString::from("--json"),
+            OsString::from("--"),
+            OsString::from(&id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(manager.state().unwrap().folders.is_empty());
+}
+
+#[test]
+fn thumbnail_and_preview_match_the_direct_engine() {
+    use std::sync::Arc;
+    use toka_search::{
+        owned_index::{OwnedIndex, OwnedIndexManager},
+        providers::OwnedIndexSearchProvider,
+        search::{MediaType, SearchEngine, SearchFields},
+        search_log::SearchLogger,
+    };
+
+    // One real index under a scratch home with a scanned image: an image is
+    // its own thumbnail and preview on both sides, so the comparison needs
+    // no ffmpeg.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let image = create_image(&media, "family-photo-00.jpg");
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    assert_eq!(folders.len(), 1);
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+
+    // Through the direct engine, behind a search result id.
+    let engine = SearchEngine::new_with_logger(
+        Arc::new(OwnedIndexSearchProvider::new(database)),
+        Arc::new(SearchLogger::disabled()),
+    );
+    let found = engine
+        .search_all(
+            "family".to_owned(),
+            SearchFields::default(),
+            MediaType::Both,
+        )
+        .unwrap();
+    assert_eq!(found.results.len(), 1);
+    let id = &found.results[0].id;
+    let direct_thumbnail = engine.thumbnail_path(id).unwrap();
+    let direct_preview = engine.preview_paths(id).unwrap();
+
+    // Through `ts thumbnail` / `ts preview --json`.
+    let image_argument = image.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_at(&home, &["thumbnail", &image_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        document["thumbnail"],
+        direct_thumbnail.to_string_lossy().into_owned()
+    );
+
+    let output = run_at(&home, &["preview", &image_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct_preview: Vec<String> = direct_preview
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(document["previews"], serde_json::json!(direct_preview));
+}
+
 /// Writes a version-999 database at the child's index path: an index
 /// from a newer Toka that this one must refuse, not migrate.
 fn write_newer_schema_database(database: &Path) {

@@ -50,6 +50,10 @@ pub const TIMEOUT_MEDIA: Duration = Duration::from_secs(300);
 pub const TIMEOUT_SERVICE: Duration = Duration::from_secs(180);
 /// A reset stops the indexer before deleting; the stop can linger.
 pub const TIMEOUT_RESET: Duration = Duration::from_secs(300);
+/// The launch-page revision fallback: a best-effort read behind a command
+/// thread, so a wedged `ts` stalls it for seconds, never the full stats
+/// wait.
+pub const TIMEOUT_REVISION: Duration = Duration::from_secs(5);
 
 /// One finished `ts` run: its exit status with captured output. `status`
 /// is -1 when the child never exited normally (a signal).
@@ -106,8 +110,25 @@ fn search_path(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|directory| directory.join(name))
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| candidate.is_file() && is_runnable(candidate))
     })
+}
+
+/// Whether `candidate` can be spawned: on unix a regular file without any
+/// execute bit is a shadow, not a binary, and the search must continue
+/// past it instead of failing at spawn.
+#[cfg(unix)]
+fn is_runnable(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    candidate
+        .metadata()
+        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_runnable(_candidate: &Path) -> bool {
+    true
 }
 
 /// Runs `ts` with `args`, killing it past `timeout`. The exit status is
@@ -132,6 +153,15 @@ pub fn run(args: &[OsString], timeout: Duration) -> Result<TsOutput, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // Its own process group, so the timeout below kills the whole
+        // tree: service operations shell out to systemctl/launchctl and
+        // thumbnails to ffmpeg, and those grandchildren must not outlive
+        // the deadline invisibly.
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     forward_fixtures(&mut command);
     let mut child = command.spawn().map_err(|error| {
         format!(
@@ -139,25 +169,33 @@ pub fn run(args: &[OsString], timeout: Duration) -> Result<TsOutput, String> {
             binary.display()
         )
     })?;
+    // Drain both pipes on reader threads while the main thread polls the
+    // deadline: nothing may wait for the child's exit before reading, or a
+    // child filling the 64 KiB pipe buffer (a broad `ts search --json`
+    // answers the whole hit set) wedges forever and dies to a spurious
+    // timeout.
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
     let deadline = Instant::now() + timeout;
     loop {
-        if child
+        if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("Toka could not wait for its search helper: {error}"))?
-            .is_some()
         {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| format!("Toka could not read its search helper: {error}"))?;
             return Ok(TsOutput {
-                status: output.status.code().unwrap_or(-1),
-                stdout: output.stdout,
-                stderr: output.stderr,
+                status: status.code().unwrap_or(-1),
+                stdout: join_pipe_reader(stdout_reader)?,
+                stderr: join_pipe_reader(stderr_reader)?,
             });
         }
         if Instant::now() >= deadline {
+            kill_child_tree(&child);
             let _ = child.kill();
             let _ = child.wait();
+            // The group kill reaps the grandchildren holding the pipes, so
+            // these joins return instead of blocking on orphaned output.
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(format!(
                 "ts {label} timed out after {} seconds.",
                 timeout.as_secs()
@@ -166,6 +204,44 @@ pub fn run(args: &[OsString], timeout: Duration) -> Result<TsOutput, String> {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Reads one captured pipe to end on its own thread; see [`run`].
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    })
+}
+
+/// Collects one [`spawn_pipe_reader`] thread: a failed read (or a reader
+/// that never ran) errors exactly as the old `wait_with_output` did.
+fn join_pipe_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| "Toka could not read its search helper.".to_owned())?
+        .map_err(|error| format!("Toka could not read its search helper: {error}"))
+}
+
+/// Kills the whole `ts` process group the child leads — grandchildren
+/// included — ahead of the direct `kill` below.
+#[cfg(unix)]
+fn kill_child_tree(child: &std::process::Child) {
+    // SAFETY: plain signal delivery to a process group this module created.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+/// No process groups off unix: the direct `kill` below is the whole tree.
+#[cfg(not(unix))]
+fn kill_child_tree(_child: &std::process::Child) {}
 
 #[cfg(unix)]
 fn has_nul(argument: &OsStr) -> bool {
@@ -412,7 +488,9 @@ impl SearchProvider for TsSearchProvider {
         if let Some(revision) = *self.revision.lock().unwrap() {
             return revision;
         }
-        stats().map(|stats| stats.revision).unwrap_or(0)
+        stats_with_timeout(TIMEOUT_REVISION)
+            .map(|stats| stats.revision)
+            .unwrap_or(0)
     }
 }
 
@@ -443,24 +521,29 @@ pub fn folders_add(path: &Path) -> Result<OwnedIndexState, String> {
     index_state_from_document("folders add", &document)
 }
 
-/// Removes the folder `id` names: resolves it through `ts folders list`
-/// first, since the shell names folders by path and the app by id. An id
-/// that resolves to nothing reports exactly what removing it in-process
+/// Removes the folder `id` names, by id end to end: `ts folders remove`
+/// resolves the id itself, so no list-then-remove race can slip between,
+/// and folders whose paths are not valid UTF-8 remove like any other. An
+/// id that resolves to nothing reports exactly what removing it in-process
 /// did — the error, not a guess.
 pub fn folders_remove_by_id(id: &str) -> Result<OwnedIndexState, String> {
-    let folders = folders_list()?;
-    let Some(folder) = folders.iter().find(|folder| folder.id == id) else {
-        return Err(toka_search::owned_index::OwnedIndexError::FolderNotConfigured.to_string());
-    };
     let args = [
         OsString::from("folders"),
         OsString::from("remove"),
         OsString::from("--json"),
         OsString::from("--"),
-        folder.path.as_os_str().to_os_string(),
+        OsString::from(id),
     ];
-    let document = run_json("folders remove", &args, TIMEOUT_FOLDERS)?;
-    index_state_from_document("folders remove", &document)
+    match run_json("folders remove", &args, TIMEOUT_FOLDERS) {
+        Ok(document) => index_state_from_document("folders remove", &document),
+        // The folder left between the caller listing it and removing it:
+        // `ts` names the id it cannot resolve, the app names the error the
+        // in-process remove reported.
+        Err(error) if error.contains("is not one of Toka's search folders") => {
+            Err(toka_search::owned_index::OwnedIndexError::FolderNotConfigured.to_string())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn index_state_from_document(
@@ -473,8 +556,14 @@ fn index_state_from_document(
 
 /// Everything the index knows, for `toka --index-stats`.
 pub fn stats() -> Result<IndexStats, String> {
+    stats_with_timeout(TIMEOUT_STATS)
+}
+
+/// One `ts stats --json` read under the caller's own deadline: the
+/// revision fallback waits less than a deliberate stats read.
+fn stats_with_timeout(timeout: Duration) -> Result<IndexStats, String> {
     let args = [OsString::from("stats"), OsString::from("--json")];
-    stats_from_output(&run(&args, TIMEOUT_STATS)?)
+    stats_from_output(&run(&args, timeout)?)
 }
 
 fn stats_from_document(document: &serde_json::Value) -> Result<IndexStats, String> {
@@ -821,6 +910,7 @@ mod tests {
         assert_eq!(timeout_for("bogus"), TIMEOUT_SERVICE);
         assert!(TIMEOUT_SEARCH < TIMEOUT_SYNC);
         assert!(TIMEOUT_SYNC < TIMEOUT_MEDIA);
+        assert!(TIMEOUT_REVISION < TIMEOUT_STATS);
     }
 
     #[test]
@@ -887,6 +977,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn path_lookup_skips_a_non_executable_shadow() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let shadow = directory.path().join("shadow");
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&shadow).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let decoy = shadow.join("ts");
+        std::fs::write(&decoy, b"not a binary\n").unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let shim = write_shim(&bin, "ts", "#!/bin/sh\necho shim\n");
+        let mut env = EnvGuard::lock();
+        env.remove("TS_BIN");
+        let path = std::env::join_paths([&shadow, &bin]).unwrap();
+        env.set("PATH", path.as_os_str());
+
+        assert_eq!(resolve_ts().unwrap(), shim);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn resolution_without_any_ts_says_where_it_looked() {
         let directory = tempfile::tempdir().unwrap();
         let empty = directory.path().join("empty");
@@ -932,6 +1043,51 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(error.contains("timed out"), "{error}");
         assert!(error.contains("ts search"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_returns_large_stdout_without_deadlocking() {
+        let directory = tempfile::tempdir().unwrap();
+        // 2 MiB: far past the 64 KiB pipe buffer, so a `run()` that only
+        // reads after the child exits would wedge the child until the
+        // deadline and report a spurious timeout.
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            "#!/bin/sh\nhead -c 2000000 /dev/zero | tr '\\0' 'o'\n",
+        );
+        let _env = use_ts(&shim);
+
+        let started = Instant::now();
+        let output = run(&[OsString::from("search")], Duration::from_secs(10)).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.len(), 2_000_000);
+        assert!(output.stdout.iter().all(|byte| *byte == b'o'));
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_returns_large_stderr_without_deadlocking() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            "#!/bin/sh\nhead -c 2000000 /dev/zero | tr '\\0' 'e' >&2\n",
+        );
+        let _env = use_ts(&shim);
+
+        let started = Instant::now();
+        let output = run(&[OsString::from("search")], Duration::from_secs(10)).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr.len(), 2_000_000);
+        assert!(output.stderr.iter().all(|byte| *byte == b'e'));
     }
 
     #[cfg(unix)]
@@ -1202,18 +1358,22 @@ EOF
 
     #[cfg(unix)]
     #[test]
-    fn folders_remove_resolves_the_id_then_removes_by_path() {
+    fn folders_remove_passes_the_id_straight_through() {
         let directory = tempfile::tempdir().unwrap();
-        let folders = folders_document();
         let shim = write_shim(
             directory.path(),
             "ts",
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = folders ] && [ \"$2\" = list ]; then cat <<'EOF'\n{folders}\nEOF\nelif [ \"$1\" = folders ] && [ \"$2\" = remove ] && [ \"$3\" = --json ] && [ \"$4\" = -- ] && [ \"$5\" = /media/new ]; then cat <<'EOF'\n{{\"schema\": 1, \"supported\": true, \"revision\": 5, \"indexedVideos\": 0, \"indexedImages\": 0, \"indexingFiles\": 0, \"folders\": []}}\nEOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
-            ),
+            r#"#!/bin/sh
+if [ "$1" = folders ] && [ "$2" = remove ] && [ "$3" = --json ] && [ "$4" = -- ] && [ "$5" = bbb ]; then cat <<'EOF'
+{"schema": 1, "supported": true, "revision": 5, "indexedVideos": 0, "indexedImages": 0, "indexingFiles": 0, "folders": []}
+EOF
+else echo "unexpected argv: $*" >&2; exit 9; fi
+"#,
         );
         let _env = use_ts(&shim);
 
+        // No `folders list` runs first: the id goes straight to `ts`, so
+        // no list-then-remove race can slip between.
         let state = folders_remove_by_id("bbb").unwrap();
 
         assert_eq!(state.revision, 5);
@@ -1224,13 +1384,13 @@ EOF
     #[test]
     fn folders_remove_of_an_unknown_id_reports_the_configured_error() {
         let directory = tempfile::tempdir().unwrap();
-        let folders = folders_document();
         let shim = write_shim(
             directory.path(),
             "ts",
-            &format!(
-                "#!/bin/sh\nif [ \"$1\" = folders ] && [ \"$2\" = list ]; then cat <<'EOF'\n{folders}\nEOF\nelse echo \"remove must not run for an unknown id\" >&2; exit 9; fi\n"
-            ),
+            r#"#!/bin/sh
+if [ "$1" = folders ] && [ "$2" = remove ] && [ "$5" = zzz ]; then echo "ts folders remove: zzz is not one of Toka's search folders." >&2; exit 1
+else echo "unexpected argv: $*" >&2; exit 9; fi
+"#,
         );
         let _env = use_ts(&shim);
 
