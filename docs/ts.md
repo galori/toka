@@ -230,8 +230,10 @@ bundler signs sidecars with the app).
 creating `~/.local/bin` if needed. The link is attempted even when the
 service setup fails, and a link that cannot be created warns instead of
 failing an installed service: a real file or a directory in the way is
-named but never clobbered. A stale symlink is replaced, and an
-already-linked path — or a copy of the binary itself — reports so.
+named but never clobbered. Any symlink that points elsewhere is
+replaced — even one whose target still exists — so preserve a custom
+`~/.local/bin/ts` link before installing. An already-linked path — or
+a copy of the binary itself — reports so.
 `ts uninstall` removes the link it owns.
 
 `ts install` refuses a temporary copy — an AppImage mount or anything

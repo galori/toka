@@ -1948,8 +1948,9 @@ fn sibling_temp_file(path: &Path) -> PathBuf {
 
 /// Links `ts` into `~/.local/bin`, so install scripts and shells find the
 /// same executable the service runs. A link that already points here is
-/// left alone; a stale link is replaced. Anything else at that path — a
-/// directory, or a real copied binary — errors instead of being deleted.
+/// left alone; any symlink pointing elsewhere is replaced, even one whose
+/// target still exists. Anything else at that path — a directory, or a
+/// real copied binary — errors instead of being deleted.
 fn link_ts(host: &mut impl Host, outcome: &mut Outcome) -> Result<(), String> {
     let home = host.home();
     let link = link_path(&home);
