@@ -1372,7 +1372,9 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
 fn read_index_stats() -> Result<index_stats::IndexStats, String> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        owned_index::OwnedIndexManager::for_inspection()?.stats()
+        // Read-only like `ts stats`: `--index-stats` promises changes nothing,
+        // so it must neither migrate nor create the index.
+        owned_index::OwnedIndexManager::for_read_only_inspection()?.stats()
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
