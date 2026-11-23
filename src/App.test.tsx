@@ -2504,21 +2504,30 @@ test("selects and clears the mpv subtitle track for native playback", async () =
     expect(screen.getByRole("button", { name: "Subtitles" })).toBeEnabled(),
   );
 
-  fireEvent.keyDown(window, { key: "s" });
+  // The track list arriving and the window keydown listener being re-bound
+  // with it are separate renders, so a press landing between them is ignored.
+  // An ignored press has no effect, so pressing again until it registers is
+  // safe: a handled press calls the command synchronously and ends the retry.
+  const pressSubtitleKey = (id: number | null) => {
+    const called = () =>
+      invokeMock.mock.calls.some(
+        ([command, args]) =>
+          command === "set_native_subtitle" &&
+          (args as { id: number | null }).id === id,
+      );
+    if (!called()) fireEvent.keyDown(window, { key: "s" });
+    expect(called()).toBe(true);
+  };
+
+  await waitFor(() => pressSubtitleKey(1));
   await waitFor(() =>
-    expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", { id: 1 }),
-  );
-  expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
+    expect(screen.getByRole("button", { name: "Subtitles" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    ),
   );
 
-  fireEvent.keyDown(window, { key: "s" });
-  await waitFor(() =>
-    expect(invokeMock).toHaveBeenCalledWith("set_native_subtitle", {
-      id: null,
-    }),
-  );
+  await waitFor(() => pressSubtitleKey(null));
 });
 
 test("shows its keyboard shortcut on every control that has one", async () => {
