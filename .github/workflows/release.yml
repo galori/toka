@@ -1,15 +1,20 @@
 name: Release
 
+# Every green main commit is a release: when CI finishes on main with success,
+# build both platform bundles and publish them under an automation-owned tag
+# (v<major>.<minor>.<main commit count>, derived by bin/prepare-release.mjs).
 on:
-  push:
-    tags:
-      - "v[0-9]*"
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event.workflow_run.conclusion == 'success'
     name: build and release (${{ matrix.status-os }}, ${{ matrix.rust-target }}, ${{ matrix.bundles }})
     strategy:
       fail-fast: false
@@ -27,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -41,17 +47,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libgtk-3-dev libepoxy-dev libegl1-mesa-dev libglx-dev librsvg2-dev libmpv2 patchelf
-      - name: Check tag version matches manifests
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          pkg="$(node -p "require('./package.json').version")"
-          conf="$(node -p "require('./src-tauri/tauri.conf.json').version")"
-          cargo="$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)"
-          if [ "$pkg" != "$tag" ] || [ "$conf" != "$tag" ] || [ "$cargo" != "$tag" ]; then
-            echo "Tag v$tag does not match manifests (package.json $pkg, tauri.conf.json $conf, Cargo.toml $cargo)"
-            exit 1
-          fi
-          echo "Release version $tag matches all manifests."
+      - name: Derive and stamp release version
+        run: node bin/prepare-release.mjs --stamp >> "$GITHUB_ENV"
       - run: npm ci
       - name: Package app
         run: |
@@ -64,7 +61,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cd "src-tauri/target/${{ matrix.rust-target }}/release/bundle/macos"
-          tar -czf "$GITHUB_WORKSPACE/toka-${{ github.ref_name }}-macos-aarch64.app.tar.gz" *.app
+          tar -czf "$GITHUB_WORKSPACE/toka-${{ env.RELEASE_TAG }}-macos-aarch64.app.tar.gz" *.app
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
@@ -76,12 +73,33 @@ jobs:
             src-tauri/target/${{ matrix.rust-target }}/release/bundle/deb/*.deb
             src-tauri/target/${{ matrix.rust-target }}/release/bundle/appimage/*.AppImage
   publish:
+    if: github.event.workflow_run.conclusion == 'success'
     name: publish release
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Derive release version
+        run: node bin/prepare-release.mjs >> "$GITHUB_ENV"
+      - name: Push release tag
+        run: |
+          TAG="${{ env.RELEASE_TAG }}"
+          if git fetch origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null; then
+            if [ "$(git rev-list -n 1 "$TAG")" = "$(git rev-parse HEAD)" ]; then
+              echo "Tag $TAG already points at HEAD; reusing it."
+            else
+              echo "Tag $TAG already exists on another commit; refusing to move it."
+              exit 1
+            fi
+          else
+            git tag "$TAG" HEAD
+            git push origin "$TAG"
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -89,6 +107,7 @@ jobs:
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |

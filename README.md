@@ -44,11 +44,12 @@ unsigned apps. Instead:
 On earlier macOS versions, right-click (or Control-click) the app, choose
 Open, then confirm.
 
-Maintainers cut a release by setting the base version in `package.json`,
-`src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` in a dedicated commit,
-then pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The
-release workflow checks the tag against all three manifests and publishes the
-bundles.
+Every merge to `main` publishes a release automatically once CI is green:
+the release workflow builds both platform bundles and attaches them to a new
+release tagged `v<major>.<minor>.<main commit count>` (for example `v0.1.250`),
+so release versions grow monotonically and re-running a release rebuilds the
+same version. The manifests carry only the base major.minor; the workflow
+stamps the full version into its own checkout and never commits it.
 
 ## Search
 
