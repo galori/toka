@@ -4,12 +4,18 @@ use std::{ffi::OsString, path::PathBuf};
 pub const ADDON_SEARCH_FLAG: &str = "--toka-addon-search";
 
 /// Whether this process should hand its GUI launch to a detached child and
-/// exit: a media, empty, or add-on search launch whose standard output or
-/// error is a terminal, i.e. Toka was started from an interactive shell.
-/// CLI commands, the indexer service, and piped or headless launches stay in
-/// this process, so their output and exit status still reach the caller.
+/// exit: a release media, empty, or add-on search launch whose standard
+/// input, output, and error are all terminals, i.e. Toka was started from an
+/// interactive shell. CLI commands, the indexer service, debug builds (such
+/// as `tauri dev`), and piped or headless launches stay in this process, so
+/// their output and exit status still reach the caller.
+#[cfg(any(
+    test,
+    all(target_os = "linux", not(feature = "e2e"), not(debug_assertions))
+))]
 pub fn should_detach_gui(
     arguments: &[OsString],
+    stdin_is_terminal: bool,
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
 ) -> bool {
@@ -17,14 +23,14 @@ pub fn should_detach_gui(
         .get(1)
         .is_some_and(|argument| argument == "--indexer")
         || crate::cli::is_command(arguments);
-    !stays_foreground && (stdout_is_terminal || stderr_is_terminal)
+    !stays_foreground && stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
 }
 
 /// Starts the same GUI launch as a session-detached child with no standard
 /// streams and exits this process, so the shell that started Toka gets its
 /// prompt back immediately and never sees the GUI toolkit's output. Only
 /// called after [`should_detach_gui`] agrees.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "e2e"), not(debug_assertions)))]
 pub fn detach_gui(arguments: &[OsString]) -> ! {
     use std::os::unix::process::CommandExt;
 
@@ -106,6 +112,7 @@ mod tests {
             &arguments(["toka".into(), "sample1.mp4".into()]),
             true,
             true,
+            true,
         ));
     }
 
@@ -114,7 +121,8 @@ mod tests {
         assert!(super::should_detach_gui(
             &arguments(["toka".into()]),
             true,
-            false,
+            true,
+            true,
         ));
     }
 
@@ -122,9 +130,28 @@ mod tests {
     fn an_addon_search_launch_from_a_terminal_hands_off_to_a_detached_child() {
         assert!(super::should_detach_gui(
             &arguments(["toka".into(), "--toka-addon-search".into(), "{}".into()]),
-            false,
+            true,
+            true,
             true,
         ));
+    }
+
+    #[test]
+    fn a_launch_with_any_piped_stream_stays_in_the_foreground() {
+        let launch = arguments(["toka".into(), "sample1.mp4".into()]);
+        for (stdin, stdout, stderr) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (false, false, true),
+            (false, true, false),
+            (true, false, false),
+        ] {
+            assert!(
+                !super::should_detach_gui(&launch, stdin, stdout, stderr),
+                "stdin={stdin} stdout={stdout} stderr={stderr}"
+            );
+        }
     }
 
     #[test]
@@ -142,7 +169,7 @@ mod tests {
         ] {
             let owned: Vec<String> = words.into_iter().map(str::to_owned).collect();
             assert!(
-                !super::should_detach_gui(&arguments(owned.clone()), true, true),
+                !super::should_detach_gui(&arguments(owned.clone()), true, true, true),
                 "{owned:?}"
             );
         }
@@ -154,6 +181,7 @@ mod tests {
             &arguments(["toka".into(), "--indexer".into()]),
             true,
             true,
+            true,
         ));
     }
 
@@ -161,6 +189,7 @@ mod tests {
     fn a_piped_gui_launch_stays_in_the_foreground() {
         assert!(!super::should_detach_gui(
             &arguments(["toka".into(), "sample1.mp4".into()]),
+            false,
             false,
             false,
         ));
