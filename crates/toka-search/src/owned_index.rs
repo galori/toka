@@ -1050,13 +1050,13 @@ impl OwnedIndexManager {
             let index_dir = canonical_spelling(parent);
             if root == index_dir {
                 return Err(format!(
-                    "Toka cannot search its own index folder ({}): reset and purge delete the index data inside it.",
+                    "Toka cannot search its own index folder ({}): watching it would feed Toka's own data back into the index.",
                     root.display()
                 ));
             }
             if root.starts_with(&index_dir) {
                 return Err(format!(
-                    "Toka cannot search {}: it is inside Toka's index folder ({}), where reset and purge delete the index data.",
+                    "Toka cannot search {}: it is inside Toka's index folder ({}), where watching it would feed Toka's own data back into the index.",
                     root.display(),
                     index_dir.display()
                 ));
@@ -6557,10 +6557,11 @@ mod tests {
             error.contains("its own index folder"),
             "unexpected error: {error}"
         );
-        // The rejection names what reset and purge actually delete: the
-        // index data inside the folder — never the folder itself.
+        // The rejection names why watching is refused: the folder would
+        // feed Toka's own data back into the index — not deletion, since
+        // purge and reset only ever remove known index files.
         assert!(
-            error.contains("reset and purge delete the index data inside it"),
+            error.contains("watching it would feed Toka's own data back into the index"),
             "unexpected error: {error}"
         );
 
@@ -6571,7 +6572,7 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            error.contains("where reset and purge delete the index data"),
+            error.contains("where watching it would feed Toka's own data back into the index"),
             "unexpected error: {error}"
         );
         let error = manager

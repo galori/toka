@@ -329,6 +329,14 @@ fn current_uid() -> u32 {
 /// writable, so without the ownership check another user's pre-created
 /// directory — or pre-created lock files — would lock this user out or
 /// collect their locks.
+///
+/// Residual TOCTOU, documented rather than rebuilt: a rename-swap after
+/// the final verification still redirects the locks taken next. It needs
+/// a world-writable temporary parent, a local attacker, and microsecond
+/// timing — and it only misplaces locks (denial of service), never
+/// grants access — so fd-pinning the directory was judged
+/// disproportionate. Unexploitable deterministically in-test, hence no
+/// test.
 #[cfg(unix)]
 fn ensure_runtime_dir(dir: &Path, uid: u32) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -2480,5 +2488,38 @@ mod tests {
             try_acquire_daemon_lock(&database).unwrap().is_none(),
             "the new supervisor must yield to the legacy lock"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_indexes_gate_on_their_locks_concurrently_and_both_proceed() {
+        // The daemon lock gates per index (and per user, through the
+        // uid-scoped runtime dir): two supervisors gating concurrently on
+        // different indexes both proceed — neither blocks the other.
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let databases = [
+            directory.path().join("a").join("index.sqlite3"),
+            directory.path().join("b").join("index.sqlite3"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = databases
+            .into_iter()
+            .map(|database| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let guard = try_acquire_daemon_lock(&database).unwrap();
+                    assert!(guard.is_some(), "each index gates on its own lock");
+                    // Held past the other's acquisition, so the two locks
+                    // really overlap.
+                    barrier.wait();
+                    drop(guard);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

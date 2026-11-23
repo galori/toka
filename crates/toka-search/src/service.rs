@@ -246,7 +246,9 @@ impl Host for SystemHost {
 
 /// The index data `uninstall --purge-data` removes: the index's known
 /// files (the database, its sidecars, the rename overlay, the legacy
-/// daemon lock), every log file, and the thumbnail cache. Never media,
+/// daemon lock), every log file, and the thumbnail cache — both the
+/// current uid-scoped root and the pre-upgrade unscoped one uid-scoping
+/// orphaned, so upgrade+purge leaves no stale cache behind. Never media,
 /// tags, or add-ons — the same set the app's reset removes, minus the
 /// app's own caches. The index directory itself is never removed, so
 /// foreign content stored there always survives; the index artifacts are
@@ -261,6 +263,9 @@ fn purge_data_paths() -> Result<Vec<crate::reset::ResetTarget>, String> {
         .collect();
     paths.extend(crate::search_log::reset_paths());
     paths.push(ResetTarget::dir(crate::thumbnails::cache_output_root()));
+    paths.push(ResetTarget::dir(
+        crate::thumbnails::legacy_cache_output_root(),
+    ));
     Ok(paths)
 }
 
@@ -502,12 +507,16 @@ fn stop_for_reset(host: &mut impl Host, manager: ServiceManager) -> Result<(), S
                 (crate::config::TS_SERVICE_NAME, unit_path(&config)),
                 (crate::config::INDEXER_SERVICE_NAME, legacy_unit_path(&home)),
             ] {
-                match systemd_liveness(host, unit, file.is_file()) {
+                // One read for both the probe and the guard: a delete or
+                // create between two reads would skew the branch taken
+                // against the state probed.
+                let present = file.is_file();
+                match systemd_liveness(host, unit, present) {
                     Liveness::Active | Liveness::Deactivating => {
                         systemd_command(host, &["stop", unit])?;
                     }
                     Liveness::Stopped => {}
-                    Liveness::Unknown if file.is_file() => {
+                    Liveness::Unknown if present => {
                         return Err(format!(
                             "could not ask systemd about {unit}, and it is still installed: \
                              refusing to reset while the indexer may be running."
@@ -910,7 +919,29 @@ fn migrate_legacy_service(host: &mut impl Host, outcome: &mut Outcome) -> Result
         ));
         return Ok(true);
     }
+    // No file, but the daemon ran: drop the dangling enablement, as an
+    // uninstall does — a fileless unit left enabled would fail at login.
+    if disable_if_enabled(host, legacy)? {
+        outcome.did(format!("disabled the old {legacy}"));
+    } else {
+        outcome.already(format!("the old {legacy} is not enabled"));
+    }
     Ok(false)
+}
+
+/// Drops a fileless unit's dangling enablement — but only when
+/// `is-enabled` confirms some. A blind disable turns its
+/// locale-specific "not found" into a hard error, which no stderr
+/// sniffing can reliably recognize. Returns whether anything was
+/// disabled, so callers report what they did.
+fn disable_if_enabled(host: &mut impl Host, unit: &str) -> Result<bool, String> {
+    match systemd_enablement(host, unit) {
+        Enablement::Enabled | Enablement::EnabledRuntime => {
+            systemd_command(host, &["disable", unit])?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Lets the service outlive the login session. Best effort only: without
@@ -949,52 +980,51 @@ fn ensure_linger(host: &mut impl Host, outcome: &mut Outcome) {
 
 fn uninstall_systemd(host: &mut impl Host, purge_data: bool) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
+    let home = host.home();
+    let config = host.config_dir();
+    // One probe per unit threaded through both phases, as on launchd: a
+    // second probe after the pre-stop would see a manager that acks stop
+    // without stopping as still running, and stop — and report — twice.
+    let mut units = [
+        PreStop::probe(
+            host,
+            crate::config::TS_SERVICE_NAME,
+            unit_path(&config),
+            true,
+        ),
+        PreStop::probe(
+            host,
+            crate::config::INDEXER_SERVICE_NAME,
+            legacy_unit_path(&home),
+            false,
+        ),
+    ];
     if purge_data {
         // Stops before the lock check: a service daemon is stopped, not
         // refused — only a hand-started survivor blocks the purge. No
         // deletion has happened yet, so a refusal removes nothing.
-        let home = host.home();
-        let config = host.config_dir();
-        for (unit, file) in [
-            (crate::config::TS_SERVICE_NAME, unit_path(&config)),
-            (crate::config::INDEXER_SERVICE_NAME, legacy_unit_path(&home)),
-        ] {
-            let present = file.is_file();
-            let liveness = systemd_liveness(host, unit, present);
+        for probed in &mut units {
             // No file and the manager cannot say: proceed, like launchd —
             // the lock check below still refuses while a live daemon holds
             // the lock.
-            if liveness == Liveness::Unknown && !present {
+            if probed.liveness == Liveness::Unknown && !probed.present {
                 continue;
             }
-            if liveness.might_run() {
-                with_outcome(systemd_command(host, &["stop", unit]), &mut outcome)?;
-                outcome.did(format!("stopped {unit}"));
+            if probed.liveness.might_run() {
+                with_outcome(systemd_command(host, &["stop", probed.unit]), &mut outcome)?;
+                outcome.did(format!("stopped {}", probed.unit));
+                probed.stopped = true;
             }
         }
         refuse_purge_if_locked(host, &mut outcome)?;
     }
     let mut removed_file = false;
-    removed_file |= with_outcome(
-        remove_systemd_service(
-            host,
+    for probed in &units {
+        removed_file |= with_outcome(
+            remove_systemd_service(host, &mut outcome, probed),
             &mut outcome,
-            crate::config::TS_SERVICE_NAME,
-            &unit_path(&host.config_dir()),
-            true,
-        ),
-        &mut outcome,
-    )?;
-    removed_file |= with_outcome(
-        remove_systemd_service(
-            host,
-            &mut outcome,
-            crate::config::INDEXER_SERVICE_NAME,
-            &legacy_unit_path(&host.home()),
-            false,
-        ),
-        &mut outcome,
-    )?;
+        )?;
+    }
     if removed_file {
         with_outcome(systemd_command(host, &["daemon-reload"]), &mut outcome)?;
         outcome.did("reloaded systemd".to_owned());
@@ -1024,6 +1054,34 @@ fn refuse_purge_if_locked(
     Ok(())
 }
 
+/// One unit's uninstall probe: its file, whether it is installed, what
+/// the manager said about it, and whether the purge pre-stop already
+/// stopped it. Probed once up front and threaded through both uninstall
+/// phases, as on launchd.
+struct PreStop {
+    unit: &'static str,
+    file: PathBuf,
+    report_absent: bool,
+    present: bool,
+    liveness: Liveness,
+    stopped: bool,
+}
+
+impl PreStop {
+    fn probe(host: &mut impl Host, unit: &'static str, file: PathBuf, report_absent: bool) -> Self {
+        let present = file.is_file();
+        let liveness = systemd_liveness(host, unit, present);
+        Self {
+            unit,
+            file,
+            report_absent,
+            present,
+            liveness,
+            stopped: false,
+        }
+    }
+}
+
 /// Stops, disables, and removes one unit, returning whether its file was
 /// removed. The daemon stops whenever it might run — including when
 /// systemd cannot say about an installed file — and a stop failure aborts
@@ -1031,18 +1089,20 @@ fn refuse_purge_if_locked(
 /// the manager there is nothing to remove, so the uninstall proceeds like
 /// launchd's instead of failing on a stop. The `ts` unit reports its own
 /// absence; the legacy one stays silent when there was never anything to
-/// migrate.
+/// migrate. The probe is threaded in from the uninstall's single pass,
+/// never re-read: a unit the pre-stop already stopped is not stopped
+/// again.
 fn remove_systemd_service(
     host: &mut impl Host,
     outcome: &mut Outcome,
-    unit: &str,
-    file: &Path,
-    report_absent: bool,
+    probed: &PreStop,
 ) -> Result<bool, String> {
-    let present = file.is_file();
-    let liveness = systemd_liveness(host, unit, present);
+    let unit = probed.unit;
+    let file = &probed.file;
+    let present = probed.present;
+    let liveness = probed.liveness;
     if liveness == Liveness::Stopped && !present {
-        if report_absent {
+        if probed.report_absent {
             outcome.already(format!("{unit} is not installed"));
         }
         return Ok(false);
@@ -1051,12 +1111,12 @@ fn remove_systemd_service(
     // is nothing installed to remove, and a purge's lock check still
     // refuses while a live daemon holds the lock.
     if liveness == Liveness::Unknown && !present {
-        if report_absent {
+        if probed.report_absent {
             outcome.already(format!("{unit} is not installed"));
         }
         return Ok(false);
     }
-    if liveness.might_run() {
+    if liveness.might_run() && !probed.stopped {
         systemd_command(host, &["stop", unit])?;
         outcome.did(format!("stopped {unit}"));
     }
@@ -1072,18 +1132,12 @@ fn remove_systemd_service(
         let _ = std::fs::remove_file(marker_path(file));
         return Ok(true);
     }
-    // No file, but the daemon ran: drop the dangling enablement — but only
-    // when `is-enabled` confirms some. A blind disable turns its
-    // locale-specific "not found" into a hard error, which no stderr
-    // sniffing can reliably recognize.
-    match systemd_enablement(host, unit) {
-        Enablement::Enabled | Enablement::EnabledRuntime => {
-            systemd_command(host, &["disable", unit])?;
-            outcome.did(format!("disabled {unit}"));
-        }
-        _ => {
-            outcome.already(format!("{unit} is not enabled"));
-        }
+    // No file, but the daemon ran: drop the dangling enablement, gated
+    // on `is-enabled` (see [`disable_if_enabled`]).
+    if disable_if_enabled(host, unit)? {
+        outcome.did(format!("disabled {unit}"));
+    } else {
+        outcome.already(format!("{unit} is not enabled"));
     }
     Ok(false)
 }
@@ -1110,13 +1164,13 @@ fn start_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
             with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
             outcome.did(format!("started {unit}"));
         }
-        // Starting blind is still converging — a start on an already
-        // running service is a no-op success — but the report says the
-        // prior state was unknown instead of claiming a fresh start.
+        // An unreadable state errors like restart's: starting blind
+        // would report `started` even over an already-running daemon.
         Liveness::Unknown => {
-            outcome.already(format!("{unit} state is unknown, starting it"));
-            with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
-            outcome.did(format!("started {unit}"));
+            return Err((
+                "could not ask systemd about the service.".to_owned(),
+                outcome,
+            ));
         }
         Liveness::Stopped => {
             with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
@@ -1876,6 +1930,9 @@ mod tests {
         /// A `bootout` that reports success without unloading, for a
         /// manager that ignores the request.
         bootout_noop: bool,
+        /// A `stop` that reports success without stopping, for a manager
+        /// that ignores the request.
+        stop_noop: bool,
         lingering: bool,
         fail: HashSet<String>,
         fail_stderr: HashMap<String, String>,
@@ -1947,7 +2004,9 @@ mod tests {
                     out(0, "")
                 }
                 ["--user", "stop", unit] => {
-                    self.active.insert((*unit).to_owned(), false);
+                    if !self.stop_noop {
+                        self.active.insert((*unit).to_owned(), false);
+                    }
                     out(0, "")
                 }
                 ["--user", "enable", unit] => {
@@ -3607,6 +3666,30 @@ mod tests {
     }
 
     #[test]
+    fn systemd_stop_stops_a_fileless_but_running_daemon() {
+        // The unit file was deleted out of band while the daemon runs:
+        // `ts stop` still stops the live daemon instead of reporting
+        // "not installed, nothing to stop".
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .active
+            .insert("toka-search.service".into(), true);
+
+        let outcome = perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Stop).unwrap();
+
+        assert!(
+            !host.calls_to("stop toka-search.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert_eq!(
+            host.changed(&outcome),
+            vec!["stopped toka-search.service".to_owned()]
+        );
+    }
+
+    #[test]
     fn systemd_uninstall_stops_an_unknown_state_daemon_first() {
         let mut host = Fake::new();
         std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
@@ -3698,10 +3781,10 @@ mod tests {
     }
 
     #[test]
-    fn systemd_start_reports_an_unknown_state_honestly() {
-        // A start on an already-running service is a no-op success, so
-        // starting blind still converges — but the report says the prior
-        // state was unknown instead of claiming a fresh start.
+    fn systemd_start_errors_when_the_state_is_unknown() {
+        // Starting blind would report `started` even over an
+        // already-running daemon, so an unreadable state errors like
+        // restart's instead.
         let mut host = Fake::new();
         std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
         std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
@@ -3710,18 +3793,14 @@ mod tests {
             .active_unknown
             .insert("toka-search.service".into());
 
-        let outcome = perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Start).unwrap();
+        let (error, _) =
+            perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Start).unwrap_err();
 
-        assert_eq!(
-            host.unchanged(&outcome),
-            vec!["toka-search.service state is unknown, starting it".to_owned()]
-        );
+        assert!(error.contains("could not ask systemd"), "{error}");
         assert!(
-            host.changed(&outcome)
-                .iter()
-                .any(|action| action == "started toka-search.service"),
-            "{}",
-            host.changed(&outcome).join("\n")
+            host.calls_to("start toka-search.service").is_empty(),
+            "no blind start: {:?}",
+            host.calls
         );
     }
 
@@ -4210,6 +4289,52 @@ mod tests {
             "{}",
             host.changed(&outcome).join("\n")
         );
+    }
+
+    #[test]
+    fn install_disables_a_fileless_legacy_service_left_enabled() {
+        // Fileless but running with dangling enablement: the migration
+        // stops the legacy daemon and drops the enablement, as an
+        // uninstall does.
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .active
+            .insert("toka-indexer.service".into(), true);
+        host.script
+            .borrow_mut()
+            .enabled
+            .insert("toka-indexer.service".into(), true);
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(
+            !host.calls_to("stop toka-indexer.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            !host.calls_to("disable toka-indexer.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        for message in [
+            "stopped the old toka-indexer.service",
+            "disabled the old toka-indexer.service",
+        ] {
+            assert!(
+                host.changed(&outcome)
+                    .iter()
+                    .any(|action| action == message),
+                "{}",
+                host.changed(&outcome).join("\n")
+            );
+        }
     }
 
     #[test]
@@ -4950,6 +5075,114 @@ mod tests {
         assert!(
             !plist_path(&host.home()).exists(),
             "the plist is still removed"
+        );
+    }
+
+    #[test]
+    fn systemd_purge_uninstall_stops_only_once_when_stop_does_not_stop() {
+        // A manager that acks stop without stopping: the single threaded
+        // probe plus the pre-stop flag stop — and report — once, like the
+        // launchd flow.
+        let mut host = Fake::new();
+        perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+        host.script.borrow_mut().stop_noop = true;
+        host.calls.clear();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.calls_to("is-active toka-search.service").len(),
+            1,
+            "one probe threaded through both phases: {:?}",
+            host.calls
+        );
+        assert_eq!(
+            host.calls_to("stop toka-search.service").len(),
+            1,
+            "{:?}",
+            host.calls
+        );
+        assert_eq!(
+            host.changed(&outcome)
+                .iter()
+                .filter(|action| *action == "stopped toka-search.service")
+                .count(),
+            1,
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            !unit_path(&host.config_dir()).exists(),
+            "the unit is still removed"
+        );
+    }
+
+    #[test]
+    fn purge_data_paths_covers_both_thumbnail_cache_roots() {
+        // The purge removes the current uid-scoped cache plus the unscoped
+        // root uid-scoping orphaned, so upgrade+purge leaves no stale
+        // cache behind — and the fresh root is still purged exactly as
+        // before. Read-only: building the list touches nothing.
+        let paths = purge_data_paths().unwrap();
+
+        for root in [
+            crate::thumbnails::cache_output_root(),
+            crate::thumbnails::legacy_cache_output_root(),
+        ] {
+            assert!(
+                paths.contains(&ResetTarget::dir(root.clone())),
+                "purge misses {} in {:?}",
+                root.display(),
+                paths
+                    .iter()
+                    .map(|target| target.path.display().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_ignores_a_unit_under_another_config_dir() {
+        // A unit under a config dir `ts` no longer reads — installed
+        // before XDG_CONFIG_HOME was honored, or orphaned by a mid-session
+        // change — is inert litter systemd never loads: the uninstall
+        // reports not-installed and leaves the stale file alone.
+        let mut host = Fake::new();
+        let stale = host
+            .home()
+            .join("stale-config")
+            .join("systemd")
+            .join("user")
+            .join("toka-search.service");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"[Unit]").unwrap();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["toka-search.service is not installed".to_owned()]
+        );
+        assert!(host.changed(&outcome).is_empty());
+        assert!(stale.is_file(), "the other dir's file is left alone");
+        assert_eq!(
+            query_on(&mut host, ServiceManager::Systemd).installed,
+            Some(false)
         );
     }
 

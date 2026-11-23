@@ -155,6 +155,13 @@ pub fn cache_output_root() -> PathBuf {
     std::env::temp_dir().join(cache_dir_name_for(current_uid()))
 }
 
+/// The pre-uid-scoping cache root: uid-scoping orphaned it (see
+/// [`cache_dir_name_for`]), and a purge removes it, so upgrade+purge
+/// leaves no stale cache behind. Fresh code never writes here.
+pub(crate) fn legacy_cache_output_root() -> PathBuf {
+    std::env::temp_dir().join(crate::config::THUMBNAIL_CACHE_DIR_NAME)
+}
+
 /// The cache directory name for one user: uid-scoped like the daemon
 /// runtime dir, so two users sharing a temporary directory never share
 /// (or fight over) one cache. An upgrade orphans the previous
