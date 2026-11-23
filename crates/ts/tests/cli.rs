@@ -1140,12 +1140,15 @@ fn thumbnail_of_an_image_prints_itself() {
     let home = scratch_home();
     let image = create_image(home.home.path(), "photo.jpg");
     let image_argument = image.to_string_lossy().into_owned();
+    // The fast path reports the canonical spelling, like the
+    // generator-backed paths, not the spelling as typed.
+    let canonical = image.canonicalize().unwrap().to_string_lossy().into_owned();
 
     let output = run_at(&home, &["thumbnail", &image_argument]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("{image_argument}\n")
+        format!("{canonical}\n")
     );
     assert!(output.stderr.is_empty());
 
@@ -1154,7 +1157,7 @@ fn thumbnail_of_an_image_prints_itself() {
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
     assert_eq!(document["schema"], 1);
-    assert_eq!(document["thumbnail"], image_argument);
+    assert_eq!(document["thumbnail"], canonical);
     assert!(output.stderr.is_empty());
 }
 
@@ -1180,12 +1183,14 @@ fn preview_of_an_image_prints_itself() {
     let home = scratch_home();
     let image = create_image(home.home.path(), "photo.jpg");
     let image_argument = image.to_string_lossy().into_owned();
+    // Canonical spelling, as with thumbnails.
+    let canonical = image.canonicalize().unwrap().to_string_lossy().into_owned();
 
     let output = run_at(&home, &["preview", &image_argument]);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("{image_argument}\n")
+        format!("{canonical}\n")
     );
     assert!(output.stderr.is_empty());
 
@@ -1194,7 +1199,7 @@ fn preview_of_an_image_prints_itself() {
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
     assert_eq!(document["schema"], 1);
-    assert_eq!(document["previews"], serde_json::json!([image_argument]));
+    assert_eq!(document["previews"], serde_json::json!([canonical]));
     assert!(output.stderr.is_empty());
 }
 
@@ -1304,3 +1309,145 @@ fn previews_of_same_named_files_in_different_directories_do_not_collide() {
 // needs ffmpeg plus a committed fixture and stays environment-dependent.
 // The app's hover path already covers generation; here the undecodable
 // and missing inputs pin the honest failures.
+
+#[test]
+fn folders_add_with_an_empty_path_is_a_usage_error() {
+    // The classic empty-variable footgun: rejected before anything can
+    // resolve it against the working directory, and nothing is stored.
+    let home = scratch_home();
+
+    let output = run_at(&home, &["folders", "add", ""]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A path must not be empty."), "{stderr}");
+    assert!(stderr.contains("Usage: ts folders add"), "{stderr}");
+
+    let output = run_at(&home, &["folders", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn folders_remove_with_an_empty_path_is_a_usage_error() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_at(&home, &["folders", "remove", ""]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A path must not be empty."), "{stderr}");
+    assert!(stderr.contains("Usage: ts folders remove"), "{stderr}");
+
+    // The watched folder survives the rejected remove.
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn sync_path_with_an_empty_path_is_a_usage_error() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    add_and_scan(&home, &media);
+
+    let output = run_at(&home, &["sync-path", ""]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A path must not be empty."), "{stderr}");
+    assert!(stderr.contains("Usage: ts sync-path"), "{stderr}");
+
+    // The rejected sync indexed nothing.
+    assert_eq!(stats_videos(&home)["videos"], 0);
+}
+
+#[test]
+fn thumbnail_with_an_empty_path_is_a_usage_error() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["thumbnail", ""]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("A path must not be empty."), "{stderr}");
+    assert!(stderr.contains("Usage: ts thumbnail"), "{stderr}");
+
+    // The generator never ran, so no cache entry exists.
+    let cache = home
+        .home
+        .path()
+        .join("tmp")
+        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let entries = fs::read_dir(&cache)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(entries, 0);
+}
+
+#[test]
+fn thumbnail_of_a_relative_image_reports_the_canonical_spelling() {
+    let home = scratch_home();
+    let image = create_image(home.home.path(), "photo.jpg");
+    let canonical = image.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert!(Path::new(&canonical).is_absolute());
+
+    // Typed relative; reported absolute, like the video paths.
+    let output = run_at_in(&home, home.home.path(), &["thumbnail", "photo.jpg"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{canonical}\n")
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at_in(
+        &home,
+        home.home.path(),
+        &["thumbnail", "photo.jpg", "--json"],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["thumbnail"], canonical);
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn folders_add_through_a_symlink_echoes_the_stored_spelling() {
+    let home = scratch_home();
+    let real = home.home.path().join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = home.home.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link_argument = link.to_string_lossy().into_owned();
+    let canonical = real.canonicalize().unwrap();
+
+    // Typed through the link; the echo names what the manager stored.
+    let output = run_at(&home, &["folders", "add", &link_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Added {}\n", canonical.display())
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let folders = document["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["path"], canonical.to_string_lossy().into_owned());
+}

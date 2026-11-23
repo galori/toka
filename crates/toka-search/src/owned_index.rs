@@ -296,11 +296,7 @@ impl IndexedFile {
             .apply_to_file(&display_name)
             .to_lowercase();
         let tags_search = parsed_tags.into_values().join(" ").to_lowercase();
-        let folders_search = path
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .to_string_lossy()
-            .to_lowercase();
+        let folders_search = folders_search_text(&path);
 
         Some(Self {
             path_bytes: path_bytes(&path),
@@ -355,7 +351,9 @@ pub enum SyncOutcome {
 }
 
 pub trait IndexUpdates: Send + Sync {
+    /// Refreshes one path after it changed on disk; reports whether a watched folder matched.
     fn synchronize_path(&self, path: &Path) -> Result<SyncOutcome, OwnedIndexError>;
+    /// Moves one indexed path to its new name; both sides must sit under one watched folder.
     fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<SyncOutcome, OwnedIndexError>;
 }
 
@@ -366,8 +364,29 @@ pub trait IndexUpdates: Send + Sync {
 /// storage assume canonical spellings; normalizing here keeps a
 /// relative sync from silently missing and a non-canonical one from
 /// storing a second row for the same file. A no-op for callers that
-/// already pass canonical paths.
+/// already pass canonical paths. Empty input returns as-is: resolving
+/// it against the working directory would silently retarget the call
+/// to whatever the shell happened to be standing in.
 pub fn canonical_spelling(path: &Path) -> PathBuf {
+    if path.as_os_str().is_empty() {
+        return path.to_path_buf();
+    }
+    let once = canonical_spelling_once(path);
+    // A `..` past a missing part can hide a symlink the first walk
+    // never saw (`R/gone/../link/…` rebuilds to `R/link/…` with the
+    // link unresolved): re-resolving the rebuilt path lets its existing
+    // ancestors canonicalize too. One more pass suffices — the rebuilt
+    // path is lexically clean, so the second walk only strips genuinely
+    // missing tails and the result is already a fixpoint.
+    let twice = canonical_spelling_once(&once);
+    if twice == once {
+        once
+    } else {
+        twice
+    }
+}
+
+fn canonical_spelling_once(path: &Path) -> PathBuf {
     use std::path::Component;
 
     if let Ok(canonical) = path.canonicalize() {
@@ -494,11 +513,16 @@ impl OwnedIndexUpdates {
         let mut matched = false;
         for (root_id, root) in index.roots()? {
             // Recorded roots are canonical in production (`add_folder`
-            // stores nothing else); normalizing the comparison heals
-            // rows that predate that guarantee instead of missing them.
-            let root = canonical_spelling(&root);
-            if path.starts_with(&root) {
-                index.synchronize_path(&root_id, &root, &path)?;
+            // stores nothing else); a row that is not — re-pointed
+            // through a symlinked parent, say — migrates to the
+            // canonical spelling on first touch, so lookups and storage
+            // never disagree about one file for long.
+            let healed = canonical_spelling(&root);
+            if healed != root {
+                index.migrate_root_spelling(&root_id, &root, &healed)?;
+            }
+            if path.starts_with(&healed) {
+                index.synchronize_path(&root_id, &healed, &path)?;
                 matched = true;
             }
         }
@@ -520,10 +544,18 @@ impl OwnedIndexUpdates {
         let from = canonical_spelling(from);
         let to = canonical_spelling(to);
         let mut index = OwnedIndex::open(database)?;
-        let matched = index
-            .roots()?
+        let mut healed_roots = Vec::new();
+        for (id, root) in index.roots()? {
+            // Same migration as `synchronize_path`: one path identity
+            // for lookups and storage, whichever sync touches it first.
+            let healed = canonical_spelling(&root);
+            if healed != root {
+                index.migrate_root_spelling(&id, &root, &healed)?;
+            }
+            healed_roots.push((id, healed));
+        }
+        let matched = healed_roots
             .into_iter()
-            .map(|(id, root)| (id, canonical_spelling(&root)))
             .find(|(_, root)| from == *root || (from.starts_with(root) && to.starts_with(root)));
         match matched {
             Some((root_id, root)) => {
@@ -774,12 +806,26 @@ impl OwnedIndexManager {
     }
 
     pub fn add_folder(&self, requested: &Path) -> Result<OwnedIndexState, String> {
+        self.add_folder_with_committed_path(requested)
+            .map(|(state, _)| state)
+    }
+
+    /// Adds a folder exactly like [`add_folder`], also reporting the spelling
+    /// the manager committed to the `roots` table. The caller echoes that
+    /// spelling — never its own resolution — so a symlink retargeted between
+    /// the two resolutions cannot print a path the index does not contain.
+    pub fn add_folder_with_committed_path(
+        &self,
+        requested: &Path,
+    ) -> Result<(OwnedIndexState, PathBuf), String> {
         let root = requested
             .canonicalize()
             .map_err(|error| format!("Toka could not open that folder: {error}"))?;
         if !root.is_dir() {
             return Err("Choose a folder to search.".into());
         }
+        // The insert below stores exactly this; callers report it back.
+        let committed = root.clone();
 
         let mut watchers = self
             .watchers
@@ -824,7 +870,8 @@ impl OwnedIndexManager {
         }
 
         drop(watchers);
-        self.state()
+        let state = self.state()?;
+        Ok((state, committed))
     }
 
     pub fn remove_folder(&self, id: &str) -> Result<OwnedIndexState, String> {
@@ -1305,6 +1352,116 @@ impl OwnedIndex {
              ) VALUES (?1, ?2, ?3, 'pending', ?4, ?4)",
             params![id, path_bytes(root), root.to_string_lossy(), now_ns()],
         )?;
+        transaction.execute(
+            "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Moves a roots row recorded under a non-canonical spelling — and the
+    /// file rows scanned under it — to the canonical spelling, so lookups
+    /// and storage share one path identity. One transaction: the root row
+    /// and its files move together or not at all. A file row another root
+    /// still references keeps its spelling (that root still matches it);
+    /// the next scan prunes whatever duplicates remain.
+    fn migrate_root_spelling(
+        &mut self,
+        root_id: &str,
+        recorded: &Path,
+        canonical: &Path,
+    ) -> Result<(), OwnedIndexError> {
+        let files: Vec<(i64, PathBuf)> = {
+            let mut statement = self.connection.prepare(
+                "SELECT files.id, files.path
+                 FROM files
+                 JOIN root_files ON root_files.file_id = files.id
+                 WHERE root_files.root_id = ?1",
+            )?;
+            let rows = statement.query_map([root_id], |row| {
+                Ok((row.get::<_, i64>(0)?, path_from_bytes(row.get(1)?)))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let generation: i64 = self.connection.query_row(
+            "SELECT scan_generation FROM roots WHERE id = ?1",
+            [root_id],
+            |row| row.get(0),
+        )?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE roots SET path = ?2, display_path = ?3, updated_at_ns = ?4 WHERE id = ?1",
+            params![
+                root_id,
+                path_bytes(canonical),
+                canonical.to_string_lossy(),
+                now_ns()
+            ],
+        )?;
+        for (file_id, old_path) in files {
+            let Ok(relative) = old_path.strip_prefix(recorded) else {
+                continue;
+            };
+            let new_path = canonical.join(relative);
+            if new_path == old_path {
+                continue;
+            }
+            // Shared with another root, which still matches the old
+            // spelling: leave it for the next scan to reconcile.
+            let links: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM root_files WHERE file_id = ?1",
+                [file_id],
+                |row| row.get(0),
+            )?;
+            if links > 1 {
+                continue;
+            }
+            let new_bytes = path_bytes(&new_path);
+            let existing: Option<i64> = transaction
+                .query_row(
+                    "SELECT id FROM files WHERE path = ?1",
+                    [&new_bytes],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match existing {
+                // A canonical sync already stored the twin: move this
+                // root's link onto it and drop the orphaned spelling.
+                Some(canonical_id) => {
+                    transaction.execute(
+                        "INSERT INTO root_files (root_id, file_id, scan_generation)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(root_id, file_id) DO UPDATE SET
+                            scan_generation = excluded.scan_generation",
+                        params![root_id, canonical_id, generation],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM root_files WHERE root_id = ?1 AND file_id = ?2",
+                        params![root_id, file_id],
+                    )?;
+                    transaction.execute(
+                        "DELETE FROM files
+                         WHERE id = ?1 AND NOT EXISTS (
+                            SELECT 1 FROM root_files WHERE root_files.file_id = files.id
+                         )",
+                        [file_id],
+                    )?;
+                }
+                None => {
+                    transaction.execute(
+                        "UPDATE files SET path = ?2, display_path = ?3, folders_search = ?4
+                         WHERE id = ?1",
+                        params![
+                            file_id,
+                            new_bytes,
+                            new_path.to_string_lossy(),
+                            folders_search_text(&new_path),
+                        ],
+                    )?;
+                }
+            }
+        }
         transaction.execute(
             "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
             [],
@@ -2263,6 +2420,16 @@ fn database_count(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// The folder half of a file's search document: its parent directory,
+/// lossy and lowercased. Shared by indexing and root-spelling migration
+/// so the two can never derive different documents for one path.
+fn folders_search_text(path: &Path) -> String {
+    path.parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_string_lossy()
+        .to_lowercase()
+}
+
 fn now_ns() -> i64 {
     time_ns(SystemTime::now()).unwrap_or_default()
 }
@@ -3150,6 +3317,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_spelling_leaves_empty_paths_alone() {
+        // Fail closed: resolving "" against the working directory would
+        // silently retarget the call at whatever the shell stands in.
+        assert_eq!(canonical_spelling(Path::new("")), PathBuf::from(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_spelling_resolves_symlinks_hidden_behind_missing_parts() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let canonical_real = root.join("real").canonicalize().unwrap();
+        // `gone` is missing, so the first walk rebuilds through the link;
+        // the link itself must still resolve, or the sync stores an alias
+        // row beside the indexed canonical one.
+        let hidden = root.join("gone").join("..").join("link").join("clip.mp4");
+
+        // The deleted-file spelling, with no endpoint on disk.
+        assert_eq!(canonical_spelling(&hidden), canonical_real.join("clip.mp4"));
+        // Same when the file exists through the link.
+        std::fs::write(root.join("real").join("clip.mp4"), b"video").unwrap();
+        assert_eq!(canonical_spelling(&hidden), canonical_real.join("clip.mp4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_spelling_preserves_non_utf8_bytes_in_missing_paths() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        // Missing on purpose: only the rejoin runs, no filesystem name.
+        let missing = root.join(OsString::from_vec(b"vid\xe9name.mp4".to_vec()));
+
+        let spelling = canonical_spelling(&missing);
+
+        assert_eq!(
+            spelling.as_os_str().as_bytes(),
+            missing.as_os_str().as_bytes()
+        );
+    }
+
     fn scanned_canonical_root(
         directory: &Path,
     ) -> (tempfile::TempDir, PathBuf, PathBuf, OwnedIndexUpdates) {
@@ -3275,8 +3489,9 @@ mod tests {
 
     #[test]
     fn sync_path_matches_recorded_roots_that_predate_canonical_storage() {
-        // A roots row recorded before `add_folder` canonicalized still
-        // matches: the comparison normalizes both sides.
+        // A roots row recorded under a non-canonical spelling (a root
+        // re-pointed through a symlinked parent, say) still matches: the
+        // comparison normalizes both sides.
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir_all(&root).unwrap();
@@ -3295,6 +3510,60 @@ mod tests {
             indexed_display_paths(&observer).contains(added.to_string_lossy().as_ref()),
             "a canonical sync must still match a non-canonical recorded root"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_migrates_a_legacy_root_to_its_canonical_spelling() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let clip = real.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The legacy row: recorded through the symlink, with a file
+        // already scanned under the recorded spelling.
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &link).unwrap();
+        index.scan_root("root", &link, |_| {}).unwrap();
+        drop(index);
+        let canonical_real = real.canonicalize().unwrap();
+        let canonical_clip = canonical_real.join("clip.mp4");
+
+        // Refreshing the scanned file rewrites the legacy rows instead of
+        // storing a canonical twin beside them.
+        let updates = OwnedIndexUpdates::new(database.clone());
+        updates.synchronize_path(&canonical_clip).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(canonical_clip.to_string_lossy().as_ref()));
+        assert_eq!(
+            observer.roots().unwrap(),
+            vec![("root".to_string(), canonical_real.clone())]
+        );
+        let folders_search: String = observer
+            .connection
+            .query_row("SELECT folders_search FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            folders_search,
+            canonical_real.to_string_lossy().to_lowercase()
+        );
+
+        // The rename side heals the same way: no twin rows, no orphans.
+        let tagged = real.join("clip-tagged.mp4");
+        std::fs::rename(&clip, &tagged).unwrap();
+        let canonical_tagged = canonical_real.join("clip-tagged.mp4");
+        updates
+            .synchronize_rename(&canonical_clip, &canonical_tagged)
+            .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(canonical_tagged.to_string_lossy().as_ref()));
     }
 
     #[test]
@@ -3345,6 +3614,26 @@ mod tests {
         // unreadable database path (an unsearchable parent, a denied file):
         // only a truly missing index may read as "no index".
         let database = directory.path().join("x".repeat(300)).join("index.sqlite3");
+        let updates = OwnedIndexUpdates::new(database);
+
+        assert!(updates
+            .synchronize_path(&directory.path().join("clip.mp4"))
+            .is_err());
+        assert!(updates
+            .synchronize_rename(
+                &directory.path().join("a.mp4"),
+                &directory.path().join("b.mp4")
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn sync_against_a_directory_at_the_database_path_is_an_error() {
+        let directory = tempdir().unwrap();
+        // A directory where the database belongs is not a missing index:
+        // both syncs fail honestly instead of skipping quietly.
+        let database = directory.path().join("index.sqlite3");
+        std::fs::create_dir(&database).unwrap();
         let updates = OwnedIndexUpdates::new(database);
 
         assert!(updates

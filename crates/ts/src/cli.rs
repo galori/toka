@@ -29,7 +29,7 @@ const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path> [--json]\n\nR
 const SYNC_PATH_USAGE: &str = "Usage: ts sync-path <path>";
 const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. The path must sit under a watched folder; anything else is an error. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
 const SYNC_RENAME_USAGE: &str = "Usage: ts sync-rename <from> <to>";
-const SYNC_RENAME_HELP: &str = "Usage: ts sync-rename <from> <to>\n\nMove one indexed path to its new name after a rename, as the app does when tagging renames a file or folder. Both paths must sit under the same watched folder; anything else is an error and the index is left untouched. Renaming a watched folder itself re-points its roots row to the new path. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to rename a path starting with a dash.";
+const SYNC_RENAME_HELP: &str = "Usage: ts sync-rename <from> <to>\n\nMove one indexed path to its new name after a rename, as the app does when tagging renames a file or folder. Both paths must sit under the same watched folder; anything else is an error and the index is left untouched. Renaming a watched folder itself re-points its roots row to the new path. Moving a watched folder into another watched folder still succeeds and nests the two roots, exactly as in the app. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to rename a path starting with a dash.";
 const THUMBNAIL_USAGE: &str = "Usage: ts thumbnail <path> [--json]";
 const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the thumbnail for one file, generating it on the first run as the app does; an image prints as its own thumbnail. Prints the thumbnail path, or one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
@@ -72,7 +72,7 @@ pub fn run_command(
     create_verbose_engine: impl FnOnce() -> Result<SearchEngine, String>,
     read_index_stats: impl FnOnce() -> Result<IndexStats, String>,
     read_folders: impl FnOnce() -> Result<Vec<OwnedIndexFolder>, String>,
-    add_folder: impl FnOnce(&Path) -> Result<OwnedIndexState, String>,
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
     remove_folder: impl FnOnce(&str) -> Result<OwnedIndexState, String>,
     sync_path: impl FnOnce(&Path) -> Result<(), String>,
     sync_rename: impl FnOnce(&Path, &Path) -> Result<(), String>,
@@ -146,7 +146,7 @@ pub fn run_command(
 fn run_folders_command(
     arguments: &[OsString],
     read_folders: impl FnOnce() -> Result<Vec<OwnedIndexFolder>, String>,
-    add_folder: impl FnOnce(&Path) -> Result<OwnedIndexState, String>,
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
     remove_folder: impl FnOnce(&str) -> Result<OwnedIndexState, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
@@ -235,7 +235,7 @@ fn run_folders_list_command(
 
 fn run_folders_add_command(
     arguments: &[OsString],
-    add_folder: impl FnOnce(&Path) -> Result<OwnedIndexState, String>,
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -266,12 +266,11 @@ fn run_folders_add_command(
         return 2;
     }
 
-    // Resolve once and echo the exact spelling handed to the insert:
-    // a second resolution after the write could name a path the index
-    // does not contain if a symlink was retargeted in between.
-    let requested = toka_search::owned_index::canonical_spelling(&paths[0]);
-    let state = match add_folder(&requested) {
-        Ok(state) => state,
+    // The manager resolves once and reports what it committed; echoing
+    // that spelling — never a resolution of our own — keeps a symlink
+    // retargeted mid-add from printing a path the index does not contain.
+    let (state, committed) = match add_folder(&paths[0]) {
+        Ok(added) => added,
         Err(error) => {
             let _ = writeln!(stderr, "ts folders add: {error}");
             return 1;
@@ -280,7 +279,7 @@ fn run_folders_add_command(
     if json {
         return print_index_state(&state, "ts folders add", stdout, stderr);
     }
-    match writeln!(stdout, "Added {}", requested.display()).and_then(|()| stdout.flush()) {
+    match writeln!(stdout, "Added {}", committed.display()).and_then(|()| stdout.flush()) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(stderr, "ts folders add: could not write: {error}");
@@ -607,6 +606,9 @@ fn run_preview_command(
 /// path-taking commands. `--` ends option parsing so a path starting with
 /// a dash stays addressable, exactly as in search. The caller checks the
 /// arity it needs; an unknown option is an error to report with usage.
+/// An empty path is rejected outright: it almost always means an unset
+/// variable expanded to nothing, and silently resolving it against the
+/// working directory would retarget the command at the wrong folder.
 fn parse_path_arguments(
     arguments: &[OsString],
     json_allowed: bool,
@@ -615,6 +617,9 @@ fn parse_path_arguments(
     let mut json = false;
     let mut only_paths = false;
     for argument in arguments {
+        if argument.is_empty() {
+            return Err("A path must not be empty.".to_owned());
+        }
         if only_paths {
             paths.push(PathBuf::from(argument));
             continue;
@@ -1065,7 +1070,7 @@ mod tests {
         panic!("this command must not read folders")
     }
 
-    fn no_add_folder(_path: &Path) -> Result<OwnedIndexState, String> {
+    fn no_add_folder(_path: &Path) -> Result<(OwnedIndexState, PathBuf), String> {
         panic!("this command must not add folders")
     }
 
@@ -2895,7 +2900,7 @@ mod tests {
             no_folders,
             |path| {
                 assert_eq!(path, Path::new("/media/new"));
-                Ok(sample_state())
+                Ok((sample_state(), PathBuf::from("/media/new")))
             },
             no_remove_folder,
             no_sync_path,
@@ -2912,15 +2917,13 @@ mod tests {
     }
 
     #[test]
-    fn folders_add_reports_the_canonical_path() {
-        let directory = tempdir().unwrap();
-        fs::create_dir(directory.path().join("sub")).unwrap();
-        let unclean = directory.path().join("sub").join("..");
-        let args = ["ts", "folders", "add"]
+    fn folders_add_reports_the_committed_path() {
+        // The manager may store a spelling that differs from what was
+        // typed (a symlink retargeted mid-add): the echo names the
+        // committed row, never a resolution of the request.
+        let args = ["ts", "folders", "add", "/media/a"]
             .map(OsString::from)
-            .into_iter()
-            .chain([unclean.into_os_string()])
-            .collect::<Vec<_>>();
+            .to_vec();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -2930,7 +2933,10 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
-            |_| Ok(sample_state()),
+            |path| {
+                assert_eq!(path, Path::new("/media/a"));
+                Ok((sample_state(), PathBuf::from("/media/b")))
+            },
             no_remove_folder,
             no_sync_path,
             no_sync_rename,
@@ -2941,13 +2947,7 @@ mod tests {
         );
 
         assert_eq!(status, 0);
-        // What the manager stored, not what was typed: a relative or
-        // unclean path still shows where it landed.
-        let canonical = directory.path().canonicalize().unwrap();
-        assert_eq!(
-            String::from_utf8(stdout).unwrap(),
-            format!("Added {}\n", canonical.display())
-        );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "Added /media/b\n");
         assert!(stderr.is_empty());
     }
 
@@ -2965,7 +2965,7 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
-            |_| Ok(sample_state()),
+            |_| Ok((sample_state(), PathBuf::from("/media/new"))),
             no_remove_folder,
             no_sync_path,
             no_sync_rename,

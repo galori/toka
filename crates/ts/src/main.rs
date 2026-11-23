@@ -113,8 +113,8 @@ fn read_folders() -> Result<Vec<OwnedIndexFolder>, String> {
 /// and its next reconcile picks the folder up, and on macOS the running
 /// app's next `index_state` poll runs `ensure_watchers`, which starts
 /// watching the `ts`-added folder too.
-fn add_folder(path: &Path) -> Result<OwnedIndexState, String> {
-    OwnedIndexManager::for_inspection()?.add_folder(path)
+fn add_folder(path: &Path) -> Result<(OwnedIndexState, PathBuf), String> {
+    OwnedIndexManager::for_inspection()?.add_folder_with_committed_path(path)
 }
 
 fn remove_folder(id: &str) -> Result<OwnedIndexState, String> {
@@ -161,7 +161,7 @@ fn sync_rename(from: &Path, to: &Path) -> Result<(), String> {
 /// share one cache entry. Errors still name the path as typed.
 fn make_thumbnail(path: &Path) -> Result<PathBuf, String> {
     if is_supported_image(path) && path.is_file() {
-        return Ok(path.to_path_buf());
+        return Ok(owned_index::canonical_spelling(path));
     }
     let video = owned_index::canonical_spelling(path);
     thumbnails::generate(&video)
@@ -173,7 +173,7 @@ fn make_thumbnail(path: &Path) -> Result<PathBuf, String> {
 /// same cache-key normalization as thumbnails.
 fn make_preview(path: &Path) -> Result<Vec<PathBuf>, String> {
     if is_supported_image(path) && path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
+        return Ok(vec![owned_index::canonical_spelling(path)]);
     }
     let video = owned_index::canonical_spelling(path);
     thumbnails::preview(&video)
