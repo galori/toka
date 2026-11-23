@@ -384,3 +384,7 @@ export function openNewWindow(): Promise<void> {
 export function openFolderInNewWindow(resultId: string): Promise<void> {
   return invoke("open_folder_in_new_window", { resultId });
 }
+
+export function openParentFolderInNewWindow(resultId: string): Promise<void> {
+  return invoke("open_parent_folder_in_new_window", { resultId });
+}

@@ -5819,6 +5819,172 @@ test("says why the playing video's folder could not be opened", async () => {
   );
 });
 
+// A folder up from the video often holds the other folders worth browsing: a
+// second Toka launched there shows them all, leaving this one where it was.
+test("opens the playing video's parent folder in a new Toka from the control and from Ctrl+Shift+P", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Video controls");
+
+  const control = screen.getByRole("button", {
+    name: "Open parent folder in new window",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+P");
+  expect(control.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+P");
+  expect(control.querySelector("svg")).not.toBeNull();
+
+  invokeMock.mockClear();
+  await user.click(control);
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_parent_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("open_parent_folder_in_new_window", {
+      resultId: "video-1",
+    }),
+  );
+  expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
+  expect(invokeMock).not.toHaveBeenCalledWith("open_folder_in_new_window", {
+    resultId: "video-1",
+  });
+});
+
+test("says why the playing video's parent folder could not be opened", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_parent_folder_in_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+  );
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
+});
+
+// The error names the video that failed; moving on clears it rather than
+// pinning the old complaint beside the next video.
+test("clears the parent-folder error when playback advances", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [
+          { id: "video-1", fileName: "clip-1.mp4", extension: "mp4" },
+          { id: "video-2", fileName: "clip-2.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_parent_folder_in_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-1.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
+
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+// A parent-folder request still in flight when playback advances belongs to
+// the old video: its late failure must not accuse the new one.
+test("drops a parent-folder failure that lands after advancing", async () => {
+  let rejectOpen!: (reason: Error) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [
+          { id: "video-1", fileName: "clip-1.mp4", extension: "mp4" },
+          { id: "video-2", fileName: "clip-2.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_parent_folder_in_new_window")
+      return new Promise<never>(
+        (_, reject) => (rejectOpen = () => reject(new Error("Too slow."))),
+      );
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-1.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+  );
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
+
+  await act(async () => rejectOpen(new Error("Too slow.")));
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
 test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {

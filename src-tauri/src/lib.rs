@@ -757,6 +757,64 @@ fn open_folder_in_new_window(
     start_toka(Some(folder_of(&path)?))
 }
 
+#[tauri::command]
+fn open_parent_folder_in_new_window(
+    result_id: String,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<(), CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    start_toka(Some(&parent_folder_of(&path)?))
+}
+
+/// The folder above the folder the video sits in, for when the folders around
+/// it are what the viewer wants to browse next.
+fn parent_folder_of(path: &std::path::Path) -> Result<std::path::PathBuf, CommandError> {
+    // Launches keep the path as given, so a relative launch stays relative:
+    // resolve it first, or the parent of a relative folder is wrongly empty.
+    let absolute = to_absolute(path);
+    // Canonical when possible, so `..` resolves through symlinks exactly as
+    // the filesystem does; lexical otherwise, so a video that moved since it
+    // was indexed can still open somewhere sensible.
+    let resolved = std::fs::canonicalize(&absolute).unwrap_or_else(|_| absolute_lexical(&absolute));
+    let folder = folder_of(&resolved)?;
+    folder
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| CommandError {
+            kind: "NewWindow",
+            message: format!("{} has no parent folder Toka can open.", path.display()),
+        })
+}
+
+/// The path made absolute without resolving `.` or `..`, so canonicalization
+/// below still sees symlinks before any parent segment.
+fn to_absolute(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    }
+}
+
+/// An absolute path with `.` and `..` resolved lexically, without touching
+/// the disk (which may have moved on since the video was indexed).
+fn absolute_lexical(absolute: &std::path::Path) -> std::path::PathBuf {
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
     path.parent()
         .filter(|folder| !folder.as_os_str().is_empty())
@@ -1448,6 +1506,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1483,6 +1542,7 @@ pub fn run() {
                 open_in_external_player,
                 open_new_window,
                 open_folder_in_new_window,
+                open_parent_folder_in_new_window,
                 matching_addon_actions,
                 run_addon_action,
                 set_video_tags,
@@ -1526,6 +1586,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1553,6 +1614,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1580,6 +1642,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1710,6 +1773,74 @@ mod tests {
         let error = folder_of(Path::new("video.mp4")).unwrap_err();
 
         assert_eq!(error.kind, "NewWindow");
+    }
+
+    #[test]
+    fn a_videos_parent_folder_is_the_folder_above_the_one_it_sits_in() {
+        assert_eq!(
+            parent_folder_of(Path::new("/root/path/to/my/video.mp4")).unwrap(),
+            Path::new("/root/path/to")
+        );
+    }
+
+    #[test]
+    fn a_video_directly_under_the_root_has_no_parent_folder_to_open() {
+        let error = parent_folder_of(Path::new("/video.mp4")).unwrap_err();
+
+        assert_eq!(error.kind, "NewWindow");
+    }
+
+    #[test]
+    fn a_relative_video_resolves_against_the_current_directory() {
+        assert_eq!(
+            parent_folder_of(Path::new("clips/video.mp4")).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_bare_filename_sits_in_the_current_directory() {
+        let current = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            parent_folder_of(Path::new("video.mp4")).unwrap(),
+            current.parent().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_dot_dot_segment_does_not_become_the_parent() {
+        assert_eq!(
+            parent_folder_of(Path::new("/Playlists/Summer/../party.mkv")).unwrap(),
+            Path::new("/")
+        );
+    }
+
+    #[test]
+    fn a_moved_video_falls_back_to_the_lexical_parent() {
+        assert_eq!(
+            parent_folder_of(Path::new("/no/such/dir/video.mp4")).unwrap(),
+            Path::new("/no/such")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dot_dot_through_a_symlink_follows_the_filesystem() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("library").join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, root.path().join("link")).unwrap();
+        // The file exists, as a playing video does when the action runs.
+        std::fs::write(root.path().join("library").join("clip.mp4"), b"x").unwrap();
+
+        // Physically `link/..` is `library`, not the root the link sits in.
+        let video = root.path().join("link").join("..").join("clip.mp4");
+        let expected = std::fs::canonicalize(root.path()).unwrap();
+
+        assert_eq!(parent_folder_of(&video).unwrap(), expected);
     }
 
     #[test]
