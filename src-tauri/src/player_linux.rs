@@ -9,7 +9,7 @@ use std::{
     ptr,
     sync::{Arc, Mutex},
 };
-use tauri::{App, Manager};
+use tauri::{App, Emitter, Manager};
 
 const MPV_FORMAT_STRING: c_int = 1;
 const MPV_FORMAT_FLAG: c_int = 3;
@@ -901,6 +901,23 @@ pub fn install(app: &mut App, player: Arc<NativePlayer>) -> Result<(), Box<dyn s
     // regions. Keep the GL area above it or a healthy mpv framebuffer is still
     // hidden behind the WebView's black player background.
     mount_video_over_web_view(&overlay, &video_area);
+    // A click on the picture does what the play button does, as in most
+    // players. The GL surface draws above the page in its own native window,
+    // where the overlay's pass-through does not deliver every click to the
+    // WebView beneath it, so the click is handed to the page as an event for
+    // the player to answer with the same toggle its own click runs. Where the
+    // pass-through does deliver it, this window never sees the click, so the
+    // picture cannot toggle twice.
+    video_area.add_events(gtk::gdk::EventMask::BUTTON_PRESS_MASK);
+    let clicked = app.handle().clone();
+    video_area.connect_button_press_event(move |_, event| {
+        if event.event_type() == gtk::gdk::EventType::ButtonPress
+            && event.button() == gtk::gdk::BUTTON_PRIMARY
+        {
+            let _ = clicked.emit("native-video-click", ());
+        }
+        gtk::glib::Propagation::Proceed
+    });
 
     let realize_player = player.clone();
     video_area.connect_realize(move |area| {

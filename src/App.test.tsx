@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   externalPlayers,
@@ -31,6 +32,9 @@ const windowApiMock = vi.hoisted(() => ({
   isFullscreen: vi.fn(),
   setFullscreen: vi.fn(),
 }));
+const nativeVideoClickListeners = vi.hoisted(() => ({
+  handlers: [] as Array<() => void>,
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -39,6 +43,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowApiMock,
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn((event: string, handler: () => void) => {
+    if (event === "native-video-click")
+      nativeVideoClickListeners.handlers.push(handler);
+    return Promise.resolve(() => {});
+  }),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -66,6 +77,7 @@ vi.mock("./api", async (importOriginal) => ({
 }));
 
 const invokeMock = vi.mocked(invoke);
+const listenMock = vi.mocked(listen);
 const externalPlayersMock = vi.mocked(externalPlayers);
 const indexStateMock = vi.mocked(indexState);
 const launchIntentMock = vi.mocked(launchIntent);
@@ -123,6 +135,8 @@ beforeEach(() => {
   windowApiMock.isFullscreen.mockReset();
   windowApiMock.setFullscreen.mockReset();
   windowApiMock.close.mockReset();
+  listenMock.mockClear();
+  nativeVideoClickListeners.handlers.length = 0;
   windowApiMock.isFullscreen.mockResolvedValue(false);
   windowApiMock.setFullscreen.mockResolvedValue(undefined);
   windowApiMock.close.mockResolvedValue(undefined);
@@ -2089,6 +2103,76 @@ test("clicking the native picture plays and pauses the video", async () => {
       paused: false,
     }),
   );
+});
+
+test("a Linux video-surface click plays and pauses the video", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "native-1", fileName: "native-1.mp4", extension: "mp4" },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native-1.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 30,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native-1.mp4" }),
+  );
+  await screen.findByRole("button", { name: "Pause" });
+  invokeMock.mockClear();
+
+  // The native surface paints above the page, so its clicks arrive as a
+  // backend event rather than a DOM click on the picture.
+  expect(listenMock).toHaveBeenCalledWith(
+    "native-video-click",
+    expect.any(Function),
+  );
+  expect(nativeVideoClickListeners.handlers).toHaveLength(1);
+
+  act(() => {
+    nativeVideoClickListeners.handlers[0]();
+  });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: true,
+    }),
+  );
+  await screen.findByRole("button", { name: "Play" });
+
+  invokeMock.mockClear();
+  act(() => {
+    nativeVideoClickListeners.handlers[0]();
+  });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: false,
+    }),
+  );
+  await screen.findByRole("button", { name: "Pause" });
 });
 
 test("starts the whole result page as a playlist positioned at the chosen video", async () => {

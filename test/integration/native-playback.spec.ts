@@ -12,6 +12,7 @@ describe("Toka native Linux playback", () => {
         return tauri.core.invoke("native_playback_state");
       }) as Promise<{
         currentTime: number;
+        paused: boolean;
         blueRenderCount?: number;
         frameColor?: [number, number, number];
         framebuffer?: number;
@@ -55,6 +56,25 @@ describe("Toka native Linux playback", () => {
     const timeText = await time.getText();
 
     expect(timeText).not.toMatch(/^0:00 \/ /);
+    // A click on the picture pauses and resumes, the way the web player's own
+    // click does. The native surface paints above the page, so the click
+    // reaches the player as a backend event rather than a DOM click.
+    await player.click();
+    await browser.waitUntil(
+      async () => (await nativeState()).paused === true,
+      {
+        timeout: 5_000,
+        timeoutMsg: "clicking the native video did not pause playback",
+      },
+    );
+    await player.click();
+    await browser.waitUntil(
+      async () => (await nativeState()).paused === false,
+      {
+        timeout: 5_000,
+        timeoutMsg: "clicking the native video did not resume playback",
+      },
+    );
     try {
       // Scan the X root window for blue pixels. A single center-pixel probe
       // misses the video under Xvfb because GTK places the GL child window at
