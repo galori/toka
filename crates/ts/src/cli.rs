@@ -2,11 +2,11 @@ use serde::Serialize;
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use toka_search::{
     index_stats::{self, IndexStats},
-    owned_index::{OwnedFolderStatus, OwnedIndexFolder},
+    owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
     search::{MediaType, SearchEngine, SearchFields, SearchRequest, VideoResult, PAGE_SIZE},
 };
 
@@ -14,14 +14,26 @@ use toka_search::{
 /// before parsing.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  folders list     List the folders the index watches\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
-const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  list [--json]   List the folders the index watches";
+const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]      Add a folder to the index\n  remove <path> [--json]   Remove a folder from the index\n  list [--json]            List the folders the index watches";
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing.";
+const FOLDERS_ADD_USAGE: &str = "Usage: ts folders add <path> [--json]";
+const FOLDERS_ADD_HELP: &str = "Usage: ts folders add <path> [--json]\n\nAdd a folder to the index, exactly as adding it in the app does. The running indexer picks it up and starts scanning on its own; on macOS with the app quit, the folder waits for the next launch. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to add a path starting with a dash.";
+const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path> [--json]";
+const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
+const SYNC_PATH_USAGE: &str = "Usage: ts sync-path <path>";
+const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. The path must sit under a watched folder; anything else is an error. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
+const SYNC_RENAME_USAGE: &str = "Usage: ts sync-rename <from> <to>";
+const SYNC_RENAME_HELP: &str = "Usage: ts sync-rename <from> <to>\n\nMove one indexed path to its new name after a rename, as the app does when tagging renames a file or folder. Both paths must sit under the same watched folder; anything else is an error and the index is left untouched. Renaming a watched folder itself re-points its roots row to the new path. Moving a watched folder into another watched folder still succeeds and nests the two roots, exactly as in the app. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to rename a path starting with a dash.";
+const THUMBNAIL_USAGE: &str = "Usage: ts thumbnail <path> [--json]";
+const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the thumbnail for one file, generating it on the first run as the app does; an image prints as its own thumbnail. Prints the thumbnail path, or one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
+const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
+const PREVIEW_HELP: &str = "Usage: ts preview <path> [--json]\n\nPrint the preview frames for one video, one per line, generating them on the first run as the app does on hover; an image prints as its own single frame. Prints one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 
 fn search_help() -> String {
     format!(
@@ -49,12 +61,23 @@ fn version_text(version: &str, git_sha: Option<&str>) -> String {
     format!("ts {version} (Git SHA {sha})")
 }
 
+/// Every constructor a command can call, injected so the unit tests stub
+/// them out and no test touches the real index. One parameter per
+/// constructor reads better than a bundle here: each closure's distinct
+/// type already makes mixing two up a compile error.
+#[allow(clippy::too_many_arguments)]
 pub fn run_command(
     arguments: &[OsString],
     create_engine: impl FnOnce() -> Result<SearchEngine, String>,
     create_verbose_engine: impl FnOnce() -> Result<SearchEngine, String>,
     read_index_stats: impl FnOnce() -> Result<IndexStats, String>,
     read_folders: impl FnOnce() -> Result<Vec<OwnedIndexFolder>, String>,
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
+    remove_folder: impl FnOnce(&str) -> Result<OwnedIndexState, String>,
+    sync_path: impl FnOnce(&Path) -> Result<(), String>,
+    sync_rename: impl FnOnce(&Path, &Path) -> Result<(), String>,
+    make_thumbnail: impl FnOnce(&Path) -> Result<PathBuf, String>,
+    make_preview: impl FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -90,7 +113,30 @@ pub fn run_command(
     }
 
     if command == OsStr::new("folders") {
-        return run_folders_command(&arguments[2..], read_folders, stdout, stderr);
+        return run_folders_command(
+            &arguments[2..],
+            read_folders,
+            add_folder,
+            remove_folder,
+            stdout,
+            stderr,
+        );
+    }
+
+    if command == OsStr::new("sync-path") {
+        return run_sync_path_command(&arguments[2..], sync_path, stdout, stderr);
+    }
+
+    if command == OsStr::new("sync-rename") {
+        return run_sync_rename_command(&arguments[2..], sync_rename, stdout, stderr);
+    }
+
+    if command == OsStr::new("thumbnail") {
+        return run_thumbnail_command(&arguments[2..], make_thumbnail, stdout, stderr);
+    }
+
+    if command == OsStr::new("preview") {
+        return run_preview_command(&arguments[2..], make_preview, stdout, stderr);
     }
 
     let _ = writeln!(stderr, "{GENERAL_HELP}");
@@ -100,6 +146,8 @@ pub fn run_command(
 fn run_folders_command(
     arguments: &[OsString],
     read_folders: impl FnOnce() -> Result<Vec<OwnedIndexFolder>, String>,
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
+    remove_folder: impl FnOnce(&str) -> Result<OwnedIndexState, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -112,11 +160,17 @@ fn run_folders_command(
         let _ = writeln!(stderr, "{FOLDERS_HELP}");
         return 2;
     };
-    if subcommand != OsStr::new("list") {
-        let _ = writeln!(stderr, "{FOLDERS_HELP}");
-        return 2;
+    if subcommand == OsStr::new("list") {
+        return run_folders_list_command(rest, read_folders, stdout, stderr);
     }
-    run_folders_list_command(rest, read_folders, stdout, stderr)
+    if subcommand == OsStr::new("add") {
+        return run_folders_add_command(rest, add_folder, stdout, stderr);
+    }
+    if subcommand == OsStr::new("remove") {
+        return run_folders_remove_command(rest, read_folders, remove_folder, stdout, stderr);
+    }
+    let _ = writeln!(stderr, "{FOLDERS_HELP}");
+    2
 }
 
 fn run_folders_list_command(
@@ -179,6 +233,173 @@ fn run_folders_list_command(
     0
 }
 
+fn run_folders_add_command(
+    arguments: &[OsString],
+    add_folder: impl FnOnce(&Path) -> Result<(OwnedIndexState, PathBuf), String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(FOLDERS_ADD_HELP, stdout, stderr);
+    }
+    let (paths, json) = match parse_path_arguments(arguments, true) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{FOLDERS_ADD_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(
+            stderr,
+            "Folders add needs a folder path.\n{FOLDERS_ADD_USAGE}"
+        );
+        return 2;
+    }
+    if paths.len() > 1 {
+        let _ = writeln!(
+            stderr,
+            "Folders add takes one folder path.\n{FOLDERS_ADD_USAGE}"
+        );
+        return 2;
+    }
+
+    // The manager resolves once and reports what it committed; echoing
+    // that spelling — never a resolution of our own — keeps a symlink
+    // retargeted mid-add from printing a path the index does not contain.
+    let (state, committed) = match add_folder(&paths[0]) {
+        Ok(added) => added,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts folders add: {error}");
+            return 1;
+        }
+    };
+    if json {
+        return print_index_state(&state, "ts folders add", stdout, stderr);
+    }
+    match writeln!(stdout, "Added {}", committed.display()).and_then(|()| stdout.flush()) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts folders add: could not write: {error}");
+            1
+        }
+    }
+}
+
+/// The folder state after an add or a remove, as one versioned document:
+/// what the app's own add/remove flows return, plus the schema version.
+fn print_index_state(
+    state: &OwnedIndexState,
+    command: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    // Encode fallibly like stats does: a future non-lossy field must
+    // exit 1, never panic inside `json!`.
+    let mut document = match serde_json::to_value(state) {
+        Ok(document) => document,
+        Err(error) => {
+            let _ = writeln!(stderr, "{command}: could not encode results: {error}");
+            return 1;
+        }
+    };
+    document["schema"] = serde_json::json!(JSON_SCHEMA_VERSION);
+    print_json(&document, command, stdout, stderr)
+}
+
+fn run_folders_remove_command(
+    arguments: &[OsString],
+    read_folders: impl FnOnce() -> Result<Vec<OwnedIndexFolder>, String>,
+    remove_folder: impl FnOnce(&str) -> Result<OwnedIndexState, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(FOLDERS_REMOVE_HELP, stdout, stderr);
+    }
+    let (paths, json) = match parse_path_arguments(arguments, true) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{FOLDERS_REMOVE_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(
+            stderr,
+            "Folders remove needs a folder path.\n{FOLDERS_REMOVE_USAGE}"
+        );
+        return 2;
+    }
+    if paths.len() > 1 {
+        let _ = writeln!(
+            stderr,
+            "Folders remove takes one folder path.\n{FOLDERS_REMOVE_USAGE}"
+        );
+        return 2;
+    }
+
+    let folders = match read_folders() {
+        Ok(folders) => folders,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts folders remove: {error}");
+            return 1;
+        }
+    };
+    // The app removes by id; the shell names a path, so resolve it to the
+    // configured folder first. Unlike the app's remove flow — which opens
+    // (and thereby creates) the database — a missing index errors here
+    // instead: `read_folders` reports no folders when the database file is
+    // absent, so nothing matches and the remove below never runs.
+    let Some(folder) = resolve_folder(&folders, &paths[0]) else {
+        let _ = writeln!(
+            stderr,
+            "ts folders remove: {} is not one of Toka's search folders.",
+            paths[0].display()
+        );
+        return 1;
+    };
+    let state = match remove_folder(&folder.id) {
+        Ok(state) => state,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts folders remove: {error}");
+            return 1;
+        }
+    };
+    if json {
+        return print_index_state(&state, "ts folders remove", stdout, stderr);
+    }
+    match writeln!(stdout, "Removed {}", folder.path.display()).and_then(|()| stdout.flush()) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts folders remove: could not write: {error}");
+            1
+        }
+    }
+}
+
+/// The configured folder `requested` names. The normalized spelling
+/// matches first: recorded entries are canonical absolute paths, and the
+/// normalization also resolves a typed spelling against the current
+/// directory, so a folder deleted from disk — often the very reason to
+/// remove it — still matches what the same shell spelling added. The
+/// spelling as typed only matches when nothing normalized does, so one
+/// request can never ambiguously name two rows.
+fn resolve_folder<'a>(
+    folders: &'a [OwnedIndexFolder],
+    requested: &Path,
+) -> Option<&'a OwnedIndexFolder> {
+    let spelling = toka_search::owned_index::canonical_spelling(requested);
+    folders
+        .iter()
+        .find(|folder| folder.path == spelling)
+        .or_else(|| folders.iter().find(|folder| folder.path == requested))
+}
+
 /// The human label for a folder state, kept identical to its JSON value (see
 /// the folder status label test).
 fn folder_status_label(status: OwnedFolderStatus) -> &'static str {
@@ -189,6 +410,241 @@ fn folder_status_label(status: OwnedFolderStatus) -> &'static str {
         OwnedFolderStatus::Offline => "offline",
         OwnedFolderStatus::Error => "error",
     }
+}
+
+fn run_sync_path_command(
+    arguments: &[OsString],
+    sync_path: impl FnOnce(&Path) -> Result<(), String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(SYNC_PATH_HELP, stdout, stderr);
+    }
+    // No --json: a sync reports nothing but success, so there is no
+    // document for the app to parse. The exit status is the contract.
+    let (paths, _) = match parse_path_arguments(arguments, false) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{SYNC_PATH_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(stderr, "Sync-path needs a path.\n{SYNC_PATH_USAGE}");
+        return 2;
+    }
+    if paths.len() > 1 {
+        let _ = writeln!(stderr, "Sync-path takes one path.\n{SYNC_PATH_USAGE}");
+        return 2;
+    }
+
+    match sync_path(&paths[0]) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts sync-path: {error}");
+            1
+        }
+    }
+}
+
+fn run_sync_rename_command(
+    arguments: &[OsString],
+    sync_rename: impl FnOnce(&Path, &Path) -> Result<(), String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(SYNC_RENAME_HELP, stdout, stderr);
+    }
+    let (paths, _) = match parse_path_arguments(arguments, false) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{SYNC_RENAME_USAGE}");
+            return 2;
+        }
+    };
+    if paths.len() != 2 {
+        let _ = writeln!(
+            stderr,
+            "Sync-rename needs the old and the new path.\n{SYNC_RENAME_USAGE}"
+        );
+        return 2;
+    }
+
+    match sync_rename(&paths[0], &paths[1]) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts sync-rename: {error}");
+            1
+        }
+    }
+}
+
+fn run_thumbnail_command(
+    arguments: &[OsString],
+    make_thumbnail: impl FnOnce(&Path) -> Result<PathBuf, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(THUMBNAIL_HELP, stdout, stderr);
+    }
+    let (paths, json) = match parse_path_arguments(arguments, true) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{THUMBNAIL_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(stderr, "Thumbnail needs a path.\n{THUMBNAIL_USAGE}");
+        return 2;
+    }
+    if paths.len() > 1 {
+        let _ = writeln!(stderr, "Thumbnail takes one path.\n{THUMBNAIL_USAGE}");
+        return 2;
+    }
+
+    let thumbnail = match make_thumbnail(&paths[0]) {
+        Ok(thumbnail) => thumbnail,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts thumbnail: {error}");
+            return 1;
+        }
+    };
+    if json {
+        // Lossy on purpose, like every path this CLI serializes: real
+        // paths can hold non-UTF-8 bytes on Unix, and those must not
+        // break encoding of this document.
+        // "thumbnail" is singular and "previews" plural on purpose: one
+        // path here, a frame list there.
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "thumbnail": thumbnail.to_string_lossy(),
+        });
+        return print_json(&document, "ts thumbnail", stdout, stderr);
+    }
+    match writeln!(stdout, "{}", thumbnail.display()).and_then(|()| stdout.flush()) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts thumbnail: could not write: {error}");
+            1
+        }
+    }
+}
+
+fn run_preview_command(
+    arguments: &[OsString],
+    make_preview: impl FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(PREVIEW_HELP, stdout, stderr);
+    }
+    let (paths, json) = match parse_path_arguments(arguments, true) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{PREVIEW_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(stderr, "Preview needs a path.\n{PREVIEW_USAGE}");
+        return 2;
+    }
+    if paths.len() > 1 {
+        let _ = writeln!(stderr, "Preview takes one path.\n{PREVIEW_USAGE}");
+        return 2;
+    }
+
+    let frames = match make_preview(&paths[0]) {
+        Ok(frames) => frames,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts preview: {error}");
+            return 1;
+        }
+    };
+    if json {
+        // Lossy paths, as in thumbnail: non-UTF-8 bytes must not break
+        // encoding of this document.
+        // "previews" is plural and "thumbnail" singular on purpose: a
+        // frame list here, one path there.
+        let frames: Vec<String> = frames
+            .iter()
+            .map(|frame| frame.to_string_lossy().into_owned())
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "previews": frames,
+        });
+        return print_json(&document, "ts preview", stdout, stderr);
+    }
+    for frame in frames {
+        if let Err(error) = writeln!(stdout, "{}", frame.display()) {
+            let _ = writeln!(stderr, "ts preview: could not write a frame: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "ts preview: could not write: {error}");
+        return 1;
+    }
+    0
+}
+
+/// Paths plus an optional `--json`: the argument language of the small
+/// path-taking commands. `--` ends option parsing so a path starting with
+/// a dash stays addressable, exactly as in search. The caller checks the
+/// arity it needs; an unknown option is an error to report with usage.
+/// An empty path is rejected outright: it almost always means an unset
+/// variable expanded to nothing, and silently resolving it against the
+/// working directory would retarget the command at the wrong folder.
+fn parse_path_arguments(
+    arguments: &[OsString],
+    json_allowed: bool,
+) -> Result<(Vec<PathBuf>, bool), String> {
+    let mut paths = Vec::new();
+    let mut json = false;
+    let mut only_paths = false;
+    for argument in arguments {
+        if argument.is_empty() {
+            return Err("A path must not be empty.".to_owned());
+        }
+        if only_paths {
+            paths.push(PathBuf::from(argument));
+            continue;
+        }
+        if argument == OsStr::new("--") {
+            only_paths = true;
+            continue;
+        }
+        if argument == OsStr::new("--json") {
+            if !json_allowed {
+                return Err("Unknown option '--json'.".to_owned());
+            }
+            json = true;
+            continue;
+        }
+        if let Some(text) = argument.to_str() {
+            if text.starts_with('-') {
+                return Err(format!("Unknown option '{text}'."));
+            }
+        }
+        // Anything else is a path, including names no UTF-8 check could
+        // read: real paths on Unix can hold non-UTF-8 bytes.
+        paths.push(PathBuf::from(argument));
+    }
+    Ok((paths, json))
 }
 
 /// Nothing or `--json`: the whole argument language of the small read-only
@@ -584,11 +1040,16 @@ fn print_text(text: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i
 #[cfg(test)]
 mod tests {
     use super::run_command;
-    use std::{ffi::OsString, fs, path::PathBuf, sync::Arc};
+    use std::{
+        ffi::OsString,
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
     use tempfile::tempdir;
     use toka_search::{
         index_stats::{FolderState, FolderStats, IndexStats},
-        owned_index::{OwnedFolderStatus, OwnedIndexFolder, ScannedDirectory},
+        owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState, ScannedDirectory},
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
     };
@@ -607,6 +1068,30 @@ mod tests {
 
     fn no_folders() -> Result<Vec<OwnedIndexFolder>, String> {
         panic!("this command must not read folders")
+    }
+
+    fn no_add_folder(_path: &Path) -> Result<(OwnedIndexState, PathBuf), String> {
+        panic!("this command must not add folders")
+    }
+
+    fn no_remove_folder(_id: &str) -> Result<OwnedIndexState, String> {
+        panic!("this command must not remove folders")
+    }
+
+    fn no_sync_path(_path: &Path) -> Result<(), String> {
+        panic!("this command must not sync paths")
+    }
+
+    fn no_sync_rename(_from: &Path, _to: &Path) -> Result<(), String> {
+        panic!("this command must not sync renames")
+    }
+
+    fn no_thumbnail(_path: &Path) -> Result<PathBuf, String> {
+        panic!("this command must not make thumbnails")
+    }
+
+    fn no_preview(_path: &Path) -> Result<Vec<PathBuf>, String> {
+        panic!("this command must not make previews")
     }
 
     #[test]
@@ -648,6 +1133,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -655,7 +1146,16 @@ mod tests {
             assert_eq!(status, 0, "{flag}");
             let output = String::from_utf8(stdout).unwrap();
             assert!(output.contains("Usage: ts <command>"), "{output}");
-            for command in ["search", "stats", "folders", "--version"] {
+            for command in [
+                "search",
+                "stats",
+                "folders",
+                "sync-path",
+                "sync-rename",
+                "thumbnail",
+                "preview",
+                "--version",
+            ] {
                 assert!(output.contains(command), "{output}");
             }
             assert!(stderr.is_empty());
@@ -713,6 +1213,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -737,6 +1243,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -762,6 +1274,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -786,6 +1304,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -826,6 +1350,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -866,6 +1396,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -908,6 +1444,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -960,6 +1502,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1001,6 +1549,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1022,6 +1576,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1070,6 +1630,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1107,6 +1673,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1132,6 +1704,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1168,6 +1746,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1221,6 +1805,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1271,6 +1861,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1309,6 +1905,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1342,6 +1944,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1378,6 +1986,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1410,6 +2024,12 @@ mod tests {
             || Ok(engine),
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1450,6 +2070,12 @@ mod tests {
             || Ok(engine),
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1480,6 +2106,12 @@ mod tests {
             || Ok(engine),
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1515,6 +2147,12 @@ mod tests {
             || Ok(engine),
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1542,6 +2180,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1568,6 +2212,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1593,6 +2243,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1625,6 +2281,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1654,6 +2316,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1684,6 +2352,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1725,6 +2399,12 @@ mod tests {
             no_verbose_engine,
             || Ok(sample_stats()),
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1750,6 +2430,12 @@ mod tests {
             no_verbose_engine,
             || Ok(sample_stats()),
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1787,6 +2473,12 @@ mod tests {
             no_verbose_engine,
             || Ok(stats),
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1812,6 +2504,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1835,6 +2533,12 @@ mod tests {
             no_verbose_engine,
             || Err("no index".to_owned()),
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1850,6 +2554,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1896,6 +2606,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             || Ok(sample_folders()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1920,6 +2636,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             || Ok(Vec::new()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -1957,6 +2679,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             || Ok(sample_folders()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -2012,6 +2740,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             || Ok(folders),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -2057,6 +2791,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2071,10 +2811,10 @@ mod tests {
     }
 
     #[test]
-    fn folders_without_list_is_a_usage_error() {
+    fn folders_without_a_known_subcommand_is_a_usage_error() {
         for arguments in [
             vec!["ts", "folders"],
-            vec!["ts", "folders", "add", "/media"],
+            vec!["ts", "folders", "dance"],
             vec!["ts", "folders", "list", "extra"],
         ] {
             let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
@@ -2087,6 +2827,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2109,6 +2855,12 @@ mod tests {
             no_verbose_engine,
             no_stats,
             || Err("no index".to_owned()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
             &mut stdout,
             &mut stderr,
         );
@@ -2119,6 +2871,1350 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "ts folders list: no index\n"
         );
+    }
+
+    fn sample_state() -> OwnedIndexState {
+        OwnedIndexState {
+            supported: true,
+            revision: 3,
+            indexed_videos: 2,
+            indexed_images: 1,
+            indexing_files: 0,
+            folders: sample_folders(),
+        }
+    }
+
+    #[test]
+    fn folders_add_prints_a_confirmation() {
+        let args = ["ts", "folders", "add", "/media/new"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            |path| {
+                assert_eq!(path, Path::new("/media/new"));
+                Ok((sample_state(), PathBuf::from("/media/new")))
+            },
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "Added /media/new\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_add_reports_the_committed_path() {
+        // The manager may store a spelling that differs from what was
+        // typed (a symlink retargeted mid-add): the echo names the
+        // committed row, never a resolution of the request.
+        let args = ["ts", "folders", "add", "/media/a"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            |path| {
+                assert_eq!(path, Path::new("/media/a"));
+                Ok((sample_state(), PathBuf::from("/media/b")))
+            },
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "Added /media/b\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_add_json_prints_the_resulting_state() {
+        let args = ["ts", "folders", "add", "/media/new", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            |_| Ok((sample_state(), PathBuf::from("/media/new"))),
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["revision"], 3);
+        assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+        assert_eq!(document["folders"][0]["id"], "abc");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_add_without_a_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "folders", "add"],
+            vec!["ts", "folders", "add", "--json"],
+            vec!["ts", "folders", "add", "/media/a", "/media/b"],
+            vec!["ts", "folders", "add", "--sort", "/media/a"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::FOLDERS_ADD_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folders_add_failure_returns_a_failure_status() {
+        let args = ["ts", "folders", "add", "/media/new"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            |_| Err("That folder is already covered by a Toka search folder.".to_owned()),
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts folders add: That folder is already covered by a Toka search folder.\n"
+        );
+    }
+
+    #[test]
+    fn folders_remove_prints_a_confirmation() {
+        let args = ["ts", "folders", "remove", "/media/movies"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "abc");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Removed /media/movies\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_matches_the_canonical_path() {
+        let directory = tempdir().unwrap();
+        let canonical = directory.path().canonicalize().unwrap();
+        fs::create_dir(directory.path().join("sub")).unwrap();
+        let unclean = directory.path().join("sub").join("..");
+        let folders = vec![OwnedIndexFolder {
+            id: "abc".into(),
+            path: canonical.clone(),
+            status: OwnedFolderStatus::Ready,
+            message: None,
+            scanned_files: 0,
+            current_path: None,
+            recent_directories: Vec::new(),
+        }];
+        let args = ["ts", "folders", "remove"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([unclean.into_os_string()])
+            .collect::<Vec<_>>();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(folders),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "abc");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Removed {}\n", canonical.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_matches_a_missing_folder_by_its_recorded_path() {
+        // /media/gone is not on disk: removing an offline folder by the
+        // path it was added under must still find it.
+        let args = ["ts", "folders", "remove", "/media/gone"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "def");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(String::from_utf8(stdout).unwrap(), "Removed /media/gone\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_remove_prefers_the_normalized_match_over_the_spelling_as_typed() {
+        // Requested through a symlink: one recorded row names the link
+        // spelling, another the folder on disk. The on-disk folder wins
+        // even though the literal row is listed first.
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let canonical = target.canonicalize().unwrap();
+        let folders = ["literal", "canonical"]
+            .iter()
+            .zip([link.clone(), canonical.clone()])
+            .map(|(id, path)| OwnedIndexFolder {
+                id: id.to_string(),
+                path,
+                status: OwnedFolderStatus::Ready,
+                message: None,
+                scanned_files: 0,
+                current_path: None,
+                recent_directories: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let args = ["ts", "folders", "remove"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([link.into_os_string()])
+            .collect::<Vec<_>>();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(folders),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "canonical");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Removed {}\n", canonical.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_of_an_unknown_folder_is_an_error() {
+        let args = ["ts", "folders", "remove", "/media/elsewhere"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts folders remove: /media/elsewhere is not one of Toka's search folders.\n"
+        );
+    }
+
+    #[test]
+    fn folders_remove_json_prints_the_resulting_state() {
+        let args = ["ts", "folders", "remove", "/media/movies", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |_| Ok(sample_state()),
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_without_a_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "folders", "remove"],
+            vec!["ts", "folders", "remove", "--json"],
+            vec!["ts", "folders", "remove", "/media/a", "/media/b"],
+            vec!["ts", "folders", "remove", "--sort", "/media/a"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::FOLDERS_REMOVE_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folders_remove_failure_returns_a_failure_status() {
+        let args = ["ts", "folders", "remove", "/media/movies"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |_| Err("That search folder is no longer configured.".to_owned()),
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts folders remove: That search folder is no longer configured.\n"
+        );
+    }
+
+    #[test]
+    fn folders_remove_when_folders_cannot_be_read_is_an_error() {
+        let args = ["ts", "folders", "remove", "/media/movies"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Err("no index".to_owned()),
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts folders remove: no index\n"
+        );
+    }
+
+    #[test]
+    fn folders_remove_help_does_not_remove() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "folders", "remove", flag]
+                .map(OsString::from)
+                .to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::FOLDERS_REMOVE_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn folders_add_help_does_not_add() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "folders", "add", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::FOLDERS_ADD_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn sync_path_succeeds_silently() {
+        let args = ["ts", "sync-path", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            |path| {
+                assert_eq!(path, Path::new("/media/movies/clip.mp4"));
+                Ok(())
+            },
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn sync_path_without_exactly_one_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "sync-path"],
+            vec!["ts", "sync-path", "/media/a", "/media/b"],
+            vec!["ts", "sync-path", "--json", "/media/a"],
+            vec!["ts", "sync-path", "--sort"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::SYNC_PATH_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_path_failure_returns_a_failure_status() {
+        let args = ["ts", "sync-path", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            |_| Err("Toka could not use its search index: bad database".to_owned()),
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts sync-path: Toka could not use its search index: bad database\n"
+        );
+    }
+
+    #[test]
+    fn sync_path_help_does_not_sync() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "sync-path", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::SYNC_PATH_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn sync_rename_succeeds_silently() {
+        let args = ["ts", "sync-rename", "/media/old.mp4", "/media/new.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            |from, to| {
+                assert_eq!(from, Path::new("/media/old.mp4"));
+                assert_eq!(to, Path::new("/media/new.mp4"));
+                Ok(())
+            },
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn sync_rename_without_two_paths_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "sync-rename"],
+            vec!["ts", "sync-rename", "/media/old.mp4"],
+            vec![
+                "ts",
+                "sync-rename",
+                "/media/old.mp4",
+                "/media/new.mp4",
+                "/media/extra.mp4",
+            ],
+            vec!["ts", "sync-rename", "--json", "/media/a", "/media/b"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::SYNC_RENAME_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_rename_with_an_empty_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "sync-rename", "", "/media/new.mp4"],
+            vec!["ts", "sync-rename", "/media/old.mp4", ""],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            let stderr = String::from_utf8(stderr).unwrap();
+            assert!(
+                stderr.contains("A path must not be empty."),
+                "{arguments:?}"
+            );
+            assert!(stderr.contains(super::SYNC_RENAME_USAGE), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn sync_rename_failure_returns_a_failure_status() {
+        let args = ["ts", "sync-rename", "/media/old.mp4", "/media/new.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            |_, _| Err("Toka could not use its search index: bad database".to_owned()),
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts sync-rename: Toka could not use its search index: bad database\n"
+        );
+    }
+
+    #[test]
+    fn sync_rename_help_does_not_sync() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "sync-rename", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::SYNC_RENAME_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn thumbnail_prints_the_thumbnail_path() {
+        let args = ["ts", "thumbnail", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            |path| {
+                assert_eq!(path, Path::new("/media/movies/clip.mp4"));
+                Ok(PathBuf::from("/tmp/toka-thumbnails/abc123.jpg"))
+            },
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "/tmp/toka-thumbnails/abc123.jpg\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_json_prints_a_versioned_document() {
+        let args = ["ts", "thumbnail", "/media/movies/clip.mp4", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            |_| Ok(PathBuf::from("/tmp/toka-thumbnails/abc123.jpg")),
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["thumbnail"], "/tmp/toka-thumbnails/abc123.jpg");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn thumbnail_json_with_non_utf8_path_prints_lossy() {
+        use std::os::unix::ffi::OsStringExt;
+        let generated = PathBuf::from(OsString::from_vec(
+            b"/tmp/toka-thumbnails/abc-\xff.jpg".to_vec(),
+        ));
+        let args = ["ts", "thumbnail", "/media/movies/clip.mp4", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            |_| Ok(generated.clone()),
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["thumbnail"],
+            generated.to_string_lossy().into_owned()
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_without_a_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "thumbnail"],
+            vec!["ts", "thumbnail", "--json"],
+            vec!["ts", "thumbnail", "/media/a", "/media/b"],
+            vec!["ts", "thumbnail", "--sort", "/media/a"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::THUMBNAIL_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_failure_returns_a_failure_status() {
+        let args = ["ts", "thumbnail", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            |_| Err("Toka could not make a thumbnail for /media/movies/clip.mp4.".to_owned()),
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts thumbnail: Toka could not make a thumbnail for /media/movies/clip.mp4.\n"
+        );
+    }
+
+    #[test]
+    fn thumbnail_help_does_not_generate() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "thumbnail", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::THUMBNAIL_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn preview_prints_one_frame_per_line() {
+        let args = ["ts", "preview", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            |path| {
+                assert_eq!(path, Path::new("/media/movies/clip.mp4"));
+                Ok(vec![
+                    PathBuf::from("/tmp/toka-thumbnails/abc-preview-0.jpg"),
+                    PathBuf::from("/tmp/toka-thumbnails/abc-preview-1.jpg"),
+                ])
+            },
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "/tmp/toka-thumbnails/abc-preview-0.jpg\n/tmp/toka-thumbnails/abc-preview-1.jpg\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn preview_json_prints_a_versioned_document() {
+        let args = ["ts", "preview", "/media/movies/clip.mp4", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            |_| {
+                Ok(vec![
+                    PathBuf::from("/tmp/toka-thumbnails/abc-preview-0.jpg"),
+                    PathBuf::from("/tmp/toka-thumbnails/abc-preview-1.jpg"),
+                ])
+            },
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["previews"],
+            serde_json::json!([
+                "/tmp/toka-thumbnails/abc-preview-0.jpg",
+                "/tmp/toka-thumbnails/abc-preview-1.jpg",
+            ])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn preview_without_a_path_is_a_usage_error() {
+        for arguments in [
+            vec!["ts", "preview"],
+            vec!["ts", "preview", "--json"],
+            vec!["ts", "preview", "/media/a", "/media/b"],
+            vec!["ts", "preview", "--sort", "/media/a"],
+        ] {
+            let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty());
+            assert!(
+                String::from_utf8(stderr)
+                    .unwrap()
+                    .contains(super::PREVIEW_USAGE),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_with_an_empty_path_is_a_usage_error() {
+        let args = ["ts", "preview", ""].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(stderr.contains("A path must not be empty."));
+        assert!(stderr.contains(super::PREVIEW_USAGE));
+    }
+
+    #[test]
+    fn preview_failure_returns_a_failure_status() {
+        let args = ["ts", "preview", "/media/movies/clip.mp4"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            |_| Err("Toka could not make a preview for /media/movies/clip.mp4.".to_owned()),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts preview: Toka could not make a preview for /media/movies/clip.mp4.\n"
+        );
+    }
+
+    #[test]
+    fn preview_help_does_not_generate() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "preview", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                no_engine,
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                String::from_utf8(stdout)
+                    .unwrap()
+                    .contains(super::PREVIEW_USAGE),
+                "{flag}"
+            );
+            assert!(stderr.is_empty());
+        }
     }
 
     #[test]
@@ -2136,6 +4232,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2161,6 +4263,12 @@ mod tests {
                 no_verbose_engine,
                 no_stats,
                 no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
                 &mut stdout,
                 &mut stderr,
             );
