@@ -121,6 +121,14 @@ fn run_daemon() -> Result<(), String> {
     toka_search::indexer_daemon::run_daemon()
 }
 
+/// Runs one service operation against the real machine.
+fn manage_service(
+    op: toka_search::service::ServiceOp,
+) -> Result<toka_search::service::Outcome, String> {
+    let mut host = toka_search::service::SystemHost::new()?;
+    toka_search::service::perform(&mut host, op)
+}
+
 fn read_folders() -> Result<Vec<OwnedIndexFolder>, String> {
     OwnedIndexManager::for_read_only_inspection()?.folders()
 }
@@ -216,6 +224,7 @@ fn main() {
         make_preview,
         read_status,
         run_daemon,
+        manage_service,
         &mut stdout,
         &mut stderr,
     );

@@ -774,11 +774,12 @@ pub fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
     }
 }
 
-/// Creates (and secures) the index parent, so acquiring the daemon lock
-/// never fails on a missing folder after a reset wipes it. Both the
-/// startup acquisition and a yielded manager's re-acquisition go through
-/// here: the lock file lives beside the index, and either path can run
-/// with the whole folder gone.
+/// Creates (and secures) the index parent, so acquiring the legacy
+/// daemon lock never fails on a missing folder after a reset wipes it.
+/// Both the startup acquisition and a yielded manager's re-acquisition go
+/// through here: the legacy lock file lives beside the index (the primary
+/// one lives in the runtime directory), and either path can run with the
+/// whole folder gone.
 pub(crate) fn ensure_index_parent(database: &Path) -> Result<(), String> {
     if let Some(parent) = database.parent() {
         fs::create_dir_all(parent).map_err(|source| {
@@ -803,10 +804,10 @@ impl OwnedIndexManager {
     /// and what tests supervise without touching the real index.
     #[cfg(any(target_os = "macos", test))]
     fn system_under(database: PathBuf) -> Result<Self, String> {
-        // Create (and secure) the lock's parent first, so a first launch
-        // — or a post-reset one, where the whole folder is gone — never
-        // fails opening the lock. Acquisition itself still happens before
-        // any watcher starts.
+        // Create (and secure) the legacy lock's parent first, so a first
+        // launch — or a post-reset one, where the whole folder is gone —
+        // never fails opening the lock. Acquisition itself still happens
+        // before any watcher starts.
         ensure_index_parent(&database)?;
         // One supervisor per index: when a `ts` daemon already runs here,
         // the app leaves supervision to it instead of interleaving scan
@@ -1118,9 +1119,10 @@ impl OwnedIndexManager {
         // every pass: once the daemon stops, this manager takes over
         // supervision instead of leaving the folders unwatched for life.
         // Watchers only (re)start below, after the lock is held. The
-        // parent is ensured first, exactly as at startup: a reset while
-        // yielded wipes the lock's folder, and without this the
-        // re-acquisition errors ENOENT on every poll until restart.
+        // legacy lock's parent is ensured first, exactly as at startup: a
+        // reset while yielded wipes the index folder, and without this the
+        // re-acquisition errors ENOENT on every poll until restart. (The
+        // primary lock survives the reset in the runtime directory.)
         if self.watch {
             let mut guard = self
                 .daemon_guard
@@ -5368,6 +5370,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_system_manager_yields_supervision_to_a_running_daemon() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
@@ -5392,6 +5395,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_system_manager_creates_a_missing_index_directory_before_locking() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let parent = directory.path().join("missing-index-folder");
         let database = parent.join("index.sqlite3");
@@ -5416,6 +5420,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_yielded_manager_resumes_supervision_once_the_daemon_stops() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
@@ -5449,6 +5454,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_yielded_manager_recreates_a_reset_index_directory_while_reacquiring() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
@@ -5470,8 +5476,9 @@ mod tests {
         let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
         assert!(!manager.supervises_watchers().unwrap());
 
-        // A reset while yielded wipes the lock's whole folder; the daemon
-        // stops with it.
+        // A reset while yielded wipes the index folder — including the
+        // legacy lock file, though never the primary one; the daemon stops
+        // with it.
         std::fs::remove_dir_all(&parent).unwrap();
         drop(daemon);
 
@@ -5499,6 +5506,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_supervising_system_manager_refuses_a_second_supervisor() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let database = directory.path().join("index.sqlite3");
 
@@ -5516,6 +5524,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn two_system_managers_yield_to_whichever_started_first() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let database = directory.path().join("index.sqlite3");
 
@@ -5556,6 +5565,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn adding_a_folder_without_supervision_starts_no_watcher() {
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();

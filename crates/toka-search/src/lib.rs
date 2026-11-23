@@ -15,6 +15,7 @@ pub mod providers;
 pub mod reset;
 pub mod search;
 pub mod search_log;
+pub mod service;
 pub mod sidecars;
 pub mod tags;
 pub mod thumbnails;

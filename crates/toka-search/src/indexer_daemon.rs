@@ -119,23 +119,6 @@ pub(crate) fn indexer_running() -> Option<bool> {
     None
 }
 
-/// Stops the indexer service so it cannot recreate state while it is deleted.
-/// The next Toka launch starts it again.
-#[cfg(not(feature = "e2e"))]
-pub fn stop_indexer() -> Result<(), String> {
-    let status = Command::new("systemctl")
-        .args(["--user", "stop", INDEXER_SERVICE])
-        .status()
-        .map_err(|error| format!("could not stop the indexer service: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the indexer service could not be stopped (systemctl exited with {status})"
-        ))
-    }
-}
-
 /// Where the indexer daemon writes its log: beside the search log.
 fn indexer_log_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
@@ -255,23 +238,138 @@ pub fn run_daemon() -> Result<(), String> {
 /// same lock, so whichever starts second yields to the first.
 #[cfg(unix)]
 pub(crate) struct DaemonLock {
-    _file: fs::File,
+    _primary: fs::File,
+    _legacy: fs::File,
 }
 
 #[cfg(not(unix))]
 pub(crate) struct DaemonLock;
 
+/// Where the primary daemon lock lives: a runtime directory, never the
+/// index folder. `TOKA_RUNTIME_DIR` wins when set (tests and isolated runs
+/// point it at scratch); otherwise Linux uses `XDG_RUNTIME_DIR/toka`, and
+/// macOS — like the Linux fallback — uses the cache folder's `toka`
+/// directory, which no reset deletes (resets delete `app.toka.desktop`,
+/// never `toka`). A missing home falls back to the temporary directory.
+#[cfg(unix)]
+pub(crate) fn daemon_runtime_dir() -> PathBuf {
+    let override_dir = std::env::var_os("TOKA_RUNTIME_DIR").map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    let xdg_runtime = dirs::runtime_dir();
+    #[cfg(not(target_os = "linux"))]
+    let xdg_runtime: Option<PathBuf> = None;
+    resolve_runtime_dir(
+        override_dir,
+        xdg_runtime,
+        dirs::cache_dir(),
+        std::env::temp_dir(),
+    )
+}
+
+/// [`daemon_runtime_dir`] with the environment passed in, so the
+/// precedence is unit-testable without touching the process environment.
+#[cfg(unix)]
+fn resolve_runtime_dir(
+    override_dir: Option<PathBuf>,
+    xdg_runtime: Option<PathBuf>,
+    cache: Option<PathBuf>,
+    temp: PathBuf,
+) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return dir;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = xdg_runtime {
+        return dir.join("toka");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = xdg_runtime;
+    if let Some(dir) = cache {
+        return dir.join("toka");
+    }
+    temp.join("toka")
+}
+
+/// FNV-1a 64-bit, naming one lock file per index: the name must be stable
+/// for one database across processes and upgrades, distinct across
+/// indexes, and short no matter how deep the database path runs.
+#[cfg(unix)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// The primary lock file for one index.
+#[cfg(unix)]
+fn lock_file_name(database: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    format!(
+        "daemon-{:016x}.lock",
+        fnv1a64(database.as_os_str().as_bytes())
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn daemon_lock_path(database: &Path) -> PathBuf {
+    daemon_runtime_dir().join(lock_file_name(database))
+}
+
 /// Tries the daemon lock without blocking: `Ok(None)` when another
 /// supervisor already runs on this index, so the caller yields instead of
 /// queueing behind it forever.
+///
+/// The primary lock lives in the runtime directory, deliberately outside
+/// every path a reset deletes. A lock beside the index breaks silently
+/// under `flock` + `unlink`: resetting while a supervisor holds the lock
+/// unlinks the file out from under it, and the next starter locks a fresh
+/// file — two supervisors, no error. Stopping before the reset (and
+/// refusing to delete when the stop fails) closes the steady-state hole,
+/// but not a supervisor that (re)starts mid-reset: a daemon revived by
+/// `Restart=on-failure` after `kill -9`, by launchd `KeepAlive`, or by a
+/// concurrent hand start locks a file the reset then unlinks, and the
+/// starter after that locks another fresh one. A lock the reset never
+/// unlinks has no such race: every contender meets on the same inode.
+///
+/// The beside-the-index `daemon.lock` is still taken too, so a supervisor
+/// from before this move and one from after it cannot both run during the
+/// upgrade: old code takes only the legacy lock, new code takes both, and
+/// either side yields when the other holds it. Both locks drop together
+/// with the guard.
 #[cfg(unix)]
 pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLock>, String> {
-    let path = database.with_file_name("daemon.lock");
+    let path = daemon_lock_path(database);
+    if let Some(runtime) = path.parent() {
+        fs::create_dir_all(runtime)
+            .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    }
+    let Some(primary) = lock_file(&path)? else {
+        return Ok(None);
+    };
+    // The legacy lock's parent is ensured here, not just by the callers:
+    // a reset may have wiped it while this supervisor was starting.
+    crate::owned_index::ensure_index_parent(database)?;
+    let Some(legacy) = lock_file(&database.with_file_name("daemon.lock"))? else {
+        return Ok(None);
+    };
+    Ok(Some(DaemonLock {
+        _primary: primary,
+        _legacy: legacy,
+    }))
+}
+
+/// Opens and exclusively locks one lock file without blocking: `Ok(None)`
+/// when another supervisor holds it.
+#[cfg(unix)]
+fn lock_file(path: &Path) -> Result<Option<fs::File>, String> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
     use std::os::fd::AsRawFd;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
@@ -281,7 +379,23 @@ pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLo
         }
         return Err(format!("Toka could not lock its indexer daemon: {error}"));
     }
-    Ok(Some(DaemonLock { _file: file }))
+    Ok(Some(file))
+}
+
+/// Points the daemon lock at a per-process scratch dir, so lock tests
+/// neither touch the real runtime dir nor contend with a live daemon. Set
+/// once, never unset: every lock-acquiring test calls this first, and the
+/// per-index file names keep tests apart within the shared dir.
+#[cfg(all(test, unix))]
+pub(crate) fn test_runtime_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("toka-test-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TOKA_RUNTIME_DIR", &dir);
+        dir
+    })
+    .clone()
 }
 
 /// No-op lock where `flock` does not exist: non-Unix platforms run a
@@ -1642,5 +1756,124 @@ mod tests {
         moved.target = PathBuf::from("/nonexistent-mount-target");
         assert!(!path_available(&media, Some(&moved)));
         assert!(!path_available(&media.join("missing"), Some(&current)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_prefers_the_override_then_the_platform_dir() {
+        let dir = |path: &str| Some(PathBuf::from(path));
+        // The override wins everywhere, exactly as given.
+        assert_eq!(
+            resolve_runtime_dir(
+                dir("/scratch/runtime"),
+                dir("/run/1"),
+                dir("/c"),
+                "/tmp".into()
+            ),
+            PathBuf::from("/scratch/runtime")
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            resolve_runtime_dir(None, dir("/run/1000"), dir("/home/u/.cache"), "/tmp".into()),
+            PathBuf::from("/run/1000/toka")
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            resolve_runtime_dir(
+                None,
+                dir("/run/1000"),
+                dir("/Users/u/Library/Caches"),
+                "/tmp".into()
+            ),
+            PathBuf::from("/Users/u/Library/Caches/toka")
+        );
+        // No platform dir at all: the cache, then the temporary dir.
+        assert_eq!(
+            resolve_runtime_dir(None, None, dir("/home/u/.cache"), "/tmp".into()),
+            PathBuf::from("/home/u/.cache/toka")
+        );
+        assert_eq!(
+            resolve_runtime_dir(None, None, None, "/tmp".into()),
+            PathBuf::from("/tmp/toka")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_paths_are_stable_per_index_and_distinct_across_indexes() {
+        let runtime = test_runtime_dir();
+        let first = runtime.join("a").join("index.sqlite3");
+        let second = runtime.join("b").join("index.sqlite3");
+
+        assert_eq!(daemon_lock_path(&first), daemon_lock_path(&first));
+        assert_ne!(daemon_lock_path(&first), daemon_lock_path(&second));
+        assert!(daemon_lock_path(&first).starts_with(&runtime));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquiring_locks_the_runtime_file_and_the_legacy_file() {
+        use std::os::fd::AsRawFd;
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        let guard = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("first acquisition wins");
+
+        // The primary lock lives outside the index folder, so a reset
+        // never unlinks it; the legacy one stays beside the index for
+        // supervisors from before the move.
+        assert!(daemon_lock_path(&database).is_file());
+        assert!(!daemon_lock_path(&database).starts_with(directory.path()));
+        assert!(database.with_file_name("daemon.lock").is_file());
+        assert!(
+            try_acquire_daemon_lock(&database).unwrap().is_none(),
+            "a second supervisor yields while the first holds the lock"
+        );
+        // Both files are really locked, not merely present: a fresh
+        // open of either refuses a non-blocking exclusive lock.
+        let _guard = guard;
+        for path in [
+            daemon_lock_path(&database),
+            database.with_file_name("daemon.lock"),
+        ] {
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(held, -1, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_lock_held_by_an_old_supervisor_blocks_a_new_one() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // An old supervisor, which takes only the beside-the-index lock.
+        let legacy = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(database.with_file_name("daemon.lock"))
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        assert!(
+            try_acquire_daemon_lock(&database).unwrap().is_none(),
+            "the new supervisor must yield to the legacy lock"
+        );
     }
 }

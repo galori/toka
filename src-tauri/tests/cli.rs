@@ -26,6 +26,7 @@ fn run_toka_with_provider(
         .args(arguments)
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", data_home)
+        .env("TOKA_RUNTIME_DIR", home.path().join("runtime"))
         .env("TOKA_E2E_VIDEOS", video_paths)
         .env_remove("TOKA_SEARCH_PROVIDER");
     if let Some(provider) = provider {

@@ -20,6 +20,8 @@ use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 #[cfg(target_os = "linux")]
 use toka_search::indexer_daemon;
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+use toka_search::service;
 use toka_search::{
     index_stats,
     owned_index::{self, IndexUpdates, OwnedIndexUpdates},
@@ -1362,9 +1364,12 @@ fn reset_plan() -> Result<reset::ResetPlan, String> {
     paths.extend(search_log::reset_paths());
     #[allow(unused_mut)]
     let mut plan = reset::ResetPlan::new(paths);
-    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+    // The indexer stops before anything is deleted, on both platforms that
+    // run it as a service — and the reset fails closed when the stop does,
+    // so a surviving supervisor never watches its state vanish.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
     {
-        plan.stop_indexer = Some(indexer_daemon::stop_indexer);
+        plan.stop_indexer = Some(service::stop_indexer_services);
     }
     Ok(plan)
 }
@@ -1978,5 +1983,19 @@ mod tests {
         assert_eq!(update.tagged.len(), 1);
         assert_eq!(update.failed, 1);
         assert!(update.problem.is_some());
+    }
+
+    /// The reset stops the indexer service before deleting anything, on
+    /// both platforms that run it — so a surviving supervisor fails the
+    /// reset instead of watching its state vanish.
+    #[cfg(not(mobile))]
+    #[test]
+    fn reset_stops_the_indexer_before_deleting() {
+        let plan = reset_plan().unwrap();
+
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+        assert!(plan.stop_indexer.is_some());
+        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e"))))]
+        assert!(plan.stop_indexer.is_none());
     }
 }

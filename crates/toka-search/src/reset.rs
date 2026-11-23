@@ -52,9 +52,14 @@ pub fn apply(plan: &ResetPlan) -> ResetReport {
         removed: Vec::new(),
         failures: Vec::new(),
     };
+    // Fail closed: a supervisor that survives the stop would rewrite what
+    // is being deleted — and, worse, deleting the lock file out from under
+    // it silently breaks mutual exclusion (see `try_acquire_daemon_lock`).
+    // When the stop fails, nothing is removed.
     if let Some(stop) = plan.stop_indexer {
         if let Err(message) = stop() {
             report.failures.push(message);
+            return report;
         }
     }
     for path in &plan.paths {
@@ -130,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_indexer_is_reported_but_does_not_block_the_removal() {
+    fn a_failed_stop_is_reported_and_nothing_is_removed() {
         let root = tempdir().unwrap();
         let file = root.path().join("index-status.json");
         fs::write(&file, b"{}").unwrap();
@@ -140,6 +145,22 @@ mod tests {
         let report = apply(&plan);
 
         assert_eq!(report.failures, vec!["systemctl failed".to_owned()]);
+        assert!(report.removed.is_empty());
+        assert!(file.exists(), "a failed stop must remove nothing");
+    }
+
+    #[test]
+    fn a_successful_stop_proceeds_with_the_removal() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("index-status.json");
+        fs::write(&file, b"{}").unwrap();
+        let mut plan = ResetPlan::new(vec![file.clone()]);
+        plan.stop_indexer = Some(|| Ok(()));
+
+        let report = apply(&plan);
+
+        assert!(report.failures.is_empty());
+        assert_eq!(report.removed, vec![file.clone()]);
         assert!(!file.exists());
     }
 }

@@ -10,13 +10,14 @@ use toka_search::{
     index_stats::{self, IndexStats},
     owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
     search::{MediaType, SearchEngine, SearchFields, SearchRequest, VideoResult, PAGE_SIZE},
+    service::{Outcome, ServiceOp},
 };
 
 /// The version of every `--json` document this CLI prints. The app checks it
 /// before parsing.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
@@ -42,6 +43,16 @@ const THUMBNAIL_USAGE: &str = "Usage: ts thumbnail <path> [--json]";
 const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the thumbnail for one file, generating it on the first run as the app does; an image prints as its own thumbnail. Prints the thumbnail path, or one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
 const PREVIEW_HELP: &str = "Usage: ts preview <path> [--json]\n\nPrint the preview frames for one video, one per line, generating them on the first run as the app does on hover; an image prints as its own single frame. Prints one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
+const INSTALL_USAGE: &str = "Usage: ts install [--link] [--json]";
+const INSTALL_HELP: &str = "Usage: ts install [--link] [--json]\n\nInstall the indexer as a background service for this ts: a systemd user unit on Linux, a launchd agent on macOS. The service runs `ts daemon run`, starts now, and starts again at login. On Linux the old toka-indexer.service is migrated away, and lingering is enabled so indexing continues while logged out. Safe to re-run: every step reports what it did versus the state it already found.\n\n  --link       Also link this ts into ~/.local/bin\n  --json       Print one JSON document (schema 1) instead of the report";
+const UNINSTALL_USAGE: &str = "Usage: ts uninstall [--purge-data] [--json]";
+const UNINSTALL_HELP: &str = "Usage: ts uninstall [--purge-data] [--json]\n\nStop and remove the indexer service. Safe to re-run: removing what was never installed succeeds and says so.\n\n  --purge-data   Also remove the index, the logs, and the thumbnail cache (never media)\n  --json         Print one JSON document (schema 1) instead of the report";
+const RESTART_USAGE: &str = "Usage: ts restart [--json]";
+const RESTART_HELP: &str = "Usage: ts restart [--json]\n\nRestart the indexer service: a stop plus a start, so a stopped service ends up running and `ts status` uptime resets. The service must be installed first.";
+const START_USAGE: &str = "Usage: ts start [--json]";
+const START_HELP: &str = "Usage: ts start [--json]\n\nStart the indexer service. Starting what already runs succeeds and says so. The service must be installed first.";
+const STOP_USAGE: &str = "Usage: ts stop [--json]";
+const STOP_HELP: &str = "Usage: ts stop [--json]\n\nStop the indexer service. Stopping what already stopped — or was never installed — succeeds and says so.";
 
 fn search_help() -> String {
     format!(
@@ -88,6 +99,7 @@ pub fn run_command(
     make_preview: impl FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
     read_status: impl FnMut() -> Result<DaemonStatus, String>,
     run_daemon: impl FnOnce() -> Result<(), String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -157,6 +169,50 @@ pub fn run_command(
     // point, not an interactive command, so it stays out of the help.
     if command == OsStr::new("daemon") {
         return run_daemon_command(&arguments[2..], run_daemon, stdout, stderr);
+    }
+
+    if command == OsStr::new("install") {
+        return run_install_command(&arguments[2..], service, stdout, stderr);
+    }
+
+    if command == OsStr::new("uninstall") {
+        return run_uninstall_command(&arguments[2..], service, stdout, stderr);
+    }
+
+    if command == OsStr::new("restart") {
+        return run_simple_service_command(
+            ServiceOp::Restart,
+            &arguments[2..],
+            RESTART_USAGE,
+            RESTART_HELP,
+            service,
+            stdout,
+            stderr,
+        );
+    }
+
+    if command == OsStr::new("start") {
+        return run_simple_service_command(
+            ServiceOp::Start,
+            &arguments[2..],
+            START_USAGE,
+            START_HELP,
+            service,
+            stdout,
+            stderr,
+        );
+    }
+
+    if command == OsStr::new("stop") {
+        return run_simple_service_command(
+            ServiceOp::Stop,
+            &arguments[2..],
+            STOP_USAGE,
+            STOP_HELP,
+            service,
+            stdout,
+            stderr,
+        );
     }
 
     let _ = writeln!(stderr, "{GENERAL_HELP}");
@@ -841,6 +897,153 @@ fn run_daemon_run_command(
     }
 }
 
+fn run_install_command(
+    arguments: &[OsString],
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(INSTALL_HELP, stdout, stderr);
+    }
+    let Some((link, json)) = parse_install_arguments(arguments) else {
+        let _ = writeln!(stderr, "{INSTALL_USAGE}");
+        return 2;
+    };
+    run_service_op(ServiceOp::Install { link }, json, service, stdout, stderr)
+}
+
+/// Nothing, `--link`, `--json`, or both: the whole argument language of
+/// `install`. `None` is a usage error for the caller to report.
+fn parse_install_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
+    let mut link = false;
+    let mut json = false;
+    for argument in arguments {
+        if argument == OsStr::new("--link") {
+            link = true;
+        } else if argument == OsStr::new("--json") {
+            json = true;
+        } else {
+            return None;
+        }
+    }
+    Some((link, json))
+}
+
+fn run_uninstall_command(
+    arguments: &[OsString],
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(UNINSTALL_HELP, stdout, stderr);
+    }
+    let Some((purge_data, json)) = parse_uninstall_arguments(arguments) else {
+        let _ = writeln!(stderr, "{UNINSTALL_USAGE}");
+        return 2;
+    };
+    run_service_op(
+        ServiceOp::Uninstall { purge_data },
+        json,
+        service,
+        stdout,
+        stderr,
+    )
+}
+
+/// Nothing, `--purge-data`, `--json`, or both: the whole argument language
+/// of `uninstall`. `None` is a usage error for the caller to report.
+fn parse_uninstall_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
+    let mut purge_data = false;
+    let mut json = false;
+    for argument in arguments {
+        if argument == OsStr::new("--purge-data") {
+            purge_data = true;
+        } else if argument == OsStr::new("--json") {
+            json = true;
+        } else {
+            return None;
+        }
+    }
+    Some((purge_data, json))
+}
+
+/// `restart`, `start`, and `stop`: the operation is fixed, so only
+/// `--json` is left to parse.
+fn run_simple_service_command(
+    op: ServiceOp,
+    arguments: &[OsString],
+    usage: &str,
+    help: &str,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(help, stdout, stderr);
+    }
+    let Some(json) = parse_json_flag(arguments) else {
+        let _ = writeln!(stderr, "{usage}");
+        return 2;
+    };
+    run_service_op(op, json, service, stdout, stderr)
+}
+
+/// Runs one service operation and reports what it did: one line per
+/// action, or one JSON document (schema 1) naming the command and each
+/// action with whether it changed anything.
+fn run_service_op(
+    op: ServiceOp,
+    json: bool,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let command = format!("ts {}", op.name());
+    let outcome = match service(op) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = writeln!(stderr, "{command}: {error}");
+            return 1;
+        }
+    };
+    if json {
+        // Encode fallibly like the other commands: a future non-lossy
+        // field must exit 1, never panic inside `json!`.
+        let actions = match serde_json::to_value(&outcome.actions) {
+            Ok(actions) => actions,
+            Err(error) => {
+                let _ = writeln!(stderr, "{command}: could not encode results: {error}");
+                return 1;
+            }
+        };
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "command": op.name(),
+            "actions": actions,
+        });
+        return print_json(&document, &command, stdout, stderr);
+    }
+    for action in &outcome.actions {
+        if let Err(error) = writeln!(stdout, "{}", action.message) {
+            let _ = writeln!(stderr, "{command}: could not write: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "{command}: could not write: {error}");
+        return 1;
+    }
+    0
+}
+
 /// Paths plus an optional `--json`: the argument language of the small
 /// path-taking commands. `--` ends option parsing so a path starting with
 /// a dash stays addressable, exactly as in search. The caller checks the
@@ -1316,6 +1519,7 @@ mod tests {
         owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState, ScannedDirectory},
         search::{SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
+        service::{Action, Outcome, ServiceOp},
     };
 
     fn no_engine() -> Result<SearchEngine, String> {
@@ -1366,6 +1570,10 @@ mod tests {
         panic!("this command must not run the daemon")
     }
 
+    fn no_service(_op: toka_search::service::ServiceOp) -> Result<super::Outcome, String> {
+        panic!("this command must not manage the service")
+    }
+
     #[test]
     fn version_prefers_the_build_version_over_the_manifest_version() {
         assert_eq!(
@@ -1413,6 +1621,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1424,6 +1633,11 @@ mod tests {
                 "search",
                 "stats",
                 "status",
+                "install",
+                "uninstall",
+                "restart",
+                "start",
+                "stop",
                 "folders",
                 "sync-path",
                 "sync-rename",
@@ -1499,6 +1713,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1531,6 +1746,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1564,6 +1780,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1596,6 +1813,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1644,6 +1862,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1692,6 +1911,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1742,6 +1962,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1802,6 +2023,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1851,6 +2073,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1880,6 +2103,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -1936,6 +2160,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1981,6 +2206,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2014,6 +2240,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2058,6 +2285,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2119,6 +2347,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2177,6 +2406,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2223,6 +2453,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2264,6 +2495,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2308,6 +2540,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2348,6 +2581,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2396,6 +2630,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2434,6 +2669,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2477,6 +2713,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2512,6 +2749,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2546,6 +2784,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2579,6 +2818,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2619,6 +2859,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2656,6 +2897,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2694,6 +2936,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2743,6 +2986,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2776,6 +3020,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2821,6 +3066,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2854,6 +3100,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2885,6 +3132,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2908,6 +3156,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2962,6 +3211,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -2994,6 +3244,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3039,6 +3290,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3102,6 +3354,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3155,6 +3408,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3193,6 +3447,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3223,6 +3478,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3271,6 +3527,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3308,6 +3565,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3339,6 +3597,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3379,6 +3638,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3416,6 +3676,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3453,6 +3714,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3505,6 +3767,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3544,6 +3807,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3603,6 +3867,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3637,6 +3902,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3671,6 +3937,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3709,6 +3976,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3746,6 +4014,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3780,6 +4049,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3815,6 +4085,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3851,6 +4122,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3891,6 +4163,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3926,6 +4199,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3963,6 +4237,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -3996,6 +4271,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4037,6 +4313,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4078,6 +4355,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4117,6 +4395,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4154,6 +4433,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4187,6 +4467,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4227,6 +4508,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4261,6 +4543,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4300,6 +4583,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4341,6 +4625,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4378,6 +4663,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4411,6 +4697,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4454,6 +4741,7 @@ mod tests {
             },
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4493,6 +4781,7 @@ mod tests {
             },
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4537,6 +4826,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4572,6 +4862,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4605,6 +4896,7 @@ mod tests {
             |_| Err("Toka could not make a preview for /media/movies/clip.mp4.".to_owned()),
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4638,6 +4930,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4676,6 +4969,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4709,6 +5003,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4744,6 +5039,8 @@ mod tests {
                 pending_thumbnails: 0,
             },
             offline_roots: 0,
+            service_installed: true,
+            service_enabled: Some(true),
             service_running: Some(true),
         }
     }
@@ -4759,6 +5056,8 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
+            service_installed: true,
+            service_enabled: Some(true),
             service_running: Some(false),
         }
     }
@@ -4774,6 +5073,8 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
+            service_installed: false,
+            service_enabled: None,
             service_running: None,
         }
     }
@@ -4799,6 +5100,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4830,6 +5132,7 @@ mod tests {
             no_preview,
             || Ok(running_daemon()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4861,6 +5164,7 @@ mod tests {
             no_preview,
             || Ok(stopped_daemon()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4897,6 +5201,7 @@ mod tests {
                 no_preview,
                 || Ok(snapshot.clone()),
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4906,6 +5211,9 @@ mod tests {
             let document: serde_json::Value = serde_json::from_str(&output).unwrap();
             assert_eq!(document["schema"], 1);
             assert_eq!(document["running"], !stopped);
+            assert_eq!(document["serviceInstalled"], true);
+            assert_eq!(document["serviceEnabled"], true);
+            assert_eq!(document["serviceRunning"], !stopped);
             assert!(stderr.is_empty());
         }
     }
@@ -4930,6 +5238,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4962,6 +5271,7 @@ mod tests {
             no_preview,
             || Err::<DaemonStatus, _>("the index is locked".to_owned()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -4994,6 +5304,7 @@ mod tests {
             no_preview,
             || Ok(idle_daemon()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5024,6 +5335,7 @@ mod tests {
             no_preview,
             || Ok(stopped_daemon()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5375,6 +5687,7 @@ mod tests {
             no_preview,
             || Ok(unknown.clone()),
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5409,6 +5722,7 @@ mod tests {
                 no_preview,
                 no_status,
                 no_daemon_run,
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5439,6 +5753,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5471,6 +5786,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5504,6 +5820,7 @@ mod tests {
             no_preview,
             no_status,
             no_daemon_run,
+            no_service,
             &mut stdout,
             &mut stderr,
         );
@@ -5540,6 +5857,7 @@ mod tests {
                 no_preview,
                 no_status,
                 || result.clone(),
+                no_service,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5556,6 +5874,280 @@ mod tests {
                     "ts daemon run: Another Toka indexer daemon is already running.\n"
                 );
             }
+        }
+    }
+
+    fn run_with_service(
+        arguments: &[&str],
+        service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    ) -> (i32, String, String) {
+        let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            service,
+            &mut stdout,
+            &mut stderr,
+        );
+        (
+            status,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    fn done(message: &str) -> Action {
+        Action {
+            message: message.to_owned(),
+            changed: true,
+        }
+    }
+
+    fn held(message: &str) -> Action {
+        Action {
+            message: message.to_owned(),
+            changed: false,
+        }
+    }
+
+    #[test]
+    fn service_help_prints_without_touching_the_service() {
+        for (command, usage) in [
+            ("install", "Usage: ts install [--link] [--json]"),
+            ("uninstall", "Usage: ts uninstall [--purge-data] [--json]"),
+            ("restart", "Usage: ts restart [--json]"),
+            ("start", "Usage: ts start [--json]"),
+            ("stop", "Usage: ts stop [--json]"),
+        ] {
+            for flag in ["-h", "--help"] {
+                // `no_service` panics when called: help must not run anything.
+                let (status, stdout, stderr) = run_with_service(&["ts", command, flag], no_service);
+                assert_eq!(status, 0, "{command} {flag}");
+                assert!(stdout.contains(usage), "{command} {flag}: {stdout}");
+                assert!(stderr.is_empty(), "{command} {flag}");
+            }
+        }
+    }
+
+    #[test]
+    fn install_reports_each_action_and_succeeds() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "install"], |op| {
+            assert_eq!(op, ServiceOp::Install { link: false });
+            Ok(Outcome {
+                actions: vec![
+                    done("wrote ~/.config/systemd/user/toka-search.service"),
+                    held("toka-search.service is already running"),
+                ],
+            })
+        });
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            stdout,
+            "wrote ~/.config/systemd/user/toka-search.service\ntoka-search.service is already running\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn install_passes_link_through_to_the_operation() {
+        for (arguments, link) in [
+            (vec!["ts", "install"], false),
+            (vec!["ts", "install", "--link"], true),
+            (vec!["ts", "install", "--json", "--link"], true),
+        ] {
+            let (status, stdout, _) = run_with_service(&arguments, |op| {
+                Ok(Outcome {
+                    actions: vec![done(&format!("{op:?}"))],
+                })
+            });
+            assert_eq!(status, 0, "{arguments:?}");
+            assert!(
+                stdout.contains(&format!("Install {{ link: {link} }}")),
+                "{arguments:?}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_json_is_a_versioned_document() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "install", "--json"], |_| {
+            Ok(Outcome {
+                actions: vec![done("started toka-search.service"), held("already enabled")],
+            })
+        });
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["command"], "install");
+        assert_eq!(
+            document["actions"][0]["message"],
+            "started toka-search.service"
+        );
+        assert_eq!(document["actions"][0]["changed"], true);
+        assert_eq!(document["actions"][1]["changed"], false);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn install_rejects_unknown_options_with_usage() {
+        for arguments in [
+            vec!["ts", "install", "--purge-data"],
+            vec!["ts", "install", "extra"],
+            vec!["ts", "install", "--link", "--link", "--bogus"],
+        ] {
+            // `no_service` panics when called: usage errors run nothing.
+            let (status, stdout, stderr) = run_with_service(&arguments, no_service);
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(
+                stderr.contains("Usage: ts install [--link] [--json]"),
+                "{arguments:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_failure_returns_a_failure_status() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "install"], |_| {
+            Err("systemctl --user start toka-search.service failed".to_owned())
+        });
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            "ts install: systemctl --user start toka-search.service failed\n"
+        );
+    }
+
+    #[test]
+    fn uninstall_passes_purge_data_and_reports_json() {
+        let (status, stdout, stderr) =
+            run_with_service(&["ts", "uninstall", "--purge-data", "--json"], |op| {
+                assert_eq!(op, ServiceOp::Uninstall { purge_data: true });
+                Ok(Outcome {
+                    actions: vec![done("removed ~/index")],
+                })
+            });
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["command"], "uninstall");
+        assert_eq!(document["actions"][0]["message"], "removed ~/index");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn uninstall_rejects_unknown_options_with_usage() {
+        for arguments in [
+            vec!["ts", "uninstall", "--link"],
+            vec!["ts", "uninstall", "extra"],
+        ] {
+            let (status, stdout, stderr) = run_with_service(&arguments, no_service);
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(
+                stderr.contains("Usage: ts uninstall [--purge-data] [--json]"),
+                "{arguments:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_failure_returns_a_failure_status() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "uninstall"], |_| {
+            Err("could not ask launchd about the service.".to_owned())
+        });
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            "ts uninstall: could not ask launchd about the service.\n"
+        );
+    }
+
+    #[test]
+    fn restart_start_and_stop_report_and_accept_json() {
+        for (command, op) in [
+            ("restart", ServiceOp::Restart),
+            ("start", ServiceOp::Start),
+            ("stop", ServiceOp::Stop),
+        ] {
+            let (status, stdout, stderr) = run_with_service(&["ts", command], |received| {
+                assert_eq!(received, op);
+                Ok(Outcome {
+                    actions: vec![done("started"), held("already enabled")],
+                })
+            });
+            assert_eq!(status, 0, "{command}");
+            assert_eq!(stdout, "started\nalready enabled\n", "{command}");
+            assert!(stderr.is_empty(), "{command}");
+
+            let (status, stdout, stderr) = run_with_service(&["ts", command, "--json"], |_| {
+                Ok(Outcome { actions: vec![] })
+            });
+            assert_eq!(status, 0, "{command} --json");
+            let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(document["schema"], 1, "{command}");
+            assert_eq!(document["command"], command, "{command}");
+            assert_eq!(
+                document["actions"].as_array().unwrap().len(),
+                0,
+                "{command}"
+            );
+            assert!(stderr.is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn restart_start_and_stop_reject_anything_but_json() {
+        for (command, usage) in [
+            ("restart", "Usage: ts restart [--json]"),
+            ("start", "Usage: ts start [--json]"),
+            ("stop", "Usage: ts stop [--json]"),
+        ] {
+            for arguments in [
+                vec!["ts", command, "--link"],
+                vec!["ts", command, "--purge-data"],
+                vec!["ts", command, "extra"],
+            ] {
+                let (status, stdout, stderr) = run_with_service(&arguments, no_service);
+                assert_eq!(status, 2, "{arguments:?}");
+                assert!(stdout.is_empty(), "{arguments:?}");
+                assert!(stderr.contains(usage), "{arguments:?}: {stderr}");
+            }
+        }
+    }
+
+    #[test]
+    fn restart_start_and_stop_failures_return_a_failure_status() {
+        for command in ["restart", "start", "stop"] {
+            let (status, stdout, stderr) =
+                run_with_service(&["ts", command], |_| Err("not installed".to_owned()));
+            assert_eq!(status, 1, "{command}");
+            assert!(stdout.is_empty(), "{command}");
+            assert_eq!(
+                stderr,
+                format!("ts {command}: not installed\n"),
+                "{command}"
+            );
         }
     }
 }

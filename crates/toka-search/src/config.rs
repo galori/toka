@@ -20,6 +20,13 @@ pub const THUMBNAIL_CACHE_DIR_NAME: &str = "toka-thumbnails";
 /// The systemd user unit running the indexer daemon on Linux.
 pub const INDEXER_SERVICE_NAME: &str = "toka-indexer.service";
 
+/// The systemd user unit `ts install` writes on Linux. It replaces
+/// [`INDEXER_SERVICE_NAME`], which `ts install` migrates away.
+pub const TS_SERVICE_NAME: &str = "toka-search.service";
+
+/// The launchd agent label `ts install` registers on macOS.
+pub const TS_LAUNCHD_LABEL: &str = "app.toka.ts";
+
 /// Filename prefix of the per-search verbose logs.
 pub const VERBOSE_LOG_FILE_PREFIX: &str = "toka_search_log_";
 
