@@ -143,6 +143,15 @@ fn run_folders_list_command(
         }
     };
     if json {
+        // Encode fallibly like stats does: a future non-lossy field must
+        // exit 1, never panic inside `json!`.
+        let folders = match serde_json::to_value(&folders) {
+            Ok(folders) => folders,
+            Err(error) => {
+                let _ = writeln!(stderr, "ts folders list: could not encode results: {error}");
+                return 1;
+            }
+        };
         let document = serde_json::json!({
             "schema": JSON_SCHEMA_VERSION,
             "folders": folders,
@@ -448,6 +457,15 @@ fn run_search(
             None => (1, 1),
         };
         let page_size = hits.len();
+        // Encode the hits fallibly (see folders list): a serialization
+        // failure exits 1 instead of panicking inside `json!`.
+        let hits = match serde_json::to_value(&hits) {
+            Ok(hits) => hits,
+            Err(error) => {
+                let _ = writeln!(stderr, "ts search: could not encode results: {error}");
+                return 1;
+            }
+        };
         let document = serde_json::json!({
             "schema": JSON_SCHEMA_VERSION,
             "query": options.query,

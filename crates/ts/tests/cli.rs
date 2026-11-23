@@ -348,8 +348,11 @@ fn read_only_commands_create_no_state_without_an_index() {
     for arguments in [
         vec!["search", "family"],
         vec!["search", "family", "--count"],
+        vec!["search", "family", "--count", "--json"],
         vec!["search", "family", "--json"],
         vec!["search", "family", "--verbose"],
+        vec!["search", "family", "--type", "video"],
+        vec!["search", "family", "--type", "image"],
         vec!["stats"],
         vec!["stats", "--json"],
         vec!["folders", "list"],
@@ -357,6 +360,54 @@ fn read_only_commands_create_no_state_without_an_index() {
     ] {
         let output = run_ts_with_home(&arguments, home.path(), &data_home, None);
         assert_eq!(output.status.code(), Some(0), "{arguments:?}");
+        // Exit 0 alone would let an empty engine print garbage; the empty
+        // outputs are part of the no-create contract.
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        if arguments.contains(&"--json") {
+            let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(document["schema"], 1, "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+            if arguments.contains(&"--count") {
+                assert_eq!(document["totalResults"], 0, "{arguments:?}");
+            } else if arguments[0] == "search" {
+                assert_eq!(document["totalResults"], 0, "{arguments:?}");
+                assert_eq!(
+                    document["results"].as_array().unwrap().len(),
+                    0,
+                    "{arguments:?}"
+                );
+            } else if arguments[0] == "stats" {
+                assert_eq!(document["videos"], 0, "{arguments:?}");
+                assert_eq!(
+                    document["folders"].as_array().unwrap().len(),
+                    0,
+                    "{arguments:?}"
+                );
+            } else {
+                assert_eq!(
+                    document["folders"].as_array().unwrap().len(),
+                    0,
+                    "{arguments:?}"
+                );
+            }
+        } else if arguments.contains(&"--count") {
+            assert_eq!(stdout, "0\n", "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+        } else if arguments.contains(&"--verbose") {
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(stderr.contains("RESULTS RETURNED"), "{stderr:?}");
+        } else if arguments[0] == "search" {
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+        } else if arguments[0] == "stats" {
+            assert!(stdout.contains("Videos:   0"), "{stdout:?}");
+            assert!(stdout.contains("Folders:  0"), "{stdout:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+        } else {
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(stderr.is_empty(), "{arguments:?}");
+        }
     }
     assert!(files_under(home.path()).is_empty());
 }
