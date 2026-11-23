@@ -7,7 +7,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 function git(args) {
   const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
-  if (result.status !== 0) throw result.error ?? new Error(`git ${args[0]} failed`);
+  if (result.status !== 0)
+    throw result.error ?? new Error(`git ${args[0]} failed`);
   return result.stdout.trim();
 }
 
@@ -20,13 +21,29 @@ export function resolveBuiltAt({ isDirty, commitTime, now }) {
   return isDirty ? now : commitTime;
 }
 
+// A release-stamped checkout carries only automation's own version stamp on
+// top of its commit, so for build provenance it is that clean commit: no
+// `.dirty` suffix and the commit timestamp, identical on every platform.
+export function resolveIsDirty({ status, releaseVersion }) {
+  if (releaseVersion) return false;
+  return status !== "";
+}
+
 // The manifests hold only the base semver, bumped deliberately for a release.
 // Every build gets a unique, coordination-free suffix from git, so parallel PRs
 // never fight over a version number: `0.1.1+482.a1b2c3d.my-branch.dirty`.
-export function resolveBuildVersion({ version, commitCount, sha, branch, isDirty }) {
+export function resolveBuildVersion({
+  version,
+  commitCount,
+  sha,
+  branch,
+  isDirty,
+}) {
   if (commitCount == null || !sha) return version;
   const parts = [String(commitCount), sha.slice(0, 7)];
-  const label = (branch ?? "").replace(/[^0-9A-Za-z-]+/g, "-").replace(/^-+|-+$/g, "")
+  const label = (branch ?? "")
+    .replace(/[^0-9A-Za-z-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
     .slice(0, 32);
   if (label && label !== "main" && label !== "HEAD") parts.push(label);
   if (isDirty) parts.push("dirty");
@@ -53,7 +70,10 @@ export function prepareBuild() {
   // A source archive has no repository: every git lookup is optional, and the
   // build falls back to the bare manifest version.
   const gitShaValue = tryGit(["rev-parse", "HEAD"]);
-  const isDirty = (tryGit(["status", "--porcelain"]) ?? "") !== "";
+  const isDirty = resolveIsDirty({
+    status: tryGit(["status", "--porcelain"]) ?? "",
+    releaseVersion: process.env.RELEASE_VERSION,
+  });
   const count = tryGit(["rev-list", "--count", "HEAD"]);
   const buildVersion = resolveBuildVersion({
     version,
@@ -67,8 +87,16 @@ export function prepareBuild() {
     commitTime: commitTimeOf(tryGit(["show", "-s", "--format=%cI", "HEAD"])),
     now: new Date().toISOString(),
   });
-  const info = { version, buildVersion, builtAt, gitSha: gitShaValue ?? "unknown" };
-  writeFileSync(join(root, "src-tauri/build-info.json"), `${JSON.stringify(info, null, 2)}\n`);
+  const info = {
+    version,
+    buildVersion,
+    builtAt,
+    gitSha: gitShaValue ?? "unknown",
+  };
+  writeFileSync(
+    join(root, "src-tauri/build-info.json"),
+    `${JSON.stringify(info, null, 2)}\n`,
+  );
   return info;
 }
 

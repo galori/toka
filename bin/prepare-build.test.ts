@@ -4,6 +4,7 @@ import {
   prepareBuild,
   resolveBuildVersion,
   resolveBuiltAt,
+  resolveIsDirty,
 } from "./prepare-build.mjs";
 
 describe("resolveBuiltAt", () => {
@@ -103,4 +104,38 @@ test("prepareBuild keeps the manifest version and adds a build version", () => {
   const info = prepareBuild();
 
   expect(info.buildVersion.startsWith(info.version)).toBe(true);
+});
+
+describe("resolveIsDirty", () => {
+  test("treats a release-stamped checkout as the clean commit it was stamped from", () => {
+    expect(
+      resolveIsDirty({
+        status: " M package.json\n",
+        releaseVersion: "0.1.249",
+      }),
+    ).toBe(false);
+  });
+
+  test("reads git status for ordinary builds", () => {
+    expect(
+      resolveIsDirty({
+        status: " M package.json\n",
+        releaseVersion: undefined,
+      }),
+    ).toBe(true);
+    expect(resolveIsDirty({ status: "", releaseVersion: undefined })).toBe(
+      false,
+    );
+  });
+});
+
+test("marks a release-stamped build clean even when the stamp dirties the tree", () => {
+  const previous = process.env.RELEASE_VERSION;
+  process.env.RELEASE_VERSION = "0.1.249";
+  try {
+    expect(prepareBuild().buildVersion).not.toContain("dirty");
+  } finally {
+    if (previous === undefined) delete process.env.RELEASE_VERSION;
+    else process.env.RELEASE_VERSION = previous;
+  }
 });

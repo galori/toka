@@ -6,7 +6,7 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 export function deriveRelease({ baseVersion, commitCount }) {
   const match = /^(\d+)\.(\d+)\.\d+$/.exec(baseVersion ?? "");
   if (!match) {
@@ -101,7 +101,8 @@ function readBaseVersion() {
   return JSON.parse(readFileSync(join(root, "package.json"), "utf8")).version;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+const entrypoint = process.argv[1] ? pathToFileURL(process.argv[1]).href : null;
+if (import.meta.url === entrypoint) {
   const args = process.argv.slice(2);
   const unknown = args.filter((arg) => arg !== "--stamp" && arg !== "--force");
   if (unknown.length > 0) {
