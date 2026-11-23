@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Serialize releases in trigger order so an older commit cannot publish over a
+# newer one; queued runs wait, they are never cancelled or dropped.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   build:
     if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
