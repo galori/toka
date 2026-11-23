@@ -1431,11 +1431,11 @@ function Player({
       next = (current - 1 + actions.length) % actions.length;
     else if (event.key === "Home") next = 0;
     else if (event.key === "End") next = actions.length - 1;
-    else if (event.key === "Tab")
-      next =
-        event.shiftKey && current <= 0
-          ? actions.length - 1
-          : (current + 1) % actions.length;
+    else if (event.key === "Tab") {
+      if (event.shiftKey)
+        next = current <= 0 ? actions.length - 1 : current - 1;
+      else next = (current + 1) % actions.length;
+    }
     if (next === undefined) return;
     event.preventDefault();
     actions[next].focus();

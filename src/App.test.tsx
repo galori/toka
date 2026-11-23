@@ -5943,6 +5943,93 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
   );
 });
 
+test("Tab cycles the add-on menu forward and Shift+Tab cycles it back", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "tiktok",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "2026-10-10_@sometiktoker_18938383490812348343.mp4",
+            extension: "mp4",
+          },
+        ],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/2026-10-10_@sometiktoker_18938383490812348343.mp4",
+        playbackBackend: "web",
+      });
+    }
+    return Promise.resolve();
+  });
+  matchingAddonActionsMock.mockResolvedValue({
+    actions: [
+      {
+        addonId: "tiktok",
+        actionId: "creator-search",
+        label: "Toka search",
+        effects: ["New Toka window"],
+      },
+      {
+        addonId: "tiktok",
+        actionId: "creator-middle",
+        label: "Middle action",
+        effects: ["tiktok.com"],
+      },
+      {
+        addonId: "tiktok",
+        actionId: "creator-profile",
+        label: "Tiktok profile",
+        effects: ["tiktok.com"],
+      },
+    ],
+    errors: [],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "tiktok{Enter}");
+  await user.click(
+    await screen.findByRole("button", {
+      name: "Play 2026-10-10_@sometiktoker_18938383490812348343.mp4",
+    }),
+  );
+
+  const addons = await screen.findByRole("button", { name: "Add-ons" });
+  fireEvent.keyDown(addons, { key: "a", ctrlKey: true, shiftKey: true });
+  const first = await screen.findByRole("menuitem", { name: /Toka search/ });
+  const middle = await screen.findByRole("menuitem", {
+    name: /Middle action/,
+  });
+  const last = await screen.findByRole("menuitem", { name: /Tiktok profile/ });
+  await waitFor(() => expect(first).toHaveFocus());
+
+  // Forward Tab walks the whole menu and wraps back to the start.
+  fireEvent.keyDown(first, { key: "Tab" });
+  await waitFor(() => expect(middle).toHaveFocus());
+  fireEvent.keyDown(middle, { key: "Tab" });
+  await waitFor(() => expect(last).toHaveFocus());
+  fireEvent.keyDown(last, { key: "Tab" });
+  await waitFor(() => expect(first).toHaveFocus());
+
+  // Shift+Tab walks back one step at a time and wraps at the start.
+  fireEvent.keyDown(first, { key: "Tab", shiftKey: true });
+  await waitFor(() => expect(last).toHaveFocus());
+  fireEvent.keyDown(last, { key: "Tab", shiftKey: true });
+  await waitFor(() => expect(middle).toHaveFocus());
+  fireEvent.keyDown(middle, { key: "Tab", shiftKey: true });
+  await waitFor(() => expect(first).toHaveFocus());
+  expect(
+    screen.queryByRole("menu", { name: "Add-ons" }),
+  ).toBeInTheDocument();
+});
+
 test("keeps unmatched add-ons disabled and shows load failures in their menu", async () => {
   const result = {
     query: "clip",
