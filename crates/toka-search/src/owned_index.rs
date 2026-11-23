@@ -1028,11 +1028,18 @@ impl OwnedIndexManager {
         &self,
         requested: &Path,
     ) -> Result<(OwnedIndexState, PathBuf), String> {
-        let root = requested
-            .canonicalize()
-            .map_err(|error| format!("Toka could not open that folder: {error}"))?;
-        if !root.is_dir() {
-            return Err("Choose a folder to search.".into());
+        // Both sides of the containment check below resolve through
+        // `canonical_spelling`, so a symlinked parent (or a `..` past a
+        // missing part) can never leave the two sides disagreeing about
+        // one folder. Adding requires an existing folder; the spelling
+        // never fails to resolve, so a missing path errors plainly here.
+        let root = canonical_spelling(requested);
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("Choose a folder to search.".into()),
+            Err(error) => {
+                return Err(format!("Toka could not open that folder: {error}"));
+            }
         }
         // Purge and reset delete the index directory's known files: a
         // watched folder at or inside it would put media on the deletion
@@ -1386,6 +1393,14 @@ pub(crate) fn clear_global_sync_probe() {
     GLOBAL_SYNC_PROBE.lock().unwrap().take();
 }
 
+/// Serializes [`with_global_sync_probe`] users: the global slot holds
+/// one probe, so two scoped users running in parallel would replace
+/// each other's installation (and one's cleanup would remove the
+/// other's). Probe firings take only the slot lock, never this guard,
+/// so a gated probe blocking mid-run cannot deadlock a waiter.
+#[cfg(test)]
+static GLOBAL_SYNC_PROBE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs `run` with a process-wide probe installed for one root id,
 /// removing it afterwards even when `run` panics — the scoped form
 /// tests should prefer over manual set/clear.
@@ -1395,14 +1410,25 @@ pub(crate) fn with_global_sync_probe<R>(
     probe: impl Fn(SyncProbeSite) + Send + Sync + 'static,
     run: impl FnOnce() -> R,
 ) -> R {
-    struct Guard;
-    impl Drop for Guard {
+    struct Guard<'a> {
+        _exclusive: std::sync::MutexGuard<'a, ()>,
+    }
+    impl Drop for Guard<'_> {
         fn drop(&mut self) {
+            // Fields drop after this: the installation clears while the
+            // guard is still held, and only then is the next user let in.
             clear_global_sync_probe();
         }
     }
+    // A previous user may have panicked mid-run; its guard still cleared
+    // the slot on unwind, so a poisoned guard is safe to recover.
+    let exclusive = GLOBAL_SYNC_PROBE_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     set_global_sync_probe(root_id, probe);
-    let _guard = Guard;
+    let _guard = Guard {
+        _exclusive: exclusive,
+    };
     run()
 }
 
@@ -2910,26 +2936,52 @@ impl OwnedIndex {
         // files as remaining work. Each run clamps at zero before
         // summing: a migrated version 1 row (indexable 0, indexed N)
         // would otherwise contribute -N and hide another root's real
-        // remainder behind the single clamp below.
+        // remainder behind the single clamp below. Offline roots are not
+        // actionable work: an aborted scan stays a 'scanning' row (a
+        // cancelled scan is never trusted as finished), so without the
+        // state check a root whose storage vanished mid-scan would hold
+        // the queue forever; it counts as `offline_roots` instead.
         let files_remaining: Option<i64> = self.connection.query_row(
-            "SELECT SUM(MAX(files_indexable - files_indexed, 0))
+            "SELECT SUM(MAX(scan_runs.files_indexable - scan_runs.files_indexed, 0))
              FROM scan_runs
-             WHERE state = 'scanning'
-               AND generation = (
-                    SELECT scan_generation FROM roots WHERE id = scan_runs.root_id
-               )",
+             JOIN roots ON roots.id = scan_runs.root_id
+             WHERE scan_runs.state = 'scanning'
+               AND scan_runs.generation = roots.scan_generation
+               AND roots.state != 'offline'",
             [],
             |row| row.get(0),
         )?;
-        let pending_repairs: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM repair_queue", [], |row| row.get(0))?;
+        let pending_repairs = self.actionable_repair_count()?;
         Ok(crate::daemon_state::DaemonQueue {
             pending_roots: pending_roots as u64,
             files_remaining: files_remaining.unwrap_or(0).max(0) as u64,
-            pending_repairs: pending_repairs as u64,
+            pending_repairs,
             pending_thumbnails,
         })
+    }
+
+    /// Repairs the daemon can act on: ones under an offline root wait for
+    /// storage with their root and count as `offline_roots` instead, never
+    /// as pending work. Repair rows carry no root id, so offline roots
+    /// filter by path prefix, the same matching a repair run uses.
+    fn actionable_repair_count(&self) -> Result<u64, OwnedIndexError> {
+        let offline: Vec<PathBuf> = self
+            .roots_with_state()?
+            .into_iter()
+            .filter(|(_, _, state)| state == "offline")
+            .map(|(_, path, _)| path)
+            .collect();
+        if offline.is_empty() {
+            let pending: i64 =
+                self.connection
+                    .query_row("SELECT COUNT(*) FROM repair_queue", [], |row| row.get(0))?;
+            return Ok(pending as u64);
+        }
+        Ok(self
+            .pending_repairs()?
+            .iter()
+            .filter(|repair| !offline.iter().any(|root| repair.path.starts_with(root)))
+            .count() as u64)
     }
 
     pub(crate) fn synchronize_path(
@@ -6277,7 +6329,7 @@ mod tests {
         let root = directory.path().join("media");
         let odd = root.join(std::ffi::OsString::from_vec(b"\xff\xfe".to_vec()));
         std::fs::create_dir_all(&odd).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
 
         let added = manager.add_folder(&root).unwrap();
@@ -6324,7 +6376,7 @@ mod tests {
             .join(std::ffi::OsString::from_vec(b"media-\xff".to_vec()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database);
 
         manager.add_folder(&root).unwrap();
@@ -6523,6 +6575,94 @@ mod tests {
         let outside = directory.path().join("media");
         std::fs::create_dir(&outside).unwrap();
         assert_eq!(manager.add_folder(&outside).unwrap().folders.len(), 1);
+    }
+
+    // Both sides of the containment check resolve through the same
+    // spelling, so a symlinked parent (`/var/...` versus
+    // `/private/...` on macOS tempdirs) cannot make rejection depend
+    // on which spelling each side was given.
+    #[cfg(unix)]
+    #[test]
+    fn index_directory_rejection_ignores_symlinked_parent_spellings() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(real.join("state").join("media")).unwrap();
+        std::fs::create_dir(real.join("media")).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The database through the link, the folder through the real path.
+        let manager = OwnedIndexManager::under(link.join("state").join("index.sqlite3"));
+        let error = manager
+            .add_folder(&real.join("state").join("media"))
+            .unwrap_err();
+        assert!(
+            error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
+
+        // The database real, the folder through the link.
+        let manager = OwnedIndexManager::under(real.join("state").join("index.sqlite3"));
+        let error = manager
+            .add_folder(&link.join("state").join("media"))
+            .unwrap_err();
+        assert!(
+            error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
+
+        // The index directory itself, spelled through the link.
+        let error = manager.add_folder(&link.join("state")).unwrap_err();
+        assert!(
+            error.contains("its own index folder"),
+            "unexpected error: {error}"
+        );
+
+        // A folder outside still adds through the link spelling.
+        assert_eq!(
+            manager
+                .add_folder(&link.join("media"))
+                .unwrap()
+                .folders
+                .len(),
+            1
+        );
+    }
+
+    // The requested folder resolves with `canonical_spelling` semantics,
+    // so a `..` past a missing part still reaches the folder that exists.
+    #[test]
+    fn add_folder_resolves_dot_dot_past_missing_parts() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
+
+        // `gone` never existed: the folder still resolves and adds.
+        let spelled = directory.path().join("gone").join("..").join("media");
+        assert_eq!(manager.add_folder(&spelled).unwrap().folders.len(), 1);
+    }
+
+    #[test]
+    fn index_directory_rejection_sees_through_dot_dot_past_missing_parts() {
+        let directory = tempdir().unwrap();
+        let inside = directory.path().join("state").join("media");
+        std::fs::create_dir_all(&inside).unwrap();
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
+
+        let spelled = directory
+            .path()
+            .join("gone")
+            .join("..")
+            .join("state")
+            .join("media");
+        let error = manager.add_folder(&spelled).unwrap_err();
+        assert!(
+            error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -7487,6 +7627,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(index.daemon_queue_counts(0).unwrap().files_remaining, 10);
+    }
+
+    #[test]
+    fn daemon_queue_counts_exclude_offline_roots() {
+        let directory = tempdir().unwrap();
+        let online_root = directory.path().join("online");
+        let offline_root = directory.path().join("gone");
+        std::fs::create_dir(&online_root).unwrap();
+        std::fs::create_dir(&offline_root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("online", &online_root).unwrap();
+        index.insert_root("gone", &offline_root).unwrap();
+        // Both roots mid-scan with ten files seen but uncommitted, and
+        // one repair queued under each.
+        for id in ["online", "gone"] {
+            index
+                .connection
+                .execute(
+                    "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+            index
+                .connection
+                .execute(
+                    "INSERT INTO scan_runs (
+                        root_id, generation, state, folders_discovered,
+                        files_discovered, files_indexable, files_indexed,
+                        started_at_ns, updated_at_ns
+                     ) VALUES (?1, 1, 'scanning', 1, 10, 10, 0, 0, 0)",
+                    [id],
+                )
+                .unwrap();
+        }
+        index
+            .queue_repair(&online_root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+        index
+            .queue_repair(&offline_root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+
+        let queue = index.daemon_queue_counts(0).unwrap();
+        assert_eq!(queue.pending_roots, 2);
+        assert_eq!(queue.files_remaining, 20);
+        assert_eq!(queue.pending_repairs, 2);
+
+        // The storage vanishes mid-scan: the aborted 'scanning' row stays,
+        // but the offline root's work leaves the actionable queue — it is
+        // reported as `offline_roots`, never as pending work.
+        index.set_root_state("gone", "offline").unwrap();
+        let queue = index.daemon_queue_counts(0).unwrap();
+        assert_eq!(queue.pending_roots, 1);
+        assert_eq!(queue.files_remaining, 10);
+        assert_eq!(queue.pending_repairs, 1);
+        assert!(!queue.is_empty());
+
+        // And with every root offline, nothing actionable remains.
+        index.set_root_state("online", "offline").unwrap();
+        let queue = index.daemon_queue_counts(0).unwrap();
+        assert!(queue.is_empty());
     }
 
     #[test]

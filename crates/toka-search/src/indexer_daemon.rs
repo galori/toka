@@ -565,6 +565,10 @@ pub(crate) fn path_available(path: &Path, expected: Option<&MountIdentity>) -> b
 pub(crate) struct ThumbnailWorker {
     sender: mpsc::Sender<PathBuf>,
     pending: Arc<AtomicU64>,
+    // Folders currently awaiting generation, mirroring `pending`: the
+    // heartbeat scopes the thumbnail count to online roots, which needs
+    // the queued paths, not just their number.
+    queued: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl ThumbnailWorker {
@@ -586,31 +590,63 @@ impl ThumbnailWorker {
         let (sender, receiver): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
         let pending = Arc::new(AtomicU64::new(0));
         let worker_pending = Arc::clone(&pending);
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let worker_queued = Arc::clone(&queued);
         std::thread::Builder::new()
             .name("toka-thumbnail-worker".into())
             .spawn(move || {
                 while let Ok(folder) = receiver.recv() {
                     generator(&folder);
+                    forget_queued(&worker_queued, &folder);
                     worker_pending.fetch_sub(1, Ordering::Relaxed);
                 }
             })
             .expect("Toka could not start its thumbnail worker");
-        Self { sender, pending }
+        Self {
+            sender,
+            pending,
+            queued,
+        }
     }
 
     pub(crate) fn enqueue(&self, folder: &Path) {
         // Reserve first: the worker's matching decrement runs only after
         // this folder is received, so the count can never dip below zero.
         self.pending.fetch_add(1, Ordering::Relaxed);
+        self.queued.lock().unwrap().push(folder.to_path_buf());
         if self.sender.send(folder.to_path_buf()).is_err() {
             // The worker is gone; the folder will never generate.
+            forget_queued(&self.queued, folder);
             self.pending.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Folders still waiting for (or undergoing) thumbnail generation.
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> u64 {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Folders awaiting generation outside `offline_roots`: queued work
+    /// for missing storage waits with its root and never holds the
+    /// queue, so the heartbeat counts it as `offline_roots` instead.
+    pub(crate) fn pending_count_excluding(&self, offline_roots: &[PathBuf]) -> u64 {
+        self.queued
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|folder| !offline_roots.iter().any(|root| folder.starts_with(root)))
+            .count() as u64
+    }
+}
+
+/// Drops one queued thumbnail folder after it generated (or when the
+/// worker is gone and it never will), keeping the tracked queue beside
+/// the atomic count.
+fn forget_queued(queued: &Mutex<Vec<PathBuf>>, folder: &Path) {
+    let mut queued = queued.lock().unwrap();
+    if let Some(position) = queued.iter().position(|queued| queued == folder) {
+        queued.swap_remove(position);
     }
 }
 
@@ -725,8 +761,25 @@ impl OwnedSupervisor {
                 return;
             }
         };
-        let (activity, current_root, current_path) = self.current_activity(&index);
-        let queue = match index.daemon_queue_counts(self.thumbnails.pending_count()) {
+        // Offline roots are not actionable work in any count: the
+        // thumbnail backlog is live, so the heartbeat scopes it here
+        // while the database counts scope themselves. An unreadable roots
+        // table scopes nothing — the queue query below fails the same way
+        // and the beat is skipped.
+        let offline_roots: Vec<PathBuf> = index
+            .roots_with_state()
+            .map(|roots| {
+                roots
+                    .into_iter()
+                    .filter(|(_, _, state)| state == "offline")
+                    .map(|(_, path, _)| path)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pending_thumbnails = self.thumbnails.pending_count_excluding(&offline_roots);
+        let (activity, current_root, current_path) =
+            self.current_activity(&index, pending_thumbnails);
+        let queue = match index.daemon_queue_counts(pending_thumbnails) {
             Ok(queue) => queue,
             Err(error) => {
                 self.logger
@@ -757,6 +810,7 @@ impl OwnedSupervisor {
     fn current_activity(
         &self,
         index: &OwnedIndex,
+        pending_thumbnails: u64,
     ) -> (DaemonActivity, Option<PathBuf>, Option<PathBuf>) {
         let mut repairing = None;
         for entry in self.watchers.values() {
@@ -785,7 +839,7 @@ impl OwnedSupervisor {
         if let Some((root, path)) = repairing {
             return (DaemonActivity::Repairing, Some(root), path);
         }
-        if self.thumbnails.pending_count() > 0 {
+        if pending_thumbnails > 0 {
             return (DaemonActivity::Thumbnails, None, None);
         }
         if all_roots_offline(index) {
@@ -1055,6 +1109,32 @@ mod tests {
 
     fn write_media(root: &Path, name: &str) {
         fs::write(root.join(name), b"media").unwrap();
+    }
+
+    /// A tree that scans slowly without ever committing a batch: one clip
+    /// per top-level folder (100 files never fill the 128-file batch)
+    /// under twenty thousand directories, so aborting mid-scan always
+    /// strands seen-but-uncommitted files. Every top-level folder holds a
+    /// clip, so whichever one the filesystem lists first, the second
+    /// directory's savepoint already shows indexable work.
+    fn write_slow_tree(root: &Path) {
+        for top in 0..100 {
+            let folder = root.join(format!("top-{top:02}"));
+            std::fs::create_dir(&folder).unwrap();
+            write_media(&folder, "clip.mp4");
+            for leaf in 0..200 {
+                std::fs::create_dir(folder.join(format!("leaf-{leaf:03}"))).unwrap();
+            }
+        }
+    }
+
+    /// Whether the root's latest scan run has classified files it has not
+    /// committed yet: the mid-scan point a delete synchronizes with.
+    fn scan_shows_indexable_work(database: &Path, root_id: &str) -> bool {
+        OwnedIndex::open(database)
+            .ok()
+            .and_then(|index| index.scan_progress(root_id).ok().flatten())
+            .is_some_and(|progress| progress.files_indexable > 0)
     }
 
     #[test]
@@ -1564,6 +1644,32 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_counts_exclude_folders_under_offline_roots() {
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |_| {
+            let _ = release_receiver.recv();
+        });
+        thumbnails.enqueue(Path::new("/media/online"));
+        thumbnails.enqueue(Path::new("/media/offline"));
+        // Both folders count while the worker is blocked generating the
+        // first; the offline one leaves the scoped count only.
+        assert_eq!(thumbnails.pending_count(), 2);
+        assert_eq!(
+            thumbnails.pending_count_excluding(&[PathBuf::from("/media/offline")]),
+            1
+        );
+        assert_eq!(thumbnails.pending_count_excluding(&[]), 2);
+
+        drop(release);
+        assert!(
+            poll_until(Duration::from_secs(10), || thumbnails.pending_count() == 0),
+            "expected the backlog to drain"
+        );
+        // The tracked queue drains beside the atomic count.
+        assert_eq!(thumbnails.pending_count_excluding(&[]), 0);
+    }
+
+    #[test]
     fn heartbeat_publishes_liveness_and_follows_a_scan_to_idle() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
@@ -1737,17 +1843,54 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        write_media(&media, "clip.mp4");
+        write_slow_tree(&media);
         let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
-        manager.add_folder(&media).unwrap();
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
         let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 1);
-        fs::remove_dir_all(&media).unwrap();
+        // The storage vanishes mid-scan, never in a race with it: the scan
+        // has demonstrably classified files it has not committed, with
+        // thousands of directories still ahead of it. The mismatch is
+        // recorded — not deleted — first, so the tree stays intact while
+        // the pass stops the worker: renaming first would let a loaded
+        // machine drain the missing directories (which fail fast, with no
+        // savepoints) and finish the scan before the stop lands.
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                scan_shows_indexable_work(&database, &id)
+            }),
+            "expected the scan to show indexable work before the delete"
+        );
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                Some(Path::new("/nonexistent-mount-target")),
+                Some("nonexistent-source"),
+                None,
+            )
+            .unwrap();
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 0);
+        // The storage really is gone, too — after the offline marking, so
+        // the removal's timing cannot race the scan.
+        fs::rename(&media, directory.path().join("media-gone")).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        // The aborted run really did strand work: still `scanning`, files
+        // seen but none committed. The queue below excludes it anyway.
+        let progress = OwnedIndex::open(&database)
+            .unwrap()
+            .scan_progress(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Scanning);
+        assert!(progress.files_indexable > 0);
+        assert_eq!(progress.files_indexed, 0);
 
         supervisor.publish_heartbeat();
         let status = crate::daemon_state::read_status(&database).unwrap();
@@ -1761,6 +1904,161 @@ mod tests {
         assert_eq!(status.queue.pending_roots, 0);
         assert!(status.queue.is_empty());
         assert_eq!(status.offline_roots, 1);
+    }
+
+    #[test]
+    fn heartbeat_reports_waiting_when_a_completed_root_goes_offline() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        // Thumbnails block, so the completed scan's queued folder is
+        // still outstanding when the root goes offline: raw count 1,
+        // deterministically.
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |_| {
+            let _ = release_receiver.recv();
+        });
+        let mut supervisor = test_supervisor(database.clone(), thumbnails);
+        supervisor.reconcile();
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+            }),
+            "expected the scan to complete before the delete"
+        );
+        // The enqueue strictly precedes Watching, but the count crosses
+        // threads on a relaxed atomic: poll for its arrival instead of
+        // asserting a visibility lag cannot happen.
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 1),
+            "expected the completed scan to queue one thumbnail folder"
+        );
+
+        fs::remove_dir_all(&media).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert!(status.running);
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
+        );
+        assert_eq!(status.queue.pending_roots, 0);
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 1);
+
+        drop(release);
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain"
+        );
+    }
+
+    #[test]
+    fn remount_and_rescan_returns_an_offline_root_to_idle() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_slow_tree(&media);
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        supervisor.reconcile();
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                scan_shows_indexable_work(&database, &id)
+            }),
+            "expected the scan to show indexable work before the delete"
+        );
+        // Recorded — not deleted — first, as above: the tree stays intact
+        // while the pass stops the worker mid-scan.
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                Some(Path::new("/nonexistent-mount-target")),
+                Some("nonexistent-source"),
+                None,
+            )
+            .unwrap();
+        supervisor.reconcile();
+        fs::rename(&media, directory.path().join("media-gone")).unwrap();
+        supervisor.reconcile();
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
+        );
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 1);
+
+        // The storage returns with a small tree on the same mount; the
+        // rescan supersedes the aborted run and the daemon returns to idle
+        // with nothing queued.
+        fs::remove_dir_all(directory.path().join("media-gone")).unwrap();
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let current = mount_identity(&media);
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                current.as_ref().map(|mount| mount.target.as_path()),
+                current.as_ref().map(|mount| mount.source.as_str()),
+                current.as_ref().and_then(|mount| mount.uuid.as_deref()),
+            )
+            .unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 1);
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+            }),
+            "expected the rescan to complete after the remount"
+        );
+        // The rescan queued thumbnails for an online root: let the quiet
+        // worker drain them before asserting an empty queue.
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain after the rescan"
+        );
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 0);
     }
 
     #[test]
@@ -1836,7 +2134,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1866,7 +2164,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
