@@ -472,6 +472,12 @@ impl SearchProvider for TsSearchProvider {
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
+        // Fixture runs serve exactly the configured videos: no watched
+        // folders to scope to, so nothing is ever filtered — the old
+        // fixture provider's no-op.
+        if std::env::var_os("TOKA_E2E_VIDEOS").is_some() {
+            return Ok(());
+        }
         // Roots come from `ts`, the check itself is the provider's own:
         // `ts search` already filtered its answers, but renames the
         // engine recorded since still need the same visibility pass.
@@ -1490,6 +1496,64 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         assert_eq!(page.results[0].file_name, "clip.mp4");
         assert_eq!(page.index_revision, 7);
         assert_eq!(engine.match_count(search_request("clip")).unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_runs_keep_every_candidate_without_watched_folders() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            r#"#!/bin/sh
+if [ "$1" != folders ] || [ "$2" != list ] || [ "$3" != --json ]; then echo "unexpected argv: $*" >&2; exit 9; fi
+cat <<'EOF'
+{"schema": 1, "folders": []}
+EOF
+"#,
+        );
+        let mut env = EnvGuard::lock();
+        env.set("TS_BIN", shim.as_os_str());
+        env.set("TOKA_E2E_VIDEOS", OsStr::new("/videos/a.mp4:/videos/b.mp4"));
+        let provider = TsSearchProvider::new();
+        let mut paths = vec![
+            PathBuf::from("/videos/a.mp4"),
+            PathBuf::from("/videos/b.mp4"),
+        ];
+
+        provider.retain_visible_paths(&mut paths).unwrap();
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/videos/a.mp4"),
+                PathBuf::from("/videos/b.mp4")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visibility_still_drops_paths_outside_watched_folders() {
+        let directory = tempfile::tempdir().unwrap();
+        let document = folders_document();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" != folders ] || [ \"$2\" != list ] || [ \"$3\" != --json ]; then echo \"unexpected argv: $*\" >&2; exit 9; fi\ncat <<'EOF'\n{document}\nEOF\n"
+            ),
+        );
+        let _env = use_ts(&shim);
+        let provider = TsSearchProvider::new();
+        let mut paths = vec![
+            PathBuf::from("/media/movies/clip.mp4"),
+            PathBuf::from("/elsewhere/clip.mp4"),
+        ];
+
+        provider.retain_visible_paths(&mut paths).unwrap();
+
+        assert_eq!(paths, vec![PathBuf::from("/media/movies/clip.mp4")]);
     }
 
     #[cfg(unix)]

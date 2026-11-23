@@ -268,14 +268,14 @@ setInterval(() => {}, 1000);
       env.CARGO_TARGET_DIR = path.join(repo, "missing");
       const result = run("launch");
       expect(result.status).toBe(1);
-      expect(result.stderr).toMatch(/No built binary/);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
     });
 
     it("refuses to launch when the ts binary is missing", async () => {
       await rm(path.join(repo, "target/release/ts"));
       const result = run("launch");
       expect(result.status).toBe(1);
-      expect(result.stderr).toMatch(/No built binary/);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
     });
   },
 );
