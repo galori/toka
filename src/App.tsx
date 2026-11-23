@@ -42,6 +42,7 @@ import {
   runAddonAction,
   openNewWindow,
   openFolderInNewWindow,
+  openParentFolderInNewWindow,
   searchMatchCount,
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
@@ -1020,6 +1021,10 @@ const HELP_SECTIONS: HelpSection[] = [
         shortcut: "Ctrl+Shift+N",
         description: "Open this file's folder in a new Toka window",
       },
+      {
+        shortcut: "Ctrl+Shift+P",
+        description: "Open this file's parent folder in a new Toka window",
+      },
       { shortcut: "T", description: "Edit tags" },
       { shortcut: "Shift+T", description: "Tag the video's folder" },
       { shortcut: "Ctrl+Shift+A", description: "Open actions from add-ons" },
@@ -1508,6 +1513,31 @@ function Player({
       if (event.key.toLowerCase() !== "n") return;
       event.preventDefault();
       void openFolder();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+  // One folder up from the video holds the folders around it. A second Toka
+  // launched there shows them all, leaving this playlist where it was.
+  const [parentFolderError, setParentFolderError] = useState<string>();
+  const openParentFolder = async () => {
+    setParentFolderError(undefined);
+    try {
+      await openParentFolderInNewWindow(video.id);
+    } catch (reason) {
+      setParentFolderError(errorMessage(reason));
+    }
+  };
+  // Ctrl+Shift+P keeps clear of the Ctrl+P that searches paths and the Ctrl+N
+  // that opens a blank window, the way Ctrl+Shift+N does for the folder.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (helpOpen || event.defaultPrevented) return;
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "p") return;
+      event.preventDefault();
+      void openParentFolder();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -2932,6 +2962,15 @@ function Player({
           <FolderWindowIcon />
         </ControlButton>
         <ControlButton
+          shortcut="Ctrl+Shift+P"
+          className="player-help-toggle"
+          aria-label="Open parent folder in new window"
+          title="Open this file's parent folder in a new Toka window"
+          onClick={() => void openParentFolder()}
+        >
+          <FolderWindowIcon />
+        </ControlButton>
+        <ControlButton
           shortcut="P"
           className="playlist-toggle"
           aria-expanded={drawerOpen}
@@ -2953,6 +2992,11 @@ function Player({
       {folderError ? (
         <p role="alert" className="message error">
           {folderError}
+        </p>
+      ) : null}
+      {parentFolderError ? (
+        <p role="alert" className="message error">
+          {parentFolderError}
         </p>
       ) : null}
       {/* The shell outlives each video: it is the element the browser promotes

@@ -755,6 +755,28 @@ fn open_folder_in_new_window(
     start_toka(Some(folder_of(&path)?))
 }
 
+#[tauri::command]
+fn open_parent_folder_in_new_window(
+    result_id: String,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<(), CommandError> {
+    let path = engine.video_path(&result_id).map_err(CommandError::from)?;
+    start_toka(Some(parent_folder_of(&path)?))
+}
+
+/// The folder above the folder the video sits in, for when the folders around
+/// it are what the viewer wants to browse next.
+fn parent_folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
+    let folder = folder_of(path)?;
+    folder
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| CommandError {
+            kind: "NewWindow",
+            message: format!("{} has no parent folder Toka can open.", path.display()),
+        })
+}
+
 fn folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
     path.parent()
         .filter(|folder| !folder.as_os_str().is_empty())
@@ -1435,6 +1457,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1470,6 +1493,7 @@ pub fn run() {
                 open_in_external_player,
                 open_new_window,
                 open_folder_in_new_window,
+                open_parent_folder_in_new_window,
                 matching_addon_actions,
                 run_addon_action,
                 set_video_tags,
@@ -1513,6 +1537,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1540,6 +1565,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1567,6 +1593,7 @@ pub fn run() {
         open_in_external_player,
         open_new_window,
         open_folder_in_new_window,
+        open_parent_folder_in_new_window,
         matching_addon_actions,
         run_addon_action,
         set_video_tags,
@@ -1695,6 +1722,28 @@ mod tests {
     #[test]
     fn a_path_with_no_folder_says_so() {
         let error = folder_of(Path::new("video.mp4")).unwrap_err();
+
+        assert_eq!(error.kind, "NewWindow");
+    }
+
+    #[test]
+    fn a_videos_parent_folder_is_the_folder_above_the_one_it_sits_in() {
+        assert_eq!(
+            parent_folder_of(Path::new("/root/path/to/my/video.mp4")).unwrap(),
+            Path::new("/root/path/to")
+        );
+    }
+
+    #[test]
+    fn a_video_directly_under_the_root_has_no_parent_folder_to_open() {
+        let error = parent_folder_of(Path::new("/video.mp4")).unwrap_err();
+
+        assert_eq!(error.kind, "NewWindow");
+    }
+
+    #[test]
+    fn a_path_with_no_folder_has_no_parent_folder_either() {
+        let error = parent_folder_of(Path::new("video.mp4")).unwrap_err();
 
         assert_eq!(error.kind, "NewWindow");
     }
