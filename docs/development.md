@@ -30,24 +30,28 @@ node scripts/isolated/toka-isolated.mjs stop --clean
 ```
 
 The branch runs beside your installed Toka with its own settings, index and
-indexer, under `<worktree>/.scratch/isolated-home`. It indexes a throwaway copy of
-`test/fixtures`, and a `systemctl` shim keeps it from controlling your real
-`toka-search.service`.
+indexer, under `<worktree>/.scratch/isolated-home`: `HOME` and the XDG
+variables all point there, so `ts install` resolves its service files inside
+the throwaway home. It indexes a throwaway copy of `test/fixtures`, and
+`systemctl`/`loginctl` shims on `PATH` keep it from controlling your real
+`toka-search.service` or changing host login state.
 
 ## Search diagnostics
 
-Toka writes the normal search log as JSON lines under the platform data
-directory. Print it with `npm run search-log`, or follow new entries with
-`npm run search-log -- --follow`; pass a path to either command to inspect a
-different log. Each running Toka window has its own session marker, so closing
-one window does not delete the shared log while another window is active. The
-indexer writes its own `indexer.log` beside the search log. Search log entries carry a readable UTC `time` (RFC 3339) next to the epoch `timestamp`, and each `indexer.log` line starts with `[<RFC 3339 UTC time>]`.
+Toka writes the normal search log as JSON lines (per-platform paths are in
+the [ts files table](ts.md#files)). Print it with `npm run search-log`, or
+follow new entries with `npm run search-log -- --follow`; pass a path to
+either command to inspect a different log. Each running Toka window has its
+own session marker, so closing one window does not delete the shared log while
+another window is active. The indexer daemon writes its own `indexer.log`
+(same table). Search log entries carry a readable UTC `time` (RFC 3339) next
+to the epoch `timestamp`, and each `indexer.log` line starts with
+`[<RFC 3339 UTC time>]`.
 
 The Search logging settings pane, available from the keyboard-help pane, can
 enable verbose per-search logs and choose their destination folder. Verbose
-logs include any provider command, filtered candidates, returned paths, and
-errors. Zero-byte media is ignored by indexing, search results, and thumbnail
-discovery.
+logs include filtered candidates, returned paths, and errors. Zero-byte media
+is ignored by indexing, search results, and thumbnail discovery.
 
 ## Add-ons
 
@@ -119,17 +123,17 @@ network.
 ## How it works
 
 - `src/` contains the React interface and Tauri command client.
-- `src-tauri/` contains the Rust application, search providers, and file-access boundary.
-- Both platforms search Toka's owned SQLite index through the `ts` helper (`crates/ts`, backed by `crates/toka-search`). A `toka-search.service` user service on Linux (a `ts` launchd agent on macOS) runs `ts daemon run`, which hosts the index watchers so folders stay current with the window closed.
+- `src-tauri/` contains the Rust application and file-access boundary. Search and indexing live outside it, in `crates/ts` (the CLI) backed by `crates/toka-search` (the engine); the app reaches both only by spawning `ts` (see `src-tauri/src/ts_client.rs`).
+- Both platforms search Toka's owned SQLite index through the `ts` helper. A `toka-search.service` user service on Linux (a `ts` launchd agent on macOS) runs `ts daemon run`, which hosts the index watchers so folders stay current with the window closed. [ts.md](ts.md) is the full `ts` reference: commands, JSON contract, service management, and troubleshooting.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, zero-byte media is ignored, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
-- Tags live in the filename inside a trailing `[...]` block. `src-tauri/src/tags.rs` owns the whole convention — parsing, normalizing (lowercase, sorted, deduplicated), and the get/set/add/remove renames — ported from the standalone `tag` library so Toka needs no external command. A rename refuses to overwrite an existing name, and the search engine repoints its result ID at the new path.
+- Tags live in the filename inside a trailing `[...]` block. `crates/toka-search/src/tags.rs` owns the whole convention — parsing, normalizing (lowercase, sorted, deduplicated), and the get/set/add/remove renames — ported from the standalone `tag` library so Toka needs no external command. A rename refuses to overwrite an existing name, and the search engine repoints its result ID at the new path.
 - Subtitles come from sidecar files beside the video (`talk.srt`, `talk.en.srt`) and from tracks inside it. Rust detects the sidecars and converts SRT to WebVTT for the web media engine; on Linux mpv supplies both sidecar and embedded tracks. `S` toggles them.
 
 `docs/thumbnails.md` records the decided approach for result thumbnails.
 
-The `e2e` Cargo feature replaces the platform search provider with a fixture provider and enables the WebDriver plugins. Normal development and release builds do not enable it. E2E builds ignore the real user add-on folder; set `TOKA_E2E_ADDONS_DIR` when a test needs its own manifests.
+The `e2e` Cargo feature forwards fixture videos (`TOKA_E2E_VIDEOS`) to a fixture-enabled `ts` build beside the app and enables the WebDriver plugins; every build searches through `ts`, e2e ones included. Normal development and release builds do not enable it. E2E builds ignore the real user add-on folder; set `TOKA_E2E_ADDONS_DIR` when a test needs its own manifests.
 
 Release builds write `/usr/share/toka/build-info.json` into the Debian package.
 After installing Toka on Linux, run `bin/toka-freshness.mjs` from the repository
@@ -145,4 +149,4 @@ to see its version, build age, Git SHA, and number of commits behind
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.
 - AppImage compatibility: build on the oldest Linux base you intend to support. Newer build systems may require a newer glibc on the destination computer.
 
-CI verifies the app on macOS arm64 and Ubuntu x64, runs both test suites, and builds the platform bundles defined in `.github/workflows/ci.yml`.
+CI runs the `ts`/`toka-search` suites first as their own job (fast failure before the slow app legs), then verifies the app on macOS arm64 and Ubuntu x64, runs both test suites, and builds the platform bundles defined in `.github/workflows/ci.yml`.

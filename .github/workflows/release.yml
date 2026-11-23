@@ -59,7 +59,14 @@ jobs:
           export VITE_APP_VERSION=$(node -e 'console.log(JSON.parse(process.argv[1]).buildVersion)' "$metadata")
           export VITE_BUILD_TIME=$(node -e 'console.log(JSON.parse(process.argv[1]).builtAt)' "$metadata")
           export VITE_GIT_SHA=$(node -e 'console.log(JSON.parse(process.argv[1]).gitSha)' "$metadata")
-          npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+          # The `binaries/ts` sidecar the bundles ship: built and staged
+          # before the bundler reads it. Compile and bundle stay split on
+          # purpose — the bundle overlay (which carries the sidecar) is
+          # only ever merged into `tauri bundle`, never into a compile.
+          # See bin/build.mjs.
+          node bin/build-ts-sidecar.mjs --target ${{ matrix.rust-target }}
+          npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
+          npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
       - name: Archive macOS .app
         if: runner.os == 'macOS'
         run: |

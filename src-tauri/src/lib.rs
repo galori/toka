@@ -465,7 +465,7 @@ fn move_to_trash(path: &std::path::Path) -> Result<Option<String>, CommandError>
     #[cfg(target_os = "macos")]
     {
         let trashed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        return Ok(Some(if trashed.is_empty() { name } else { trashed }));
+        Ok(Some(if trashed.is_empty() { name } else { trashed }))
     }
     #[cfg(not(target_os = "macos"))]
     {

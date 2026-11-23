@@ -50,6 +50,7 @@
           "libstdc++6",
           "liburing2"
         ],
+        "conflicts": ["moreutils"],
         "files": {
           "/usr/share/toka/build-info.json": "build-info.json"
         }

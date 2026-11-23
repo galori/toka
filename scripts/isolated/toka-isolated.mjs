@@ -105,12 +105,20 @@ async function build(flags) {
   const load = (file) => import(pathToFileURL(path.join(worktree, file)).href);
   const { prepareBuild } = await load("bin/prepare-build.mjs");
   const info = prepareBuild();
+  // `ts` has no build script, so it ignores VITE_GIT_SHA: without its own
+  // provenance `ts --version` shows `(Git SHA development)` next to an app
+  // showing the real SHA.
+  const tsGitSha = /^[0-9a-f]+$/i.test(info.gitSha ?? "")
+    ? info.gitSha
+    : undefined;
   const env = {
     ...process.env,
     CARGO_BUILD_JOBS: process.env.CARGO_BUILD_JOBS ?? "4",
     VITE_APP_VERSION: info.buildVersion,
     VITE_BUILD_TIME: info.builtAt,
     VITE_GIT_SHA: info.gitSha,
+    TS_BUILD_VERSION: info.buildVersion,
+    ...(tsGitSha === undefined ? {} : { TOKA_GIT_SHA: tsGitSha }),
   };
   const child = spawn(
     "npm",

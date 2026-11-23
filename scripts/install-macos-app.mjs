@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runTsInstall as runInstalledTs } from "./run-ts-install.mjs";
 
 const DEFAULT_APP_BUNDLE = "src-tauri/target/release/bundle/macos/Toka.app";
 const DEFAULT_APPLICATIONS_DIR = "/Applications";
@@ -36,6 +37,7 @@ export function installMacosApp({
   applicationsDir = process.env.TOKA_APPLICATIONS_DIR ??
     DEFAULT_APPLICATIONS_DIR,
   homeDir = os.homedir(),
+  runTsInstall = runInstalledTs,
 } = {}) {
   const resolvedSource = path.resolve(source);
   const resolvedApplicationsDir = path.resolve(applicationsDir);
@@ -74,6 +76,20 @@ export function installMacosApp({
   if (createCommandLink) {
     fs.mkdirSync(path.dirname(commandLink), { recursive: true });
     fs.symlinkSync(commandTarget, commandLink);
+  }
+
+  // The search helper the bundle ships as a sidecar: `ts install --link`
+  // points the launchd agent at this installed copy, links it for the
+  // shell, and restarts the daemon onto it — the same step the Linux
+  // installer runs. A drag-installed bundle never passes through here;
+  // its first launch runs `ts install` from the app instead.
+  const sidecar = path.join(destination, "Contents", "MacOS", "ts");
+  if (fs.existsSync(sidecar)) {
+    runTsInstall(sidecar);
+  } else {
+    console.warn(
+      `No ts sidecar found at ${sidecar}; search runs without a background indexer until one is installed.`,
+    );
   }
 
   return destination;

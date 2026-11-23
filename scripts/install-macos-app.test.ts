@@ -79,6 +79,76 @@ describe("installMacosApp", () => {
     expect(fs.readFileSync(commandLink, "utf8")).toBe("new build");
   });
 
+  test("points the indexer service at the bundled ts sidecar", () => {
+    const root = makeTempRoot();
+    const source = path.join(root, "build", "Toka.app");
+    const applicationsDir = path.join(root, "Applications");
+    const homeDir = path.join(root, "home");
+    const sidecar = path.join(
+      applicationsDir,
+      "Toka.app",
+      "Contents",
+      "MacOS",
+      "ts",
+    );
+    const tsInstalls: string[] = [];
+
+    fs.mkdirSync(path.join(source, "Contents", "MacOS"), { recursive: true });
+    fs.writeFileSync(
+      path.join(source, "Contents", "MacOS", "toka"),
+      "fresh build",
+    );
+    fs.writeFileSync(path.join(source, "Contents", "MacOS", "ts"), "ts build");
+
+    installMacosApp({
+      source,
+      applicationsDir,
+      homeDir,
+      runTsInstall: (installedTsPath: string) =>
+        tsInstalls.push(installedTsPath),
+    });
+
+    // The service always points at the installed copy, never the build
+    // directory the bundle moved away from.
+    expect(tsInstalls).toEqual([sidecar]);
+  });
+
+  test("skips the ts setup when the bundle ships no sidecar", () => {
+    const root = makeTempRoot();
+    const source = path.join(root, "build", "Toka.app");
+    const applicationsDir = path.join(root, "Applications");
+    const homeDir = path.join(root, "home");
+    const tsInstalls: string[] = [];
+    const warnings: unknown[][] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args);
+    };
+
+    try {
+      fs.mkdirSync(path.join(source, "Contents", "MacOS"), { recursive: true });
+      fs.writeFileSync(
+        path.join(source, "Contents", "MacOS", "toka"),
+        "fresh build",
+      );
+
+      installMacosApp({
+        source,
+        applicationsDir,
+        homeDir,
+        runTsInstall: (installedTsPath: string) =>
+          tsInstalls.push(installedTsPath),
+      });
+    } finally {
+      console.warn = warn;
+    }
+
+    expect(tsInstalls).toEqual([]);
+    expect(
+      warnings.some((args) => String(args[0]).includes("No ts sidecar")),
+    ).toBe(true);
+  });
+
   test("fails clearly when the built app bundle is missing", () => {
     const root = makeTempRoot();
 

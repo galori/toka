@@ -38,7 +38,9 @@ needed, and nothing outside your home directory is touched. It also links the
 `toka` and `ts` commands into `~/.local/bin` and runs `ts install`, which
 enables the `toka-search.service` user service for the current user. The
 service runs while you are logged in; `ts install` also attempts to enable
-systemd lingering so indexing can continue while logged out.
+systemd lingering so indexing can continue while logged out. Service
+management (`ts status`, `ts restart`, `ts uninstall`) and the full command
+reference are in [ts.md](ts.md).
 
 Add `-- --appimage` to build and install a self-contained AppImage instead. That
 is what you want when copying Toka to another machine; it takes about 90 seconds
