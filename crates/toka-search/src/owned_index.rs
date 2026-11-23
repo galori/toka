@@ -1041,21 +1041,22 @@ impl OwnedIndexManager {
                 return Err(format!("Toka could not open that folder: {error}"));
             }
         }
-        // Purge and reset delete the index directory's known files: a
-        // watched folder at or inside it would put media on the deletion
-        // list, so the shared add path refuses it here, for the app and
+        // Purge and reset delete the index directory's known files (never
+        // the directory itself or anything foreign inside it): a watched
+        // folder at or inside it would feed Toka's own data back into the
+        // index, so the shared add path refuses it here, for the app and
         // `ts` alike.
         if let Some(parent) = self.database.parent() {
             let index_dir = canonical_spelling(parent);
             if root == index_dir {
                 return Err(format!(
-                    "Toka cannot search its own index folder ({}): reset and purge delete it.",
+                    "Toka cannot search its own index folder ({}): reset and purge delete the index data inside it.",
                     root.display()
                 ));
             }
             if root.starts_with(&index_dir) {
                 return Err(format!(
-                    "Toka cannot search {}: it is inside Toka's index folder ({}), which reset and purge delete.",
+                    "Toka cannot search {}: it is inside Toka's index folder ({}), where reset and purge delete the index data.",
                     root.display(),
                     index_dir.display()
                 ));
@@ -6556,11 +6557,21 @@ mod tests {
             error.contains("its own index folder"),
             "unexpected error: {error}"
         );
+        // The rejection names what reset and purge actually delete: the
+        // index data inside the folder — never the folder itself.
+        assert!(
+            error.contains("reset and purge delete the index data inside it"),
+            "unexpected error: {error}"
+        );
 
         // A folder inside it (even spelled through `.`).
         let error = manager.add_folder(&inside).unwrap_err();
         assert!(
             error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("where reset and purge delete the index data"),
             "unexpected error: {error}"
         );
         let error = manager

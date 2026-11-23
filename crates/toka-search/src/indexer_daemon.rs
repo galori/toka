@@ -331,7 +331,7 @@ fn current_uid() -> u32 {
 /// collect their locks.
 #[cfg(unix)]
 fn ensure_runtime_dir(dir: &Path, uid: u32) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     if fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(format!(
             "Toka could not lock its indexer daemon: {} is a symlink",
@@ -340,18 +340,46 @@ fn ensure_runtime_dir(dir: &Path, uid: u32) -> Result<(), String> {
     }
     fs::create_dir_all(dir)
         .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
-    let owner = fs::metadata(dir)
-        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?
-        .uid();
-    if owner != uid {
+    // The pre-check above races a concurrent swap — creation and chmod
+    // both follow links — so the directory is verified AFTER creation:
+    // what exists now must be this user's real directory, never a link
+    // planted between the two calls.
+    verified_runtime_metadata(dir, uid)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    // And once more after the chmod, so a swap between the chmod and the
+    // first verification cannot hand back a link with trusted contents.
+    let metadata = verified_runtime_metadata(dir, uid)?;
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} changed while it was secured",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The runtime directory this instant: a real directory (never a link)
+/// owned by `uid`. Called after every filesystem step above, so a swap
+/// between the steps cannot redirect the locks.
+#[cfg(unix)]
+fn verified_runtime_metadata(dir: &Path, uid: u32) -> Result<fs::Metadata, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is a symlink",
+            dir.display()
+        ));
+    }
+    if metadata.uid() != uid {
         return Err(format!(
             "Toka could not lock its indexer daemon: {} is owned by another user",
             dir.display()
         ));
     }
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
-    Ok(())
+    Ok(metadata)
 }
 
 /// FNV-1a 64-bit, naming one lock file per index: the name must be stable
@@ -2281,17 +2309,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_runtime_dir_is_pinned_to_its_user() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let directory = tempdir().unwrap();
         let uid = current_uid();
 
         // Created missing, and narrowed to 0700 even when it exists wider.
+        // The secured result is a real directory owned by this user — read
+        // back through `symlink_metadata`, never a following call.
         let fresh = directory.path().join("fresh");
         ensure_runtime_dir(&fresh, uid).unwrap();
-        assert_eq!(
-            fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        let secured = fs::symlink_metadata(&fresh).unwrap();
+        assert!(!secured.file_type().is_symlink());
+        assert_eq!(secured.uid(), uid);
+        assert_eq!(secured.permissions().mode() & 0o777, 0o700);
         let wide = directory.path().join("wide");
         fs::create_dir(&wide).unwrap();
         fs::set_permissions(&wide, fs::Permissions::from_mode(0o755)).unwrap();

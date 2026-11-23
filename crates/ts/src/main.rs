@@ -121,13 +121,23 @@ fn run_daemon() -> Result<(), String> {
     toka_search::indexer_daemon::run_daemon()
 }
 
-/// Runs one service operation against the real machine.
+/// Runs one service operation against the real machine. Only install
+/// and uninstall need the executable resolved — the service file points
+/// at it, and the link cleanup compares against it — so the other
+/// operations use a query host, which an unresolvable current executable
+/// cannot fail.
 fn manage_service(
     op: toka_search::service::ServiceOp,
 ) -> Result<toka_search::service::Outcome, (String, toka_search::service::Outcome)> {
-    use toka_search::service::Outcome;
-    let mut host =
-        toka_search::service::SystemHost::new().map_err(|error| (error, Outcome::default()))?;
+    use toka_search::service::{Outcome, ServiceOp, SystemHost};
+    let mut host = match op {
+        ServiceOp::Install { .. } | ServiceOp::Uninstall { .. } => {
+            SystemHost::new().map_err(|error| (error, Outcome::default()))?
+        }
+        ServiceOp::Restart | ServiceOp::Start | ServiceOp::Stop => {
+            SystemHost::for_query().map_err(|error| (error, Outcome::default()))?
+        }
+    };
     toka_search::service::perform(&mut host, op)
 }
 

@@ -250,7 +250,11 @@ fn purge_data_paths() -> Result<Vec<PathBuf>, String> {
 }
 
 /// The unit file `ts install` writes, under the user config directory
-/// (`XDG_CONFIG_HOME` when set, otherwise `~/.config`).
+/// (`XDG_CONFIG_HOME` when set, otherwise `~/.config`). A unit under any
+/// other config dir — installed before `ts` honored `XDG_CONFIG_HOME`, or
+/// orphaned by an `XDG_CONFIG_HOME` change mid-session — is neither read
+/// nor removed: the user manager loads only the current dir's units, so
+/// the stale file is inert litter, not a second service.
 pub fn unit_path(config_dir: &Path) -> PathBuf {
     config_dir
         .join("systemd")
@@ -418,7 +422,10 @@ fn with_outcome<T>(
 /// when nothing is installed. After the stops, a held daemon lock fails
 /// too: a hand-started daemon survives every stop above.
 pub fn stop_indexer_services() -> Result<(), String> {
-    let mut host = SystemHost::new()?;
+    // A query host suffices: stopping never points a service file at the
+    // executable, so an unresolvable current executable must not fail the
+    // reset's pre-stop.
+    let mut host = SystemHost::for_query()?;
     let Some(manager) = ServiceManager::current() else {
         return Ok(());
     };
@@ -435,7 +442,7 @@ fn stop_for_reset(host: &mut impl Host, manager: ServiceManager) -> Result<(), S
                 (crate::config::TS_SERVICE_NAME, unit_path(&config)),
                 (crate::config::INDEXER_SERVICE_NAME, legacy_unit_path(&home)),
             ] {
-                match systemd_active(host, unit) {
+                match systemd_active(host, unit, file.is_file()) {
                     Some(true) => {
                         systemd_command(host, &["stop", unit])?;
                     }
@@ -475,7 +482,8 @@ fn stop_for_reset(host: &mut impl Host, manager: ServiceManager) -> Result<(), S
 }
 
 fn query_systemd(host: &mut impl Host) -> ServiceState {
-    if !unit_path(&host.config_dir()).is_file() {
+    let installed = unit_path(&host.config_dir()).is_file();
+    if !installed {
         return ServiceState {
             installed: Some(false),
             enabled: None,
@@ -485,7 +493,7 @@ fn query_systemd(host: &mut impl Host) -> ServiceState {
     ServiceState {
         installed: Some(true),
         enabled: systemd_enabled(host, crate::config::TS_SERVICE_NAME),
-        running: systemd_active(host, crate::config::TS_SERVICE_NAME),
+        running: systemd_active(host, crate::config::TS_SERVICE_NAME, installed),
     }
 }
 
@@ -494,23 +502,30 @@ fn query_systemd(host: &mut impl Host) -> ServiceState {
 /// `deactivating` count as active — a pending start must be cancelled by a
 /// stop, never skipped over — while only `inactive` and `failed` read as
 /// stopped. Anything else (no user bus, signals, no systemctl at all, an
-/// unrecognized word) means systemd cannot say.
-fn systemd_active(host: &mut impl Host, unit: &str) -> Option<bool> {
+/// unrecognized word) means systemd cannot say — except exit-3 `unknown`
+/// for a unit with no file installed: real systemctl answers that for a
+/// unit it never loaded, and with nothing installed nothing can run, so
+/// that reads as stopped instead of failing closed. The caller passes
+/// whether the unit's file exists; an `unknown` with a file present keeps
+/// failing closed, since a lingering service may still run there.
+fn systemd_active(host: &mut impl Host, unit: &str, file_present: bool) -> Option<bool> {
     let result = host.run("systemctl", &["--user", "is-active", unit]).ok()?;
-    systemd_active_state(result.code, &result.stdout)
+    systemd_active_state(result.code, &result.stdout, file_present)
 }
 
 /// Maps one `systemctl is-active` answer to running, stopped, or unknown.
 /// Exit 0 is running; exit 3 consults the state word, since `activating`
 /// exits 3 yet must still be stopped. Any other word (including
-/// `maintenance`) reads as unknown: only confirmed-absent states skip
-/// the stop.
-fn systemd_active_state(code: Option<i32>, stdout: &str) -> Option<bool> {
+/// `maintenance`) reads as unknown — except `unknown` itself with no unit
+/// file installed, which is a never-loaded unit and reads as stopped:
+/// only confirmed-absent states skip the stop.
+fn systemd_active_state(code: Option<i32>, stdout: &str, file_present: bool) -> Option<bool> {
     match code {
         Some(0) => Some(true),
         Some(3) => match stdout.split_whitespace().next().unwrap_or("") {
             "inactive" | "failed" => Some(false),
             "activating" | "deactivating" | "reloading" => Some(true),
+            "unknown" if !file_present => Some(false),
             _ => None,
         },
         _ => None,
@@ -650,7 +665,7 @@ fn install_systemd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     // restart the stale binary keeps running. An unreadable answer
     // restarts too — the stop is a harmless no-op on a stopped daemon —
     // since a plain start would claim success while the old binary runs.
-    let active = systemd_active(host, name);
+    let active = systemd_active(host, name, unit.is_file());
     if (written || stale_manager) && active != Some(false) {
         with_outcome(systemd_command(host, &["stop", name]), &mut outcome)?;
         with_outcome(systemd_command(host, &["start", name]), &mut outcome)?;
@@ -690,9 +705,12 @@ fn previous_unit_executable(host: &mut impl Host, unit: &Path, name: &str) -> Op
 fn migrate_legacy_service(host: &mut impl Host, outcome: &mut Outcome) -> Result<bool, String> {
     let legacy = crate::config::INDEXER_SERVICE_NAME;
     let file = legacy_unit_path(&host.home());
-    let active = systemd_active(host, legacy);
     let present = file.is_file();
-    if active == Some(false) && !present {
+    let active = systemd_active(host, legacy, present);
+    // No file and no confirmed daemon: nothing to migrate. An unreadable
+    // answer proceeds like launchd's fileless uninstall — there is no
+    // legacy file to remove, so a stop can only fail the install.
+    if !present && active != Some(true) {
         outcome.already(format!("no old {legacy} to migrate"));
         return Ok(false);
     }
@@ -757,11 +775,21 @@ fn uninstall_systemd(host: &mut impl Host, purge_data: bool) -> Result<Outcome, 
         // Stops before the lock check: a service daemon is stopped, not
         // refused — only a hand-started survivor blocks the purge. No
         // deletion has happened yet, so a refusal removes nothing.
-        for unit in [
-            crate::config::TS_SERVICE_NAME,
-            crate::config::INDEXER_SERVICE_NAME,
+        let home = host.home();
+        let config = host.config_dir();
+        for (unit, file) in [
+            (crate::config::TS_SERVICE_NAME, unit_path(&config)),
+            (crate::config::INDEXER_SERVICE_NAME, legacy_unit_path(&home)),
         ] {
-            if systemd_active(host, unit) != Some(false) {
+            let present = file.is_file();
+            let active = systemd_active(host, unit, present);
+            // No file and the manager cannot say: proceed, like launchd —
+            // the lock check below still refuses while a live daemon holds
+            // the lock.
+            if active.is_none() && !present {
+                continue;
+            }
+            if active != Some(false) {
                 with_outcome(systemd_command(host, &["stop", unit]), &mut outcome)?;
                 outcome.did(format!("stopped {unit}"));
             }
@@ -820,9 +848,12 @@ fn refuse_purge_if_locked(
 
 /// Stops, disables, and removes one unit, returning whether its file was
 /// removed. The daemon stops whenever it might run — including when
-/// systemd cannot say — and a stop failure aborts before anything is
-/// deleted. The `ts` unit reports its own absence; the legacy one stays
-/// silent when there was never anything to migrate.
+/// systemd cannot say about an installed file — and a stop failure aborts
+/// before anything is deleted. With no file installed and no answer from
+/// the manager there is nothing to remove, so the uninstall proceeds like
+/// launchd's instead of failing on a stop. The `ts` unit reports its own
+/// absence; the legacy one stays silent when there was never anything to
+/// migrate.
 fn remove_systemd_service(
     host: &mut impl Host,
     outcome: &mut Outcome,
@@ -830,9 +861,18 @@ fn remove_systemd_service(
     file: &Path,
     report_absent: bool,
 ) -> Result<bool, String> {
-    let active = systemd_active(host, unit);
     let present = file.is_file();
+    let active = systemd_active(host, unit, present);
     if active == Some(false) && !present {
+        if report_absent {
+            outcome.already(format!("{unit} is not installed"));
+        }
+        return Ok(false);
+    }
+    // No file and the manager cannot say: proceed, like launchd — there
+    // is nothing installed to remove, and a purge's lock check still
+    // refuses while a live daemon holds the lock.
+    if active.is_none() && !present {
         if report_absent {
             outcome.already(format!("{unit} is not installed"));
         }
@@ -850,43 +890,48 @@ fn remove_systemd_service(
         outcome.did(format!("removed {}", display_path(&host.home(), file)));
         return Ok(true);
     }
-    // No file, but the daemon ran: drop the dangling enablement too. A
-    // "does not exist" failure only means there was none.
-    match systemd_command(host, &["disable", unit]) {
-        Ok(()) => {
+    // No file, but the daemon ran: drop the dangling enablement — but only
+    // when `is-enabled` confirms some. A blind disable turns its
+    // locale-specific "not found" into a hard error, which no stderr
+    // sniffing can reliably recognize.
+    match systemd_enablement(host, unit) {
+        Enablement::Enabled | Enablement::EnabledRuntime => {
+            systemd_command(host, &["disable", unit])?;
             outcome.did(format!("disabled {unit}"));
         }
-        Err(error) if is_disable_not_found(&error) => {
+        _ => {
             outcome.already(format!("{unit} is not enabled"));
         }
-        Err(error) => return Err(error),
     }
     Ok(false)
-}
-
-/// Whether a failed `systemctl disable` only reports nothing to disable:
-/// the unit file is gone and no enablement symlink dangles.
-fn is_disable_not_found(error: &str) -> bool {
-    error.contains("does not exist")
-        || error.contains("No such file")
-        || error.contains("not found")
-        || error.contains("not-found")
 }
 
 fn start_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
     let unit = crate::config::TS_SERVICE_NAME;
-    if !unit_path(&host.config_dir()).is_file() {
+    let installed = unit_path(&host.config_dir()).is_file();
+    if !installed {
         return Err((
             format!("{unit} is not installed; run `ts install` first."),
             outcome,
         ));
     }
-    if systemd_active(host, unit) == Some(true) {
-        outcome.already(format!("{unit} is already running"));
-    } else {
-        with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
-        outcome.did(format!("started {unit}"));
+    match systemd_active(host, unit, installed) {
+        Some(true) => {
+            outcome.already(format!("{unit} is already running"));
+        }
+        // Starting blind is still converging — a start on an already
+        // running service is a no-op success — but the report says the
+        // prior state was unknown instead of claiming a fresh start.
+        None => {
+            outcome.already(format!("{unit} state is unknown, starting it"));
+            with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
+            outcome.did(format!("started {unit}"));
+        }
+        Some(false) => {
+            with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
+            outcome.did(format!("started {unit}"));
+        }
     }
     Ok(outcome)
 }
@@ -895,7 +940,7 @@ fn stop_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
     let unit = crate::config::TS_SERVICE_NAME;
     let installed = unit_path(&host.config_dir()).is_file();
-    match systemd_active(host, unit) {
+    match systemd_active(host, unit, installed) {
         Some(true) => {
             with_outcome(systemd_command(host, &["stop", unit]), &mut outcome)?;
             outcome.did(format!("stopped {unit}"));
@@ -922,7 +967,8 @@ fn stop_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
 fn restart_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
     let mut outcome = Outcome::default();
     let unit = crate::config::TS_SERVICE_NAME;
-    if !unit_path(&host.config_dir()).is_file() {
+    let installed = unit_path(&host.config_dir()).is_file();
+    if !installed {
         return Err((
             format!("{unit} is not installed; run `ts install` first."),
             outcome,
@@ -931,7 +977,9 @@ fn restart_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
     // Stop plus start, not `systemctl restart`: each half reports what it
     // did, and a stopped service still ends up running. The new daemon
     // process publishes a fresh start time, so `ts status` uptime resets.
-    match systemd_active(host, unit) {
+    // An unreadable state errors like launchd's restart: starting without
+    // stopping would silently no-op while a stale daemon runs.
+    match systemd_active(host, unit, installed) {
         Some(true) => {
             with_outcome(systemd_command(host, &["stop", unit]), &mut outcome)?;
             outcome.did(format!("stopped {unit}"));
@@ -940,7 +988,10 @@ fn restart_systemd(host: &mut impl Host) -> Result<Outcome, (String, Outcome)> {
             outcome.already(format!("{unit} is already stopped"));
         }
         None => {
-            outcome.already(format!("{unit} state is unknown, starting it"));
+            return Err((
+                "could not ask systemd about the service.".to_owned(),
+                outcome,
+            ));
         }
     }
     with_outcome(systemd_command(host, &["start", unit]), &mut outcome)?;
@@ -1120,11 +1171,15 @@ fn install_launchd(host: &mut impl Host, link: bool) -> Result<Outcome, (String,
     let running = state.running;
     // A loaded agent running another copy's binary: the last reload never
     // completed (a failed bootout would otherwise report success on
-    // retry), so reload again even though the plist file is current.
-    let stale = state
-        .program
-        .as_ref()
-        .is_some_and(|program| !same_executable(program, &host.executable()));
+    // retry), so reload again even though the plist file is current. A
+    // loaded agent naming no program at all is stale too: older
+    // `launchctl print` output carries no `program` line, so the loaded
+    // binary cannot be confirmed current — reload-always on old launchctl.
+    let stale = bootstrapped
+        && state
+            .program
+            .as_ref()
+            .is_none_or(|program| !same_executable(program, &host.executable()));
     if bootstrapped && !written && !stale {
         match running {
             Some(true) => outcome.already(format!("{label} is already running")),
@@ -1212,21 +1267,27 @@ fn uninstall_launchd(host: &mut impl Host, purge_data: bool) -> Result<Outcome, 
     let label = crate::config::TS_LAUNCHD_LABEL;
     let present = plist.is_file();
 
+    // One probe threaded through both phases: a second probe after the
+    // pre-stop would see a manager that ignores bootout as still loaded
+    // and stop — and report — twice.
+    let bootstrapped = launchd_bootstrapped(host);
+    let mut stopped = false;
     if purge_data {
         // A bootout before the lock check, mirroring systemd: a managed
         // daemon is stopped, not refused. An unreadable answer is left to
         // the main flow, which errors before deleting anything.
-        if launchd_bootstrapped(host) == Some(true) {
+        if bootstrapped == Some(true) {
             with_outcome(
                 launchd_command(host, &["bootout", &launchd_target(host)]),
                 &mut outcome,
             )?;
             outcome.did(format!("stopped {label}"));
+            stopped = true;
         }
         refuse_purge_if_locked(host, &mut outcome)?;
     }
 
-    match launchd_probe(host) {
+    match bootstrapped {
         None if !present => {
             outcome.already(format!("{label} is not installed"));
         }
@@ -1236,8 +1297,8 @@ fn uninstall_launchd(host: &mut impl Host, purge_data: bool) -> Result<Outcome, 
                 std::mem::take(&mut outcome),
             ));
         }
-        Some(state) => {
-            if state.bootstrapped {
+        Some(was_bootstrapped) => {
+            if was_bootstrapped && !stopped {
                 with_outcome(
                     launchd_command(host, &["bootout", &launchd_target(host)]),
                     &mut outcome,
@@ -1252,7 +1313,7 @@ fn uninstall_launchd(host: &mut impl Host, purge_data: bool) -> Result<Outcome, 
                 )?;
                 outcome.did(format!("removed {}", display_path(&home, &plist)));
             }
-            if !state.bootstrapped && !present {
+            if !was_bootstrapped && !present {
                 outcome.already(format!("{label} is not installed"));
             }
         }
@@ -1614,6 +1675,10 @@ mod tests {
         active: HashMap<String, bool>,
         active_unknown: HashSet<String>,
         activating: HashSet<String>,
+        /// A pinned exit-3 state word per unit, for answers no other
+        /// script field expresses: real `unknown`, or a localized word.
+        /// Wins over every other liveness field.
+        active_word: HashMap<String, String>,
         enabled: HashMap<String, bool>,
         enabled_runtime: HashSet<String>,
         /// The executable `show -p ExecStart` reports per unit. Set only
@@ -1625,6 +1690,9 @@ mod tests {
         /// The loaded agent's executable, printed as `program = ...`. `None`
         /// omits the line, as older `launchctl print` output does.
         program: Option<String>,
+        /// A `bootout` that reports success without unloading, for a
+        /// manager that ignores the request.
+        bootout_noop: bool,
         lingering: bool,
         fail: HashSet<String>,
         fail_stderr: HashMap<String, String>,
@@ -1665,7 +1733,9 @@ mod tests {
             };
             match args {
                 ["--user", "is-active", unit] => {
-                    if self.active_unknown.contains(*unit) {
+                    if let Some(word) = self.active_word.get(*unit) {
+                        out(3, &format!("{word}\n"))
+                    } else if self.active_unknown.contains(*unit) {
                         // A signal-killed probe: no exit code at all.
                         CommandResult {
                             code: None,
@@ -1743,8 +1813,10 @@ mod tests {
                     out(0, "", "")
                 }
                 ["bootout", _] => {
-                    self.bootstrapped = false;
-                    self.job_running = false;
+                    if !self.bootout_noop {
+                        self.bootstrapped = false;
+                        self.job_running = false;
+                    }
                     out(0, "", "")
                 }
                 ["kickstart", "-k", _] => {
@@ -1877,26 +1949,30 @@ mod tests {
                 if let ["--user", "show", "-p", "ExecStart", unit] = args {
                     // The unit file on disk answers, but missing and
                     // injected failures still apply, as in `Script::answer`.
-                    let script = self.script.borrow();
-                    if script.missing.contains(program) {
-                        return Err(format!("could not run {program}"));
+                    if let Some(outcome) = self.scripted_outcome(program, args)? {
+                        return Ok(outcome);
                     }
-                    let call = format!("{program} {}", args.join(" "));
-                    if script.fail.contains(&call) {
-                        let stderr = script
-                            .fail_stderr
-                            .get(&call)
-                            .cloned()
-                            .unwrap_or_else(|| "injected failure".to_owned());
-                        return Ok(CommandResult {
-                            code: Some(1),
-                            stdout: String::new(),
-                            stderr,
-                        });
-                    }
-                    drop(script);
                     return Ok(self.answer_show(unit));
                 }
+                if let ["--user", "is-active", unit] = args {
+                    if let Some(outcome) = self.scripted_outcome(program, args)? {
+                        return Ok(outcome);
+                    }
+                    if let Some(answer) = self.answer_never_loaded(unit) {
+                        return Ok(answer);
+                    }
+                }
+            }
+            if program == "launchctl" && args.first() == Some(&"bootstrap") {
+                let result = self.script.borrow_mut().answer(program, args)?;
+                // A current launchctl reports the loaded agent's program:
+                // bootstrapping records it, so installs converge. Tests
+                // simulating old launchctl clear `program` themselves.
+                if result.success() {
+                    self.script.borrow_mut().program =
+                        Some(self.executable.to_string_lossy().into_owned());
+                }
+                return Ok(result);
             }
             self.script.borrow_mut().answer(program, args)
         }
@@ -1914,11 +1990,77 @@ mod tests {
     }
 
     impl Fake {
+        /// Missing binaries and injected failures, shared by the
+        /// intercepted verbs so they behave exactly as `Script::answer`.
+        fn scripted_outcome(
+            &self,
+            program: &str,
+            args: &[&str],
+        ) -> Result<Option<CommandResult>, String> {
+            let script = self.script.borrow();
+            if script.missing.contains(program) {
+                return Err(format!("could not run {program}"));
+            }
+            let call = format!("{program} {}", args.join(" "));
+            if script.fail.contains(&call) {
+                let stderr = script
+                    .fail_stderr
+                    .get(&call)
+                    .cloned()
+                    .unwrap_or_else(|| "injected failure".to_owned());
+                return Ok(Some(CommandResult {
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr,
+                }));
+            }
+            Ok(None)
+        }
+
+        /// Real systemctl's answer for a unit it never loaded — exit-3
+        /// `unknown` — when the script pins no manager state for the unit
+        /// and no unit file exists for the manager to load on demand.
+        /// `None` delegates to the script: pinned state, or a present file
+        /// the manager would load, answers there.
+        fn answer_never_loaded(&self, unit: &str) -> Option<CommandResult> {
+            let script = self.script.borrow();
+            if script.active.contains_key(unit)
+                || script.active_unknown.contains(unit)
+                || script.activating.contains(unit)
+                || script.active_word.contains_key(unit)
+            {
+                return None;
+            }
+            drop(script);
+            if self.unit_file(unit).is_some_and(|file| file.is_file()) {
+                return None;
+            }
+            Some(CommandResult {
+                code: Some(3),
+                stdout: "unknown\n".to_owned(),
+                stderr: String::new(),
+            })
+        }
+
+        /// The unit file the manager would load for `unit`, for the two
+        /// units these tests know.
+        fn unit_file(&self, unit: &str) -> Option<PathBuf> {
+            if unit == crate::config::TS_SERVICE_NAME {
+                Some(unit_path(&self.config))
+            } else if unit == crate::config::INDEXER_SERVICE_NAME {
+                Some(legacy_unit_path(&self.home()))
+            } else {
+                None
+            }
+        }
+
         /// Synthesizes `systemctl show -p ExecStart` from the unit file on
         /// disk, so takeover tests install from one executable and
         /// reinstall from another without scripting manager state. A
         /// scripted override wins when the manager's copy diverges from
-        /// the file (a failed reload).
+        /// the file (a failed reload). With no file and no override the
+        /// answer is an empty `ExecStart=`, as a never-loaded unit
+        /// reports.
         fn answer_show(&self, unit: &str) -> CommandResult {
             if let Some(report) = self.script.borrow().show_override.get(unit).cloned() {
                 return Self::show_output(report);
@@ -2476,6 +2618,10 @@ mod tests {
         std::fs::write(plist_path(&host.home()), render_plist(&host.executable)).unwrap();
         host.script.borrow_mut().bootstrapped = true;
         host.script.borrow_mut().job_running = false;
+        // A current launchctl naming the loaded program: only then can the
+        // install confirm the loaded agent is current instead of reloading.
+        let executable = host.executable.to_string_lossy().into_owned();
+        host.script.borrow_mut().program = Some(executable);
 
         let outcome = perform_on(
             &mut host,
@@ -3033,20 +3179,43 @@ mod tests {
 
     #[test]
     fn active_state_treats_pending_starts_as_running() {
-        assert_eq!(systemd_active_state(Some(0), "active\n"), Some(true));
-        assert_eq!(systemd_active_state(Some(0), ""), Some(true));
-        assert_eq!(systemd_active_state(Some(3), "inactive\n"), Some(false));
-        assert_eq!(systemd_active_state(Some(3), "failed\n"), Some(false));
+        assert_eq!(systemd_active_state(Some(0), "active\n", true), Some(true));
+        assert_eq!(systemd_active_state(Some(0), "", true), Some(true));
+        assert_eq!(
+            systemd_active_state(Some(3), "inactive\n", true),
+            Some(false)
+        );
+        assert_eq!(systemd_active_state(Some(3), "failed\n", true), Some(false));
         // `activating` exits 3 yet must still be stopped: a pending start
         // is cancelled by a stop, never skipped over.
-        assert_eq!(systemd_active_state(Some(3), "activating\n"), Some(true));
-        assert_eq!(systemd_active_state(Some(3), "deactivating\n"), Some(true));
-        assert_eq!(systemd_active_state(Some(3), "reloading\n"), Some(true));
-        assert_eq!(systemd_active_state(Some(3), "maintenance\n"), None);
-        assert_eq!(systemd_active_state(Some(3), ""), None);
-        assert_eq!(systemd_active_state(Some(3), "bogus\n"), None);
-        assert_eq!(systemd_active_state(Some(1), ""), None);
-        assert_eq!(systemd_active_state(None, ""), None);
+        assert_eq!(
+            systemd_active_state(Some(3), "activating\n", true),
+            Some(true)
+        );
+        assert_eq!(
+            systemd_active_state(Some(3), "deactivating\n", true),
+            Some(true)
+        );
+        assert_eq!(
+            systemd_active_state(Some(3), "reloading\n", true),
+            Some(true)
+        );
+        assert_eq!(systemd_active_state(Some(3), "maintenance\n", true), None);
+        assert_eq!(systemd_active_state(Some(3), "", true), None);
+        assert_eq!(systemd_active_state(Some(3), "bogus\n", true), None);
+        assert_eq!(systemd_active_state(Some(1), "", true), None);
+        assert_eq!(systemd_active_state(None, "", true), None);
+        // Real systemctl's never-loaded answer: with no unit file nothing
+        // can run, so it reads as stopped; with a file present it keeps
+        // failing closed. A localized word is not the `unknown` word, so
+        // it always fails closed.
+        assert_eq!(
+            systemd_active_state(Some(3), "unknown\n", false),
+            Some(false)
+        );
+        assert_eq!(systemd_active_state(Some(3), "unknown\n", true), None);
+        assert_eq!(systemd_active_state(Some(3), "inaktiv\n", false), None);
+        assert_eq!(systemd_active_state(Some(3), "inaktiv\n", true), None);
     }
 
     #[test]
@@ -3267,7 +3436,9 @@ mod tests {
     }
 
     #[test]
-    fn systemd_restart_reports_an_unknown_state_honestly() {
+    fn systemd_restart_errors_when_the_state_is_unknown() {
+        // Starting without stopping would silently no-op while a stale
+        // daemon runs, so an unreadable state errors like launchd's.
         let mut host = Fake::new();
         std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
         std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
@@ -3276,7 +3447,31 @@ mod tests {
             .active_unknown
             .insert("toka-search.service".into());
 
-        let outcome = perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Restart).unwrap();
+        let (error, _) =
+            perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Restart).unwrap_err();
+
+        assert!(error.contains("could not ask systemd"), "{error}");
+        assert!(
+            host.calls_to("start toka-search.service").is_empty(),
+            "no blind start: {:?}",
+            host.calls
+        );
+    }
+
+    #[test]
+    fn systemd_start_reports_an_unknown_state_honestly() {
+        // A start on an already-running service is a no-op success, so
+        // starting blind still converges — but the report says the prior
+        // state was unknown instead of claiming a fresh start.
+        let mut host = Fake::new();
+        std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
+        std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
+        host.script
+            .borrow_mut()
+            .active_unknown
+            .insert("toka-search.service".into());
+
+        let outcome = perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Start).unwrap();
 
         assert_eq!(
             host.unchanged(&outcome),
@@ -3289,11 +3484,6 @@ mod tests {
             "{}",
             host.changed(&outcome).join("\n")
         );
-        assert!(
-            !host.calls_to("start toka-search.service").is_empty(),
-            "{:?}",
-            host.calls
-        );
     }
 
     #[test]
@@ -3302,6 +3492,12 @@ mod tests {
         host.script
             .borrow_mut()
             .active
+            .insert("toka-search.service".into(), true);
+        // Dangling enablement for the fileless unit: `is-enabled`
+        // confirms it, so the uninstall disables it.
+        host.script
+            .borrow_mut()
+            .enabled
             .insert("toka-search.service".into(), true);
 
         let outcome = perform_on(
@@ -3326,7 +3522,9 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_ignores_a_not_found_disable_for_a_fileless_unit() {
+    fn uninstall_skips_disable_without_confirmed_enablement_in_any_locale() {
+        // No `is-enabled` confirmation, so no disable is attempted at all:
+        // a non-English "not found" can never surface as a hard error.
         let mut host = Fake::new();
         host.script
             .borrow_mut()
@@ -3338,7 +3536,7 @@ mod tests {
             .insert("systemctl --user disable toka-search.service".to_owned());
         host.script.borrow_mut().fail_stderr.insert(
             "systemctl --user disable toka-search.service".to_owned(),
-            "Failed to disable unit: Unit file toka-search.service does not exist.".to_owned(),
+            "Fehler beim Deaktivieren: Unit-Datei toka-search.service existiert nicht.".to_owned(),
         );
 
         let outcome = perform_on(
@@ -3348,6 +3546,11 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            host.calls_to("disable toka-search.service").is_empty(),
+            "no blind disable: {:?}",
+            host.calls
+        );
         assert!(
             host.unchanged(&outcome)
                 .iter()
@@ -3363,6 +3566,10 @@ mod tests {
         host.script
             .borrow_mut()
             .active
+            .insert("toka-search.service".into(), true);
+        host.script
+            .borrow_mut()
+            .enabled
             .insert("toka-search.service".into(), true);
         host.script
             .borrow_mut()
@@ -4095,5 +4302,459 @@ mod tests {
 
         assert!(error.contains("could not write"), "{error}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+    }
+
+    #[test]
+    fn never_loaded_units_answer_unknown_with_an_empty_show() {
+        // The Fake speaks real systemctl for units it never loaded, so the
+        // parsers see the same words production does.
+        let mut host = Fake::new();
+
+        let probe = host
+            .run("systemctl", &["--user", "is-active", "toka-search.service"])
+            .unwrap();
+        assert_eq!(probe.code, Some(3));
+        assert_eq!(probe.stdout, "unknown\n");
+
+        let show = host
+            .run(
+                "systemctl",
+                &["--user", "show", "-p", "ExecStart", "toka-search.service"],
+            )
+            .unwrap();
+        assert_eq!(show.stdout, "ExecStart=\n");
+
+        // A unit file the manager would load on demand still reads as a
+        // loaded-but-stopped unit.
+        std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
+        std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
+        let probe = host
+            .run("systemctl", &["--user", "is-active", "toka-search.service"])
+            .unwrap();
+        assert_eq!(probe.stdout, "inactive\n");
+    }
+
+    #[test]
+    fn fresh_install_reports_started_with_no_bogus_stops() {
+        // A fresh machine's manager never loaded either unit: the install
+        // starts the new service (not a restart of nothing) and migrates
+        // no old service, without depending on stopping the unknown.
+        let mut host = Fake::new();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action == "started toka-search.service"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .all(|action| !action.contains("restarted")),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            host.calls_to("stop").is_empty(),
+            "no stops on a fresh machine: {:?}",
+            host.calls
+        );
+        assert!(
+            host.unchanged(&outcome)
+                .iter()
+                .any(|action| action == "no old toka-indexer.service to migrate"),
+            "{}",
+            host.unchanged(&outcome).join("\n")
+        );
+    }
+
+    #[test]
+    fn fresh_purge_uninstall_prints_zero_bogus_stops() {
+        let mut host = Fake::new();
+        let data = host.home().join("data");
+        std::fs::write(&data, b"index").unwrap();
+        host.purge = vec![data.clone()];
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert!(
+            outcome
+                .actions
+                .iter()
+                .all(|action| !action.message.contains("stopped")),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            host.calls_to("stop").is_empty(),
+            "no stops on a fresh machine: {:?}",
+            host.calls
+        );
+        assert!(!data.exists(), "the purge itself still runs");
+    }
+
+    #[test]
+    fn an_unknown_word_with_a_file_fails_closed() {
+        // Exit-3 `unknown` with a unit file installed: a lingering
+        // service may still run there, so stop and restart error, and
+        // uninstall stops first.
+        for op in [ServiceOp::Stop, ServiceOp::Restart] {
+            let mut host = Fake::new();
+            std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
+            std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
+            host.script
+                .borrow_mut()
+                .active_word
+                .insert("toka-search.service".into(), "unknown".into());
+
+            let (error, _) = perform_on(&mut host, ServiceManager::Systemd, op).unwrap_err();
+
+            assert!(error.contains("could not ask systemd"), "{op:?}: {error}");
+        }
+
+        let mut host = Fake::new();
+        std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
+        std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
+        host.script
+            .borrow_mut()
+            .active_word
+            .insert("toka-search.service".into(), "unknown".into());
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+
+        assert!(
+            !host.calls_to("stop toka-search.service").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(!unit_path(&host.config_dir()).exists());
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action == "stopped toka-search.service"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+    }
+
+    #[test]
+    fn a_localized_word_always_fails_closed() {
+        // `is-active` in another language is not the `unknown` word, so an
+        // installed file fails closed — while with no file the uninstall
+        // still proceeds, since there is nothing to remove.
+        let mut host = Fake::new();
+        std::fs::create_dir_all(unit_path(&host.config_dir()).parent().unwrap()).unwrap();
+        std::fs::write(unit_path(&host.config_dir()), b"[Unit]").unwrap();
+        host.script
+            .borrow_mut()
+            .active_word
+            .insert("toka-search.service".into(), "inaktiv".into());
+
+        let (error, _) =
+            perform_on(&mut host, ServiceManager::Systemd, ServiceOp::Stop).unwrap_err();
+        assert!(error.contains("could not ask systemd"), "{error}");
+
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .active_word
+            .insert("toka-search.service".into(), "inaktiv".into());
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["toka-search.service is not installed".to_owned()]
+        );
+        assert!(
+            host.calls_to("stop toka-search").is_empty(),
+            "{:?}",
+            host.calls
+        );
+    }
+
+    #[test]
+    fn fileless_unknown_state_proceeds_without_stopping() {
+        // A signal-killed probe with nothing installed: the reset's
+        // pre-stop and the uninstall both proceed — there is no file to
+        // remove and no confirmed daemon to stop.
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .active_unknown
+            .insert("toka-search.service".into());
+        host.script
+            .borrow_mut()
+            .active_unknown
+            .insert("toka-indexer.service".into());
+
+        stop_for_reset(&mut host, ServiceManager::Systemd).unwrap();
+        assert!(
+            host.calls_to("stop").is_empty(),
+            "reset stops nothing fileless: {:?}",
+            host.calls
+        );
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["toka-search.service is not installed".to_owned()]
+        );
+        assert!(
+            host.calls_to("stop").is_empty(),
+            "uninstall stops nothing fileless: {:?}",
+            host.calls
+        );
+
+        // Launchd's matching arm: an unexpected print failure with no
+        // plist installed proceeds the same way.
+        let mut host = Fake::new();
+        host.script
+            .borrow_mut()
+            .fail
+            .insert("launchctl print gui/501/app.toka.ts".to_owned());
+
+        stop_for_reset(&mut host, ServiceManager::Launchd).unwrap();
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["app.toka.ts is not installed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn fileless_uninstall_proceeds_when_the_manager_is_unreachable() {
+        // No service file and no manager to ask: both managers proceed —
+        // there is nothing installed to remove — instead of failing on a
+        // stop.
+        let mut host = Fake::new();
+        host.script.borrow_mut().missing.insert("systemctl".into());
+        let data = host.home().join("data");
+        std::fs::write(&data, b"index").unwrap();
+        host.purge = vec![data.clone()];
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["toka-search.service is not installed".to_owned()]
+        );
+        assert!(!data.exists(), "the purge itself still runs");
+
+        let mut host = Fake::new();
+        host.script.borrow_mut().missing.insert("launchctl".into());
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Uninstall { purge_data: false },
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.unchanged(&outcome),
+            vec!["app.toka.ts is not installed".to_owned()]
+        );
+        assert!(host.changed(&outcome).is_empty());
+    }
+
+    #[test]
+    fn install_migration_proceeds_when_the_manager_is_unreachable() {
+        // The legacy check cannot stop what it cannot see — and with no
+        // legacy file there is nothing to migrate — so the install fails
+        // later, at the reload, having attempted no legacy stop.
+        let mut host = Fake::new();
+        host.script.borrow_mut().missing.insert("systemctl".into());
+
+        let (error, partial) = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not run systemctl"), "{error}");
+        assert!(
+            host.calls_to("stop toka-indexer").is_empty(),
+            "{:?}",
+            host.calls
+        );
+        assert!(
+            host.unchanged(&partial)
+                .iter()
+                .any(|action| action == "no old toka-indexer.service to migrate"),
+            "{}",
+            host.unchanged(&partial).join("\n")
+        );
+    }
+
+    #[test]
+    fn launchd_install_retry_without_program_always_reloads() {
+        // Old `launchctl print` output names no program: after a failed
+        // reload the retry cannot confirm the loaded agent is current, so
+        // it reloads instead of reporting the stale agent "already running".
+        let mut host = Fake::new();
+        perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+        host.executable = host.home().join("elsewhere").join("ts");
+        host.script
+            .borrow_mut()
+            .fail
+            .insert(format!("launchctl bootout {}", launchd_target(&host)));
+
+        // The bootout fails after the rewrite: the loaded agent still
+        // runs the old binary.
+        perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap_err();
+        host.script.borrow_mut().fail.clear();
+        // Old launchctl: the retry's `print` names no program.
+        host.script.borrow_mut().program = None;
+        host.calls.clear();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+
+        assert!(!host.calls_to("bootout").is_empty(), "{:?}", host.calls);
+        assert!(!host.calls_to("bootstrap").is_empty(), "{:?}", host.calls);
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action == "reloaded app.toka.ts"),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            host.unchanged(&outcome)
+                .iter()
+                .all(|action| !action.contains("already running")),
+            "{}",
+            host.unchanged(&outcome).join("\n")
+        );
+    }
+
+    #[test]
+    fn launchd_purge_uninstall_stops_only_once_when_bootout_does_not_unload() {
+        // A manager that reports bootout success without unloading: the
+        // pre-stop and the main flow must not each report a stop.
+        let mut host = Fake::new();
+        perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Install { link: false },
+        )
+        .unwrap();
+        host.script.borrow_mut().bootout_noop = true;
+        host.calls.clear();
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Launchd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert_eq!(host.calls_to("bootout").len(), 1, "{:?}", host.calls);
+        assert_eq!(
+            host.changed(&outcome)
+                .iter()
+                .filter(|action| *action == "stopped app.toka.ts")
+                .count(),
+            1,
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
+        assert!(
+            !plist_path(&host.home()).exists(),
+            "the plist is still removed"
+        );
+    }
+
+    #[test]
+    fn purge_leaves_crash_litter_beside_the_index() {
+        // A kill -9 mid-write leaves the overlay's temp sibling beside the
+        // database; it is no known index file, so a purge removes the
+        // index around it and leaves the litter behind.
+        let mut host = Fake::new();
+        let database = host.home().join("index.sqlite3");
+        for name in [
+            "index.sqlite3",
+            "index.sqlite3-wal",
+            "index.sqlite3-shm",
+            "daemon.lock",
+            "search-renames.json",
+            "search-renames.lock",
+        ] {
+            std::fs::write(host.home().join(name), b"data").unwrap();
+        }
+        let litter = host.home().join("search-renames.json.tmp-999-0");
+        std::fs::write(&litter, b"partial").unwrap();
+        host.purge = crate::owned_index::index_data_files(&database);
+
+        let outcome = perform_on(
+            &mut host,
+            ServiceManager::Systemd,
+            ServiceOp::Uninstall { purge_data: true },
+        )
+        .unwrap();
+
+        assert!(!database.exists());
+        assert!(litter.is_file(), "tmp litter survives the purge");
+        assert!(
+            host.changed(&outcome)
+                .iter()
+                .any(|action| action.contains("index.sqlite3")),
+            "{}",
+            host.changed(&outcome).join("\n")
+        );
     }
 }

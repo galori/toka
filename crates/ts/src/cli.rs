@@ -14,7 +14,9 @@ use toka_search::{
 };
 
 /// The version of every `--json` document this CLI prints. The app checks it
-/// before parsing.
+/// before parsing. A failed service command adds an `error` key to its
+/// document without a version bump: success documents never carry the key,
+/// so readers gate on the exit status.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
 const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
@@ -44,15 +46,15 @@ const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the t
 const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
 const PREVIEW_HELP: &str = "Usage: ts preview <path> [--json]\n\nPrint the preview frames for one video, one per line, generating them on the first run as the app does on hover; an image prints as its own single frame. Prints one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 const INSTALL_USAGE: &str = "Usage: ts install [--link] [--json]";
-const INSTALL_HELP: &str = "Usage: ts install [--link] [--json]\n\nInstall the indexer as a background service for this ts: a systemd user unit on Linux, a launchd agent on macOS. The service runs `ts daemon run`, starts now, and starts again at login. On Linux the old toka-indexer.service is migrated away, and login lingering is attempted so indexing can continue while logged out (without it, indexing stops at logout). Safe to re-run: every step reports what it did versus the state it already found. The service always points at the ts that installed it last: installing from another copy takes it over, and says so. Run as your own user, never under sudo: under sudo the service would be installed for root instead of you.\n\n  --link       Also link this ts into ~/.local/bin\n  --json       Print one JSON document (schema 1) instead of the report";
+const INSTALL_HELP: &str = "Usage: ts install [--link] [--json]\n\nInstall the indexer as a background service for this ts: a systemd user unit on Linux, a launchd agent on macOS. The service runs `ts daemon run`, starts now, and starts again at login. On Linux the old toka-indexer.service is migrated away, and login lingering is attempted so indexing can continue while logged out (without it, indexing stops at logout). Safe to re-run: every step reports what it did versus the state it already found. The service always points at the ts that installed it last: installing from another copy takes it over, and says so. Run as your own user, never under sudo: under sudo the service would be installed for root instead of you.\n\n  --link       Also link this ts into ~/.local/bin\n  --json       Print one JSON document (schema 1) instead of the report. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key";
 const UNINSTALL_USAGE: &str = "Usage: ts uninstall [--purge-data] [--json]";
-const UNINSTALL_HELP: &str = "Usage: ts uninstall [--purge-data] [--json]\n\nStop and remove the indexer service. Safe to re-run: removing what was never installed succeeds and says so.\n\n  --purge-data   Also remove the index, the logs, and the thumbnail cache (never media)\n  --json         Print one JSON document (schema 1) instead of the report";
+const UNINSTALL_HELP: &str = "Usage: ts uninstall [--purge-data] [--json]\n\nStop and remove the indexer service. Safe to re-run: removing what was never installed succeeds and says so.\n\n  --purge-data   Also remove the index, the logs, and the thumbnail cache (never media)\n  --json         Print one JSON document (schema 1) instead of the report. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key";
 const RESTART_USAGE: &str = "Usage: ts restart [--json]";
-const RESTART_HELP: &str = "Usage: ts restart [--json]\n\nRestart the indexer service: a stop plus a start, so a stopped service ends up running and `ts status` uptime resets. The service must be installed first.";
+const RESTART_HELP: &str = "Usage: ts restart [--json]\n\nRestart the indexer service: a stop plus a start, so a stopped service ends up running and `ts status` uptime resets. The service must be installed first. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key.";
 const START_USAGE: &str = "Usage: ts start [--json]";
-const START_HELP: &str = "Usage: ts start [--json]\n\nStart the indexer service. Starting what already runs succeeds and says so. The service must be installed first.";
+const START_HELP: &str = "Usage: ts start [--json]\n\nStart the indexer service. Starting what already runs succeeds and says so. The service must be installed first. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key.";
 const STOP_USAGE: &str = "Usage: ts stop [--json]";
-const STOP_HELP: &str = "Usage: ts stop [--json]\n\nStop the indexer service. Stopping what already stopped — or was never installed — succeeds and says so.";
+const STOP_HELP: &str = "Usage: ts stop [--json]\n\nStop the indexer service. Stopping what already stopped — or was never installed — succeeds and says so. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key.";
 
 fn search_help() -> String {
     format!(
@@ -5956,6 +5958,23 @@ mod tests {
     }
 
     #[test]
+    fn service_helps_document_the_json_failure_contract() {
+        for command in ["install", "uninstall", "restart", "start", "stop"] {
+            // `no_service` panics when called: help must not run anything.
+            let (status, stdout, _) = run_with_service(&["ts", command, "--help"], no_service);
+            assert_eq!(status, 0, "{command}");
+            assert!(
+                stdout.contains("`error`"),
+                "{command} help documents no failure key: {stdout}"
+            );
+            assert!(
+                stdout.contains("success documents omit the key"),
+                "{command} help omits no success note: {stdout}"
+            );
+        }
+    }
+
+    #[test]
     fn install_reports_each_action_and_succeeds() {
         let (status, stdout, stderr) = run_with_service(&["ts", "install"], |op| {
             assert_eq!(op, ServiceOp::Install { link: false });
@@ -6013,6 +6032,10 @@ mod tests {
         );
         assert_eq!(document["actions"][0]["changed"], true);
         assert_eq!(document["actions"][1]["changed"], false);
+        assert!(
+            document.get("error").is_none(),
+            "success documents omit the key: {document}"
+        );
         assert!(stderr.is_empty());
     }
 

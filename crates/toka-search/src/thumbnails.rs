@@ -152,7 +152,26 @@ fn cache_output(video: &Path) -> PathBuf {
 }
 
 pub fn cache_output_root() -> PathBuf {
-    std::env::temp_dir().join(crate::config::THUMBNAIL_CACHE_DIR_NAME)
+    std::env::temp_dir().join(cache_dir_name_for(current_uid()))
+}
+
+/// The cache directory name for one user: uid-scoped like the daemon
+/// runtime dir, so two users sharing a temporary directory never share
+/// (or fight over) one cache. An upgrade orphans the previous
+/// unscoped name; the cache regenerates on first use.
+fn cache_dir_name_for(uid: u32) -> String {
+    format!("{}-{uid}", crate::config::THUMBNAIL_CACHE_DIR_NAME)
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
 }
 
 fn fingerprint(video: &Path) -> String {
@@ -283,6 +302,16 @@ mod tests {
     use super::*;
     use std::{fs, thread, time::Duration};
     use tempfile::tempdir;
+
+    #[test]
+    fn the_thumbnail_cache_is_scoped_to_the_user() {
+        assert_eq!(cache_dir_name_for(501), "toka-thumbnails-501");
+        assert_eq!(cache_dir_name_for(0), "toka-thumbnails-0");
+        assert_eq!(
+            cache_output_root(),
+            std::env::temp_dir().join(cache_dir_name_for(current_uid()))
+        );
+    }
 
     #[test]
     fn preview_offsets_are_spread_inside_the_video() {

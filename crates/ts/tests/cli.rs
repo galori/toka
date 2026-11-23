@@ -823,6 +823,19 @@ fn run_at_in(home: &ScratchHome, cwd: &Path, arguments: &[&str]) -> Output {
     )
 }
 
+/// The thumbnail cache dir a scratch child resolves: its scratch TMPDIR
+/// plus the uid-scoped cache name, mirroring
+/// `toka_search::thumbnails::cache_output_root` under the child's
+/// environment. The child runs as this user, so its uid is ours.
+fn thumbnail_cache_dir(home: &Path) -> PathBuf {
+    use toka_search::service::{Host, SystemHost};
+    let uid = SystemHost::for_query().map(|host| host.uid()).unwrap_or(0);
+    home.join("tmp").join(format!(
+        "{}-{uid}",
+        toka_search::config::THUMBNAIL_CACHE_DIR_NAME
+    ))
+}
+
 fn create_image(directory: &Path, name: &str) -> PathBuf {
     let path = directory.join(name);
     fs::write(&path, b"fixture image").unwrap();
@@ -1626,11 +1639,7 @@ fn same_named_files_in_different_directories_keep_distinct_cache_entries(command
         assert!(output.stdout.is_empty());
     }
 
-    let cache = home
-        .home
-        .path()
-        .join("tmp")
-        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let cache = thumbnail_cache_dir(home.home.path());
     let markers = fs::read_dir(&cache)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -1730,11 +1739,7 @@ fn thumbnail_with_an_empty_path_is_a_usage_error() {
     assert!(stderr.contains("Usage: ts thumbnail"), "{stderr}");
 
     // The generator never ran, so no cache entry exists.
-    let cache = home
-        .home
-        .path()
-        .join("tmp")
-        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let cache = thumbnail_cache_dir(home.home.path());
     let entries = fs::read_dir(&cache)
         .map(|entries| entries.count())
         .unwrap_or(0);
@@ -2432,19 +2437,21 @@ fi
 verb="$2"
 unit=""
 for arg in "$@"; do unit="$arg"; done
+unitdir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 active="$TS_SHIM_STATE/active_$unit"
 enabled="$TS_SHIM_STATE/enabled_$unit"
 case "$verb" in
   is-active)
-    if [ "$(cat "$active" 2>/dev/null)" = "1" ]; then echo "active"; exit 0;
+    if [ -f "$TS_SHIM_STATE/word_$unit" ]; then cat "$TS_SHIM_STATE/word_$unit"; exit 3;
+    elif [ "$(cat "$active" 2>/dev/null)" = "1" ]; then echo "active"; exit 0;
     elif [ "$(cat "$TS_SHIM_STATE/activating_$unit" 2>/dev/null)" = "1" ]; then echo "activating"; exit 3;
+    elif [ ! -f "$unitdir/$unit" ] && [ ! -f "$HOME/.config/systemd/user/$unit" ]; then echo "unknown"; exit 3;
     else echo "inactive"; exit 3; fi;;
   is-enabled)
     if [ "$(cat "$enabled" 2>/dev/null)" = "1" ]; then echo "enabled"; exit 0;
     else echo "disabled"; exit 1; fi;;
   show)
-    dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-    line=$(grep '^ExecStart=' "$dir/$unit" 2>/dev/null | head -n 1)
+    line=$(grep '^ExecStart=' "$unitdir/$unit" 2>/dev/null | head -n 1)
     exe=$(printf '%s' "$line" | sed -n 's/^ExecStart="\(.*\)" daemon run$/\1/p')
     if [ -n "$exe" ]; then echo "ExecStart={ path=$exe ; argv[]=$exe daemon run ; ignore_errors=no }";
     else echo "ExecStart="; fi;;
@@ -2477,7 +2484,10 @@ case "$1" in
     else
       echo "Could not find service $2 in domain" >&2; exit 1
     fi;;
-  bootstrap) echo 1 > "$TS_SHIM_STATE/bootstrapped"; echo 1 > "$TS_SHIM_STATE/job_running";;
+  bootstrap)
+    echo 1 > "$TS_SHIM_STATE/bootstrapped"; echo 1 > "$TS_SHIM_STATE/job_running"
+    exe=$(grep -A3 '<key>ProgramArguments</key>' "$3" 2>/dev/null | grep '<string>' | head -n 1 | sed 's/.*<string>//;s/<\/string>.*//')
+    if [ -n "$exe" ]; then printf '%s' "$exe" > "$TS_SHIM_STATE/program"; else rm -f "$TS_SHIM_STATE/program"; fi;;
   bootout) echo 0 > "$TS_SHIM_STATE/bootstrapped"; echo 0 > "$TS_SHIM_STATE/job_running";;
   kickstart)
     if [ "$(cat "$TS_SHIM_STATE/bootstrapped" 2>/dev/null)" = "1" ]; then
@@ -2606,6 +2616,57 @@ fn shim_plist_file(home: &ShimHome) -> PathBuf {
 #[cfg(unix)]
 fn shim_link(home: &ShimHome) -> PathBuf {
     home.home().join(".local/bin/ts")
+}
+
+#[cfg(unix)]
+#[test]
+fn the_systemctl_shim_answers_unknown_for_never_loaded_units() {
+    // Pins the shim's never-loaded answers without a `ts` run: exit-3
+    // `unknown` from `is-active`, an empty `ExecStart=` from `show` — the
+    // words real systemctl uses for a unit it never loaded.
+    let dir = tempdir().unwrap();
+    let shim = dir.path().join("systemctl");
+    fs::write(&shim, SYSTEMCTL_SHIM).unwrap();
+    let home = dir.path().join("home");
+    let xdg = dir.path().join("xdg");
+    let state = dir.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&xdg).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let log = dir.path().join("shim.log");
+    let run = |args: &[&str]| {
+        Command::new("sh")
+            .arg(&shim)
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TS_SHIM_STATE", &state)
+            .env("TS_SHIM_LOG", &log)
+            .env_remove("TS_SHIM_FAIL")
+            .output()
+            .unwrap()
+    };
+
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(probe.status.code(), Some(3));
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "unknown\n");
+
+    let show = run(&["--user", "show", "-p", "ExecStart", "toka-search.service"]);
+    assert_eq!(String::from_utf8(show.stdout).unwrap(), "ExecStart=\n");
+
+    // A pinned word wins outright, and a unit file the manager would
+    // load on demand reads as loaded-but-stopped.
+    fs::write(state.join("word_toka-search.service"), "inaktiv\n").unwrap();
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inaktiv\n");
+    fs::remove_file(state.join("word_toka-search.service")).unwrap();
+
+    let unit = xdg.join("systemd/user/toka-search.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Unit]\n").unwrap();
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(probe.status.code(), Some(3));
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inactive\n");
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -2765,6 +2826,59 @@ fn install_fails_when_the_manager_refuses_to_start() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("wrote ~/"), "{stdout}");
     assert!(stdout.contains("enabled toka-search.service"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn fresh_install_with_never_loaded_units_starts_without_bogus_stops() {
+    // The shim answers real systemctl's exit-3 `unknown` for units it
+    // never loaded: a fresh install starts the service without stopping
+    // the unknown first.
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("started toka-search.service"), "{stdout}");
+    assert!(!stdout.contains("restarted"), "{stdout}");
+    assert!(!stdout.contains("stopped"), "{stdout}");
+    let calls = home.calls();
+    assert!(!calls.contains("stop"), "{calls}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn stop_with_an_unreadable_word_and_a_file_fails_closed() {
+    // A pinned `unknown` — or a localized word — with a unit file
+    // installed: a lingering service may still run there, so stop errors
+    // instead of claiming convergence.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    for word in ["unknown", "inaktiv"] {
+        fs::write(
+            home.state.join("word_toka-search.service"),
+            format!("{word}\n"),
+        )
+        .unwrap();
+
+        let output = run_shimmed(&home, &["stop"]);
+
+        assert_eq!(output.status.code(), Some(1), "{word}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("could not ask systemd"),
+            "{word}"
+        );
+    }
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -2952,6 +3066,25 @@ fn install_is_idempotent() {
     let calls = home.calls();
     assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_without_a_reported_program_reloads_the_agent() {
+    // Old `launchctl print` output names no program: with the plist
+    // current but the loaded binary unconfirmable, the install reloads
+    // instead of reporting "already running".
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    fs::remove_file(home.state.join("program")).unwrap();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("reloaded app.toka.ts"), "{stdout}");
+    assert!(!stdout.contains("already running"), "{stdout}");
 }
 
 #[cfg(all(unix, target_os = "macos"))]
@@ -3185,7 +3318,7 @@ fn uninstall_purge_removes_data_but_keeps_media() {
     let logs_dir = home.scratch.data_home.join("app.toka.desktop/logs");
     fs::create_dir_all(&logs_dir).unwrap();
     fs::write(logs_dir.join("search.log"), b"log").unwrap();
-    let cache_dir = home.home().join("tmp/toka-thumbnails");
+    let cache_dir = thumbnail_cache_dir(home.home());
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("thumb.jpg"), b"thumb").unwrap();
     // Foreign content inside the index directory: purge deletes only
