@@ -22,6 +22,34 @@ so no system-wide setup is needed. See the platform quick-start guide for detail
 The macOS install puts the app in `/Applications` and links the `toka` command
 in `~/.local/bin`.
 
+## Releases
+
+Published builds are on the [Releases page](https://github.com/galori/toka/releases):
+
+- macOS (Apple Silicon): the `.dmg`, or the `.app.tar.gz` when you prefer to
+  unpack the app yourself.
+- Ubuntu/Debian: the `.deb`, or the portable `.AppImage`. The `.deb` installs
+  its playback dependency automatically; the `.AppImage` needs `libmpv2` on
+  the host (`sudo apt install libmpv2`).
+
+The builds are unsigned. On first launch macOS Gatekeeper may refuse to open
+Toka. On macOS Sequoia, Control-click does not override Gatekeeper for
+unsigned apps. Instead:
+
+1. Try to open Toka, then dismiss the warning.
+2. Open System Settings > Privacy & Security, scroll to the Security section,
+   and click Open Anyway.
+3. Open Toka again and confirm. Enter your admin password if prompted.
+
+On earlier macOS versions, right-click (or Control-click) the app, choose
+Open, then confirm.
+
+Maintainers cut a release by setting the base version in `package.json`,
+`src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` in a dedicated commit,
+then pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The
+release workflow checks the tag against all three manifests and publishes the
+bundles.
+
 ## Search
 
 A search looks at three separate things, and any combination of them can be

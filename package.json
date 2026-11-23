@@ -13,7 +13,7 @@
     "build": "tsc && node bin/build-frontend.mjs",
     "search-log": "node bin/toka-search-log.mjs --follow",
     "lint": "eslint . --max-warnings=0",
-    "format:check": "prettier --check package.json package-lock.json eslint.config.js .prettierrc.json .github/workflows/pr-quality.yml",
+    "format:check": "prettier --check package.json package-lock.json eslint.config.js .prettierrc.json .github/workflows/pr-quality.yml .github/workflows/release.yml",
     "test": "vitest run",
     "gen:test-data": "node scripts/generate-test-data.mjs",
     "test:integration": "node scripts/run-integration.mjs all",
