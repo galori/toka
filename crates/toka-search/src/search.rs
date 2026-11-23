@@ -347,17 +347,17 @@ struct SearchSnapshots {
 }
 
 impl SearchEngine {
-    #[cfg(test)]
+    // Unconditional (not just `cfg(test)`): the app's tests build engines too,
+    // and this crate compiles without `cfg(test)` when they do.
     pub fn new(provider: Arc<dyn SearchProvider>) -> Self {
         Self::new_with_logger(provider, Arc::new(SearchLogger::disabled()))
     }
 
-    #[cfg(test)]
     pub fn new_with_logger(provider: Arc<dyn SearchProvider>, logger: Arc<SearchLogger>) -> Self {
         Self::new_with_logger_and_ttl(provider, logger, SNAPSHOT_TTL)
     }
 
-    pub(crate) fn new_with_logger_and_rename_store(
+    pub fn new_with_logger_and_rename_store(
         provider: Arc<dyn SearchProvider>,
         logger: Arc<SearchLogger>,
         rename_overlay_path: Option<PathBuf>,
@@ -375,7 +375,6 @@ impl SearchEngine {
         Self::new_with_logger_and_ttl(provider, Arc::new(SearchLogger::disabled()), snapshot_ttl)
     }
 
-    #[cfg(test)]
     fn new_with_logger_and_ttl(
         provider: Arc<dyn SearchProvider>,
         logger: Arc<SearchLogger>,

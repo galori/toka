@@ -1,0 +1,22 @@
+[package]
+name = "toka-search"
+version = "0.1.1"
+description = "Toka search and indexing: owned SQLite index, search engine, tags, thumbnails, and the indexer daemon"
+authors = ["Toka contributors"]
+edition = "2021"
+
+[features]
+e2e = []
+
+[dependencies]
+dirs = "6"
+libc = "0.2"
+notify = "8"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

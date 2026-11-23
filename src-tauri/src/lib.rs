@@ -1,34 +1,32 @@
 mod addons;
 mod cli;
 mod external_players;
-mod index_stats;
-mod index_visibility;
-#[cfg(any(target_os = "linux", test))]
-mod indexer_daemon;
 mod launch;
-mod owned_index;
 #[cfg(target_os = "linux")]
 mod player_linux;
 mod playlist;
-mod providers;
-mod reset;
 mod restart;
-mod search;
-mod search_log;
 mod subtitles;
-mod tags;
-mod thumbnails;
-mod timestamp;
 
-use owned_index::{IndexUpdates, OwnedIndexUpdates};
-use providers::OwnedIndexSearchProvider;
-use search::{SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest};
-use search_log::{SearchLogSettings, SearchLogger};
+// The search and indexing modules live in the `toka-search` crate. They are
+// imported by module name so the rest of this file — and `crate::search`
+// paths elsewhere — keep working unchanged.
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
+#[cfg(target_os = "linux")]
+use toka_search::indexer_daemon;
+use toka_search::{
+    index_stats,
+    owned_index::{self, IndexUpdates, OwnedIndexUpdates},
+    providers::OwnedIndexSearchProvider,
+    reset,
+    search::{self, SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest},
+    search_log::{self, SearchLogSettings, SearchLogger},
+    tags, thumbnails,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

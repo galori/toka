@@ -1,11 +1,11 @@
-use crate::{
-    index_stats::{self, IndexStats},
-    reset::{self, ResetPlan},
-    search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
-};
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
+};
+use toka_search::{
+    index_stats::{self, IndexStats},
+    reset::{self, ResetPlan},
+    search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
 };
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";

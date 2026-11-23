@@ -13,7 +13,7 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub(crate) struct SearchLogContext {
+pub struct SearchLogContext {
     pub(crate) query: String,
     pub(crate) page: usize,
     pub(crate) page_size: usize,
@@ -41,12 +41,12 @@ impl From<&SearchRequest> for SearchLogContext {
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SearchLogSettings {
+pub struct SearchLogSettings {
     pub(crate) verbose: bool,
     pub(crate) path: Option<PathBuf>,
 }
 
-pub(crate) struct SearchLogger {
+pub struct SearchLogger {
     path: PathBuf,
     settings_path: Option<PathBuf>,
     settings: Mutex<SearchLogSettings>,
@@ -57,12 +57,12 @@ pub(crate) struct SearchLogger {
 }
 
 impl SearchLogger {
-    #[cfg(test)]
-    pub(crate) fn new(path: PathBuf) -> Self {
+    // Unconditional (not just `cfg(test)`): the app's tests build loggers too,
+    // and this crate compiles without `cfg(test)` when they do.
+    pub fn new(path: PathBuf) -> Self {
         Self::with_settings(path, None, SearchLogSettings::default(), None)
     }
 
-    #[cfg(test)]
     pub(crate) fn disabled() -> Self {
         Self::new(PathBuf::new())
     }
@@ -71,15 +71,18 @@ impl SearchLogger {
         #[cfg(target_os = "macos")]
         let path = dirs::home_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("Library/Logs/app.toka.desktop/search.log");
+            .join("Library/Logs")
+            .join(crate::config::APP_LOG_DIR_NAME)
+            .join("search.log");
         #[cfg(not(target_os = "macos"))]
         let path = dirs::data_local_dir()
             .unwrap_or_else(std::env::temp_dir)
-            .join("app.toka.desktop/logs/search.log");
+            .join(crate::config::APP_LOG_DIR_NAME)
+            .join("logs/search.log");
         path
     }
 
-    pub(crate) fn system() -> Self {
+    pub fn system() -> Self {
         let path = Self::system_path();
         let settings_path = path.with_file_name("search-log-settings.json");
         let settings = load_settings(&settings_path);
@@ -112,11 +115,11 @@ impl SearchLogger {
         }
     }
 
-    pub(crate) fn settings(&self) -> SearchLogSettings {
+    pub fn settings(&self) -> SearchLogSettings {
         self.settings.lock().unwrap().clone()
     }
 
-    pub(crate) fn set_settings(
+    pub fn set_settings(
         &self,
         verbose: bool,
         path: Option<PathBuf>,
@@ -264,7 +267,7 @@ fn now_seconds() -> u64 {
 /// Every log file Toka writes: its log folder (the search log, its settings and
 /// session markers, and on Linux the indexer log) and any verbose search logs
 /// saved to the folder the user chose.
-pub(crate) fn reset_paths() -> Vec<PathBuf> {
+pub fn reset_paths() -> Vec<PathBuf> {
     let path = SearchLogger::system_path();
     let Some(directory) = path.parent() else {
         return Vec::new();
@@ -286,7 +289,7 @@ fn verbose_log_files(directory: &Path) -> Vec<PathBuf> {
         .filter(|entry| {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            name.starts_with("toka_search_log_")
+            name.starts_with(crate::config::VERBOSE_LOG_FILE_PREFIX)
                 && name.ends_with(".log")
                 && entry.file_type().is_ok_and(|kind| kind.is_file())
         })
@@ -330,7 +333,8 @@ fn validate_log_directory(path: &Path) -> Result<(), String> {
         return Err("Choose an existing folder for verbose search logs.".into());
     }
     let probe = path.join(format!(
-        ".toka-search-log-write-test-{}-{}",
+        "{}{}-{}",
+        crate::config::LOG_WRITE_PROBE_PREFIX,
         std::process::id(),
         VERBOSE_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -359,7 +363,8 @@ fn create_verbose_log(
     }
     for _ in 0..10 {
         let name = format!(
-            "toka_search_log_{}_{}_{}.log",
+            "{}{}_{}_{}.log",
+            crate::config::VERBOSE_LOG_FILE_PREFIX,
             now_millis(),
             std::process::id(),
             VERBOSE_COUNTER.fetch_add(1, Ordering::Relaxed)

@@ -2,12 +2,12 @@ use crate::search::{tokenize_query, SearchError, SearchProvider};
 use crate::search_log::SearchLogContext;
 use std::path::PathBuf;
 
-pub(crate) struct OwnedIndexSearchProvider {
+pub struct OwnedIndexSearchProvider {
     database: PathBuf,
 }
 
 impl OwnedIndexSearchProvider {
-    pub(crate) fn new(database: PathBuf) -> Self {
+    pub fn new(database: PathBuf) -> Self {
         Self { database }
     }
 }
