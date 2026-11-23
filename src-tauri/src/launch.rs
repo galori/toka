@@ -3,6 +3,63 @@ use std::{ffi::OsString, path::PathBuf};
 
 pub const ADDON_SEARCH_FLAG: &str = "--toka-addon-search";
 
+/// Whether this process should hand its GUI launch to a detached child and
+/// exit: a media, empty, or add-on search launch whose standard output or
+/// error is a terminal, i.e. Toka was started from an interactive shell.
+/// CLI commands, the indexer service, and piped or headless launches stay in
+/// this process, so their output and exit status still reach the caller.
+pub fn should_detach_gui(
+    arguments: &[OsString],
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    let stays_foreground = arguments
+        .get(1)
+        .is_some_and(|argument| argument == "--indexer")
+        || crate::cli::is_command(arguments);
+    !stays_foreground && (stdout_is_terminal || stderr_is_terminal)
+}
+
+/// Starts the same GUI launch as a session-detached child with no standard
+/// streams and exits this process, so the shell that started Toka gets its
+/// prompt back immediately and never sees the GUI toolkit's output. Only
+/// called after [`should_detach_gui`] agrees.
+#[cfg(target_os = "linux")]
+pub fn detach_gui(arguments: &[OsString]) -> ! {
+    use std::os::unix::process::CommandExt;
+
+    let spawn = || -> Result<(), String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Toka could not find its own program: {error}"))?;
+        let mut command = std::process::Command::new(&executable);
+        command.args(arguments.iter().skip(1));
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: setsid is async-signal-safe; it detaches the child so it
+        // survives this process and its terminal.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Toka could not start {}: {error}", executable.display()))
+    };
+
+    match spawn() {
+        Ok(()) => std::process::exit(0),
+        Err(message) => {
+            eprintln!("toka: {message}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchIntent {
     Empty,
@@ -41,6 +98,72 @@ mod tests {
 
     fn arguments(arguments: impl IntoIterator<Item = String>) -> Vec<OsString> {
         arguments.into_iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn a_media_launch_from_a_terminal_hands_off_to_a_detached_child() {
+        assert!(super::should_detach_gui(
+            &arguments(["toka".into(), "sample1.mp4".into()]),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn an_empty_launch_from_a_terminal_hands_off_to_a_detached_child() {
+        assert!(super::should_detach_gui(
+            &arguments(["toka".into()]),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn an_addon_search_launch_from_a_terminal_hands_off_to_a_detached_child() {
+        assert!(super::should_detach_gui(
+            &arguments(["toka".into(), "--toka-addon-search".into(), "{}".into()]),
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn cli_commands_stay_in_the_terminal_they_were_run_from() {
+        for words in [
+            vec!["toka", "search", "cats"],
+            vec!["toka", "reset"],
+            vec!["toka", "reset", "--yes"],
+            vec!["toka", "restart"],
+            vec!["toka", "--index-stats"],
+            vec!["toka", "--help"],
+            vec!["toka", "-h"],
+            vec!["toka", "--version"],
+            vec!["toka", "-v"],
+        ] {
+            let owned: Vec<String> = words.into_iter().map(str::to_owned).collect();
+            assert!(
+                !super::should_detach_gui(&arguments(owned.clone()), true, true),
+                "{owned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_indexer_stays_in_the_foreground_it_was_started_from() {
+        assert!(!super::should_detach_gui(
+            &arguments(["toka".into(), "--indexer".into()]),
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn a_piped_gui_launch_stays_in_the_foreground() {
+        assert!(!super::should_detach_gui(
+            &arguments(["toka".into(), "sample1.mp4".into()]),
+            false,
+            false,
+        ));
     }
 
     #[test]
