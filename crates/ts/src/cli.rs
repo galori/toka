@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::{
     ffi::{OsStr, OsString},
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -22,7 +22,7 @@ const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--pag
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
-const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether the indexer daemon is running and what it is doing: its process, uptime, current activity (idle, scanning, repairing, thumbnails, or offline-waiting), the folder and file under the cursor, and the work still queued. Exits 3 when the daemon is not running, so scripts can branch on it. Changes nothing.\n\n  --json       Print one JSON document (schema 1) instead of the report\n  --watch      Re-render in place every second until the daemon turns idle";
+const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether the indexer daemon is running and what it is doing: its process, uptime, current activity (idle, scanning, repairing, thumbnails, offline-waiting, or unknown from a newer daemon), the folder and file under the cursor, and the work still queued. Folders whose storage is missing count as offline and are listed on their own line, never as queued work; folders backing off after an error still count as pending until they scan. Exits 3 when the daemon is not running, so scripts can branch on it. Changes nothing.\n\n  --json       Print one JSON document (schema 1) instead of the report\n  --watch      Re-render every second until the daemon is idle with nothing queued; offline folders never hold the wait. Stop it with Ctrl-C";
 const DAEMON_HELP: &str =
     "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
 const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
@@ -638,9 +638,13 @@ fn run_status_command(
         return 2;
     };
     if watch {
+        // Screen clears only reach a terminal: piped watch output stays a
+        // plain stream of reports, with no escape sequences in it.
+        let clear_screen = !json && std::io::stdout().is_terminal();
         return run_status_watch(
             read_status,
             json,
+            clear_screen,
             || std::thread::sleep(Duration::from_secs(1)),
             stdout,
             stderr,
@@ -718,27 +722,59 @@ fn print_status(
     }
 }
 
-/// Re-reads the daemon status until it turns idle or stops: `--watch`.
-/// Human output clears the screen between renders; `--json` streams one
-/// document per line instead, so it stays machine-readable.
+/// How many times `--watch` retries a failed status read before giving
+/// up. Each retry waits out the normal one-second cadence, so a transient
+/// failure (a locked database mid-scan) rides out about five seconds of
+/// trouble; anything longer is reported and exits 1.
+const WATCH_READ_RETRIES: u32 = 5;
+
+/// Whether `--watch` is done: the daemon reports idle (or waiting on
+/// offline storage alone) with nothing actionable queued. Offline folders
+/// never hold the wait; an unknown activity keeps watching, since only a
+/// known-idle daemon proves the queue drained.
+fn watch_is_done(status: &DaemonStatus) -> bool {
+    status.running
+        && status.queue.is_empty()
+        && matches!(
+            status.activity,
+            Some(DaemonActivity::Idle | DaemonActivity::OfflineWaiting)
+        )
+}
+
+/// Re-reads the daemon status until the queue drains or the daemon stops:
+/// `--watch`. Human output clears the screen between renders when it
+/// reaches a terminal; piped output and `--json` stay plain streams, JSON
+/// as one compact document per line.
 fn run_status_watch(
     mut read_status: impl FnMut() -> Result<DaemonStatus, String>,
     json: bool,
+    clear_screen: bool,
     mut wait: impl FnMut(),
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
     let mut first = true;
+    let mut failures = 0;
     loop {
         let status = match read_status() {
-            Ok(status) => status,
+            Ok(status) => {
+                failures = 0;
+                status
+            }
             Err(error) => {
-                let _ = writeln!(stderr, "ts status: {error}");
-                return 1;
+                // A failed read retries silently: only a failure that
+                // outlasts the retry bound is worth reporting.
+                failures += 1;
+                if failures > WATCH_READ_RETRIES {
+                    let _ = writeln!(stderr, "ts status: {error}");
+                    return 1;
+                }
+                wait();
+                continue;
             }
         };
-        if !json && !first {
-            // Re-render in place; plain `ts status` stays pipe-safe.
+        if clear_screen && !first {
+            // Re-render in place; piped output never sees these escapes.
             if write!(stdout, "\x1b[2J\x1b[H").is_err() {
                 let _ = writeln!(stderr, "ts status: could not write");
                 return 1;
@@ -752,7 +788,7 @@ fn run_status_watch(
             // A write or encode error (1), or a stopped daemon (3).
             return code;
         }
-        if status.activity == Some(DaemonActivity::Idle) {
+        if watch_is_done(&status) {
             return 0;
         }
         wait();
@@ -4707,6 +4743,7 @@ mod tests {
                 pending_repairs: 0,
                 pending_thumbnails: 0,
             },
+            offline_roots: 0,
             service_running: Some(true),
         }
     }
@@ -4721,6 +4758,7 @@ mod tests {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots: 0,
             service_running: Some(false),
         }
     }
@@ -4735,6 +4773,7 @@ mod tests {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots: 0,
             service_running: None,
         }
     }
@@ -5005,6 +5044,7 @@ mod tests {
         let code = super::run_status_watch(
             || Ok(reads.next().unwrap()),
             false,
+            true,
             || waits.set(waits.get() + 1),
             &mut stdout,
             &mut stderr,
@@ -5030,6 +5070,7 @@ mod tests {
         let code = super::run_status_watch(
             || Ok(reads.next().unwrap()),
             true,
+            false,
             || {},
             &mut stdout,
             &mut stderr,
@@ -5059,6 +5100,7 @@ mod tests {
         let code = super::run_status_watch(
             || Ok(reads.next().unwrap()),
             false,
+            true,
             || waits.set(waits.get() + 1),
             &mut stdout,
             &mut stderr,
@@ -5073,24 +5115,240 @@ mod tests {
     }
 
     #[test]
-    fn watch_read_failure_returns_a_failure_status() {
+    fn watch_waits_while_idle_with_work_queued() {
+        // An idle report with folders still pending predates the daemon's
+        // reconcile: the watch holds until the queue drains to idle.
+        let mut pending = idle_daemon();
+        pending.queue.pending_roots = 1;
+        let mut reads = [pending, idle_daemon()].into_iter();
+        let waits = std::cell::Cell::new(0);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
         let code = super::run_status_watch(
-            || Err::<DaemonStatus, _>("the index is locked".to_owned()),
+            || Ok(reads.next().unwrap()),
+            false,
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(waits.get(), 1);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: idle").count(), 2, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_exits_when_only_offline_folders_remain() {
+        // Offline folders wait for their storage, not for the daemon: an
+        // offline-waiting daemon with nothing actionable queued is done,
+        // and the report says what is still offline.
+        let mut waiting = idle_daemon();
+        waiting.activity = Some(DaemonActivity::OfflineWaiting);
+        waiting.offline_roots = 2;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(waiting.clone()),
+            false,
+            false,
+            || panic!("an offline-only watch must not wait"),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output.matches("Activity: offline-waiting").count(),
+            1,
+            "{output}"
+        );
+        assert!(
+            output.contains("Offline:  2 folders waiting for storage\n"),
+            "{output}"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_exits_on_idle_with_offline_folders_outstanding() {
+        // Idle with an empty queue is done even when offline folders are
+        // listed: they never hold the wait.
+        let mut idle = idle_daemon();
+        idle.offline_roots = 1;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(idle.clone()),
+            false,
+            false,
+            || panic!("an idle watch with only offline folders must not wait"),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Activity: idle\n"), "{output}");
+        assert!(
+            output.contains("Offline:  1 folder waiting for storage\n"),
+            "{output}"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_keeps_watching_an_unknown_activity() {
+        // Only a known-idle daemon proves the queue drained: an activity
+        // from a newer daemon holds the watch even with an empty queue.
+        let mut unknown = idle_daemon();
+        unknown.activity = Some(DaemonActivity::Unknown);
+        let mut reads = [unknown, idle_daemon()].into_iter();
+        let waits = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            false,
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(waits.get(), 1);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: unknown").count(), 1, "{output}");
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_without_a_terminal_never_clears_the_screen() {
+        // Piped watch output is a plain stream of reports: no escape
+        // sequences between renders.
+        let mut reads = [running_daemon(), running_daemon(), idle_daemon()].into_iter();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            false,
             false,
             || {},
             &mut stdout,
             &mut stderr,
         );
 
+        assert_eq!(code, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: scanning").count(), 2, "{output}");
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
+        assert!(!output.contains('\x1b'), "{output:?}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_read_failure_retries_before_failing() {
+        // A failure that outlasts the retry bound still exits 1, after one
+        // wait per retry and a single report of the last error.
+        let reads = std::cell::Cell::new(0u32);
+        let waits = std::cell::Cell::new(0u32);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || {
+                reads.set(reads.get() + 1);
+                Err::<DaemonStatus, _>("the index is locked".to_owned())
+            },
+            false,
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
         assert_eq!(code, 1);
+        assert_eq!(reads.get(), 1 + super::WATCH_READ_RETRIES);
+        assert_eq!(waits.get(), super::WATCH_READ_RETRIES);
         assert!(stdout.is_empty());
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
             "ts status: the index is locked\n"
         );
+    }
+
+    #[test]
+    fn watch_recovers_after_transient_read_failures() {
+        // Two failed reads ride out the retry bound silently; the
+        // recovered read renders and the watch continues from it.
+        let mut reads = [
+            Err("the index is locked".to_owned()),
+            Err("the index is locked".to_owned()),
+            Ok(idle_daemon()),
+        ]
+        .into_iter();
+        let waits = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || reads.next().unwrap(),
+            false,
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(waits.get(), 2);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn status_reports_an_unknown_activity_and_succeeds() {
+        // A newer daemon's activity renders verbatim; the daemon is
+        // running, so the command still exits 0.
+        let args = ["ts", "status"].map(OsString::from).to_vec();
+        let mut unknown = idle_daemon();
+        unknown.activity = Some(DaemonActivity::Unknown);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            || Ok(unknown.clone()),
+            no_daemon_run,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(output.contains("Activity: unknown\n"), "{output}");
+        assert!(stderr.is_empty());
     }
 
     #[test]

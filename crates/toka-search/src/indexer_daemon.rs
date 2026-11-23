@@ -5,7 +5,9 @@
 //! holds the Linux-only service helpers.
 
 use crate::daemon_state::DaemonActivity;
-use crate::owned_index::{OwnedIndex, OwnedIndexWatcher, ScanPhase, WatcherLive, WorkerStage};
+use crate::owned_index::{
+    OwnedIndex, OwnedIndexError, OwnedIndexWatcher, ScanPhase, WatcherLive, WorkerStage,
+};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 #[cfg(not(feature = "e2e"))]
@@ -285,6 +287,11 @@ pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLo
     Ok(Some(DaemonLock { _file: file }))
 }
 
+/// No-op lock where `flock` does not exist: non-Unix platforms run a
+/// single supervisor per index by deployment (the service manager starts
+/// one), so mutual exclusion is assumed rather than enforced. Liveness
+/// assumes the same: `process_is_alive` answers true there, so a fresh
+/// heartbeat alone reports the daemon running.
 #[cfg(not(unix))]
 pub(crate) fn try_acquire_daemon_lock(_database: &Path) -> Result<Option<DaemonLock>, String> {
     Ok(Some(DaemonLock))
@@ -459,6 +466,21 @@ fn current_path(live: &WatcherLive) -> Option<PathBuf> {
     })
 }
 
+/// Logs a watcher stop failure — unless the worker already exited
+/// because its root row is gone. A folder removed mid-pass fails its scan
+/// with `FolderNotConfigured` before the reap below runs, so stopping its
+/// watcher "fails" with the routine race, not a real stop error, and
+/// logging it would blame the shutdown for the removal.
+fn log_stop_error(logger: &IndexLogger, path: &Path, error: &OwnedIndexError) {
+    if matches!(error, OwnedIndexError::FolderNotConfigured) {
+        return;
+    }
+    logger.record(format!(
+        "could not stop the search watcher for {}: {error}",
+        path.display()
+    ));
+}
+
 /// Whether every configured root is offline. An unreadable roots table
 /// reads as "not all offline" so the heartbeat still publishes.
 fn all_roots_offline(index: &OwnedIndex) -> bool {
@@ -607,10 +629,7 @@ impl OwnedSupervisor {
         for id in gone {
             if let Some(entry) = self.watchers.remove(&id) {
                 if let Err(error) = entry.watcher.stop() {
-                    self.logger.record(format!(
-                        "could not stop the search watcher for {}: {error}",
-                        entry.path.display()
-                    ));
+                    log_stop_error(&self.logger, &entry.path, &error);
                 }
             }
             self.last_failure.remove(&id);
@@ -634,19 +653,29 @@ impl OwnedSupervisor {
             if !path_available(&path, expected.as_ref()) {
                 if let Some(entry) = self.watchers.remove(&id) {
                     if let Err(error) = entry.watcher.stop() {
+                        log_stop_error(&self.logger, &entry.path, &error);
+                    }
+                }
+                // One root's write failure must not skip the rest: log it
+                // and move on, so a single bad row cannot stall every
+                // folder behind it.
+                if stored != "offline" {
+                    if let Err(error) = self.set_root_state(&id, "offline") {
                         self.logger.record(format!(
-                            "could not stop the search watcher for {}: {error}",
+                            "could not mark {} offline: {error}",
                             path.display()
                         ));
                     }
                 }
-                if stored != "offline" && self.set_root_state(&id, "offline").is_err() {
-                    break;
-                }
                 continue;
             }
-            if stored == "offline" && self.set_root_state(&id, "pending").is_err() {
-                break;
+            if stored == "offline" {
+                if let Err(error) = self.set_root_state(&id, "pending") {
+                    self.logger.record(format!(
+                        "could not mark {} pending: {error}",
+                        path.display()
+                    ));
+                }
             }
             let same = self
                 .watchers
@@ -665,16 +694,19 @@ impl OwnedSupervisor {
             }
             if expected.is_none() {
                 let current = mount_identity(&path);
-                if self
-                    .record_mount(
-                        &id,
-                        current.as_ref().map(|mount| mount.target.as_path()),
-                        current.as_ref().map(|mount| mount.source.as_str()),
-                        current.as_ref().and_then(|mount| mount.uuid.as_deref()),
-                    )
-                    .is_err()
-                {
-                    break;
+                if let Err(error) = self.record_mount(
+                    &id,
+                    current.as_ref().map(|mount| mount.target.as_path()),
+                    current.as_ref().map(|mount| mount.source.as_str()),
+                    current.as_ref().and_then(|mount| mount.uuid.as_deref()),
+                ) {
+                    // As above: a failed mount write skips this root, not
+                    // the rest of the pass.
+                    self.logger.record(format!(
+                        "could not record the mount for {}: {error}",
+                        path.display()
+                    ));
+                    continue;
                 }
             }
             let thumbnails = self.thumbnails.clone();
@@ -762,10 +794,7 @@ impl OwnedSupervisor {
     fn stop_all(&mut self) {
         for (_, entry) in self.watchers.drain() {
             if let Err(error) = entry.watcher.stop() {
-                self.logger.record(format!(
-                    "could not stop the search watcher for {}: {error}",
-                    entry.path.display()
-                ));
+                log_stop_error(&self.logger, &entry.path, &error);
             }
         }
     }
@@ -992,6 +1021,122 @@ mod tests {
     }
 
     #[test]
+    fn stop_errors_skip_the_unconfigured_root_race() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
+
+        // A database with the schema but no row for this root: the
+        // worker fails closed with FolderNotConfigured and exits, as a
+        // folder removed mid-pass does.
+        let ghost = directory.path().join("ghost.sqlite3");
+        OwnedIndex::open(&ghost).unwrap();
+        let failed =
+            OwnedIndexWatcher::start_with_progress(&ghost, id.clone(), media.clone(), |_| {})
+                .unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || failed.is_finished()),
+            "expected the worker to exit on its missing root row"
+        );
+        // Sanity for the assertion below: stopping really does surface
+        // the routine race.
+        assert!(matches!(
+            failed.stop(),
+            Err(crate::owned_index::OwnedIndexError::FolderNotConfigured)
+        ));
+
+        let twin =
+            OwnedIndexWatcher::start_with_progress(&ghost, id.clone(), media.clone(), |_| {})
+                .unwrap();
+        assert!(
+            poll_until(Duration::from_secs(10), || twin.is_finished()),
+            "expected the twin worker to exit the same way"
+        );
+        let log = directory.path().join("indexer.log");
+        let mut supervisor = OwnedSupervisor::new(
+            database,
+            Arc::new(IndexLogger::new(log.clone())),
+            quiet_thumbnails(),
+        );
+        supervisor.watchers.insert(
+            id,
+            ActiveWatcher {
+                path: media.clone(),
+                watcher: twin,
+            },
+        );
+        supervisor.stop_all();
+
+        let logged = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !logged.contains("could not stop"),
+            "the routine race must not log a stop error: {logged}"
+        );
+
+        // A genuine stop failure still logs: only the unconfigured
+        // race is skipped.
+        let log = directory.path().join("indexer-direct.log");
+        let logger = IndexLogger::new(log.clone());
+        log_stop_error(
+            &logger,
+            Path::new("/media"),
+            &crate::owned_index::OwnedIndexError::WorkerStopped,
+        );
+        let logged = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            logged.contains("could not stop the search watcher for /media"),
+            "a genuine stop failure must still log: {logged}"
+        );
+    }
+
+    #[test]
+    fn reconcile_continues_past_a_failing_root_write() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        write_media(&first, "a.mp4");
+        write_media(&second, "b.mp4");
+        let database = directory.path().join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&first).unwrap();
+        manager.add_folder(&second).unwrap();
+
+        // Roots reconcile in id order; fail the first one's writes so a
+        // break would skip the second root entirely.
+        let roots = OwnedIndex::open(&database)
+            .unwrap()
+            .roots_with_state()
+            .unwrap();
+        assert_eq!(roots.len(), 2);
+        let failing = roots[0].0.clone();
+        let healthy = roots[1].0.clone();
+        let trigger = format!(
+            "CREATE TRIGGER fail_first_root BEFORE UPDATE ON roots
+             WHEN NEW.id = '{failing}'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END"
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(&trigger)
+            .unwrap();
+
+        let mut supervisor = test_supervisor(database, quiet_thumbnails());
+        supervisor.reconcile();
+
+        assert!(
+            supervisor.watchers.contains_key(&healthy),
+            "a failing root must not skip the rest of the pass"
+        );
+        assert!(!supervisor.watchers.contains_key(&failing));
+    }
+
+    #[test]
     fn waiting_for_reconcile_returns_on_events_timeouts_and_disconnects() {
         // An event ends the wait immediately, with no heartbeat due yet.
         let (sender, receiver) = mpsc::channel();
@@ -1020,6 +1165,19 @@ mod tests {
             await_reconcile(&receiver, Duration::from_secs(10), || {}),
             ReconcileWake::Gone
         );
+    }
+
+    #[test]
+    fn reconcile_waits_heartbeat_on_a_two_second_cadence() {
+        // A quiet 4.5-second wait heartbeats about twice (every
+        // HEARTBEAT_INTERVAL) and then reports the elapsed interval.
+        // Bounds are generous: scheduling jitter may steal or delay a
+        // beat, but a dead cadence or a hot loop fails loudly.
+        let (_sender, receiver) = mpsc::channel::<u8>();
+        let mut beats = 0;
+        let wake = await_reconcile(&receiver, Duration::from_millis(4500), || beats += 1);
+        assert_eq!(wake, ReconcileWake::Elapsed);
+        assert!((1..=3).contains(&beats), "expected ~2 beats, got {beats}");
     }
 
     #[test]
@@ -1209,7 +1367,11 @@ mod tests {
             status.activity,
             Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
         );
-        assert_eq!(status.queue.pending_roots, 1);
+        // Offline is not queued work: the root counts apart from the
+        // pending total, which is empty.
+        assert_eq!(status.queue.pending_roots, 0);
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 1);
     }
 
     #[test]

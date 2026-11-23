@@ -1720,6 +1720,273 @@ fn indexer_log_path(home: &ScratchHome) -> PathBuf {
         .join("logs/indexer.log")
 }
 
+/// Rewinds a version 2 index to version 1: no liveness table, no
+/// indexable counter, version markers back to 1.
+#[cfg(not(feature = "fixtures"))]
+fn rewind_to_v1(database: &Path) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE daemon_state;
+             ALTER TABLE scan_runs DROP COLUMN files_indexable;
+             UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn schema_user_version(database: &Path) -> i64 {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap()
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn schema_meta_version(database: &Path) -> i64 {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A logical dump of the index: every table's row count, in name order.
+/// Compared alongside the raw bytes, so a read that rewrote content
+/// without changing the file size still fails.
+#[cfg(not(feature = "fixtures"))]
+fn index_dump(database: &Path) -> Vec<(String, i64)> {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table, count)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn assert_v1_untouched(database: &Path, bytes: &[u8], dump: &[(String, i64)]) {
+    assert_eq!(schema_user_version(database), 1);
+    assert_eq!(schema_meta_version(database), 1);
+    assert_eq!(index_dump(database), dump);
+    assert_eq!(fs::read(database).unwrap(), bytes);
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn read_commands_leave_a_version_1_database_untouched() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media, 0);
+    create_video(&media, 1);
+
+    // A scanned version 2 index, rewound to version 1.
+    let media_argument = media.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = scratch_database(&home);
+    let manager = OwnedIndexManager::under(database.clone());
+    let folders = manager.folders().unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &folders[0].path, |_| {})
+        .unwrap();
+    rewind_to_v1(&database);
+    let before = fs::read(&database).unwrap();
+    let dump = index_dump(&database);
+
+    // Every read command proves it can read version 1, then proves it
+    // changed nothing: version markers, logical dump, and raw bytes.
+    let output = run_at(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Daemon:   not running\n"));
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["status", "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["running"], false);
+    assert_v1_untouched(&database, &before, &dump);
+
+    // A stopped daemon exits the watch immediately, without waiting.
+    let output = run_at(&home, &["status", "--watch"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["stats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Videos:   2"), "{stdout}");
+    assert!(stdout.contains("Folders:  1"), "{stdout}");
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["videos"], 2);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["folders", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{} [ready]\n", media.display())
+    );
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["search", "family"]);
+    assert_eq!(output.status.code(), Some(0));
+    let mut expected = [
+        media.join("family-trip-00.mp4").display().to_string(),
+        media.join("family-trip-01.mp4").display().to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        expected.join("\n") + "\n"
+    );
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["search", "family", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["totalResults"], 2);
+    assert_v1_untouched(&database, &before, &dump);
+
+    // A write migrates: adding a folder moves the database to version 2,
+    // and the version 1 content survives the move.
+    let more = home.home.path().join("more");
+    fs::create_dir_all(&more).unwrap();
+    let more_argument = more.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &more_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(schema_user_version(&database), 2);
+    let output = run_at(&home, &["stats", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["videos"], 2);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+
+    // So does starting the daemon: rewind, let the heartbeat migrate,
+    // and the folders are still all there.
+    rewind_to_v1(&database);
+    assert_eq!(schema_user_version(&database), 1);
+    with_daemon(&home, || {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+    });
+    assert_eq!(schema_user_version(&database), 2);
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn status_watch_against_a_live_daemon_exits_when_the_queue_drains() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    // Enough files that the scan cannot finish before the watch's first
+    // read, so the watch provably holds instead of exiting at once.
+    for number in 0..200 {
+        create_video(&media, number);
+    }
+
+    let mut daemon = spawn_daemon(&home);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+
+        let media_argument = media.to_string_lossy().into_owned();
+        let output = run_at(&home, &["folders", "add", &media_argument]);
+        assert_eq!(output.status.code(), Some(0));
+
+        // Wait until the daemon publishes outstanding work: the watch
+        // must start while the queue is non-empty, or a stale idle
+        // heartbeat would end it before the scan even starts. The first
+        // non-empty publish lands seconds before the drain, so the
+        // watch's first read still sees work outstanding.
+        let queue_empty = |document: &serde_json::Value| {
+            document["queue"]["pendingRoots"] == 0
+                && document["queue"]["filesRemaining"] == 0
+                && document["queue"]["pendingRepairs"] == 0
+                && document["queue"]["pendingThumbnails"] == 0
+        };
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+                    && (document["activity"] != "idle" || !queue_empty(document))
+            }),
+            "the daemon never published outstanding work"
+        );
+
+        // The watch holds while the daemon scans, then exits 0 on the
+        // drained queue. Piped, so no screen clears may appear.
+        let output = run_at(&home, &["status", "--watch"]);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains('\x1b'), "{stdout:?}");
+        assert!(stdout.contains("Activity: idle"), "{stdout}");
+        assert!(
+            stdout.matches("Daemon:").count() >= 2,
+            "expected the watch to hold for several renders, got:\n{stdout}"
+        );
+        assert!(output.stderr.is_empty());
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 #[test]
 fn a_second_daemon_on_the_same_index_exits_with_an_error() {
     let home = scratch_home();

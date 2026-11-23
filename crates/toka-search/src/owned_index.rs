@@ -372,6 +372,12 @@ impl IndexedFile {
 pub struct OwnedIndex {
     connection: Connection,
     path: PathBuf,
+    /// The `user_version` this handle opened at. A migrating open always
+    /// normalizes to [`SCHEMA_VERSION`]; a read-only open keeps whatever it
+    /// found, so readers can tolerate older schemas (no `daemon_state`
+    /// table or `files_indexable` column on version 1, no tables at all on
+    /// a version 0 empty file) instead of erroring on them.
+    opened_version: i64,
 }
 
 /// A root's recorded mount columns. `None` fields mean nothing was recorded
@@ -736,6 +742,7 @@ pub struct OwnedIndexState {
 pub struct OwnedIndexManager {
     database: PathBuf,
     watch: bool,
+    read_only: bool,
     watchers: Mutex<HashMap<String, ManagedRootWatcher>>,
     daemon_guard: Option<crate::indexer_daemon::DaemonLock>,
 }
@@ -775,6 +782,25 @@ impl OwnedIndexManager {
         Ok(Self::new(database_path()?, false))
     }
 
+    /// A manager for `ts` reads that must change nothing: every open is
+    /// read-only, so a version 1 database is never migrated and stays
+    /// usable by a version 1 app. Anything that writes through this
+    /// manager fails loudly on the query-only connection instead of
+    /// slipping through; `ts` wires only its read commands to it.
+    pub fn for_read_only_inspection() -> Result<Self, String> {
+        let mut manager = Self::new(database_path()?, false);
+        manager.read_only = true;
+        Ok(manager)
+    }
+
+    /// A read-only manager on an explicit database, for tests. Mirrors
+    /// [`under`]: no watchers, and every open read-only.
+    pub fn under_read_only(database: PathBuf) -> Self {
+        let mut manager = Self::new(database, false);
+        manager.read_only = true;
+        manager
+    }
+
     // Unconditional (not just `cfg(test)`): the app's tests build managers
     // too, and this crate compiles without `cfg(test)` when they do.
     /// A manager rooted at an explicit database, without watchers. Exists
@@ -787,6 +813,7 @@ impl OwnedIndexManager {
         Self {
             database,
             watch,
+            read_only: false,
             watchers: Mutex::new(HashMap::new()),
             daemon_guard: None,
         }
@@ -1024,7 +1051,11 @@ impl OwnedIndexManager {
     }
 
     fn open(&self) -> Result<OwnedIndex, OwnedIndexError> {
-        OwnedIndex::open(&self.database)
+        if self.read_only {
+            OwnedIndex::open_read_only(&self.database)
+        } else {
+            OwnedIndex::open(&self.database)
+        }
     }
 
     fn ensure_watchers(&self) -> Result<(), String> {
@@ -1102,16 +1133,6 @@ pub fn database_path() -> Result<PathBuf, String> {
 /// index database; the one helper both the app and `ts` use.
 pub fn search_rename_overlay_path() -> Result<PathBuf, String> {
     Ok(database_path()?.with_file_name("search-renames.json"))
-}
-
-pub(crate) fn root_paths(database: &Path) -> Result<Vec<PathBuf>, OwnedIndexError> {
-    OwnedIndex::open(database)?
-        .roots()
-        .map(|roots| roots.into_iter().map(|(_, path)| path).collect())
-}
-
-pub(crate) fn index_revision(database: &Path) -> Result<u64, OwnedIndexError> {
-    OwnedIndex::open(database)?.revision()
 }
 
 /// Opens a write transaction, taking the write lock up front. Deferred
@@ -1202,10 +1223,16 @@ pub(crate) struct OwnedIndexWatcher {
 }
 
 /// Records a worker stage transition. Advisory only: a poisoned lock keeps
-/// the last-known stage rather than crashing the worker.
+/// the last-known stage rather than crashing the worker. Entering the
+/// repair stage drops the last scan's progress, so the heartbeat never
+/// reports a stale file as the repair's current path; progress a repair
+/// itself reports repopulates it.
 fn set_stage(live: &Mutex<WatcherLive>, stage: WorkerStage) {
     if let Ok(mut live) = live.lock() {
         live.stage = stage;
+        if stage == WorkerStage::Repairing {
+            live.last_progress = None;
+        }
     }
 }
 
@@ -1524,26 +1551,45 @@ impl OwnedIndex {
         )?;
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(Self {
+                connection,
+                path: path.to_path_buf(),
+                opened_version: SCHEMA_VERSION,
+            });
+        }
+        if version != 0 && version != 1 {
+            return Err(OwnedIndexError::UnsupportedSchema(version));
+        }
+        // Creating or migrating under an immediate transaction: the first
+        // opener wins the write lock, and a concurrent first-opener waits
+        // out the busy timeout, then re-reads the version inside its own
+        // transaction and finds nothing left to do. A deferred transaction
+        // would let both select the migration before either locked, and the
+        // loser would die creating a table the winner already committed.
+        let transaction = write_transaction(&mut connection)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
-                let transaction = connection.transaction()?;
                 transaction.execute_batch(SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
             }
             1 => {
-                let transaction = connection.transaction()?;
                 transaction.execute_batch(MIGRATION_1_TO_2)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
             }
+            // A concurrent first-opener migrated while this one waited for
+            // the write lock: nothing left to do.
             SCHEMA_VERSION => {}
             other => return Err(OwnedIndexError::UnsupportedSchema(other)),
         }
+        transaction.commit()?;
 
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            opened_version: SCHEMA_VERSION,
         })
     }
 
@@ -1565,10 +1611,27 @@ impl OwnedIndex {
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            opened_version: version,
         })
     }
 
-    fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
+    /// Whether this handle opened an empty (version 0) database: no tables
+    /// exist, so every read below answers empty instead of failing.
+    fn is_empty_database(&self) -> bool {
+        self.opened_version == 0
+    }
+
+    /// Whether `scan_runs` has the version 2 indexable counter. A
+    /// migrating open always lands on version 2; only a read-only open of
+    /// a version 1 database answers false.
+    fn has_indexable_column(&self) -> bool {
+        self.opened_version >= SCHEMA_VERSION
+    }
+
+    pub(crate) fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare("SELECT id, path FROM roots ORDER BY id")?;
@@ -1581,6 +1644,9 @@ impl OwnedIndex {
     pub(crate) fn roots_with_state(
         &self,
     ) -> Result<Vec<(String, PathBuf, String)>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare("SELECT id, path, state FROM roots ORDER BY id")?;
@@ -1643,6 +1709,9 @@ impl OwnedIndex {
         &self,
         terms: &[String],
     ) -> Result<Vec<PathBuf>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         if terms.is_empty()
             || terms
                 .iter()
@@ -1857,7 +1926,10 @@ impl OwnedIndex {
         Ok(())
     }
 
-    fn revision(&self) -> Result<u64, OwnedIndexError> {
+    pub(crate) fn revision(&self) -> Result<u64, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(0);
+        }
         let revision: i64 = self.connection.query_row(
             "SELECT value FROM schema_meta WHERE key = 'index_revision'",
             [],
@@ -1867,6 +1939,9 @@ impl OwnedIndex {
     }
 
     fn media_counts(&self) -> Result<(u64, u64), OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok((0, 0));
+        }
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
                 COALESCE(SUM(media_type = 'video'), 0),
@@ -1879,6 +1954,9 @@ impl OwnedIndex {
     }
 
     fn root_media_counts(&self, root_id: &str) -> Result<(u64, u64), OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok((0, 0));
+        }
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
                 COALESCE(SUM(files.media_type = 'video'), 0),
@@ -2311,47 +2389,58 @@ impl OwnedIndex {
         &self,
         root_id: &str,
     ) -> Result<Option<ScanProgress>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(None);
+        }
+        // Version 1 has no `files_indexable` column; the committed count
+        // stands in for it there, so remaining work reads as none rather
+        // than inventing a backlog. Selecting it in the same position
+        // keeps every column index below identical on both schemas.
+        let indexable = if self.has_indexable_column() {
+            "files_indexable"
+        } else {
+            "files_indexed"
+        };
+        let query = format!(
+            "SELECT root_id, state,
+                folders_discovered, folders_scanned,
+                files_discovered, {indexable}, files_indexed,
+                videos_indexed, images_indexed,
+                skipped_paths, read_failures,
+                current_folder, current_file,
+                started_at_ns, updated_at_ns, error
+             FROM scan_runs
+             WHERE root_id = ?1
+             ORDER BY generation DESC
+             LIMIT 1"
+        );
         self.connection
-            .query_row(
-                "SELECT root_id, state,
-                    folders_discovered, folders_scanned,
-                    files_discovered, files_indexable, files_indexed,
-                    videos_indexed, images_indexed,
-                    skipped_paths, read_failures,
-                    current_folder, current_file,
-                    started_at_ns, updated_at_ns, error
-                 FROM scan_runs
-                 WHERE root_id = ?1
-                 ORDER BY generation DESC
-                 LIMIT 1",
-                [root_id],
-                |row| {
-                    let phase = ScanPhase::from_database(&row.get::<_, String>(1)?)?;
-                    let started_at_ns: i64 = row.get(13)?;
-                    let updated_at_ns: i64 = row.get(14)?;
-                    let files_indexed = row.get::<_, i64>(6)? as u64;
-                    let elapsed_ns = updated_at_ns.saturating_sub(started_at_ns).max(1);
-                    Ok(ScanProgress {
-                        root_id: row.get(0)?,
-                        phase,
-                        folders_discovered: row.get::<_, i64>(2)? as u64,
-                        folders_scanned: row.get::<_, i64>(3)? as u64,
-                        files_discovered: row.get::<_, i64>(4)? as u64,
-                        files_indexable: row.get::<_, i64>(5)? as u64,
-                        files_indexed,
-                        videos_indexed: row.get::<_, i64>(7)? as u64,
-                        images_indexed: row.get::<_, i64>(8)? as u64,
-                        skipped_paths: row.get::<_, i64>(9)? as u64,
-                        read_failures: row.get::<_, i64>(10)? as u64,
-                        current_folder: row.get::<_, Option<Vec<u8>>>(11)?.map(path_from_bytes),
-                        current_file: row.get::<_, Option<Vec<u8>>>(12)?.map(path_from_bytes),
-                        started_at_ns,
-                        updated_at_ns,
-                        scan_rate: files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64,
-                        error: row.get(15)?,
-                    })
-                },
-            )
+            .query_row(&query, [root_id], |row| {
+                let phase = ScanPhase::from_database(&row.get::<_, String>(1)?)?;
+                let started_at_ns: i64 = row.get(13)?;
+                let updated_at_ns: i64 = row.get(14)?;
+                let files_indexed = row.get::<_, i64>(6)? as u64;
+                let elapsed_ns = updated_at_ns.saturating_sub(started_at_ns).max(1);
+                Ok(ScanProgress {
+                    root_id: row.get(0)?,
+                    phase,
+                    folders_discovered: row.get::<_, i64>(2)? as u64,
+                    folders_scanned: row.get::<_, i64>(3)? as u64,
+                    files_discovered: row.get::<_, i64>(4)? as u64,
+                    files_indexable: row.get::<_, i64>(5)? as u64,
+                    files_indexed,
+                    videos_indexed: row.get::<_, i64>(7)? as u64,
+                    images_indexed: row.get::<_, i64>(8)? as u64,
+                    skipped_paths: row.get::<_, i64>(9)? as u64,
+                    read_failures: row.get::<_, i64>(10)? as u64,
+                    current_folder: row.get::<_, Option<Vec<u8>>>(11)?.map(path_from_bytes),
+                    current_file: row.get::<_, Option<Vec<u8>>>(12)?.map(path_from_bytes),
+                    started_at_ns,
+                    updated_at_ns,
+                    scan_rate: files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+                    error: row.get(15)?,
+                })
+            })
             .optional()
             .map_err(OwnedIndexError::from)
     }
@@ -2432,20 +2521,45 @@ impl OwnedIndex {
                         heartbeat_at_ns: row.get(2)?,
                         activity: crate::daemon_state::DaemonActivity::from_database(
                             &row.get::<_, String>(3)?,
-                        )?,
+                        ),
                         current_root: row.get::<_, Option<Vec<u8>>>(4)?.map(path_from_bytes),
                         current_path: row.get::<_, Option<Vec<u8>>>(5)?.map(path_from_bytes),
                         queue: crate::daemon_state::DaemonQueue {
-                            pending_roots: row.get::<_, i64>(6)? as u64,
+                            // Stored counts are trusted but tamperable; a
+                            // negative reads as zero rather than wrapping
+                            // to billions of phantom files.
+                            pending_roots: row.get::<_, i64>(6)?.max(0) as u64,
                             files_remaining: row.get::<_, i64>(7)?.max(0) as u64,
-                            pending_repairs: row.get::<_, i64>(8)? as u64,
-                            pending_thumbnails: row.get::<_, i64>(9)? as u64,
+                            pending_repairs: row.get::<_, i64>(8)?.max(0) as u64,
+                            pending_thumbnails: row.get::<_, i64>(9)?.max(0) as u64,
                         },
                     })
                 },
             )
             .optional()
             .map_err(OwnedIndexError::from)
+    }
+
+    /// Roots whose storage is missing, as last recorded. Read live by
+    /// `ts status` (like the service state) rather than published with the
+    /// heartbeat, so no schema change carries it. A missing `roots` table
+    /// — an empty database — reads as none.
+    pub(crate) fn offline_root_count(&self) -> Result<u64, OwnedIndexError> {
+        let has_table: bool = self.connection.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master
+             WHERE type = 'table' AND name = 'roots'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_table {
+            return Ok(0);
+        }
+        let offline: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM roots WHERE state = 'offline'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(offline.max(0) as u64)
     }
 
     /// The queued work the daemon publishes with its heartbeat: roots not
@@ -2456,8 +2570,11 @@ impl OwnedIndex {
         &self,
         pending_thumbnails: u64,
     ) -> Result<crate::daemon_state::DaemonQueue, OwnedIndexError> {
+        // Pending, scanning, and errored roots: work the daemon can act
+        // on. Offline roots count separately — `ts status` lists them on
+        // their own line, and they never hold `ts status --watch`.
         let pending_roots: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM roots WHERE state != 'ready'",
+            "SELECT COUNT(*) FROM roots WHERE state != 'ready' AND state != 'offline'",
             [],
             |row| row.get(0),
         )?;
@@ -5987,6 +6104,440 @@ mod tests {
             result,
             Err(OwnedIndexError::UnsupportedSchema(99))
         ));
+    }
+
+    #[test]
+    fn read_only_inspection_reads_a_version_1_database_without_migrating() {
+        use crate::providers::OwnedIndexSearchProvider;
+        use crate::search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE};
+        use crate::search_log::SearchLogContext;
+
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("family-trip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 1: no liveness table, no indexable
+            // counter, version markers back to 1.
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+
+        // Everything `ts` reads: folders, stats, and search.
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        let folders = manager.folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].status, OwnedFolderStatus::Ready);
+        let stats = manager.stats().unwrap();
+        assert_eq!(stats.videos, 1);
+        assert_eq!(stats.folders.len(), 1);
+        let provider = OwnedIndexSearchProvider::new_read_only(database.clone());
+        let request = SearchRequest {
+            query: "family".into(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Videos,
+        };
+        let context = SearchLogContext::from(&request);
+        let candidates = provider.candidates("family", false, &context).unwrap();
+        assert_eq!(candidates, vec![root.join("family-trip.mp4")]);
+        assert!(provider.revision() > 0);
+        let mut paths = vec![
+            root.join("family-trip.mp4"),
+            PathBuf::from("/elsewhere/nope.mp4"),
+        ];
+        provider.retain_visible_paths(&mut paths).unwrap();
+        assert_eq!(paths, vec![root.join("family-trip.mp4")]);
+
+        // Still version 1, byte for byte: no read migrated anything.
+        let version: i64 = Connection::open(&database)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn scan_progress_on_version_1_reports_committed_files_as_indexable() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("family-trip.mp4"), b"video").unwrap();
+        std::fs::write(root.join("notes.txt"), b"unsupported").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        let progress = index.scan_progress("root").unwrap().expect("scan run");
+
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(progress.files_discovered, 2);
+        assert_eq!(progress.files_indexed, 1);
+        // No indexable counter on version 1: the committed count stands
+        // in, so remaining work reads as none.
+        assert_eq!(progress.files_indexable, 1);
+    }
+
+    #[test]
+    fn read_only_inspection_of_an_empty_database_is_empty() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // Version 0: an empty file with no tables at all.
+        std::fs::write(&database, []).unwrap();
+
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        assert!(manager.folders().unwrap().is_empty());
+        let stats = manager.stats().unwrap();
+        assert_eq!(stats.revision, 0);
+        assert_eq!(stats.videos, 0);
+        assert_eq!(stats.images, 0);
+        assert!(stats.folders.is_empty());
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        assert!(index
+            .search_candidates(&["family".to_owned()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(index.revision().unwrap(), 0);
+        assert!(index.roots().unwrap().is_empty());
+        assert!(index.scan_progress("root").unwrap().is_none());
+
+        // And nothing was created: still an empty file.
+        assert_eq!(std::fs::read(&database).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn writes_through_a_read_only_manager_fail_loudly() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        OwnedIndexManager::under(database.clone())
+            .add_folder(&root)
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        let other = directory.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(manager.add_folder(&other).is_err());
+        assert!(manager.remove_folder("root").is_err());
+
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn concurrent_first_opens_migrate_exactly_once() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        // Eight first-openers race the same version 1 database: one
+        // migrates, the rest wait out the busy timeout and find nothing
+        // left to do. Every opener succeeds.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    OwnedIndex::open(&database)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let index = OwnedIndex::open(&database).unwrap();
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(index.roots().unwrap().len(), 1);
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+
+        // The same race for fresh creation: one wins, the rest open what
+        // the winner created.
+        let fresh = directory.path().join("fresh.sqlite3");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let fresh = fresh.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    OwnedIndex::open(&fresh)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let version: i64 = Connection::open(&fresh)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn write_transactions_hold_the_write_lock_up_front() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut first = OwnedIndex::open(&database).unwrap();
+
+        let transaction = write_transaction(&mut first.connection).unwrap();
+
+        // A second writer cannot even begin while the first holds its
+        // transaction open with no statements run: the lock was taken up
+        // front, not deferred to the first write — which is what keeps a
+        // concurrent commit from failing the upgrade with BUSY_SNAPSHOT.
+        let second = Connection::open(&database).unwrap();
+        second.busy_timeout(Duration::ZERO).unwrap();
+        let blocked = second.execute_batch("BEGIN IMMEDIATE");
+        assert!(
+            matches!(
+                blocked,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "expected BUSY, got {blocked:?}"
+        );
+        drop(transaction);
+        second.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn migrating_preserves_scan_error_and_offline_roots_with_wal_present() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        for name in ["scanning", "errored", "offline"] {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let offline_dir = directory.path().join("offline").canonicalize().unwrap();
+        std::fs::write(offline_dir.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index
+            .insert_root("scanning", &directory.path().join("scanning"))
+            .unwrap();
+        index
+            .insert_root("errored", &directory.path().join("errored"))
+            .unwrap();
+        index.insert_root("offline", &offline_dir).unwrap();
+        index.scan_root("offline", &offline_dir, |_| {}).unwrap();
+        // A mid-scan run and an errored run, as an interrupted daemon
+        // would leave them, plus the scanned root going offline — then
+        // the whole thing rewound to version 1.
+        index
+            .connection
+            .execute_batch(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'scanning';
+                 INSERT INTO scan_runs (
+                    root_id, generation, state,
+                    folders_discovered, folders_scanned,
+                    files_discovered, files_indexable, files_indexed,
+                    videos_indexed, images_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('scanning', 1, 'scanning', 4, 2, 10, 8, 5, 5, 0, 1, 2);
+                 UPDATE roots SET state = 'error', scan_generation = 1 WHERE id = 'errored';
+                 INSERT INTO scan_runs (
+                    root_id, generation, state,
+                    folders_discovered, folders_scanned,
+                    files_discovered, files_indexable, files_indexed,
+                    videos_indexed, images_indexed,
+                    started_at_ns, updated_at_ns, error
+                 ) VALUES ('errored', 1, 'error', 2, 2, 6, 6, 6, 5, 1, 1, 2, 'boom');
+                 UPDATE roots SET state = 'offline' WHERE id = 'offline';
+                 DROP TABLE daemon_state;
+                 ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                 UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        index
+            .connection
+            .pragma_update(None, "user_version", 1)
+            .unwrap();
+        // Uncheckpointed version 1 content still sits in the WAL, and the
+        // old handle stays open while the migration runs — as a version 1
+        // app holding the database would — so the migration must read
+        // through the WAL instead of a clean file.
+        let wal = database.with_extension("sqlite3-wal");
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "expected WAL content beside the version 1 database"
+        );
+        let migrated = OwnedIndex::open(&database).unwrap();
+        drop(index);
+        let index = migrated;
+
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let states = index.roots_with_state().unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .map(|(id, _, state)| (id.as_str(), state.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("errored", "error"),
+                ("offline", "offline"),
+                ("scanning", "scanning")
+            ]
+        );
+        let mid = index
+            .scan_progress("scanning")
+            .unwrap()
+            .expect("mid-scan run");
+        assert_eq!(mid.phase, ScanPhase::Scanning);
+        assert_eq!(mid.files_discovered, 10);
+        assert_eq!(mid.files_indexed, 5);
+        // The re-added counter defaults to zero for pre-migration rows.
+        assert_eq!(mid.files_indexable, 0);
+        let failed = index
+            .scan_progress("errored")
+            .unwrap()
+            .expect("errored run");
+        assert_eq!(failed.phase, ScanPhase::Error);
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+        // The offline root's files survive the migration.
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+        assert!(index.read_daemon_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn opening_a_newer_schema_fails_cleanly_without_migrating() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 999)
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+
+        let result = OwnedIndex::open(&database);
+
+        // A downgrade is a clean error, not a migration attempt: the
+        // database is untouched and still opens once upgraded again.
+        assert!(matches!(
+            result,
+            Err(OwnedIndexError::UnsupportedSchema(999))
+        ));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn entering_repair_clears_the_last_reported_progress() {
+        let shared = WorkerShared::new();
+        let mut progress = ScanProgress::new("root");
+        progress.current_file = Some(PathBuf::from("/media/a.mp4"));
+        shared.record_progress(&progress);
+        shared.set_stage(WorkerStage::Scanning);
+        assert!(shared.snapshot().last_progress.is_some());
+
+        // Entering repair drops the scan's stale path...
+        shared.set_stage(WorkerStage::Repairing);
+        let live = shared.snapshot();
+        assert_eq!(live.stage, WorkerStage::Repairing);
+        assert!(live.last_progress.is_none());
+
+        // ...until the repair itself reports progress.
+        shared.record_progress(&progress);
+        assert!(shared.snapshot().last_progress.is_some());
+
+        // Other transitions keep what was reported.
+        shared.set_stage(WorkerStage::Watching);
+        assert!(shared.snapshot().last_progress.is_some());
+    }
+
+    #[test]
+    fn negative_stored_counts_read_as_zero() {
+        let (_directory, index) = open_index();
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 2_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Idle,
+            current_root: None,
+            current_path: None,
+            queue: crate::daemon_state::DaemonQueue::default(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "UPDATE daemon_state
+                 SET pending_roots = -5, files_remaining = -3,
+                     pending_repairs = -1, pending_thumbnails = -7
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+
+        assert_eq!(row.queue, crate::daemon_state::DaemonQueue::default());
     }
 
     #[test]

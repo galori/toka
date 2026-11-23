@@ -64,7 +64,7 @@ fn search_provider() -> Result<Arc<dyn SearchProvider>, String> {
     }
     #[cfg(not(feature = "fixtures"))]
     {
-        Ok(Arc::new(OwnedIndexSearchProvider::new(
+        Ok(Arc::new(OwnedIndexSearchProvider::new_read_only(
             owned_index::database_path()?,
         )))
     }
@@ -101,7 +101,7 @@ fn create_verbose_engine() -> Result<SearchEngine, String> {
 }
 
 fn read_index_stats() -> Result<IndexStats, String> {
-    OwnedIndexManager::for_inspection()?.stats()
+    OwnedIndexManager::for_read_only_inspection()?.stats()
 }
 
 fn read_status() -> Result<DaemonStatus, String> {
@@ -115,7 +115,7 @@ fn run_daemon() -> Result<(), String> {
 }
 
 fn read_folders() -> Result<Vec<OwnedIndexFolder>, String> {
-    OwnedIndexManager::for_inspection()?.folders()
+    OwnedIndexManager::for_read_only_inspection()?.folders()
 }
 
 /// Adds a folder exactly as the app does: the manager inserts the `roots`

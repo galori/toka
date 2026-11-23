@@ -28,17 +28,20 @@ pub enum DaemonActivity {
     Repairing,
     Thumbnails,
     OfflineWaiting,
+    /// An activity this `ts` does not know: a newer daemon's heartbeat.
+    /// Reading it never fails — old `ts` shows `unknown` and exits 0.
+    Unknown,
 }
 
 impl DaemonActivity {
-    pub(crate) fn from_database(value: &str) -> Result<Self, rusqlite::Error> {
+    pub(crate) fn from_database(value: &str) -> Self {
         match value {
-            "idle" => Ok(Self::Idle),
-            "scanning" => Ok(Self::Scanning),
-            "repairing" => Ok(Self::Repairing),
-            "thumbnails" => Ok(Self::Thumbnails),
-            "offline-waiting" => Ok(Self::OfflineWaiting),
-            _ => Err(rusqlite::Error::InvalidQuery),
+            "idle" => Self::Idle,
+            "scanning" => Self::Scanning,
+            "repairing" => Self::Repairing,
+            "thumbnails" => Self::Thumbnails,
+            "offline-waiting" => Self::OfflineWaiting,
+            _ => Self::Unknown,
         }
     }
 
@@ -49,6 +52,10 @@ impl DaemonActivity {
             Self::Repairing => "repairing",
             Self::Thumbnails => "thumbnails",
             Self::OfflineWaiting => "offline-waiting",
+            // A read-only fallback, never published: the daemon only
+            // writes the concrete activities above, and the table's CHECK
+            // would reject anything else.
+            Self::Unknown => "unknown",
         }
     }
 
@@ -63,7 +70,10 @@ impl DaemonActivity {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonQueue {
-    /// Roots not fully indexed yet.
+    /// Roots with work the daemon can act on: pending, scanning, or
+    /// errored (including ones backing off before a retry). Offline
+    /// roots are not queued work and count separately as
+    /// [`DaemonStatus::offline_roots`].
     pub pending_roots: u64,
     /// Indexable files seen but not yet committed by scans in progress:
     /// a lower bound, since a scan cannot know how many files it has not
@@ -77,7 +87,10 @@ pub struct DaemonQueue {
 }
 
 impl DaemonQueue {
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Whether no actionable work is queued. Offline roots are not
+    /// queued work and never affect this: `ts status --watch` exits
+    /// with offline folders outstanding.
+    pub fn is_empty(&self) -> bool {
         self.pending_roots == 0
             && self.files_remaining == 0
             && self.pending_repairs == 0
@@ -105,6 +118,10 @@ pub struct DaemonStatus {
     #[serde(serialize_with = "crate::lossy_path::serialize_option")]
     pub current_path: Option<PathBuf>,
     pub queue: DaemonQueue,
+    /// Roots whose storage is missing, as last recorded. Read live rather
+    /// than published with the heartbeat, and never queued work: `ts
+    /// status --watch` exits with offline folders outstanding.
+    pub offline_roots: u64,
     /// Whether the indexer service is running. `None` where no service
     /// manager reports it (today: everywhere but Linux).
     pub service_running: Option<bool>,
@@ -143,7 +160,7 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
     let service_running = crate::indexer_daemon::indexer_running();
     #[cfg(not(any(target_os = "linux", test)))]
     let service_running: Option<bool> = None;
-    let stopped = || DaemonStatus {
+    let stopped = |offline_roots: u64| DaemonStatus {
         running: false,
         pid: None,
         uptime_secs: None,
@@ -152,18 +169,22 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         current_root: None,
         current_path: None,
         queue: DaemonQueue::default(),
+        offline_roots,
         service_running,
     };
     if !database.is_file() {
-        return Ok(stopped());
+        return Ok(stopped(0));
     }
     let index = crate::owned_index::OwnedIndex::open_read_only(database)
+        .map_err(|error| error.to_string())?;
+    let offline_roots = index
+        .offline_root_count()
         .map_err(|error| error.to_string())?;
     let Some(row) = index
         .read_daemon_state()
         .map_err(|error| error.to_string())?
     else {
-        return Ok(stopped());
+        return Ok(stopped(offline_roots));
     };
     let now_ns = crate::timestamp::now_ns();
     let heartbeat_age_secs = elapsed_secs(row.heartbeat_at_ns, now_ns);
@@ -179,6 +200,7 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots,
             service_running,
         });
     }
@@ -191,6 +213,7 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         current_root: row.current_root,
         current_path: row.current_path,
         queue: row.queue,
+        offline_roots,
         service_running,
     })
 }
@@ -244,6 +267,7 @@ pub fn render(status: &DaemonStatus) -> String {
             line.push(')');
         }
         let _ = writeln!(out, "{line}");
+        render_offline_line(&mut out, status.offline_roots);
         match status.service_running {
             Some(true) => {
                 let _ = writeln!(out, "Service:  running");
@@ -308,6 +332,7 @@ pub fn render(status: &DaemonStatus) -> String {
         }
         let _ = writeln!(out, "Queue:    {} still to index", parts.join(" / "));
     }
+    render_offline_line(&mut out, status.offline_roots);
     match status.service_running {
         Some(true) => {
             let _ = writeln!(out, "Service:  running");
@@ -318,6 +343,20 @@ pub fn render(status: &DaemonStatus) -> String {
         None => {}
     }
     out
+}
+
+/// The offline line, shared by the running and stopped reports: folders
+/// whose storage is missing wait for their disk, not for the daemon, so
+/// they are listed apart from the queue and never hold `--watch`.
+fn render_offline_line(out: &mut String, offline_roots: u64) {
+    use std::fmt::Write as _;
+    if offline_roots > 0 {
+        let _ = writeln!(
+            out,
+            "Offline:  {offline_roots} folder{} waiting for storage",
+            if offline_roots == 1 { "" } else { "s" },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +415,7 @@ mod tests {
                 pending_repairs: 0,
                 pending_thumbnails: 3,
             },
+            offline_roots: 0,
             service_running: Some(true),
         }
     }
@@ -388,12 +428,18 @@ mod tests {
             (DaemonActivity::Repairing, "repairing"),
             (DaemonActivity::Thumbnails, "thumbnails"),
             (DaemonActivity::OfflineWaiting, "offline-waiting"),
+            (DaemonActivity::Unknown, "unknown"),
         ] {
             assert_eq!(activity.as_database(), stored);
-            assert_eq!(DaemonActivity::from_database(stored).unwrap(), activity);
+            assert_eq!(DaemonActivity::from_database(stored), activity);
             assert_eq!(activity.label(), stored);
         }
-        assert!(DaemonActivity::from_database("napping").is_err());
+        // A newer daemon's activity reads as unknown instead of failing,
+        // so old `ts` keeps reporting against a new daemon.
+        assert_eq!(
+            DaemonActivity::from_database("compacting"),
+            DaemonActivity::Unknown
+        );
     }
 
     #[test]
@@ -560,7 +606,123 @@ mod tests {
         assert_eq!(json["queue"]["filesRemaining"], 15);
         assert_eq!(json["queue"]["pendingRepairs"], 0);
         assert_eq!(json["queue"]["pendingThumbnails"], 3);
+        assert_eq!(json["offlineRoots"], 0);
         assert_eq!(json["serviceRunning"], true);
+    }
+
+    #[test]
+    fn heartbeat_freshness_tolerates_several_missed_beats() {
+        // Liveness must not flap when one beat publishes late: the
+        // freshness window spans several publish intervals, so a missed
+        // beat plus scheduling jitter still reads as running.
+        assert!(
+            HEARTBEAT_FRESH_FOR >= 3 * HEARTBEAT_INTERVAL,
+            "fresh window {HEARTBEAT_FRESH_FOR:?} must span several {HEARTBEAT_INTERVAL:?} beats"
+        );
+    }
+
+    #[test]
+    fn unknown_activity_from_a_newer_daemon_reports_running() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            // A future daemon_state row: no activity CHECK, holding an
+            // activity this `ts` never learned.
+            connection
+                .execute_batch(
+                    "CREATE TABLE daemon_state (
+                        id INTEGER PRIMARY KEY,
+                        pid INTEGER NOT NULL,
+                        started_at_ns INTEGER NOT NULL,
+                        heartbeat_at_ns INTEGER NOT NULL,
+                        activity TEXT NOT NULL,
+                        current_root BLOB,
+                        current_path BLOB,
+                        pending_roots INTEGER NOT NULL DEFAULT 0,
+                        files_remaining INTEGER NOT NULL DEFAULT 0,
+                        pending_repairs INTEGER NOT NULL DEFAULT 0,
+                        pending_thumbnails INTEGER NOT NULL DEFAULT 0
+                    );",
+                )
+                .unwrap();
+            let now = crate::timestamp::now_ns();
+            connection
+                .execute(
+                    "INSERT INTO daemon_state (
+                        id, pid, started_at_ns, heartbeat_at_ns, activity,
+                        current_root, current_path,
+                        pending_roots, files_remaining, pending_repairs, pending_thumbnails
+                     ) VALUES (1, ?1, ?2, ?3, 'frobnicate', NULL, NULL, 0, 0, 0, 0)",
+                    rusqlite::params![std::process::id(), now - 65 * SECOND_NS, now - SECOND_NS,],
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 2).unwrap();
+        }
+
+        let status = read_status(&database).unwrap();
+
+        // Old `ts` against a new daemon: running, activity unknown, and
+        // the report still renders — the command exits 0.
+        assert!(status.running);
+        assert_eq!(status.activity, Some(DaemonActivity::Unknown));
+        let text = render(&status);
+        assert!(text.contains("Activity: unknown\n"), "{text}");
+    }
+
+    #[test]
+    fn offline_folders_render_on_their_own_line() {
+        let mut status = running_status();
+        status.offline_roots = 2;
+
+        let text = render(&status);
+
+        assert!(
+            text.contains("Queue:    2 folders / 15 files / 3 thumbnails still to index\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Offline:  2 folders waiting for storage\n"),
+            "{text}"
+        );
+
+        let mut status = running_status();
+        status.activity = Some(DaemonActivity::Idle);
+        status.current_root = None;
+        status.current_path = None;
+        status.queue = DaemonQueue::default();
+        status.offline_roots = 1;
+        status.service_running = None;
+
+        let text = render(&status);
+
+        // Idle with nothing queued omits the queue line but still notes
+        // the offline folder.
+        assert!(!text.contains("Queue:"), "{text}");
+        assert!(
+            text.contains("Offline:  1 folder waiting for storage\n"),
+            "{text}"
+        );
+
+        let mut stopped = DaemonStatus {
+            running: false,
+            pid: Some(1234),
+            uptime_secs: Some(90),
+            heartbeat_age_secs: Some(300),
+            activity: None,
+            current_root: None,
+            current_path: None,
+            queue: DaemonQueue::default(),
+            offline_roots: 1,
+            service_running: Some(false),
+        };
+        let text = render(&stopped);
+        assert!(
+            text.contains("Offline:  1 folder waiting for storage\n"),
+            "{text}"
+        );
+        stopped.offline_roots = 0;
+        assert!(!render(&stopped).contains("Offline:"), "{text}");
     }
 
     #[test]
@@ -574,6 +736,7 @@ mod tests {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots: 0,
             service_running: None,
         };
 
@@ -648,6 +811,7 @@ mod tests {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots: 0,
             service_running: Some(false),
         };
 
@@ -671,6 +835,7 @@ mod tests {
             current_root: None,
             current_path: None,
             queue: DaemonQueue::default(),
+            offline_roots: 0,
             service_running: None,
         };
 
