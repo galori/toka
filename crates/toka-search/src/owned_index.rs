@@ -755,6 +755,42 @@ struct ManagedRootWatcher {
     watcher: OwnedIndexWatcher,
 }
 
+/// Whether an inspectable index file exists: only a truly missing index
+/// reads empty. Any other metadata failure (permissions, I/O) is an
+/// error, and a non-file at the index path is a broken setup, not an
+/// empty index — `is_file` answers false for all three, which used to
+/// report every metadata failure as a healthy-empty index with exit 0.
+fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
+    match fs::metadata(database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Toka could not read its search index: {error}")),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "Toka's search index path is not a file: {}",
+            database.display()
+        )),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// Creates (and secures) the index parent, so acquiring the daemon lock
+/// never fails on a missing folder after a reset wipes it. Both the
+/// startup acquisition and a yielded manager's re-acquisition go through
+/// here: the lock file lives beside the index, and either path can run
+/// with the whole folder gone.
+fn ensure_index_parent(database: &Path) -> Result<(), String> {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            OwnedIndexError::Permissions {
+                path: parent.display().to_string(),
+                source,
+            }
+            .to_string()
+        })?;
+        secure_directory(parent).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 impl OwnedIndexManager {
     #[cfg(any(target_os = "macos", test))]
     pub fn system() -> Result<Self, String> {
@@ -765,20 +801,11 @@ impl OwnedIndexManager {
     /// and what tests supervise without touching the real index.
     #[cfg(any(target_os = "macos", test))]
     fn system_under(database: PathBuf) -> Result<Self, String> {
-        // The lock file lives beside the index: create (and secure) its
-        // parent first, so a first launch — or a post-reset one, where the
-        // whole folder is gone — never fails opening the lock. Acquisition
-        // itself still happens before any watcher starts.
-        if let Some(parent) = database.parent() {
-            fs::create_dir_all(parent).map_err(|source| {
-                OwnedIndexError::Permissions {
-                    path: parent.display().to_string(),
-                    source,
-                }
-                .to_string()
-            })?;
-            secure_directory(parent).map_err(|error| error.to_string())?;
-        }
+        // Create (and secure) the lock's parent first, so a first launch
+        // — or a post-reset one, where the whole folder is gone — never
+        // fails opening the lock. Acquisition itself still happens before
+        // any watcher starts.
+        ensure_index_parent(&database)?;
         // One supervisor per index: when a `ts` daemon already runs here,
         // the app leaves supervision to it instead of interleaving scan
         // generations with its own watchers.
@@ -931,7 +958,7 @@ impl OwnedIndexManager {
     /// The search folders and their indexing state. Inspecting must not
     /// create an index that does not exist yet.
     pub fn folders(&self) -> Result<Vec<OwnedIndexFolder>, String> {
-        if !self.database.is_file() {
+        if !index_file_for_inspection(&self.database)? {
             return Ok(Vec::new());
         }
         Ok(self.state()?.folders)
@@ -941,7 +968,7 @@ impl OwnedIndexManager {
     pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
         // Inspecting must not create an index that does not exist yet.
-        if !self.database.is_file() {
+        if !index_file_for_inspection(&self.database)? {
             return Ok(IndexStats {
                 revision: 0,
                 videos: 0,
@@ -1088,13 +1115,17 @@ impl OwnedIndexManager {
         // A manager that yielded to a running daemon retries the lock on
         // every pass: once the daemon stops, this manager takes over
         // supervision instead of leaving the folders unwatched for life.
-        // Watchers only (re)start below, after the lock is held.
+        // Watchers only (re)start below, after the lock is held. The
+        // parent is ensured first, exactly as at startup: a reset while
+        // yielded wipes the lock's folder, and without this the
+        // re-acquisition errors ENOENT on every poll until restart.
         if self.watch {
             let mut guard = self
                 .daemon_guard
                 .lock()
                 .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
             if guard.is_none() {
+                ensure_index_parent(&self.database)?;
                 *guard = crate::indexer_daemon::try_acquire_daemon_lock(&self.database)?;
             }
         }
@@ -1184,6 +1215,36 @@ fn write_transaction(connection: &mut Connection) -> Result<Transaction<'_>, Own
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(OwnedIndexError::from)
+}
+
+/// Whether a SQLite error is a lock conflict worth retrying.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Switches the database to WAL mode, retrying while a racing opener
+/// holds the write lock. Unlike ordinary statements, `PRAGMA journal_mode`
+/// does not honor the connection's busy timeout: it needs an EXCLUSIVE
+/// lock and reports SQLITE_BUSY at once when a concurrent first-opener is
+/// mid-migration, so the retry lives at this layer instead. Bounded like
+/// the busy timeout, so a wedged lock still surfaces as an error.
+fn set_wal_mode(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Where a sync-step probe fired: after one file's write transaction
@@ -1631,33 +1692,44 @@ fn apply_notify_event(
 
 impl OwnedIndex {
     pub fn open(path: &Path) -> Result<Self, OwnedIndexError> {
+        // The parent must exist before SQLite can open inside it; creating
+        // it is the only filesystem effect before the version check below.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OwnedIndexError::Permissions {
                 path: parent.display().to_string(),
                 source,
             })?;
-            secure_directory(parent)?;
         }
 
         let mut connection = Connection::open(path)?;
-        secure_file(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
+
+        // The version gates every side effect: refusing an unknown schema
+        // must leave the database byte-identical — no chmod, no WAL flip,
+        // not even securing the parent — so a newer app's index still
+        // opens once upgraded again.
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != 0 && version != 1 && version != SCHEMA_VERSION {
+            return Err(OwnedIndexError::UnsupportedSchema(version));
+        }
+
+        if let Some(parent) = path.parent() {
+            secure_directory(parent)?;
+        }
+        secure_file(path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;\n\
-             PRAGMA journal_mode = WAL;\n\
              PRAGMA synchronous = NORMAL;",
         )?;
+        // Retried, not batched: the WAL flip bypasses the busy timeout.
+        set_wal_mode(&connection)?;
 
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version == SCHEMA_VERSION {
             return Ok(Self {
                 connection,
                 path: path.to_path_buf(),
                 opened_version: SCHEMA_VERSION,
             });
-        }
-        if version != 0 && version != 1 {
-            return Err(OwnedIndexError::UnsupportedSchema(version));
         }
         // Creating or migrating under an immediate transaction: the first
         // opener wins the write lock, and a concurrent first-opener waits
@@ -1700,9 +1772,12 @@ impl OwnedIndex {
     /// listing. `PRAGMA query_only` makes any accidental write fail loudly
     /// instead of slipping through. Readers must tolerate whatever the
     /// accepted schemas lack (today: no `daemon_state` table on version 1,
-    /// and an empty file on version 0).
+    /// and an empty file on version 0). The 5s busy timeout matches
+    /// writable opens: on a read-only handle it only waits out a writer's
+    /// lock, never writes.
     pub fn open_read_only(path: &Path) -> Result<Self, OwnedIndexError> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA query_only = ON;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
@@ -5250,6 +5325,56 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_yielded_manager_recreates_a_reset_index_directory_while_reacquiring() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        // The index lives in its own folder so the reset below wipes only
+        // it, never the watched media.
+        let parent = directory.path().join("index-folder");
+        let database = parent.join("index.sqlite3");
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+
+        // The daemon holds the lock: the manager starts yielded, with no
+        // watchers of its own.
+        let daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(!manager.supervises_watchers().unwrap());
+
+        // A reset while yielded wipes the lock's whole folder; the daemon
+        // stops with it.
+        std::fs::remove_dir_all(&parent).unwrap();
+        drop(daemon);
+
+        // The next poll recreates the parent and re-acquires instead of
+        // erroring ENOENT on every poll until restart. A just-released
+        // lock can read as held for microseconds (forked children
+        // inherit the lock file), so the re-acquisition retries until a
+        // reconcile takes over supervision.
+        wait_for(|| {
+            manager.ensure_watchers().unwrap();
+            manager.supervises_watchers().unwrap()
+        });
+        assert!(parent.is_dir());
+        assert!(
+            crate::indexer_daemon::try_acquire_daemon_lock(&database)
+                .unwrap()
+                .is_none(),
+            "the manager must hold the daemon lock"
+        );
+        // Supervision actually resumes: a folder added now gets a watcher.
+        manager.add_folder(&root).unwrap();
+        assert_eq!(manager.watchers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_supervising_system_manager_refuses_a_second_supervisor() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("index.sqlite3");
@@ -5262,6 +5387,46 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the daemon side must yield to the app's watchers"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_system_managers_yield_to_whichever_started_first() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        // Two coeval managers, not a manager against a bare lock: the
+        // second yields supervision while its reads keep working.
+        let first = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(first.supervises_watchers().unwrap());
+        let second = OwnedIndexManager::system_under(database.clone()).unwrap();
+
+        assert!(!second.supervises_watchers().unwrap());
+        assert!(second.watchers.lock().unwrap().is_empty());
+        assert!(second.state().unwrap().folders.is_empty());
+        assert!(first.supervises_watchers().unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn system_under_reports_an_index_directory_it_cannot_secure() {
+        // Root can chmod anything, so this refusal only exists for the
+        // rest of us.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // The filesystem root always exists (so ensuring it gets past
+        // creation) and is never securable by an unprivileged user.
+        let database = PathBuf::from("/").join("toka-test-index.sqlite3");
+
+        let error = OwnedIndexManager::system_under(database)
+            .err()
+            .expect("system_under must refuse an unsecurable index directory");
+
+        assert!(
+            error.contains("could not secure"),
+            "unexpected error: {error}"
         );
     }
 
@@ -6051,6 +6216,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn stats_and_folders_on_a_metadata_failure_error_instead_of_reporting_empty() {
+        let directory = tempdir().unwrap();
+        // A component past NAME_MAX fails metadata with ENAMETOOLONG on
+        // Unix for every user — unlike chmod tricks, which root sails
+        // through.
+        let database = directory.path().join("a".repeat(300)).join("index.sqlite3");
+        let manager = OwnedIndexManager::under_read_only(database);
+
+        let folders = manager.folders().unwrap_err();
+        let stats = manager.stats().unwrap_err();
+
+        assert!(
+            folders.contains("could not read its search index"),
+            "unexpected error: {folders}"
+        );
+        assert!(
+            stats.contains("could not read its search index"),
+            "unexpected error: {stats}"
+        );
+    }
+
+    #[test]
+    fn stats_and_folders_on_a_directory_at_the_index_path_error_instead_of_reporting_empty() {
+        let directory = tempdir().unwrap();
+        let manager = OwnedIndexManager::under_read_only(directory.path().to_path_buf());
+
+        let folders = manager.folders().unwrap_err();
+        let stats = manager.stats().unwrap_err();
+
+        assert!(
+            folders.contains("is not a file"),
+            "unexpected error: {folders}"
+        );
+        assert!(stats.contains("is not a file"), "unexpected error: {stats}");
+    }
+
+    #[test]
     fn removing_a_managed_root_removes_its_files() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
@@ -6293,6 +6496,44 @@ mod tests {
             result,
             Err(OwnedIndexError::UnsupportedSchema(99))
         ));
+    }
+
+    #[test]
+    fn read_only_open_carries_the_same_busy_timeout_as_writable_opens() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+
+        let busy_timeout: i64 = index
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        // Without it contended reads fail instantly with BUSY; old reads
+        // went through open() with 5s.
+        assert_eq!(busy_timeout, 5_000);
+    }
+
+    #[test]
+    fn a_read_only_open_waits_out_a_contended_lock_instead_of_failing_busy() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // An EXCLUSIVE lock blocks even readers: the open below (and its
+        // version probe) must wait for the release instead of failing.
+        let blocker = Connection::open(&database).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        let roots = index.roots().unwrap();
+
+        releaser.join().unwrap();
+        assert!(roots.is_empty());
     }
 
     #[test]
@@ -6663,17 +6904,76 @@ mod tests {
             .unwrap()
             .pragma_update(None, "user_version", 999)
             .unwrap();
+        // Roll back to delete-mode with loose permissions, so any chmod
+        // or WAL flip during the refusal below shows up.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = DELETE;")
+            .unwrap();
+        let sidecars = ["-wal", "-shm", "-journal"]
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", database.display())));
+        for sidecar in &sidecars {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
         let before = std::fs::read(&database).unwrap();
+        #[cfg(unix)]
+        let mode_before = {
+            use std::os::unix::fs::PermissionsExt;
+            (
+                std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(directory.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+            )
+        };
 
         let result = OwnedIndex::open(&database);
 
         // A downgrade is a clean error, not a migration attempt: the
-        // database is untouched and still opens once upgraded again.
+        // version check runs before any side effect, so the database —
+        // bytes, mode, and sidecars — is untouched and still opens once
+        // upgraded again.
         assert!(matches!(
             result,
             Err(OwnedIndexError::UnsupportedSchema(999))
         ));
         assert_eq!(std::fs::read(&database).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                (
+                    std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+                    std::fs::metadata(directory.path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                ),
+                mode_before
+            );
+        }
+        for sidecar in &sidecars {
+            assert!(
+                !sidecar.exists(),
+                "refusal must not create {}",
+                sidecar.display()
+            );
+        }
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        OwnedIndex::open(&database).unwrap();
     }
 
     #[test]
@@ -7326,6 +7626,51 @@ mod tests {
         );
         assert!(index.pending_repairs().unwrap().is_empty());
         assert_eq!(indexed_display_paths(&index).len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_rename_repair_replays_to_completion_on_the_next_run() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(3);
+        let before: BTreeSet<String> = (0..3)
+            .map(|number| {
+                from.join(format!("clip-{number:02}.mp4"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(indexed_display_paths(&index), before);
+        let cancel = AtomicBool::new(true);
+
+        let result = index.synchronize_rename("root", &root, &from, &to, &cancel);
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(indexed_display_paths(&index), before);
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+        assert_eq!(repairs[0].reason, "direct rename");
+
+        // The next run replays the rename repair to completion: the rows
+        // move to their new names and the queue drains.
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            index
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
+        assert!(index.pending_repairs().unwrap().is_empty());
+        let expected: BTreeSet<String> = (0..3)
+            .map(|number| {
+                to.join(format!("clip-{number:02}.mp4"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(indexed_display_paths(&index), expected);
     }
 
     #[test]

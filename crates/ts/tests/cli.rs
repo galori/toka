@@ -326,6 +326,269 @@ fn folders_list_json_with_no_index_is_an_empty_document() {
     assert!(output.stderr.is_empty());
 }
 
+/// Where the child resolves the index: dirs honors XDG_DATA_HOME on
+/// Linux but derives it from HOME on macOS.
+fn index_database_path(home: &Path, data_home: &Path) -> PathBuf {
+    // Each platform resolves from one root and ignores the other.
+    #[cfg(target_os = "macos")]
+    let _ = data_home;
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+    #[cfg(target_os = "macos")]
+    let database = home
+        .join("Library/Application Support")
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    #[cfg(not(target_os = "macos"))]
+    let database = data_home
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    database
+}
+
+/// Runs `ts` with explicit HOME / data-home / TMPDIR, creating none of
+/// them: the caller sets up exactly the layout the probe needs —
+/// including layouts that cannot exist, like an overlong path.
+fn run_ts_with_raw_envs(
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    tmpdir: &Path,
+) -> Output {
+    let child = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args(arguments)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", data_home)
+        .env("TMPDIR", tmpdir)
+        .env_remove("TS_FIXTURE_VIDEOS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_exit(child)
+}
+
+/// A scratch layout whose index path fails metadata with ENAMETOOLONG on
+/// Unix for every user: a component past NAME_MAX under both HOME (what
+/// macOS resolves) and XDG_DATA_HOME (what Linux resolves), with a
+/// normal TMPDIR beside them. Nothing under the overlong components is
+/// ever created — metadata fails whether or not the path exists.
+fn overlong_env() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let base = tempdir().unwrap();
+    let overlong = "a".repeat(300);
+    let home = base.path().join(&overlong).join("home");
+    let data_home = base.path().join(&overlong).join("data");
+    let tmpdir = base.path().join("tmp");
+    fs::create_dir_all(&tmpdir).unwrap();
+    (base, home, data_home, tmpdir)
+}
+
+#[test]
+fn stats_with_an_unreadable_index_errors_instead_of_reporting_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_with_an_unreadable_index_errors_instead_of_reporting_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_with_an_unreadable_index_errors_instead_of_searching_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn stats_with_a_directory_at_the_index_path_errors_instead_of_reporting_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+#[test]
+fn folders_list_with_a_directory_at_the_index_path_errors_instead_of_reporting_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_with_a_directory_at_the_index_path_errors_instead_of_searching_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+/// Writes a version-999 database at the child's index path: an index
+/// from a newer Toka that this one must refuse, not migrate.
+fn write_newer_schema_database(database: &Path) {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    toka_search::owned_index::OwnedIndex::open(database).unwrap();
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .pragma_update(None, "user_version", 999)
+        .unwrap();
+}
+
+fn write_corrupt_database(database: &Path) {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(database, b"this is not a SQLite database at all").unwrap();
+}
+
+#[test]
+fn stats_on_a_newer_schema_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_on_a_newer_schema_errors_instead_of_listing() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_on_a_newer_schema_errors_instead_of_searching() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    let output = run_ts_with_home(
+        &["search", "family"],
+        home.home.path(),
+        &home.data_home,
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("schema version 999"), "{stderr}");
+}
+
+#[test]
+fn stats_on_a_corrupt_index_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    let output = run_ts_with_home(&["stats"], home.home.path(), &home.data_home, None, None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("could not use its search index"),
+        "{stderr}"
+    );
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_on_a_corrupt_index_errors_instead_of_searching() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    let output = run_ts_with_home(
+        &["search", "family"],
+        home.home.path(),
+        &home.data_home,
+        None,
+        None,
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("could not use its search index"),
+        "{stderr}"
+    );
+}
+
 #[cfg(feature = "fixtures")]
 #[test]
 fn search_page_past_the_last_page_succeeds_without_output() {

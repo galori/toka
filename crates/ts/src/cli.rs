@@ -26,7 +26,7 @@ const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether t
 const DAEMON_HELP: &str =
     "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
 const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
-const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command; a second daemon on the same index exits with an error instead of starting. Do not run it alongside the Toka app on macOS: the app still keeps its own watchers there until it switches to ts, and two supervisors must never share one index.";
+const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command. One supervisor owns each index: whichever starts first wins, so a second `ts daemon run` on the same index exits 1 instead of starting. The Toka app takes the same lock, so running a daemon alongside it is safe: the app yields its own watchers with a warning and keeps reading the index.";
 const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]      Add a folder to the index\n  remove <path> [--json]   Remove a folder from the index\n  list [--json]            List the folders the index watches";
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing in the index.";
@@ -5138,6 +5138,40 @@ mod tests {
         assert_eq!(waits.get(), 1);
         let output = String::from_utf8(stdout).unwrap();
         assert_eq!(output.matches("Activity: idle").count(), 2, "{output}");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn watch_waits_while_offline_waiting_with_work_queued() {
+        // Offline-waiting with queued work is not done: the daemon still
+        // has actionable work (an offline-only queue would already read
+        // empty), so the watch holds until the queue drains.
+        let mut pending = idle_daemon();
+        pending.activity = Some(DaemonActivity::OfflineWaiting);
+        pending.queue.pending_roots = 1;
+        let mut reads = [pending, idle_daemon()].into_iter();
+        let waits = std::cell::Cell::new(0);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let code = super::run_status_watch(
+            || Ok(reads.next().unwrap()),
+            false,
+            false,
+            || waits.set(waits.get() + 1),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(waits.get(), 1);
+        let output = String::from_utf8(stdout).unwrap();
+        assert_eq!(
+            output.matches("Activity: offline-waiting").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(output.matches("Activity: idle").count(), 1, "{output}");
         assert!(stderr.is_empty());
     }
 

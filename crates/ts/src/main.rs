@@ -74,13 +74,32 @@ fn create_engine_with_logger(logger: SearchLogger) -> Result<SearchEngine, Strin
     // A missing index searches empty instead of being created: opening it
     // would write a database and locking the rename overlay would write a
     // lock file, and a read-only command must leave no state behind. No
-    // overlay path either, so nothing is ever locked or persisted.
+    // overlay path either, so nothing is ever locked or persisted. Only a
+    // truly missing index reads empty, though: any other metadata failure
+    // (permissions, I/O) is an error, and a non-file at the index path is
+    // a broken setup — `is_file` answers false for all three, which used
+    // to report every metadata failure as a healthy-empty search.
     #[cfg(not(feature = "fixtures"))]
-    if !owned_index::database_path()?.is_file() {
-        return Ok(SearchEngine::new_with_logger(
-            Arc::new(EmptyProvider),
-            Arc::new(logger),
-        ));
+    {
+        let database = owned_index::database_path()?;
+        match std::fs::metadata(&database) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SearchEngine::new_with_logger(
+                    Arc::new(EmptyProvider),
+                    Arc::new(logger),
+                ));
+            }
+            Err(error) => {
+                return Err(format!("Toka could not read its search index: {error}"));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(format!(
+                    "Toka's search index path is not a file: {}",
+                    database.display()
+                ));
+            }
+            Ok(_) => {}
+        }
     }
     let provider = search_provider()?;
     let rename_overlay_path = Some(owned_index::search_rename_overlay_path()?);
