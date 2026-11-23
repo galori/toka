@@ -21,7 +21,7 @@ fn run_ts_with_fixture_env(arguments: &[&str], fixture_videos: Option<OsString>)
     let data_home = home.path().join("data");
     fs::create_dir_all(&data_home).unwrap();
 
-    run_ts_with_home(arguments, home.path(), &data_home, fixture_videos)
+    run_ts_with_home(arguments, home.path(), &data_home, fixture_videos, None)
 }
 
 fn run_ts_with_home(
@@ -29,6 +29,7 @@ fn run_ts_with_home(
     home: &Path,
     data_home: &Path,
     fixture_videos: Option<OsString>,
+    cwd: Option<&Path>,
 ) -> Output {
     // A scratch temp space too, so even cache reads cannot escape the
     // test's directories.
@@ -41,6 +42,9 @@ fn run_ts_with_home(
         .env("HOME", home)
         .env("XDG_DATA_HOME", data_home)
         .env("TMPDIR", &scratch);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     match fixture_videos {
         Some(videos) => {
             command.env("TS_FIXTURE_VIDEOS", videos);
@@ -310,7 +314,7 @@ fn real_index_search_stats_and_folders_agree() {
         .scan_root(&state.folders[0].id, &root, |_| {})
         .unwrap();
 
-    let output = run_ts_with_home(&["search", "family"], home.path(), &data_home, None);
+    let output = run_ts_with_home(&["search", "family"], home.path(), &data_home, None, None);
     assert_eq!(output.status.code(), Some(0));
     let mut expected = [first.display().to_string(), second.display().to_string()];
     expected.sort();
@@ -320,7 +324,7 @@ fn real_index_search_stats_and_folders_agree() {
     );
     assert!(output.stderr.is_empty());
 
-    let output = run_ts_with_home(&["stats", "--json"], home.path(), &data_home, None);
+    let output = run_ts_with_home(&["stats", "--json"], home.path(), &data_home, None, None);
     assert_eq!(output.status.code(), Some(0));
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
@@ -329,7 +333,7 @@ fn real_index_search_stats_and_folders_agree() {
     assert_eq!(document["folders"].as_array().unwrap().len(), 1);
     assert!(output.stderr.is_empty());
 
-    let output = run_ts_with_home(&["folders", "list"], home.path(), &data_home, None);
+    let output = run_ts_with_home(&["folders", "list"], home.path(), &data_home, None, None);
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
@@ -358,7 +362,7 @@ fn read_only_commands_create_no_state_without_an_index() {
         vec!["folders", "list"],
         vec!["folders", "list", "--json"],
     ] {
-        let output = run_ts_with_home(&arguments, home.path(), &data_home, None);
+        let output = run_ts_with_home(&arguments, home.path(), &data_home, None, None);
         assert_eq!(output.status.code(), Some(0), "{arguments:?}");
         // Exit 0 alone would let an empty engine print garbage; the empty
         // outputs are part of the no-create contract.
@@ -457,7 +461,19 @@ fn scratch_home() -> ScratchHome {
 }
 
 fn run_at(home: &ScratchHome, arguments: &[&str]) -> Output {
-    run_ts_with_home(arguments, home.home.path(), &home.data_home, None)
+    run_ts_with_home(arguments, home.home.path(), &home.data_home, None, None)
+}
+
+/// Like `run_at`, but with the child's working directory set, so relative
+/// shell spellings resolve the way they do for a real invocation.
+fn run_at_in(home: &ScratchHome, cwd: &Path, arguments: &[&str]) -> Output {
+    run_ts_with_home(
+        arguments,
+        home.home.path(),
+        &home.data_home,
+        None,
+        Some(cwd),
+    )
 }
 
 fn create_image(directory: &Path, name: &str) -> PathBuf {
@@ -629,6 +645,93 @@ fn folders_remove_finds_a_folder_deleted_from_disk() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn folders_add_with_a_relative_path_stores_the_canonical_spelling() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let canonical = media.canonicalize().unwrap();
+
+    // What was typed is relative; what lands in the index is absolute.
+    let output = run_at_in(&home, home.home.path(), &["folders", "add", "media"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Added {}\n", canonical.display())
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let folders = document["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["path"], canonical.to_string_lossy().into_owned());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_remove_with_a_relative_path_finds_a_folder_deleted_from_disk() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let canonical = media.canonicalize().unwrap();
+
+    let output = run_at_in(&home, home.home.path(), &["folders", "add", "media"]);
+    assert_eq!(output.status.code(), Some(0));
+    fs::remove_dir(&media).unwrap();
+
+    // The same shell spelling that added it still removes it, even
+    // though nothing on disk resolves anymore.
+    let output = run_at_in(&home, home.home.path(), &["folders", "remove", "media"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Removed {}\n", canonical.display())
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["folders", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_add_of_a_file_matches_the_app() {
+    // Both go through the same manager, which only takes directories.
+    let home = scratch_home();
+    let elsewhere = tempdir().unwrap();
+    let file = create_video(elsewhere.path(), 0);
+    let file_argument = file.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &file_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "ts folders add: Choose a folder to search.\n"
+    );
+    assert!(files_under(home.home.path()).is_empty());
+}
+
+#[test]
+fn folders_remove_with_no_index_errors_without_creating_state() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["folders", "remove", "/media/movies"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "ts folders remove: /media/movies is not one of Toka's search folders.\n"
+    );
+    // Unlike the app's remove flow, resolving first means a missing
+    // index never gets a database created for it.
+    assert!(files_under(home.home.path()).is_empty());
+}
+
 /// Where the child resolves the index: dirs honors XDG_DATA_HOME on
 /// Linux but derives it from HOME on macOS.
 fn scratch_database(home: &ScratchHome) -> PathBuf {
@@ -752,6 +855,286 @@ fn sync_commands_with_no_index_are_silent_noops() {
     assert!(files_under(home.home.path()).is_empty());
 }
 
+/// Adds `media` through the CLI and scans it standing in for the daemon,
+/// which has no test double in this phase.
+fn add_and_scan(home: &ScratchHome, media: &Path) {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let media_argument = media.to_string_lossy().into_owned();
+    let output = run_at(home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = scratch_database(home);
+    let manager = OwnedIndexManager::under(database.clone());
+    let folders = manager.folders().unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &folders[0].path, |_| {})
+        .unwrap();
+}
+
+#[test]
+fn sync_path_removes_a_deleted_file_from_the_index() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media, 0);
+    add_and_scan(&home, &media);
+    assert_eq!(stats_videos(&home)["videos"], 1);
+
+    let clip = media.join("family-trip-00.mp4");
+    fs::remove_file(&clip).unwrap();
+    let output = run_at(&home, &["sync-path", &clip.to_string_lossy()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    assert_eq!(stats_videos(&home)["videos"], 0);
+}
+
+#[test]
+fn sync_path_accepts_a_relative_path() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    add_and_scan(&home, &media);
+
+    create_video(&media, 1);
+    let output = run_at_in(&home, &media, &["sync-path", "family-trip-01.mp4"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    assert_eq!(stats_videos(&home)["videos"], 1);
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn sync_rename_accepts_relative_paths() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media, 0);
+    add_and_scan(&home, &media);
+
+    fs::rename(
+        media.join("family-trip-00.mp4"),
+        media.join("family-trip-00-tagged.mp4"),
+    )
+    .unwrap();
+    let output = run_at_in(
+        &home,
+        &media,
+        &[
+            "sync-rename",
+            "family-trip-00.mp4",
+            "family-trip-00-tagged.mp4",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["search", "tagged"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n", media.join("family-trip-00-tagged.mp4").display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn sync_rename_moves_a_directory_to_its_new_name() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(media.join("sub")).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media.join("sub"), 0);
+    add_and_scan(&home, &media);
+
+    fs::rename(media.join("sub"), media.join("episodes")).unwrap();
+    let output = run_at_in(&home, &media, &["sync-rename", "sub", "episodes"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["search", "family"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!(
+            "{}\n",
+            media.join("episodes").join("family-trip-00.mp4").display()
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn sync_rename_of_a_search_folder_repoints_its_roots_row() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media, 0);
+    add_and_scan(&home, &media);
+    assert_eq!(stats_videos(&home)["videos"], 1);
+
+    let moved = home.home.path().join("media-moved");
+    fs::rename(&media, &moved).unwrap();
+    let moved = moved.canonicalize().unwrap();
+    let output = run_at(
+        &home,
+        &[
+            "sync-rename",
+            &media.to_string_lossy(),
+            &moved.to_string_lossy(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    // The folder kept its identity but moved: the roots row names the
+    // new path and the files came along.
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let folders = document["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["path"], moved.to_string_lossy().into_owned());
+    assert_eq!(stats_videos(&home)["videos"], 1);
+}
+
+#[test]
+fn sync_rename_across_watched_folders_is_an_error() {
+    let home = scratch_home();
+    let movies = home.home.path().join("movies");
+    let series = home.home.path().join("series");
+    fs::create_dir_all(&movies).unwrap();
+    fs::create_dir_all(&series).unwrap();
+    let movies = movies.canonicalize().unwrap();
+    let series = series.canonicalize().unwrap();
+    for folder in [&movies, &series] {
+        let output = run_at(&home, &["folders", "add", &folder.to_string_lossy()]);
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    // A move across folders is not a rename the index can apply: both
+    // sides must sit under one watched folder.
+    let from = movies.join("clip.mp4");
+    let to = series.join("clip.mp4");
+    fs::write(&from, b"video").unwrap();
+    fs::rename(&from, &to).unwrap();
+    let output = run_at(
+        &home,
+        &[
+            "sync-rename",
+            &from.to_string_lossy(),
+            &to.to_string_lossy(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "ts sync-rename: {} and {} are not under the same watched folder.\n",
+            from.display(),
+            to.display()
+        )
+    );
+
+    // The failed rename touched nothing: both folders still listed.
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn sync_path_outside_any_watched_folder_is_an_error() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    add_and_scan(&home, &media);
+
+    // Watched or not is about the folders, not about existence: both an
+    // existing outsider and a missing path fail the same way.
+    let outsider = home.home.path().join("outside.mp4");
+    fs::write(&outsider, b"video").unwrap();
+    let missing = home.home.path().join("missing.mp4");
+    for path in [&outsider, &missing] {
+        let argument = path.to_string_lossy().into_owned();
+        let output = run_at(&home, &["sync-path", &argument]);
+        assert_eq!(output.status.code(), Some(1), "{argument}");
+        assert!(output.stdout.is_empty(), "{argument}");
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("ts sync-path: {argument} is not in any watched folder.\n"),
+            "{argument}"
+        );
+    }
+}
+
+#[test]
+fn sync_errors_carry_the_command_prefix() {
+    // The Phase 6 error contract: a failure names the command that failed.
+    let home = scratch_home();
+    let database = scratch_database(&home);
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    fs::write(&database, b"not a database").unwrap();
+
+    for (arguments, prefix) in [
+        (vec!["sync-path", "clip.mp4"], "ts sync-path: "),
+        (
+            vec!["sync-rename", "old.mp4", "new.mp4"],
+            "ts sync-rename: ",
+        ),
+    ] {
+        let output = run_at(&home, &arguments);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with(prefix), "{stderr:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_path_accepts_symlinked_and_unclean_spellings() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(media.join("sub")).unwrap();
+    let media = media.canonicalize().unwrap();
+    add_and_scan(&home, &media);
+    let link = home.home.path().join("link");
+    std::os::unix::fs::symlink(&media, &link).unwrap();
+
+    // Through a symlinked ancestor with a `..` segment: the same file
+    // the canonical spelling names, indexed once.
+    let clip = media.join("clip.mp4");
+    fs::write(&clip, b"video").unwrap();
+    let unclean = link.join("sub").join("..").join("clip.mp4");
+    let output = run_at(&home, &["sync-path", &unclean.to_string_lossy()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+    assert_eq!(stats_videos(&home)["videos"], 1);
+
+    // And the canonical spelling afterwards refreshes the same row.
+    let output = run_at(&home, &["sync-path", &clip.to_string_lossy()]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stats_videos(&home)["videos"], 1);
+}
+
 #[test]
 fn thumbnail_of_an_image_prints_itself() {
     let home = scratch_home();
@@ -829,3 +1212,95 @@ fn preview_of_an_undecodable_video_is_an_error() {
         format!("ts preview: Toka could not make a preview for {clip_argument}.\n")
     );
 }
+
+#[test]
+fn thumbnail_of_a_missing_image_is_an_honest_error() {
+    // The image fast path needs the file on disk; a missing image falls
+    // through to generation and fails instead of echoing a path to
+    // nothing. Pinned as is — Phase 6 owns the app-parity decision.
+    let home = scratch_home();
+    let missing = home.home.path().join("gone.jpg");
+    let missing_argument = missing.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["thumbnail", &missing_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("ts thumbnail: Toka could not make a thumbnail for {missing_argument}.\n")
+    );
+}
+
+#[test]
+fn preview_of_a_missing_image_is_an_honest_error() {
+    // Same fall-through as thumbnails, pinned the same way.
+    let home = scratch_home();
+    let missing = home.home.path().join("gone.jpg");
+    let missing_argument = missing.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["preview", &missing_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("ts preview: Toka could not make a preview for {missing_argument}.\n")
+    );
+}
+
+/// Two same-named files requested by relative path from different
+/// directories must not share one thumbnail cache entry: the keys also
+/// cover size and modification time, so both are pinned equal here and
+/// only the directory differs. The failure markers stand in for the
+/// cache entries — undecodable input writes one marker per key whether
+/// or not ffmpeg is installed.
+fn same_named_files_in_different_directories_keep_distinct_cache_entries(command: &str) {
+    let home = scratch_home();
+    for name in ["a", "b"] {
+        let directory = home.home.path().join(name);
+        fs::create_dir(&directory).unwrap();
+        let clip = directory.join("clip.mp4");
+        fs::write(&clip, b"fixture video").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&clip)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+
+    for name in ["a", "b"] {
+        let output = run_at_in(&home, &home.home.path().join(name), &[command, "clip.mp4"]);
+        assert_eq!(output.status.code(), Some(1), "{command} from {name}");
+        assert!(output.stdout.is_empty());
+    }
+
+    let cache = home
+        .home
+        .path()
+        .join("tmp")
+        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let markers = fs::read_dir(&cache)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "failed")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 2, "{command}: {markers:?}");
+}
+
+#[test]
+fn thumbnails_of_same_named_files_in_different_directories_do_not_collide() {
+    same_named_files_in_different_directories_keep_distinct_cache_entries("thumbnail");
+}
+
+#[test]
+fn previews_of_same_named_files_in_different_directories_do_not_collide() {
+    same_named_files_in_different_directories_keep_distinct_cache_entries("preview");
+}
+
+// No success-path test for real videos: generating from a valid file
+// needs ffmpeg plus a committed fixture and stays environment-dependent.
+// The app's hover path already covers generation; here the undecodable
+// and missing inputs pin the honest failures.

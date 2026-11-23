@@ -23,13 +23,13 @@ const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <pat
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing.";
 const FOLDERS_ADD_USAGE: &str = "Usage: ts folders add <path> [--json]";
-const FOLDERS_ADD_HELP: &str = "Usage: ts folders add <path> [--json]\n\nAdd a folder to the index, exactly as adding it in the app does. The running indexer picks it up and starts scanning on its own. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to add a path starting with a dash.";
+const FOLDERS_ADD_HELP: &str = "Usage: ts folders add <path> [--json]\n\nAdd a folder to the index, exactly as adding it in the app does. The running indexer picks it up and starts scanning on its own; on macOS with the app quit, the folder waits for the next launch. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to add a path starting with a dash.";
 const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path> [--json]";
 const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
 const SYNC_PATH_USAGE: &str = "Usage: ts sync-path <path>";
-const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
+const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. The path must sit under a watched folder; anything else is an error. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
 const SYNC_RENAME_USAGE: &str = "Usage: ts sync-rename <from> <to>";
-const SYNC_RENAME_HELP: &str = "Usage: ts sync-rename <from> <to>\n\nMove one indexed path to its new name after a rename, as the app does when tagging renames a file or folder. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to rename a path starting with a dash.";
+const SYNC_RENAME_HELP: &str = "Usage: ts sync-rename <from> <to>\n\nMove one indexed path to its new name after a rename, as the app does when tagging renames a file or folder. Both paths must sit under the same watched folder; anything else is an error and the index is left untouched. Renaming a watched folder itself re-points its roots row to the new path. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to rename a path starting with a dash.";
 const THUMBNAIL_USAGE: &str = "Usage: ts thumbnail <path> [--json]";
 const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the thumbnail for one file, generating it on the first run as the app does; an image prints as its own thumbnail. Prints the thumbnail path, or one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
@@ -266,7 +266,11 @@ fn run_folders_add_command(
         return 2;
     }
 
-    let state = match add_folder(&paths[0]) {
+    // Resolve once and echo the exact spelling handed to the insert:
+    // a second resolution after the write could name a path the index
+    // does not contain if a symlink was retargeted in between.
+    let requested = toka_search::owned_index::canonical_spelling(&paths[0]);
+    let state = match add_folder(&requested) {
         Ok(state) => state,
         Err(error) => {
             let _ = writeln!(stderr, "ts folders add: {error}");
@@ -276,10 +280,7 @@ fn run_folders_add_command(
     if json {
         return print_index_state(&state, "ts folders add", stdout, stderr);
     }
-    // The manager stores the canonical path; echo that rather than what
-    // was typed, so a relative path still shows where it landed.
-    let added = paths[0].canonicalize().unwrap_or_else(|_| paths[0].clone());
-    match writeln!(stdout, "Added {}", added.display()).and_then(|()| stdout.flush()) {
+    match writeln!(stdout, "Added {}", requested.display()).and_then(|()| stdout.flush()) {
         Ok(()) => 0,
         Err(error) => {
             let _ = writeln!(stderr, "ts folders add: could not write: {error}");
@@ -351,7 +352,10 @@ fn run_folders_remove_command(
         }
     };
     // The app removes by id; the shell names a path, so resolve it to the
-    // configured folder first.
+    // configured folder first. Unlike the app's remove flow — which opens
+    // (and thereby creates) the database — a missing index errors here
+    // instead: `read_folders` reports no folders when the database file is
+    // absent, so nothing matches and the remove below never runs.
     let Some(folder) = resolve_folder(&folders, &paths[0]) else {
         let _ = writeln!(
             stderr,
@@ -379,20 +383,22 @@ fn run_folders_remove_command(
     }
 }
 
-/// The configured folder `requested` names: the canonical path when it
-/// still resolves, falling back to the path as typed so a folder that no
-/// longer exists on disk — often the very reason to remove it — still
-/// matches its recorded entry.
+/// The configured folder `requested` names. The normalized spelling
+/// matches first: recorded entries are canonical absolute paths, and the
+/// normalization also resolves a typed spelling against the current
+/// directory, so a folder deleted from disk — often the very reason to
+/// remove it — still matches what the same shell spelling added. The
+/// spelling as typed only matches when nothing normalized does, so one
+/// request can never ambiguously name two rows.
 fn resolve_folder<'a>(
     folders: &'a [OwnedIndexFolder],
     requested: &Path,
 ) -> Option<&'a OwnedIndexFolder> {
-    let canonical = requested
-        .canonicalize()
-        .unwrap_or_else(|_| requested.to_path_buf());
+    let spelling = toka_search::owned_index::canonical_spelling(requested);
     folders
         .iter()
-        .find(|folder| folder.path == canonical || folder.path == requested)
+        .find(|folder| folder.path == spelling)
+        .or_else(|| folders.iter().find(|folder| folder.path == requested))
 }
 
 /// The human label for a folder state, kept identical to its JSON value (see
@@ -518,6 +524,8 @@ fn run_thumbnail_command(
         // Lossy on purpose, like every path this CLI serializes: real
         // paths can hold non-UTF-8 bytes on Unix, and those must not
         // break encoding of this document.
+        // "thumbnail" is singular and "previews" plural on purpose: one
+        // path here, a frame list there.
         let document = serde_json::json!({
             "schema": JSON_SCHEMA_VERSION,
             "thumbnail": thumbnail.to_string_lossy(),
@@ -570,6 +578,8 @@ fn run_preview_command(
     if json {
         // Lossy paths, as in thumbnail: non-UTF-8 bytes must not break
         // encoding of this document.
+        // "previews" is plural and "thumbnail" singular on purpose: a
+        // frame list here, one path there.
         let frames: Vec<String> = frames
             .iter()
             .map(|frame| frame.to_string_lossy().into_owned())
@@ -3162,6 +3172,66 @@ mod tests {
 
         assert_eq!(status, 0);
         assert_eq!(String::from_utf8(stdout).unwrap(), "Removed /media/gone\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folders_remove_prefers_the_normalized_match_over_the_spelling_as_typed() {
+        // Requested through a symlink: one recorded row names the link
+        // spelling, another the folder on disk. The on-disk folder wins
+        // even though the literal row is listed first.
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let canonical = target.canonicalize().unwrap();
+        let folders = ["literal", "canonical"]
+            .iter()
+            .zip([link.clone(), canonical.clone()])
+            .map(|(id, path)| OwnedIndexFolder {
+                id: id.to_string(),
+                path,
+                status: OwnedFolderStatus::Ready,
+                message: None,
+                scanned_files: 0,
+                current_path: None,
+                recent_directories: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let args = ["ts", "folders", "remove"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([link.into_os_string()])
+            .collect::<Vec<_>>();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(folders),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "canonical");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("Removed {}\n", canonical.display())
+        );
         assert!(stderr.is_empty());
     }
 

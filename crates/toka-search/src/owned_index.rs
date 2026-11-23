@@ -341,9 +341,112 @@ pub struct OwnedIndexUpdates {
     database: Option<PathBuf>,
 }
 
+/// What a sync matched. The app ignores the outcome — its paths always
+/// come from the index — while `ts` turns `Unmatched` into an honest
+/// error instead of a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// The paths sit under a watched folder; the sync was applied.
+    Matched,
+    /// The paths sit under no watched folder; the index is untouched.
+    Unmatched,
+    /// There is no index yet, and a sync never creates one.
+    NoIndex,
+}
+
 pub trait IndexUpdates: Send + Sync {
-    fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError>;
-    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError>;
+    fn synchronize_path(&self, path: &Path) -> Result<SyncOutcome, OwnedIndexError>;
+    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<SyncOutcome, OwnedIndexError>;
+}
+
+/// The index's spelling of `path`: canonical when the path exists,
+/// otherwise the canonical nearest existing ancestor with the missing
+/// remainder re-joined. Shell callers hand over paths as typed —
+/// relative, with `.`/`..`, through symlinks — while matching and
+/// storage assume canonical spellings; normalizing here keeps a
+/// relative sync from silently missing and a non-canonical one from
+/// storing a second row for the same file. A no-op for callers that
+/// already pass canonical paths.
+pub fn canonical_spelling(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    // A deleted file or an already-moved rename source has no canonical
+    // form of its own; resolve what is still there and re-join the rest.
+    // Each ancestor goes to the OS first, so `..` past parts that exist
+    // resolves with symlinks honored; only `..` past truly missing parts
+    // falls back to lexical meaning in the final cleanup.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut missing: Vec<OsString> = Vec::new();
+    let mut ancestor: &Path = &absolute;
+    loop {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let mut spelling = canonical;
+            for component in missing.into_iter().rev() {
+                spelling.push(component);
+            }
+            return normalize_lexically(&spelling);
+        }
+        // One raw component at a time — `..` included, which `file_name`
+        // would silently drop — so the walk cannot lose climbs.
+        let stripped = ancestor.components().next_back();
+        let parent = ancestor
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        match (stripped, parent) {
+            (Some(Component::Normal(name)), Some(parent)) => {
+                missing.push(name.to_os_string());
+                ancestor = parent;
+            }
+            (Some(Component::ParentDir), Some(parent)) => {
+                missing.push(OsString::from(".."));
+                ancestor = parent;
+            }
+            (Some(Component::CurDir), Some(parent)) => {
+                ancestor = parent;
+            }
+            // No existing ancestor (only when the current directory is
+            // unreadable and the path is relative): the cleaned-up
+            // spelling is still absolute-or-as-typed and deterministic.
+            _ => return normalize_lexically(&absolute),
+        }
+    }
+}
+
+/// Resolves `.` and `..` without touching the filesystem, for paths
+/// with missing parts that `canonicalize` refuses. A `..` past the
+/// root of an absolute path is dropped; one a relative path cannot
+/// climb out of survives, so the result keeps its meaning.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `pop` fails on a root (leave it: nothing to climb)
+                // and on an empty path (keep the `..`: relative).
+                if !normalized.pop() && !normalized.is_absolute() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(_) => normalized.push(component),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        normalized
+    }
 }
 
 impl OwnedIndexUpdates {
@@ -361,41 +464,83 @@ impl OwnedIndexUpdates {
         }
     }
 
-    pub(crate) fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError> {
-        let Some(database) = self.database.as_deref().filter(|path| path.is_file()) else {
-            return Ok(());
+    /// The database to sync against, if there is one. Only a truly
+    /// missing index is a silent no-op: `is_file` is also false when the
+    /// metadata itself cannot be read (an unsearchable parent, a denied
+    /// path), and those failures are errors, never quiet skips.
+    fn index_file(&self) -> Result<Option<&Path>, OwnedIndexError> {
+        let Some(database) = self.database.as_deref() else {
+            return Ok(None);
         };
-        let mut index = OwnedIndex::open(database)?;
-        for (root_id, root) in index.roots()? {
-            if path.starts_with(&root) {
-                index.synchronize_path(&root_id, &root, path)?;
-            }
+        match fs::metadata(database) {
+            Ok(metadata) if metadata.is_file() => Ok(Some(database)),
+            // A directory (or anything else) where the database belongs
+            // is not a missing index: opening it below fails honestly.
+            Ok(_) => Ok(Some(database)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(OwnedIndexError::PathRead {
+                path: database.display().to_string(),
+                source,
+            }),
         }
-        Ok(())
     }
 
-    pub(crate) fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError> {
-        let Some(database) = self.database.as_deref().filter(|path| path.is_file()) else {
-            return Ok(());
+    pub(crate) fn synchronize_path(&self, path: &Path) -> Result<SyncOutcome, OwnedIndexError> {
+        let Some(database) = self.index_file()? else {
+            return Ok(SyncOutcome::NoIndex);
         };
+        let path = canonical_spelling(path);
         let mut index = OwnedIndex::open(database)?;
-        if let Some((root_id, root)) = index
+        let mut matched = false;
+        for (root_id, root) in index.roots()? {
+            // Recorded roots are canonical in production (`add_folder`
+            // stores nothing else); normalizing the comparison heals
+            // rows that predate that guarantee instead of missing them.
+            let root = canonical_spelling(&root);
+            if path.starts_with(&root) {
+                index.synchronize_path(&root_id, &root, &path)?;
+                matched = true;
+            }
+        }
+        Ok(if matched {
+            SyncOutcome::Matched
+        } else {
+            SyncOutcome::Unmatched
+        })
+    }
+
+    pub(crate) fn synchronize_rename(
+        &self,
+        from: &Path,
+        to: &Path,
+    ) -> Result<SyncOutcome, OwnedIndexError> {
+        let Some(database) = self.index_file()? else {
+            return Ok(SyncOutcome::NoIndex);
+        };
+        let from = canonical_spelling(from);
+        let to = canonical_spelling(to);
+        let mut index = OwnedIndex::open(database)?;
+        let matched = index
             .roots()?
             .into_iter()
-            .find(|(_, root)| from == root || (from.starts_with(root) && to.starts_with(root)))
-        {
-            index.synchronize_rename(&root_id, &root, from, to)?;
+            .map(|(id, root)| (id, canonical_spelling(&root)))
+            .find(|(_, root)| from == *root || (from.starts_with(root) && to.starts_with(root)));
+        match matched {
+            Some((root_id, root)) => {
+                index.synchronize_rename(&root_id, &root, &from, &to)?;
+                Ok(SyncOutcome::Matched)
+            }
+            None => Ok(SyncOutcome::Unmatched),
         }
-        Ok(())
     }
 }
 
 impl IndexUpdates for OwnedIndexUpdates {
-    fn synchronize_path(&self, path: &Path) -> Result<(), OwnedIndexError> {
+    fn synchronize_path(&self, path: &Path) -> Result<SyncOutcome, OwnedIndexError> {
         OwnedIndexUpdates::synchronize_path(self, path)
     }
 
-    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<(), OwnedIndexError> {
+    fn synchronize_rename(&self, from: &Path, to: &Path) -> Result<SyncOutcome, OwnedIndexError> {
         OwnedIndexUpdates::synchronize_rename(self, from, to)
     }
 }
@@ -2869,6 +3014,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
+        // Canonical, as production roots always are (`add_folder` stores
+        // nothing else): the sync layer matches on canonical spellings.
+        let root = root.canonicalize().unwrap();
         let clip = root.join("clip.mp4");
         std::fs::write(&clip, b"video").unwrap();
         let database = directory.path().join("index.sqlite3");
@@ -2895,6 +3043,319 @@ mod tests {
         updates.synchronize_path(&tagged).unwrap();
         let observer = OwnedIndex::open(&database).unwrap();
         assert!(indexed_display_paths(&observer).contains(tagged.to_string_lossy().as_ref()));
+    }
+
+    /// Runs a closure with the process working directory changed, restoring
+    /// it afterwards. No other test in this crate depends on the working
+    /// directory, so the brief switch is safe under parallel execution.
+    struct WorkingDirectoryGuard {
+        previous: PathBuf,
+    }
+
+    impl WorkingDirectoryGuard {
+        fn enter(directory: &Path) -> Self {
+            let previous = std::env::current_dir().unwrap();
+            std::env::set_current_dir(directory).unwrap();
+            Self { previous }
+        }
+    }
+
+    impl Drop for WorkingDirectoryGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    #[test]
+    fn canonical_spelling_cleans_existing_paths() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let file = root.join("clip.mp4");
+        std::fs::write(&file, b"video").unwrap();
+        let canonical = file.canonicalize().unwrap();
+
+        assert_eq!(canonical_spelling(&file), canonical);
+        assert_eq!(
+            canonical_spelling(&root.join("sub").join("..").join("clip.mp4")),
+            canonical
+        );
+        assert_eq!(
+            canonical_spelling(&root.join(".").join("clip.mp4")),
+            canonical
+        );
+    }
+
+    #[test]
+    fn canonical_spelling_rejoins_missing_paths_onto_existing_ancestors() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+
+        // A deleted file keeps the spelling its directory gives it.
+        assert_eq!(
+            canonical_spelling(&root.join("gone.mp4")),
+            root.join("gone.mp4")
+        );
+        // So does a path nested under missing directories.
+        assert_eq!(
+            canonical_spelling(&root.join("a").join("b.mp4")),
+            root.join("a").join("b.mp4")
+        );
+        // And a `..` past a missing part still climbs out of it.
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        assert_eq!(
+            canonical_spelling(&root.join("gone").join("..").join("clip.mp4")),
+            clip
+        );
+    }
+
+    #[test]
+    fn canonical_spelling_resolves_relative_paths_against_the_working_directory() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let _guard = WorkingDirectoryGuard::enter(&root);
+        let cwd = root.canonicalize().unwrap();
+
+        assert_eq!(
+            canonical_spelling(Path::new("clip.mp4")),
+            cwd.join("clip.mp4")
+        );
+        // The shell spelling that added a now-deleted folder still
+        // resolves to where the recorded entry points.
+        assert_eq!(
+            canonical_spelling(Path::new("gone.mp4")),
+            cwd.join("gone.mp4")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_spelling_resolves_symlinked_ancestors() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        assert_eq!(
+            canonical_spelling(&link.join("clip.mp4")),
+            clip.canonicalize().unwrap()
+        );
+    }
+
+    fn scanned_canonical_root(
+        directory: &Path,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, OwnedIndexUpdates) {
+        // Production roots are always canonical (`add_folder` stores
+        // nothing else), so the sync tests record canonical roots too.
+        let scratch = tempdir().unwrap();
+        let root = scratch.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let database = directory.join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        drop(index);
+        let updates = OwnedIndexUpdates::new(database.clone());
+        (scratch, root, database, updates)
+    }
+
+    #[test]
+    fn sync_path_stores_one_row_for_non_canonical_spellings() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, database, updates) = scanned_canonical_root(directory.path());
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+
+        // A `..` spelling of the file refreshes its row instead of
+        // storing a second one for the same bytes on disk.
+        updates
+            .synchronize_path(&root.join("sub").join("..").join("clip.mp4"))
+            .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(clip.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn sync_path_removes_deleted_files_by_non_canonical_spelling() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, database, updates) = scanned_canonical_root(directory.path());
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        updates.synchronize_path(&clip).unwrap();
+
+        std::fs::remove_file(&clip).unwrap();
+        updates
+            .synchronize_path(&root.join("sub").join("..").join("clip.mp4"))
+            .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert!(indexed_display_paths(&observer).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_path_matches_roots_through_symlinked_ancestors() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, database, updates) = scanned_canonical_root(directory.path());
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        // Written through the link, so the bytes live under the root.
+        std::fs::write(link.join("added.mp4"), b"video").unwrap();
+
+        updates.synchronize_path(&link.join("added.mp4")).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(
+            paths.contains(root.join("added.mp4").to_string_lossy().as_ref()),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn sync_rename_moves_a_file_through_non_canonical_spellings() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, database, updates) = scanned_canonical_root(directory.path());
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        updates.synchronize_path(&clip).unwrap();
+
+        let renamed = root.join("clip-tagged.mp4");
+        std::fs::rename(&clip, &renamed).unwrap();
+        updates
+            .synchronize_rename(
+                &root.join("sub").join("..").join("clip.mp4"),
+                &root.join("sub").join("..").join("clip-tagged.mp4"),
+            )
+            .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(renamed.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn sync_rename_stores_the_canonical_spelling_of_a_moved_root() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, database, updates) = scanned_canonical_root(directory.path());
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        updates.synchronize_path(&clip).unwrap();
+
+        let moved = directory.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let moved_canonical = moved.canonicalize().unwrap();
+        updates
+            .synchronize_rename(
+                &root,
+                &directory.path().join("media").join("..").join("moved"),
+            )
+            .unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert_eq!(
+            observer.roots().unwrap(),
+            vec![("root".to_string(), moved_canonical.clone())]
+        );
+        assert!(indexed_display_paths(&observer)
+            .contains(moved_canonical.join("clip.mp4").to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn sync_path_matches_recorded_roots_that_predate_canonical_storage() {
+        // A roots row recorded before `add_folder` canonicalized still
+        // matches: the comparison normalizes both sides.
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir_all(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        drop(index);
+        let updates = OwnedIndexUpdates::new(database.clone());
+
+        let added = root.canonicalize().unwrap().join("added.mp4");
+        std::fs::write(&added, b"video").unwrap();
+        updates.synchronize_path(&added).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert!(
+            indexed_display_paths(&observer).contains(added.to_string_lossy().as_ref()),
+            "a canonical sync must still match a non-canonical recorded root"
+        );
+    }
+
+    #[test]
+    fn sync_outcomes_report_whether_a_watched_folder_matched() {
+        let directory = tempdir().unwrap();
+        let (_scratch, root, _database, updates) = scanned_canonical_root(directory.path());
+        let clip = root.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let outside = directory.path().join("elsewhere.mp4");
+        std::fs::write(&outside, b"video").unwrap();
+
+        assert_eq!(
+            updates.synchronize_path(&clip).unwrap(),
+            SyncOutcome::Matched
+        );
+        assert_eq!(
+            updates.synchronize_path(&outside).unwrap(),
+            SyncOutcome::Unmatched
+        );
+        let renamed = root.join("clip-tagged.mp4");
+        std::fs::rename(&clip, &renamed).unwrap();
+        assert_eq!(
+            updates.synchronize_rename(&clip, &renamed).unwrap(),
+            SyncOutcome::Matched
+        );
+        assert_eq!(
+            updates
+                .synchronize_rename(&outside, &root.join("moved-in.mp4"))
+                .unwrap(),
+            SyncOutcome::Unmatched
+        );
+
+        let missing = OwnedIndexUpdates::new(directory.path().join("no-index.sqlite3"));
+        assert_eq!(
+            missing.synchronize_path(&clip).unwrap(),
+            SyncOutcome::NoIndex
+        );
+        assert_eq!(
+            missing.synchronize_rename(&clip, &renamed).unwrap(),
+            SyncOutcome::NoIndex
+        );
+    }
+
+    #[test]
+    fn sync_surfaces_an_unreadable_index_instead_of_skipping_it() {
+        let directory = tempdir().unwrap();
+        // A name the filesystem refuses to even look up stands in for any
+        // unreadable database path (an unsearchable parent, a denied file):
+        // only a truly missing index may read as "no index".
+        let database = directory.path().join("x".repeat(300)).join("index.sqlite3");
+        let updates = OwnedIndexUpdates::new(database);
+
+        assert!(updates
+            .synchronize_path(&directory.path().join("clip.mp4"))
+            .is_err());
+        assert!(updates
+            .synchronize_rename(
+                &directory.path().join("a.mp4"),
+                &directory.path().join("b.mp4")
+            )
+            .is_err());
     }
 
     #[test]
