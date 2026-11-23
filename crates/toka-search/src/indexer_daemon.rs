@@ -1975,6 +1975,18 @@ mod tests {
         assert!(progress.files_indexable > 0);
         assert_eq!(progress.files_indexed, 0);
 
+        // Drain the thumbnail backlog before asserting an empty queue:
+        // files committed before the abort enqueue generation the quiet
+        // worker may not have collected yet, and the heartbeat would
+        // count them. The bound guards a stuck worker, not a slow one.
+        assert!(
+            poll_until(Duration::from_secs(30), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain after the stop"
+        );
+
         supervisor.publish_heartbeat();
         let status = crate::daemon_state::read_status(&database).unwrap();
         assert!(status.running);
@@ -2112,8 +2124,29 @@ mod tests {
                 current.as_ref().and_then(|mount| mount.uuid.as_deref()),
             )
             .unwrap();
-        supervisor.reconcile();
-        assert_eq!(supervisor.active_count(), 1);
+        // Gate on the rescan's first committed batch: Watching is also
+        // the pre-start state, so polling for it alone can pass before
+        // the worker runs a single file. The gate proves the scan
+        // started; only then does Watching prove it finished.
+        use std::sync::mpsc;
+        let (gated_tx, gated_rx) = mpsc::channel::<()>();
+        crate::owned_index::with_global_sync_probe(
+            &id,
+            move |site| {
+                if site == crate::owned_index::SyncProbeSite::ScanBatchCommitted {
+                    let _ = gated_tx.send(());
+                }
+            },
+            || {
+                supervisor.reconcile();
+                assert_eq!(supervisor.active_count(), 1);
+                gated_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the rescan must commit a first batch");
+            },
+        );
+        // The gate proved the scan ran, so Watching now proves it
+        // finished — the pre-start alias is gone.
         assert!(
             poll_until(Duration::from_secs(30), || {
                 supervisor
