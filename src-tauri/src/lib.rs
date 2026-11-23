@@ -12,6 +12,8 @@ mod subtitles;
 // imported by module name so the rest of this file — and `crate::search`
 // paths elsewhere — keep working unchanged.
 use serde::Serialize;
+#[cfg(all(target_os = "linux", not(feature = "e2e")))]
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
@@ -1368,6 +1370,19 @@ pub fn run() {
             std::process::exit(status);
         }
         return;
+    }
+
+    // A GUI launch from an interactive shell hands off to a detached child
+    // with no standard streams and exits, so the shell gets its prompt back
+    // immediately and never sees the GUI toolkit's output. CLI commands, the
+    // indexer, and piped launches stay in this process.
+    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+    if crate::launch::should_detach_gui(
+        &arguments,
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        crate::launch::detach_gui(&arguments);
     }
 
     #[cfg(all(target_os = "linux", not(feature = "e2e")))]
