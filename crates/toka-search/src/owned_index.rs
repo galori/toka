@@ -1034,6 +1034,26 @@ impl OwnedIndexManager {
         if !root.is_dir() {
             return Err("Choose a folder to search.".into());
         }
+        // Purge and reset delete the index directory's known files: a
+        // watched folder at or inside it would put media on the deletion
+        // list, so the shared add path refuses it here, for the app and
+        // `ts` alike.
+        if let Some(parent) = self.database.parent() {
+            let index_dir = canonical_spelling(parent);
+            if root == index_dir {
+                return Err(format!(
+                    "Toka cannot search its own index folder ({}): reset and purge delete it.",
+                    root.display()
+                ));
+            }
+            if root.starts_with(&index_dir) {
+                return Err(format!(
+                    "Toka cannot search {}: it is inside Toka's index folder ({}), which reset and purge delete.",
+                    root.display(),
+                    index_dir.display()
+                ));
+            }
+        }
         // The insert below stores exactly this; callers report it back.
         let committed = root.clone();
 
@@ -1206,7 +1226,31 @@ pub fn database_path() -> Result<PathBuf, String> {
 /// them, so searches find them by their current name. It lives beside the
 /// index database; the one helper both the app and `ts` use.
 pub fn search_rename_overlay_path() -> Result<PathBuf, String> {
-    Ok(database_path()?.with_file_name("search-renames.json"))
+    Ok(database_path()?.with_file_name(RENAME_OVERLAY_FILE_NAME))
+}
+
+/// The rename overlay's file name, beside the index database.
+pub(crate) const RENAME_OVERLAY_FILE_NAME: &str = "search-renames.json";
+
+/// The rename overlay lock's file name, beside the index database (see
+/// `lock_rename_overlay`, which derives it the same way).
+pub(crate) const RENAME_OVERLAY_LOCK_FILE_NAME: &str = "search-renames.lock";
+
+/// The known files of the index directory: the database, its SQLite
+/// sidecars, the legacy daemon lock, and the rename overlay plus its
+/// lock. Purge and reset delete exactly these — never the directory
+/// itself — so foreign content (including any media stored there)
+/// always survives.
+pub fn index_data_files(database: &Path) -> Vec<PathBuf> {
+    let mut files = vec![
+        database.with_file_name(crate::indexer_daemon::LEGACY_DAEMON_LOCK_FILE_NAME),
+        database.with_file_name(RENAME_OVERLAY_FILE_NAME),
+        database.with_file_name(RENAME_OVERLAY_LOCK_FILE_NAME),
+    ];
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        files.push(database.with_file_name(format!("{}{suffix}", crate::config::INDEX_FILE_NAME)));
+    }
+    files
 }
 
 /// Opens a write transaction, taking the write lock up front. Deferred
@@ -5331,6 +5375,8 @@ mod tests {
 
     #[test]
     fn manager_state_restores_folder_watchers_after_restart() {
+        #[cfg(unix)]
+        crate::indexer_daemon::test_runtime_dir();
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
@@ -5569,7 +5615,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let _daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
             .unwrap()
             .expect("test holds the daemon lock");
@@ -5581,6 +5627,36 @@ mod tests {
         // in-process watcher is skipped.
         assert_eq!(state.folders.len(), 1);
         assert!(manager.watchers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_held_lock_check_sees_the_app_supervisor() {
+        crate::indexer_daemon::test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        // The app holds the same primary lock as a daemon (plus the
+        // legacy co-take), so purge and reset refuse under it too.
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(manager.supervises_watchers().unwrap());
+        assert!(database.with_file_name("daemon.lock").is_file());
+        assert!(
+            crate::indexer_daemon::daemon_lock_held(&database).unwrap(),
+            "an app-held lock must block a purge or reset"
+        );
+        drop(manager);
+
+        // A just-released lock can read as held for microseconds (forked
+        // children inherit the lock file), so the release polls.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while crate::indexer_daemon::daemon_lock_held(&database).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released lock never cleared"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -6052,7 +6128,8 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
         std::fs::write(root.join("photo.jpg"), b"image").unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
 
         let added = manager.add_folder(&root).unwrap();
         assert_eq!(added.folders.len(), 1);
@@ -6087,7 +6164,8 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
 
         let added = manager.add_folder(&root).unwrap();
         assert_eq!(added.folders[0].current_path, None);
@@ -6112,7 +6190,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
 
         let added = manager.add_folder(&root).unwrap();
@@ -6158,7 +6236,7 @@ mod tests {
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
         // No supported media under Trips, so no batch ever commits there.
         std::fs::write(trips.join("notes.txt"), b"notes").unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
 
         let added = manager.add_folder(&root).unwrap();
@@ -6274,7 +6352,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         manager.add_folder(&root).unwrap();
 
         let state = manager.state().unwrap();
@@ -6297,7 +6376,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         let before = manager.state().unwrap().revision;
 
         let added = manager.add_folder(&root).unwrap();
@@ -6312,7 +6392,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         manager.add_folder(&root).unwrap();
         std::fs::remove_dir(&root).unwrap();
 
@@ -6326,7 +6407,8 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         manager.add_folder(&root).unwrap();
 
         let folders = manager.folders().unwrap();
@@ -6392,7 +6474,8 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("clip.mp4"), b"video").unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         let id = manager.add_folder(&root).unwrap().folders[0].id.clone();
         OwnedIndex::open(&manager.database)
             .unwrap()
@@ -6406,12 +6489,77 @@ mod tests {
     }
 
     #[test]
+    fn folders_at_or_inside_the_index_directory_are_rejected() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("state").join("index.sqlite3");
+        let index_dir = database.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let inside = index_dir.join("media");
+        std::fs::create_dir(&inside).unwrap();
+        let manager = OwnedIndexManager::under(database);
+
+        // The index directory itself.
+        let error = manager.add_folder(&index_dir).unwrap_err();
+        assert!(
+            error.contains("its own index folder"),
+            "unexpected error: {error}"
+        );
+
+        // A folder inside it (even spelled through `.`).
+        let error = manager.add_folder(&inside).unwrap_err();
+        assert!(
+            error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
+        let error = manager
+            .add_folder(&index_dir.join(".").join("media"))
+            .unwrap_err();
+        assert!(
+            error.contains("inside Toka's index folder"),
+            "unexpected error: {error}"
+        );
+
+        // A folder next to it still adds.
+        let outside = directory.path().join("media");
+        std::fs::create_dir(&outside).unwrap();
+        assert_eq!(manager.add_folder(&outside).unwrap().folders.len(), 1);
+    }
+
+    #[test]
+    fn index_data_files_enumerate_the_known_files_only() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        let files = index_data_files(&database);
+        let names: Vec<_> = files
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "daemon.lock",
+                "search-renames.json",
+                "search-renames.lock",
+                "index.sqlite3",
+                "index.sqlite3-wal",
+                "index.sqlite3-shm",
+                "index.sqlite3-journal",
+            ]
+        );
+        // Siblings of the database — never the directory itself.
+        assert!(files.iter().all(|path| path.parent() == database.parent()));
+    }
+
+    #[test]
     fn overlapping_managed_roots_are_rejected() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         let child = root.join("child");
         std::fs::create_dir_all(&child).unwrap();
-        let manager = OwnedIndexManager::under(directory.path().join("index.sqlite3"));
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
         manager.add_folder(&root).unwrap();
 
         let error = manager.add_folder(&child).unwrap_err();
@@ -6431,7 +6579,7 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         let link = directory.path().join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         // A legacy row recorded through the symlink.
         OwnedIndex::open(&database)
             .unwrap()
@@ -6808,7 +6956,7 @@ mod tests {
     #[test]
     fn writes_through_a_read_only_manager_fail_loudly() {
         let directory = tempdir().unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         OwnedIndexManager::under(database.clone())

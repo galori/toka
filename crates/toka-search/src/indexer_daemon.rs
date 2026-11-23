@@ -73,11 +73,29 @@ impl IndexLogger {
 use crate::config::INDEXER_SERVICE_NAME as INDEXER_SERVICE;
 
 #[cfg(not(feature = "e2e"))]
-pub(crate) fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
+pub(crate) fn ensure_indexer_with_runner<F>(
+    home: Option<&Path>,
+    config_dir: Option<&Path>,
+    mut run: F,
+) -> Result<(), String>
 where
     F: FnMut(&[&str]) -> io::Result<ExitStatus>,
 {
-    let arguments = ["--user", "start", INDEXER_SERVICE];
+    // The `ts` service owns the daemon now; the legacy one only still
+    // exists where `ts install` has not migrated it away yet. The new
+    // unit lives under the config directory (`XDG_CONFIG_HOME` when
+    // set); the legacy one stays where the old installer wrote it, under
+    // `~/.config`. A home with neither installed (or no home at all)
+    // still attempts the new service, so a missing install fails loudly
+    // instead of silently starting nothing.
+    let ts_present = config_dir.is_some_and(|dir| crate::service::unit_path(dir).is_file());
+    let legacy_present = home.is_some_and(|home| crate::service::legacy_unit_path(home).is_file());
+    let service = if ts_present || !legacy_present {
+        crate::config::TS_SERVICE_NAME
+    } else {
+        INDEXER_SERVICE
+    };
+    let arguments = ["--user", "start", service];
     let status = run(&arguments)
         .map_err(|error| format!("Toka could not start its indexer service: {error}"))?;
     if status.success() {
@@ -91,8 +109,12 @@ where
 
 #[cfg(not(feature = "e2e"))]
 pub fn ensure_indexer() {
+    let home = dirs::home_dir();
+    let config = dirs::config_dir();
     if let Err(message) =
-        ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
+        ensure_indexer_with_runner(home.as_deref(), config.as_deref(), |arguments| {
+            Command::new("systemctl").args(arguments).status()
+        })
     {
         eprintln!("{message}");
     }
@@ -250,7 +272,8 @@ pub(crate) struct DaemonLock;
 /// point it at scratch); otherwise Linux uses `XDG_RUNTIME_DIR/toka`, and
 /// macOS — like the Linux fallback — uses the cache folder's `toka`
 /// directory, which no reset deletes (resets delete `app.toka.desktop`,
-/// never `toka`). A missing home falls back to the temporary directory.
+/// never `toka`). A missing home falls back to a per-user directory under
+/// the temporary directory, since that fallback is shared across users.
 #[cfg(unix)]
 pub(crate) fn daemon_runtime_dir() -> PathBuf {
     let override_dir = std::env::var_os("TOKA_RUNTIME_DIR").map(PathBuf::from);
@@ -263,17 +286,22 @@ pub(crate) fn daemon_runtime_dir() -> PathBuf {
         xdg_runtime,
         dirs::cache_dir(),
         std::env::temp_dir(),
+        current_uid(),
     )
 }
 
 /// [`daemon_runtime_dir`] with the environment passed in, so the
 /// precedence is unit-testable without touching the process environment.
+/// The temporary-directory fallback carries the user id: without it every
+/// user would share one `$TMPDIR/toka`, and the first to create it would
+/// lock the rest out.
 #[cfg(unix)]
 fn resolve_runtime_dir(
     override_dir: Option<PathBuf>,
     xdg_runtime: Option<PathBuf>,
     cache: Option<PathBuf>,
     temp: PathBuf,
+    uid: u32,
 ) -> PathBuf {
     if let Some(dir) = override_dir {
         return dir;
@@ -287,7 +315,43 @@ fn resolve_runtime_dir(
     if let Some(dir) = cache {
         return dir.join("toka");
     }
-    temp.join("toka")
+    temp.join(format!("toka-{uid}"))
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Creates the runtime directory and pins it to this user: mode 0700, not
+/// a symlink, owned by `uid`. The temporary-directory fallback is world
+/// writable, so without the ownership check another user's pre-created
+/// directory — or pre-created lock files — would lock this user out or
+/// collect their locks.
+#[cfg(unix)]
+fn ensure_runtime_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is a symlink",
+            dir.display()
+        ));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    let owner = fs::metadata(dir)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?
+        .uid();
+    if owner != uid {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is owned by another user",
+            dir.display()
+        ));
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    Ok(())
 }
 
 /// FNV-1a 64-bit, naming one lock file per index: the name must be stable
@@ -303,13 +367,17 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// The primary lock file for one index.
+/// The primary lock file for one index. The database identity is
+/// normalized before hashing: `/data` and `/data/.` name one index and
+/// must meet on one lock, or two supervisors would split after a reset
+/// unlinks the legacy lock they shared.
 #[cfg(unix)]
 fn lock_file_name(database: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
+    let identity = crate::owned_index::canonical_spelling(database);
     format!(
         "daemon-{:016x}.lock",
-        fnv1a64(database.as_os_str().as_bytes())
+        fnv1a64(identity.as_os_str().as_bytes())
     )
 }
 
@@ -317,6 +385,11 @@ fn lock_file_name(database: &Path) -> String {
 pub(crate) fn daemon_lock_path(database: &Path) -> PathBuf {
     daemon_runtime_dir().join(lock_file_name(database))
 }
+
+/// The beside-the-index lock file supervisors from before the runtime-dir
+/// move take: new code co-takes it during the upgrade, and purge/reset
+/// delete it as a known index file.
+pub(crate) const LEGACY_DAEMON_LOCK_FILE_NAME: &str = "daemon.lock";
 
 /// Tries the daemon lock without blocking: `Ok(None)` when another
 /// supervisor already runs on this index, so the caller yields instead of
@@ -339,12 +412,19 @@ pub(crate) fn daemon_lock_path(database: &Path) -> PathBuf {
 /// upgrade: old code takes only the legacy lock, new code takes both, and
 /// either side yields when the other holds it. Both locks drop together
 /// with the guard.
+///
+/// Pre-delete checks (purge, reset) refuse while EITHER lock is held, so an
+/// old hand-run supervisor blocks a reset instead of losing its lock file
+/// mid-run. A residual upgrade-window race remains: an old binary started
+/// after the check but before the deletion takes a legacy lock the
+/// deletion then unlinks, and the next starter locks a fresh file — two
+/// supervisors, no error. The window closes once old binaries stop
+/// running; new binaries meet on the primary lock, which no reset unlinks.
 #[cfg(unix)]
 pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLock>, String> {
     let path = daemon_lock_path(database);
     if let Some(runtime) = path.parent() {
-        fs::create_dir_all(runtime)
-            .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+        ensure_runtime_dir(runtime, current_uid())?;
     }
     let Some(primary) = lock_file(&path)? else {
         return Ok(None);
@@ -352,13 +432,22 @@ pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLo
     // The legacy lock's parent is ensured here, not just by the callers:
     // a reset may have wiped it while this supervisor was starting.
     crate::owned_index::ensure_index_parent(database)?;
-    let Some(legacy) = lock_file(&database.with_file_name("daemon.lock"))? else {
+    let Some(legacy) = lock_file(&database.with_file_name(LEGACY_DAEMON_LOCK_FILE_NAME))? else {
         return Ok(None);
     };
     Ok(Some(DaemonLock {
         _primary: primary,
         _legacy: legacy,
     }))
+}
+
+/// Whether another supervisor holds the daemon lock on `database` right
+/// now: either the primary runtime lock or the legacy beside-the-index
+/// one, since an old supervisor takes only the legacy lock. Purge and
+/// reset refuse while either is held, so a live supervisor — managed or
+/// hand-started — never watches its index vanish.
+pub(crate) fn daemon_lock_held(database: &Path) -> Result<bool, String> {
+    Ok(try_acquire_daemon_lock(database)?.is_none())
 }
 
 /// Opens and exclusively locks one lock file without blocking: `Ok(None)`
@@ -990,10 +1079,51 @@ mod tests {
 
     #[cfg(not(feature = "e2e"))]
     #[test]
-    fn starts_the_user_indexer_service_when_toka_launches() {
+    fn starts_the_ts_service_once_it_is_installed() {
+        // The new unit lives under the config directory, which may diverge
+        // from `~/.config` when `XDG_CONFIG_HOME` is set.
+        for config in [".config", "xdg-config"] {
+            let home = tempdir().unwrap();
+            let config = home.path().join(config);
+            let unit = crate::service::unit_path(&config);
+            fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            fs::write(&unit, b"[Unit]").unwrap();
+            let mut commands: Vec<Vec<String>> = Vec::new();
+
+            ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
+                commands.push(
+                    arguments
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect(),
+                );
+                std::process::Command::new("true").status()
+            })
+            .unwrap();
+
+            assert_eq!(
+                commands,
+                vec![vec![
+                    "--user".to_owned(),
+                    "start".to_owned(),
+                    "toka-search.service".to_owned(),
+                ]],
+                "{config:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    #[test]
+    fn falls_back_to_the_legacy_service_until_ts_migrates_it() {
+        let home = tempdir().unwrap();
+        let config = home.path().join(".config");
+        let legacy = crate::service::legacy_unit_path(home.path());
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"[Unit]").unwrap();
         let mut commands: Vec<Vec<String>> = Vec::new();
 
-        ensure_indexer_with_runner(|arguments| {
+        ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
             commands.push(
                 arguments
                     .iter()
@@ -1014,13 +1144,46 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "e2e"))]
+    #[test]
+    fn attempts_the_ts_service_when_nothing_is_installed() {
+        let home = tempdir().unwrap();
+        let config = home.path().join(".config");
+        for missing in [(Some(home.path()), Some(config.as_path())), (None, None)] {
+            let mut commands: Vec<Vec<String>> = Vec::new();
+
+            ensure_indexer_with_runner(missing.0, missing.1, |arguments| {
+                commands.push(
+                    arguments
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect(),
+                );
+                std::process::Command::new("true").status()
+            })
+            .unwrap();
+
+            // A missing install fails loudly on the new service instead of
+            // silently starting nothing.
+            assert_eq!(
+                commands,
+                vec![vec![
+                    "--user".to_owned(),
+                    "start".to_owned(),
+                    "toka-search.service".to_owned(),
+                ]],
+                "{missing:?}"
+            );
+        }
+    }
+
     #[test]
     fn reconcile_starts_a_watcher_and_rows_appear() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
 
         let mut supervisor = test_supervisor(database, quiet_thumbnails());
@@ -1056,7 +1219,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1080,7 +1243,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
         let log = directory.path().join("indexer.log");
@@ -1130,7 +1293,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1162,7 +1325,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1205,7 +1368,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1281,7 +1444,7 @@ mod tests {
         fs::create_dir(&second).unwrap();
         write_media(&first, "a.mp4");
         write_media(&second, "b.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&first).unwrap();
         manager.add_folder(&second).unwrap();
@@ -1406,7 +1569,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1465,7 +1628,7 @@ mod tests {
         for number in 0..2000 {
             write_media(&media, &format!("clip-{number:05}.mp4"));
         }
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let root_id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1536,7 +1699,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1575,7 +1738,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1606,7 +1769,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1659,7 +1822,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database);
         manager.add_folder(&media).unwrap();
 
@@ -1775,13 +1938,20 @@ mod tests {
                 dir("/scratch/runtime"),
                 dir("/run/1"),
                 dir("/c"),
-                "/tmp".into()
+                "/tmp".into(),
+                1000
             ),
             PathBuf::from("/scratch/runtime")
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
-            resolve_runtime_dir(None, dir("/run/1000"), dir("/home/u/.cache"), "/tmp".into()),
+            resolve_runtime_dir(
+                None,
+                dir("/run/1000"),
+                dir("/home/u/.cache"),
+                "/tmp".into(),
+                1000
+            ),
             PathBuf::from("/run/1000/toka")
         );
         #[cfg(not(target_os = "linux"))]
@@ -1790,18 +1960,100 @@ mod tests {
                 None,
                 dir("/run/1000"),
                 dir("/Users/u/Library/Caches"),
-                "/tmp".into()
+                "/tmp".into(),
+                501
             ),
             PathBuf::from("/Users/u/Library/Caches/toka")
         );
-        // No platform dir at all: the cache, then the temporary dir.
+        // No platform dir at all: the cache, then a per-user temporary dir.
         assert_eq!(
-            resolve_runtime_dir(None, None, dir("/home/u/.cache"), "/tmp".into()),
+            resolve_runtime_dir(None, None, dir("/home/u/.cache"), "/tmp".into(), 1000),
             PathBuf::from("/home/u/.cache/toka")
         );
         assert_eq!(
-            resolve_runtime_dir(None, None, None, "/tmp".into()),
-            PathBuf::from("/tmp/toka")
+            resolve_runtime_dir(None, None, None, "/tmp".into(), 1000),
+            PathBuf::from("/tmp/toka-1000")
+        );
+        assert_eq!(
+            resolve_runtime_dir(None, None, None, "/tmp".into(), 1001),
+            PathBuf::from("/tmp/toka-1001")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_dir_is_pinned_to_its_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let uid = current_uid();
+
+        // Created missing, and narrowed to 0700 even when it exists wider.
+        let fresh = directory.path().join("fresh");
+        ensure_runtime_dir(&fresh, uid).unwrap();
+        assert_eq!(
+            fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let wide = directory.path().join("wide");
+        fs::create_dir(&wide).unwrap();
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_dir(&wide, uid).unwrap();
+        assert_eq!(
+            fs::metadata(&wide).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Another user's directory is refused, not joined: with a faked uid
+        // this own-user directory reads as someone else's.
+        let error = ensure_runtime_dir(&fresh, uid.wrapping_add(1)).unwrap_err();
+        assert!(error.contains("owned by another user"), "{error}");
+
+        // So is a symlink, which would redirect the locks elsewhere.
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        let error = ensure_runtime_dir(&link, uid).unwrap_err();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_sees_a_primary_supervisor() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        assert!(
+            !daemon_lock_held(&database).unwrap(),
+            "no supervisor holds the lock yet"
+        );
+        let _daemon = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        assert!(daemon_lock_held(&database).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_sees_a_legacy_only_supervisor() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // An old supervisor, which takes only the beside-the-index lock.
+        let legacy = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(database.with_file_name("daemon.lock"))
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        assert!(
+            daemon_lock_held(&database).unwrap(),
+            "a legacy-only lock must still block a purge or reset"
         );
     }
 
@@ -1815,6 +2067,31 @@ mod tests {
         assert_eq!(daemon_lock_path(&first), daemon_lock_path(&first));
         assert_ne!(daemon_lock_path(&first), daemon_lock_path(&second));
         assert!(daemon_lock_path(&first).starts_with(&runtime));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_database_spellings_share_one_lock() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let dotted = directory.path().join(".").join("index.sqlite3");
+
+        assert_eq!(
+            daemon_lock_path(&database),
+            daemon_lock_path(&dotted),
+            "spellings of one index must meet on one lock"
+        );
+
+        // And supervision actually meets there: a supervisor started
+        // through one spelling blocks the other.
+        let _daemon = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        assert!(
+            try_acquire_daemon_lock(&dotted).unwrap().is_none(),
+            "the aliased spelling must yield"
+        );
     }
 
     #[cfg(unix)]

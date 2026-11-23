@@ -23,7 +23,7 @@ const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--pag
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing in the index.";
 const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
-const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether the indexer daemon is running and what it is doing: its process, uptime, current activity (idle, scanning, repairing, thumbnails, offline-waiting, or unknown from a newer daemon), the folder and file under the cursor, and the work still queued. Folders whose storage is missing count as offline and are listed on their own line, never as queued work; folders backing off after an error still count as pending until they scan. Exits 3 when the daemon is not running, so scripts can branch on it. Changes nothing in the index.\n\n  --json       Print one JSON document (schema 1) instead of the report\n  --watch      Re-render every second until the daemon is idle with nothing queued; offline folders never hold the wait. Stop it with Ctrl-C";
+const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether the indexer daemon is running and what it is doing: its process, uptime, current activity (idle, scanning, repairing, thumbnails, offline-waiting, or unknown from a newer daemon), the folder and file under the cursor, and the work still queued. Folders whose storage is missing count as offline and are listed on their own line, never as queued work; folders backing off after an error still count as pending until they scan. The Service line shows whether the ts background service is installed, enabled, and running; parts the service manager cannot answer are omitted, and an install state that cannot be determined reads as unknown. Exits 3 when the daemon is not running, so scripts can branch on it. Changes nothing in the index.\n\n  --json       Print one JSON document (schema 1) instead of the report\n  --watch      Re-render every second until the daemon is idle with nothing queued; offline folders never hold the wait. Stop it with Ctrl-C";
 const DAEMON_HELP: &str =
     "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
 const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
@@ -44,7 +44,7 @@ const THUMBNAIL_HELP: &str = "Usage: ts thumbnail <path> [--json]\n\nPrint the t
 const PREVIEW_USAGE: &str = "Usage: ts preview <path> [--json]";
 const PREVIEW_HELP: &str = "Usage: ts preview <path> [--json]\n\nPrint the preview frames for one video, one per line, generating them on the first run as the app does on hover; an image prints as its own single frame. Prints one JSON document (schema 1) with --json.\n\nUse -- for a path starting with a dash.";
 const INSTALL_USAGE: &str = "Usage: ts install [--link] [--json]";
-const INSTALL_HELP: &str = "Usage: ts install [--link] [--json]\n\nInstall the indexer as a background service for this ts: a systemd user unit on Linux, a launchd agent on macOS. The service runs `ts daemon run`, starts now, and starts again at login. On Linux the old toka-indexer.service is migrated away, and lingering is enabled so indexing continues while logged out. Safe to re-run: every step reports what it did versus the state it already found.\n\n  --link       Also link this ts into ~/.local/bin\n  --json       Print one JSON document (schema 1) instead of the report";
+const INSTALL_HELP: &str = "Usage: ts install [--link] [--json]\n\nInstall the indexer as a background service for this ts: a systemd user unit on Linux, a launchd agent on macOS. The service runs `ts daemon run`, starts now, and starts again at login. On Linux the old toka-indexer.service is migrated away, and login lingering is attempted so indexing can continue while logged out (without it, indexing stops at logout). Safe to re-run: every step reports what it did versus the state it already found. The service always points at the ts that installed it last: installing from another copy takes it over, and says so. Run as your own user, never under sudo: under sudo the service would be installed for root instead of you.\n\n  --link       Also link this ts into ~/.local/bin\n  --json       Print one JSON document (schema 1) instead of the report";
 const UNINSTALL_USAGE: &str = "Usage: ts uninstall [--purge-data] [--json]";
 const UNINSTALL_HELP: &str = "Usage: ts uninstall [--purge-data] [--json]\n\nStop and remove the indexer service. Safe to re-run: removing what was never installed succeeds and says so.\n\n  --purge-data   Also remove the index, the logs, and the thumbnail cache (never media)\n  --json         Print one JSON document (schema 1) instead of the report";
 const RESTART_USAGE: &str = "Usage: ts restart [--json]";
@@ -99,7 +99,7 @@ pub fn run_command(
     make_preview: impl FnOnce(&Path) -> Result<Vec<PathBuf>, String>,
     read_status: impl FnMut() -> Result<DaemonStatus, String>,
     run_daemon: impl FnOnce() -> Result<(), String>,
-    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -899,7 +899,7 @@ fn run_daemon_run_command(
 
 fn run_install_command(
     arguments: &[OsString],
-    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -934,7 +934,7 @@ fn parse_install_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
 
 fn run_uninstall_command(
     arguments: &[OsString],
-    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -980,7 +980,7 @@ fn run_simple_service_command(
     arguments: &[OsString],
     usage: &str,
     help: &str,
-    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -998,21 +998,21 @@ fn run_simple_service_command(
 
 /// Runs one service operation and reports what it did: one line per
 /// action, or one JSON document (schema 1) naming the command and each
-/// action with whether it changed anything.
+/// action with whether it changed anything. A mid-command failure still
+/// prints what completed before the error — the partial report first,
+/// then the failure — and a JSON failure carries the error alongside
+/// the partial actions.
 fn run_service_op(
     op: ServiceOp,
     json: bool,
-    service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+    service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
     let command = format!("ts {}", op.name());
-    let outcome = match service(op) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let _ = writeln!(stderr, "{command}: {error}");
-            return 1;
-        }
+    let (outcome, failure) = match service(op) {
+        Ok(outcome) => (outcome, None),
+        Err((error, outcome)) => (outcome, Some(error)),
     };
     if json {
         // Encode fallibly like the other commands: a future non-lossy
@@ -1024,21 +1024,32 @@ fn run_service_op(
                 return 1;
             }
         };
-        let document = serde_json::json!({
+        let mut document = serde_json::json!({
             "schema": JSON_SCHEMA_VERSION,
             "command": op.name(),
             "actions": actions,
         });
-        return print_json(&document, &command, stdout, stderr);
-    }
-    for action in &outcome.actions {
-        if let Err(error) = writeln!(stdout, "{}", action.message) {
+        if let Some(error) = &failure {
+            document["error"] = serde_json::Value::String(error.clone());
+        }
+        let status = print_json(&document, &command, stdout, stderr);
+        if status != 0 {
+            return status;
+        }
+    } else {
+        for action in &outcome.actions {
+            if let Err(error) = writeln!(stdout, "{}", action.message) {
+                let _ = writeln!(stderr, "{command}: could not write: {error}");
+                return 1;
+            }
+        }
+        if let Err(error) = stdout.flush() {
             let _ = writeln!(stderr, "{command}: could not write: {error}");
             return 1;
         }
     }
-    if let Err(error) = stdout.flush() {
-        let _ = writeln!(stderr, "{command}: could not write: {error}");
+    if let Some(error) = failure {
+        let _ = writeln!(stderr, "{command}: {error}");
         return 1;
     }
     0
@@ -1570,7 +1581,9 @@ mod tests {
         panic!("this command must not run the daemon")
     }
 
-    fn no_service(_op: toka_search::service::ServiceOp) -> Result<super::Outcome, String> {
+    fn no_service(
+        _op: toka_search::service::ServiceOp,
+    ) -> Result<super::Outcome, (String, super::Outcome)> {
         panic!("this command must not manage the service")
     }
 
@@ -5039,7 +5052,7 @@ mod tests {
                 pending_thumbnails: 0,
             },
             offline_roots: 0,
-            service_installed: true,
+            service_installed: Some(true),
             service_enabled: Some(true),
             service_running: Some(true),
         }
@@ -5056,7 +5069,7 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
-            service_installed: true,
+            service_installed: Some(true),
             service_enabled: Some(true),
             service_running: Some(false),
         }
@@ -5073,7 +5086,7 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
-            service_installed: false,
+            service_installed: Some(false),
             service_enabled: None,
             service_running: None,
         }
@@ -5879,7 +5892,7 @@ mod tests {
 
     fn run_with_service(
         arguments: &[&str],
-        service: impl FnOnce(ServiceOp) -> Result<Outcome, String>,
+        service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
     ) -> (i32, String, String) {
         let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
         let mut stdout = Vec::new();
@@ -6024,11 +6037,68 @@ mod tests {
     #[test]
     fn install_failure_returns_a_failure_status() {
         let (status, stdout, stderr) = run_with_service(&["ts", "install"], |_| {
-            Err("systemctl --user start toka-search.service failed".to_owned())
+            Err((
+                "systemctl --user start toka-search.service failed".to_owned(),
+                Outcome { actions: vec![] },
+            ))
         });
 
         assert_eq!(status, 1);
         assert!(stdout.is_empty());
+        assert_eq!(
+            stderr,
+            "ts install: systemctl --user start toka-search.service failed\n"
+        );
+    }
+
+    #[test]
+    fn install_failure_prints_the_partial_report_before_the_error() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "install"], |_| {
+            Err((
+                "systemctl --user start toka-search.service failed".to_owned(),
+                Outcome {
+                    actions: vec![
+                        done("wrote ~/.config/systemd/user/toka-search.service"),
+                        done("enabled toka-search.service"),
+                    ],
+                },
+            ))
+        });
+
+        assert_eq!(status, 1);
+        assert_eq!(
+            stdout,
+            "wrote ~/.config/systemd/user/toka-search.service\nenabled toka-search.service\n"
+        );
+        assert_eq!(
+            stderr,
+            "ts install: systemctl --user start toka-search.service failed\n"
+        );
+    }
+
+    #[test]
+    fn install_json_failure_carries_the_partial_actions_and_the_error() {
+        let (status, stdout, stderr) = run_with_service(&["ts", "install", "--json"], |_| {
+            Err((
+                "systemctl --user start toka-search.service failed".to_owned(),
+                Outcome {
+                    actions: vec![done("enabled toka-search.service")],
+                },
+            ))
+        });
+
+        assert_eq!(status, 1);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["command"], "install");
+        assert_eq!(
+            document["actions"][0]["message"],
+            "enabled toka-search.service"
+        );
+        assert_eq!(
+            document["error"],
+            "systemctl --user start toka-search.service failed"
+        );
         assert_eq!(
             stderr,
             "ts install: systemctl --user start toka-search.service failed\n"
@@ -6072,7 +6142,10 @@ mod tests {
     #[test]
     fn uninstall_failure_returns_a_failure_status() {
         let (status, stdout, stderr) = run_with_service(&["ts", "uninstall"], |_| {
-            Err("could not ask launchd about the service.".to_owned())
+            Err((
+                "could not ask launchd about the service.".to_owned(),
+                Outcome { actions: vec![] },
+            ))
         });
 
         assert_eq!(status, 1);
@@ -6139,8 +6212,9 @@ mod tests {
     #[test]
     fn restart_start_and_stop_failures_return_a_failure_status() {
         for command in ["restart", "start", "stop"] {
-            let (status, stdout, stderr) =
-                run_with_service(&["ts", command], |_| Err("not installed".to_owned()));
+            let (status, stdout, stderr) = run_with_service(&["ts", command], |_| {
+                Err(("not installed".to_owned(), Outcome { actions: vec![] }))
+            });
             assert_eq!(status, 1, "{command}");
             assert!(stdout.is_empty(), "{command}");
             assert_eq!(

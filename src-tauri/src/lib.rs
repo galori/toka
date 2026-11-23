@@ -1351,12 +1351,9 @@ fn addon_directory(
 /// add-ons.
 #[cfg(not(mobile))]
 fn reset_plan() -> Result<reset::ResetPlan, String> {
-    let mut paths = Vec::new();
-    // The owned index, the search rename overlay, and the folder the indexer
-    // keeps its state in.
-    if let Some(directory) = owned_index::database_path()?.parent() {
-        paths.push(directory.to_path_buf());
-    }
+    // The index's known files — never the directory itself, so foreign
+    // content stored there always survives.
+    let mut paths = owned_index::index_data_files(&owned_index::database_path()?);
     paths.push(thumbnails::cache_output_root());
     if let Some(cache) = dirs::cache_dir() {
         paths.push(cache.join("app.toka.desktop"));
@@ -1871,7 +1868,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let sample = root.join("sample.mp4");
         std::fs::write(&sample, b"sample video").unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = owned_index::OwnedIndexManager::under(database.clone());
         let state = manager.add_folder(&root).unwrap();
         let folder_id = &state.folders[0].id;

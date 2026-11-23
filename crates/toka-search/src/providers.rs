@@ -133,7 +133,7 @@ mod tests {
         let root = directory.path().join("media");
         std::fs::create_dir_all(root.join(".worktrees")).unwrap();
         let root = root.canonicalize().unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         crate::owned_index::OwnedIndexManager::under(database.clone())
             .add_folder(&root)
             .unwrap();
@@ -165,7 +165,7 @@ mod tests {
         std::fs::write(&visible, b"video").unwrap();
         std::fs::write(&hidden, b"video").unwrap();
         let root = root.canonicalize().unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let state = crate::owned_index::OwnedIndexManager::under(database.clone())
             .add_folder(&root)
             .unwrap();

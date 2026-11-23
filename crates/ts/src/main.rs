@@ -124,8 +124,10 @@ fn run_daemon() -> Result<(), String> {
 /// Runs one service operation against the real machine.
 fn manage_service(
     op: toka_search::service::ServiceOp,
-) -> Result<toka_search::service::Outcome, String> {
-    let mut host = toka_search::service::SystemHost::new()?;
+) -> Result<toka_search::service::Outcome, (String, toka_search::service::Outcome)> {
+    use toka_search::service::Outcome;
+    let mut host =
+        toka_search::service::SystemHost::new().map_err(|error| (error, Outcome::default()))?;
     toka_search::service::perform(&mut host, op)
 }
 

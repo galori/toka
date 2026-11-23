@@ -2435,12 +2435,21 @@ for arg in "$@"; do unit="$arg"; done
 active="$TS_SHIM_STATE/active_$unit"
 enabled="$TS_SHIM_STATE/enabled_$unit"
 case "$verb" in
-  is-active) [ "$(cat "$active" 2>/dev/null)" = "1" ] && exit 0 || exit 3;;
+  is-active)
+    if [ "$(cat "$active" 2>/dev/null)" = "1" ]; then echo "active"; exit 0;
+    elif [ "$(cat "$TS_SHIM_STATE/activating_$unit" 2>/dev/null)" = "1" ]; then echo "activating"; exit 3;
+    else echo "inactive"; exit 3; fi;;
   is-enabled)
     if [ "$(cat "$enabled" 2>/dev/null)" = "1" ]; then echo "enabled"; exit 0;
     else echo "disabled"; exit 1; fi;;
-  start) echo 1 > "$active";;
-  stop) echo 0 > "$active";;
+  show)
+    dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    line=$(grep '^ExecStart=' "$dir/$unit" 2>/dev/null | head -n 1)
+    exe=$(printf '%s' "$line" | sed -n 's/^ExecStart="\(.*\)" daemon run$/\1/p')
+    if [ -n "$exe" ]; then echo "ExecStart={ path=$exe ; argv[]=$exe daemon run ; ignore_errors=no }";
+    else echo "ExecStart="; fi;;
+  start) echo 1 > "$active"; rm -f "$TS_SHIM_STATE/activating_$unit";;
+  stop) echo 0 > "$active"; rm -f "$TS_SHIM_STATE/activating_$unit";;
   enable) echo 1 > "$enabled";;
   disable) echo 0 > "$enabled";;
   daemon-reload) ;;
@@ -2461,7 +2470,9 @@ case "$1" in
     if [ "$(cat "$TS_SHIM_STATE/bootstrapped" 2>/dev/null)" = "1" ]; then
       if [ "$(cat "$TS_SHIM_STATE/job_running" 2>/dev/null)" = "1" ]; then job="running";
       else job="exited"; fi
-      printf '%s = {\n\tstate = %s;\n}\n' "$2" "$job"
+      printf '%s = {\n\tstate = %s;\n' "$2" "$job"
+      if [ -f "$TS_SHIM_STATE/program" ]; then printf '\tprogram = %s;\n' "$(cat "$TS_SHIM_STATE/program")"; fi
+      printf '}\n'
       exit 0
     else
       echo "Could not find service $2 in domain" >&2; exit 1
@@ -2530,13 +2541,19 @@ impl ShimHome {
 
 #[cfg(unix)]
 fn run_shimmed(home: &ShimHome, arguments: &[&str]) -> Output {
-    run_shimmed_with_fail(home, arguments, None)
+    run_shimmed_with_fail(home, arguments, None, &[])
 }
 
 /// Like [`run_shimmed`], but every shimmed invocation whose arguments
-/// contain `fail` exits 1, so failure paths are testable.
+/// contain `fail` exits 1, so failure paths are testable. Extra
+/// environment entries override the harness defaults per run.
 #[cfg(unix)]
-fn run_shimmed_with_fail(home: &ShimHome, arguments: &[&str], fail: Option<&str>) -> Output {
+fn run_shimmed_with_fail(
+    home: &ShimHome,
+    arguments: &[&str],
+    fail: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Output {
     let mut command = ts_command(
         arguments,
         home.scratch.home.path(),
@@ -2548,6 +2565,12 @@ fn run_shimmed_with_fail(home: &ShimHome, arguments: &[&str], fail: Option<&str>
     command.env("PATH", format!("{}:{path}", home.shim_dir.display()));
     command.env("TS_SHIM_LOG", &home.log);
     command.env("TS_SHIM_STATE", &home.state);
+    // A fixture login name: lingering flows must not depend on the
+    // developer's own USER.
+    command.env("USER", "tester");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     match fail {
         Some(pattern) => {
             command.env("TS_SHIM_FAIL", pattern);
@@ -2608,6 +2631,7 @@ fn install_writes_enables_and_starts_the_systemd_unit() {
     );
     for line in [
         "Description=Toka search indexer",
+        "Type=exec",
         "Restart=on-failure",
         "RestartSec=2",
         "Nice=10",
@@ -2684,14 +2708,63 @@ fn install_migrates_the_old_service() {
 
 #[cfg(all(unix, target_os = "linux"))]
 #[test]
+fn install_respects_xdg_config_home() {
+    let home = shim_home();
+    let config = home
+        .home()
+        .join("xdg-config")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_CONFIG_HOME", config.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        Path::new(&config)
+            .join("systemd/user/toka-search.service")
+            .is_file(),
+        "the unit lands under XDG_CONFIG_HOME"
+    );
+    assert!(
+        !shim_unit_file(&home).exists(),
+        "nothing lands under ~/.config"
+    );
+
+    // Status finds it there too.
+    let output = run_shimmed_with_fail(
+        &home,
+        &["status"],
+        None,
+        &[("XDG_CONFIG_HOME", config.as_str())],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Service:  installed"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
 fn install_fails_when_the_manager_refuses_to_start() {
     let home = shim_home();
 
-    let output = run_shimmed_with_fail(&home, &["install"], Some("start toka-search.service"));
+    let output = run_shimmed_with_fail(&home, &["install"], Some("start toka-search.service"), &[]);
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("ts install: systemctl"), "{stderr}");
+    // The failure still prints what completed before it.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("wrote ~/"), "{stdout}");
+    assert!(stdout.contains("enabled toka-search.service"), "{stdout}");
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -2850,6 +2923,12 @@ fn install_writes_and_bootstraps_the_agent() {
     for key in ["KeepAlive", "RunAtLoad", "ProcessType", "LowPriorityIO"] {
         assert!(plist.contains(&format!("<key>{key}</key>")), "{plist}");
     }
+    // launchd agents inherit a minimal PATH: the plist pins one that
+    // covers both Homebrew prefixes so background thumbnails find ffmpeg.
+    assert!(
+        plist.contains("<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"),
+        "{plist}"
+    );
     assert!(plist.contains("<string>Background</string>"), "{plist}");
     let calls = home.calls();
     assert!(calls.contains("bootstrap"), "{calls}");
@@ -2880,11 +2959,14 @@ fn install_is_idempotent() {
 fn install_fails_when_the_manager_refuses_to_bootstrap() {
     let home = shim_home();
 
-    let output = run_shimmed_with_fail(&home, &["install"], Some("bootstrap"));
+    let output = run_shimmed_with_fail(&home, &["install"], Some("bootstrap"), &[]);
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("ts install: launchctl"), "{stderr}");
+    // The failure still prints what completed before it.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("wrote ~/"), "{stdout}");
 }
 
 #[cfg(all(unix, target_os = "macos"))]
@@ -3106,6 +3188,10 @@ fn uninstall_purge_removes_data_but_keeps_media() {
     let cache_dir = home.home().join("tmp/toka-thumbnails");
     fs::create_dir_all(&cache_dir).unwrap();
     fs::write(cache_dir.join("thumb.jpg"), b"thumb").unwrap();
+    // Foreign content inside the index directory: purge deletes only
+    // known index files, so this always survives.
+    let foreign = index_dir.join("my-media-clip.mp4");
+    fs::write(&foreign, b"video").unwrap();
 
     let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
 
@@ -3115,7 +3201,12 @@ fn uninstall_purge_removes_data_but_keeps_media() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!index_dir.exists(), "the index is purged");
+    assert!(
+        !index_dir.join("index.sqlite3").exists(),
+        "the index is purged"
+    );
+    assert!(foreign.is_file(), "foreign index-dir content survives");
+    assert!(index_dir.is_dir(), "the index directory itself survives");
     assert!(!logs_dir.exists(), "the logs are purged");
     assert!(!cache_dir.exists(), "the thumbnail cache is purged");
     assert!(clip.is_file(), "media is never purged");
