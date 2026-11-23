@@ -1822,15 +1822,11 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let sample = root.join("sample.mp4");
         std::fs::write(&sample, b"sample video").unwrap();
-        let search = serde_json::json!({
+        let candidates = serde_json::json!({
             "schema": 1,
             "query": "sample",
-            "page": 1,
-            "pageSize": 1,
-            "totalResults": 1,
-            "totalPages": 1,
             "indexRevision": 42,
-            "results": [{"path": sample.to_string_lossy()}],
+            "candidates": [sample.to_string_lossy()],
         });
         let folders = serde_json::json!({
             "schema": 1,
@@ -1848,7 +1844,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = search ]; then cat <<'TS_EOF'\n{search}\nTS_EOF\nelif [ \"$1\" = folders ]; then cat <<'TS_EOF'\n{folders}\nTS_EOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
+                "#!/bin/sh\nif [ \"$1\" = candidates ]; then cat <<'TS_EOF'\n{candidates}\nTS_EOF\nelif [ \"$1\" = folders ]; then cat <<'TS_EOF'\n{folders}\nTS_EOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
             ),
         )
         .unwrap();

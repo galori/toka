@@ -72,6 +72,7 @@ export function isolatedPaths(worktree, env = process.env) {
     cache: path.join(home, "cache"),
     shimDir: path.join(home, "bin"),
     shim: path.join(home, "bin", "systemctl"),
+    loginctlShim: path.join(home, "bin", "loginctl"),
     shimLog: path.join(home, "run", "systemctl-shim.log"),
     indexerPidFile: path.join(home, "run", "indexer.pid"),
     indexerLog: path.join(home, "run", "indexer.log"),
@@ -89,12 +90,16 @@ export function isolatedPaths(worktree, env = process.env) {
 
 /**
  * The environment an isolated Toka and its indexer run with. The XDG variables
- * give them their own settings, index and logs. The PATH shim keeps either
- * process from reaching the user's `toka-search.service` through systemctl.
+ * give them their own settings, index and logs. HOME points at the isolated
+ * home too: `ts install` resolves the legacy service file from it, so the
+ * real home stays untouched. The PATH shims keep either
+ * process from reaching the user's `toka-search.service` through systemctl
+ * or changing host login state through loginctl.
  */
 export function isolatedEnv(paths, base = process.env) {
   return {
     ...base,
+    HOME: paths.home,
     XDG_CONFIG_HOME: paths.config,
     XDG_DATA_HOME: paths.data,
     XDG_CACHE_HOME: paths.cache,
@@ -151,6 +156,27 @@ exit 0
 `;
 }
 
+/**
+ * A stand-in `loginctl`. `ts install` probes lingering with
+ * `show-user $USER -p Linger --value` and enables it otherwise; unshimmed,
+ * an isolated instance would change the user's real login state. The probe
+ * passes `--value`, so it answers the bare `yes` the real tool prints (and
+ * the probe compares against), reporting lingering as already enabled.
+ * Every other call is a no-op that succeeds.
+ */
+export function loginctlShimScript() {
+  return `#!/bin/sh
+# Installed by scripts/isolated: isolated Toka must never change host login
+# state. Report lingering as already enabled; do nothing otherwise.
+case "$*" in
+  *"show-user"*)
+    echo yes
+    ;;
+esac
+exit 0
+`;
+}
+
 /** The index-folders.json an isolated home starts with. */
 export function seedConfig(folderPaths, newId) {
   return {
@@ -164,6 +190,22 @@ export function seedConfig(folderPaths, newId) {
 
 export function indexerArguments() {
   return ["daemon", "run"];
+}
+
+/**
+ * How the isolated build compiles the `ts` search helper. It runs from
+ * `src-tauri` because the tauri CLI builds from there too (it sets its
+ * working directory to the project dir before invoking cargo), so a
+ * relative `CARGO_TARGET_DIR` resolves under `src-tauri` for both
+ * binaries — matching `isolatedPaths`, and landing `ts` where `launch`
+ * looks. An absolute target dir is unaffected by the cwd either way.
+ */
+export function tsBuildInvocation(paths) {
+  return {
+    command: "cargo",
+    args: ["build", "--release", "-p", "ts"],
+    cwd: path.join(paths.worktree, "src-tauri"),
+  };
 }
 
 /**

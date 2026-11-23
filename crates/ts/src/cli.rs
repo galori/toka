@@ -20,9 +20,11 @@ use toka_search::{
 /// so readers gate on the exit status.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  reset [--yes]    Remove Toka's search state\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  candidates <query> Print the raw candidate paths behind a search query\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  reset [--yes]    Remove Toka's search state\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
+const CANDIDATES_USAGE: &str = "Usage: ts candidates <query> [--json]";
+const CANDIDATES_HELP: &str = "Usage: ts candidates <query> [--json]\n\nPrint the raw candidate paths behind a search query: the OR-widened set the search engine filters by fields, media type, and visibility, with recorded renames applied. The Toka app searches through this and filters it with the viewer's own fields; `ts search` runs the same engine's filters itself. Prints one full path per result line, or one JSON document (schema 1) with --json. A missing index reads empty, never created. Changes nothing in the index.\n\nUse -- to ask for text starting with a dash.";
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing in the index.";
 const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
@@ -134,6 +136,10 @@ pub fn run_command(
             stdout,
             stderr,
         );
+    }
+
+    if command == OsStr::new("candidates") {
+        return run_candidates_command(&arguments[2..], create_engine, stdout, stderr);
     }
 
     if command == OsStr::new("stats") {
@@ -559,14 +565,14 @@ fn run_folders_remove_command(
     if paths.is_empty() {
         let _ = writeln!(
             stderr,
-            "Folders remove needs a folder path.\n{FOLDERS_REMOVE_USAGE}"
+            "Folders remove needs a folder path or id.\n{FOLDERS_REMOVE_USAGE}"
         );
         return 2;
     }
     if paths.len() > 1 {
         let _ = writeln!(
             stderr,
-            "Folders remove takes one folder path.\n{FOLDERS_REMOVE_USAGE}"
+            "Folders remove takes one folder path or id.\n{FOLDERS_REMOVE_USAGE}"
         );
         return 2;
     }
@@ -1661,6 +1667,105 @@ fn take_search_number(
         .ok_or_else(|| format!("{flag} needs a positive number, got '{value}'."))
 }
 
+struct CandidatesOptions {
+    query: String,
+    json: bool,
+}
+
+fn run_candidates_command(
+    arguments: &[OsString],
+    create_engine: impl FnOnce() -> Result<SearchEngine, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(CANDIDATES_HELP, stdout, stderr);
+    }
+
+    let options = match parse_candidates_arguments(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{CANDIDATES_USAGE}");
+            return 2;
+        }
+    };
+
+    let engine = match create_engine() {
+        Ok(engine) => engine,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts candidates: {error}");
+            return 1;
+        }
+    };
+    let (candidates, revision) = match engine.raw_candidates(&options.query) {
+        Ok(found) => found,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts candidates: {error}");
+            return 1;
+        }
+    };
+    if options.json {
+        // Lossy strings, never `PathBuf`s: real paths can hold
+        // non-UTF-8 bytes on Unix, and those must not break this
+        // document — the same lossy encoding the human output uses.
+        let candidates: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "query": options.query,
+            "indexRevision": revision,
+            "candidates": candidates,
+        });
+        return print_json(&document, "ts candidates", stdout, stderr);
+    }
+    for path in candidates {
+        if let Err(error) = writeln!(stdout, "{}", path.display()) {
+            let _ = writeln!(stderr, "ts candidates: could not write a result: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "ts candidates: could not write results: {error}");
+        return 1;
+    }
+    0
+}
+
+fn parse_candidates_arguments(arguments: &[OsString]) -> Result<CandidatesOptions, String> {
+    let mut options = CandidatesOptions {
+        query: String::new(),
+        json: false,
+    };
+    let mut words: Vec<&str> = Vec::new();
+    let mut only_words = false;
+    for argument in arguments {
+        let Some(text) = argument.to_str() else {
+            return Err("Candidate terms must be valid text.".to_owned());
+        };
+        if only_words {
+            words.push(text);
+        } else if text == "--" {
+            only_words = true;
+        } else if text == "--json" {
+            options.json = true;
+        } else if text.starts_with('-') {
+            return Err(format!("Unknown option '{text}'."));
+        } else {
+            words.push(text);
+        }
+    }
+    let query = words.join(" ");
+    if query.trim().is_empty() {
+        return Err("Candidates needs a query.".to_owned());
+    }
+    options.query = query;
+    Ok(options)
+}
+
 fn print_text(text: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
     if let Err(error) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
         let _ = writeln!(stderr, "ts: could not write output: {error}");
@@ -1804,6 +1909,7 @@ mod tests {
             assert!(output.contains("Usage: ts <command>"), "{output}");
             for command in [
                 "search",
+                "candidates",
                 "stats",
                 "status",
                 "install",
@@ -3150,6 +3256,369 @@ mod tests {
             format!("{}\n", video.display())
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_command_prints_the_unfiltered_candidate_paths() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("clip.mp4");
+        let unfiltered = directory.path().join("unrelated.mp4");
+        fs::write(&matching, b"video").unwrap();
+        fs::write(&unfiltered, b"video").unwrap();
+        // A negation the engine would narrow: candidates keep both.
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![
+            matching.clone(),
+            unfiltered.clone(),
+        ])));
+        let args = ["ts", "candidates", "clip", "NOT", "unrelated"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("{}\n{}\n", matching.display(), unfiltered.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_without_a_query_prints_usage() {
+        let args = ["ts", "candidates"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("Candidates needs a query.\n{}\n", super::CANDIDATES_USAGE)
+        );
+    }
+
+    #[test]
+    fn candidates_help_does_not_create_the_search_engine() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "candidates", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                || panic!("help must not create the search engine"),
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                no_status,
+                no_daemon_run,
+                no_service,
+                no_reset,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(String::from_utf8(stdout)
+                .unwrap()
+                .contains(super::CANDIDATES_USAGE));
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn candidates_engine_setup_error_returns_a_failure_status() {
+        let args = ["ts", "candidates", "family"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Err("search index could not be opened".into()),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts candidates: search index could not be opened\n"
+        );
+    }
+
+    #[test]
+    fn candidates_provider_error_returns_a_failure_status() {
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let args = ["ts", "candidates", "family"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts candidates: backend unavailable\n"
+        );
+    }
+
+    #[test]
+    fn candidates_json_prints_a_versioned_document() {
+        let directory = tempdir().unwrap();
+        let videos = (0..2)
+            .map(|number| {
+                let video = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&video, b"video").unwrap();
+                video
+            })
+            .collect::<Vec<_>>();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(videos.clone())));
+        let args = ["ts", "candidates", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["query"], "family");
+        // The fixture provider carries no revision; the real provider's
+        // revision flows through the same field.
+        assert_eq!(document["indexRevision"], 0);
+        assert_eq!(
+            document["candidates"],
+            serde_json::json!([videos[0].to_string_lossy(), videos[1].to_string_lossy(),])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    // Non-UTF-8 names only exist on Unix filesystems, and Linux alone in
+    // practice: macOS (APFS) rejects them at creation, so this scenario
+    // cannot occur there. The lossy conversion itself is platform-neutral.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidates_json_with_non_utf8_names_prints_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempdir().unwrap();
+        let name = OsString::from_vec(b"family-\xff-trip.mp4".to_vec());
+        let video = directory.path().join(&name);
+        fs::write(&video, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![video.clone()])));
+        let args = ["ts", "candidates", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["candidates"],
+            serde_json::json!([video.to_string_lossy().into_owned()])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_after_a_dash_separator_takes_flags_literally() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("--json-fan.mp4");
+        fs::write(&video, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![video.clone()])));
+        let args = ["ts", "candidates", "--", "--json-fan"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("{}\n", video.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_with_an_unknown_option_is_a_usage_error() {
+        let args = ["ts", "candidates", "family", "--page", "2"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("Unknown option '--page'.\n{}\n", super::CANDIDATES_USAGE)
+        );
     }
 
     fn sample_stats() -> IndexStats {

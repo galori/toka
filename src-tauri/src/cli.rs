@@ -195,14 +195,9 @@ fn run_search_command(
             1
         }
         // The query was validated above and `search` never exits 3, so
-        // anything else is unreachable — but never silent.
+        // anything else is a signal kill (status -1) or a future exit —
+        // reported like any failure, never silent.
         _ => {
-            debug_assert!(
-                false,
-                "unexpected `ts search` status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
             let _ = writeln!(
                 stderr,
                 "toka search: {}",
@@ -324,8 +319,12 @@ fn run_confirmed_reset(
         }
     };
     // Fail closed exactly as one plan: when the stop failed, `ts`
-    // removed nothing — so the app cache stays too.
-    if !applied.indexer_stopped {
+    // removed nothing — so the app cache stays too. A preflight refusal
+    // reads the same: nothing removed with failures means the plan never
+    // ran, and the app cache is part of that refused plan. A partial
+    // removal already ran, so the app cache still goes, as the old
+    // sequential plan continued past mid-plan failures.
+    if !applied.indexer_stopped || (applied.removed.is_empty() && !applied.failures.is_empty()) {
         for failure in &applied.failures {
             let _ = writeln!(stderr, "toka reset: {failure}");
         }
@@ -558,6 +557,30 @@ mod tests {
     }
 
     #[test]
+    fn search_reports_a_signal_killed_ts_instead_of_panicking() {
+        // A signal leaves `ts` with no exit code (`run` reports status
+        // -1): the search reports it like any failure, even in debug
+        // builds where an assertion used to panic on it.
+        let args = ["toka", "search", "family"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            |_| Ok(ts_output(-1, "", "")),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "toka search: ts search failed.\n"
+        );
+    }
+
+    #[test]
     fn search_ts_spawn_error_returns_a_failure_status() {
         let args = ["toka", "search", "family"].map(OsString::from).to_vec();
         let mut stdout = Vec::new();
@@ -651,13 +674,31 @@ mod tests {
     }
 
     /// Redirects the cache dir at scratch, so reset tests name a
-    /// throwaway app cache instead of the developer's own. `TMPDIR` stays
-    /// alone: `tempfile` resolves it process-wide, so redirecting it here
+    /// throwaway app cache instead of the developer's own. `HOME` goes
+    /// along because `dirs::cache_dir()` on macOS is
+    /// `$HOME/Library/Caches`, ignoring `XDG_CACHE_HOME` — without it
+    /// these tests would create and recursively delete the developer's
+    /// real `~/Library/Caches/app.toka.desktop`. `TMPDIR` stays alone:
+    /// `tempfile` resolves it process-wide, so redirecting it here
     /// would break parallel tests' tempdirs.
     fn redirect_reset_dirs(directory: &tempfile::TempDir) -> crate::ts_client::test_env::EnvGuard {
         let mut env = crate::ts_client::test_env::EnvGuard::lock();
         env.set("XDG_CACHE_HOME", directory.path().join("cache").as_os_str());
+        env.set("HOME", directory.path().as_os_str());
         env
+    }
+
+    /// The app cache a reset targets, proven to sit under the test's own
+    /// temp dir before anything is allowed to delete it.
+    fn reset_app_cache_under(directory: &tempfile::TempDir) -> std::path::PathBuf {
+        let cache = super::app_cache_dir().unwrap();
+        assert!(
+            cache.starts_with(directory.path()),
+            "reset would touch {} outside {}",
+            cache.display(),
+            directory.path().display()
+        );
+        cache
     }
 
     #[test]
@@ -665,7 +706,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let _env = redirect_reset_dirs(&directory);
         let thumb_root = toka_search::thumbnails::cache_output_root();
-        let app_cache = super::app_cache_dir().unwrap();
+        let app_cache = reset_app_cache_under(&directory);
         // The app cache exists but must survive the preview.
         std::fs::create_dir_all(&app_cache).unwrap();
         let args = ["toka", "reset"].map(OsString::from).to_vec();
@@ -713,7 +754,7 @@ mod tests {
     fn reset_with_yes_removes_ts_state_and_the_app_cache() {
         let directory = tempfile::tempdir().unwrap();
         let _env = redirect_reset_dirs(&directory);
-        let app_cache = super::app_cache_dir().unwrap();
+        let app_cache = reset_app_cache_under(&directory);
         std::fs::create_dir_all(app_cache.join("webview")).unwrap();
         let args = ["toka", "reset", "--yes"].map(OsString::from).to_vec();
         let mut stdout = Vec::new();
@@ -756,7 +797,7 @@ mod tests {
     fn reset_with_yes_fails_closed_when_the_stop_failed() {
         let directory = tempfile::tempdir().unwrap();
         let _env = redirect_reset_dirs(&directory);
-        let app_cache = super::app_cache_dir().unwrap();
+        let app_cache = reset_app_cache_under(&directory);
         std::fs::create_dir_all(&app_cache).unwrap();
         let args = ["toka", "reset", "--yes"].map(OsString::from).to_vec();
         let mut stdout = Vec::new();
@@ -784,6 +825,88 @@ mod tests {
         assert!(
             app_cache.is_dir(),
             "a failed stop removes nothing, not even the app cache"
+        );
+    }
+
+    #[test]
+    fn reset_with_yes_keeps_the_app_cache_on_a_preflight_refusal() {
+        // `ts` refused before removing anything (a file-only target
+        // occupied by a directory): the app cache is part of that same
+        // refused plan, so it stays too.
+        let directory = tempfile::tempdir().unwrap();
+        let _env = redirect_reset_dirs(&directory);
+        let app_cache = reset_app_cache_under(&directory);
+        std::fs::create_dir_all(&app_cache).unwrap();
+        let args = ["toka", "reset", "--yes"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            |_| {
+                Ok(ts_output(
+                    1,
+                    r#"{"schema": 1, "indexerStopped": true, "removed": [], "failures": ["refusing to remove /state/index.sqlite3: a directory occupies this file's path"]}"#,
+                    "ts reset: refusing to remove /state/index.sqlite3: a directory occupies this file's path\n",
+                ))
+            },
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "toka reset: refusing to remove /state/index.sqlite3: a directory occupies this file's path\n"
+        );
+        assert!(
+            app_cache.is_dir(),
+            "a refused reset removes nothing, not even the app cache"
+        );
+    }
+
+    #[test]
+    fn reset_with_yes_still_clears_the_app_cache_after_a_partial_removal() {
+        // `ts` removed some targets before a failure: the reset already
+        // ran, so the app cache goes too, exactly as the old sequential
+        // plan continued past mid-plan failures.
+        let directory = tempfile::tempdir().unwrap();
+        let _env = redirect_reset_dirs(&directory);
+        let app_cache = reset_app_cache_under(&directory);
+        std::fs::create_dir_all(app_cache.join("webview")).unwrap();
+        let args = ["toka", "reset", "--yes"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            |_| {
+                Ok(ts_output(
+                    1,
+                    r#"{"schema": 1, "indexerStopped": true, "removed": ["/state/index.sqlite3"], "failures": ["could not remove /logs/search.log: permission denied"]}"#,
+                    "ts reset: could not remove /logs/search.log: permission denied\n",
+                ))
+            },
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(
+            !app_cache.exists(),
+            "a partial reset still clears the app cache"
+        );
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "removed /state/index.sqlite3\nremoved {}\n",
+                app_cache.display()
+            )
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "toka reset: could not remove /logs/search.log: permission denied\n"
         );
     }
 

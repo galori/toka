@@ -310,6 +310,189 @@ fn search_verbose_streams_the_trace_to_stderr() {
 }
 
 #[test]
+fn candidates_without_a_query_prints_usage_and_exits_with_a_usage_error() {
+    let output = run_ts(&["candidates"], &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Candidates needs a query.\nUsage: ts candidates <query> [--json]\n"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn candidates_help_prints_usage_and_exits_successfully() {
+    let output = run_ts(&["candidates", "--help"], &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        help.starts_with("Usage: ts candidates <query> [--json]\n"),
+        "{help}"
+    );
+    assert!(help.contains("OR-widened"), "{help}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_prints_every_fixture_video_unfiltered() {
+    let directory = tempdir().unwrap();
+    let videos = (0..3)
+        .map(|number| create_video(directory.path(), number))
+        .collect::<Vec<_>>();
+
+    // A negation the engine would narrow: candidates keep every video,
+    // in fixture order.
+    let output = run_ts(&["candidates", "family", "NOT", "trip-01"], &videos);
+
+    assert_eq!(output.status.code(), Some(0));
+    let expected = videos
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_json_prints_a_versioned_document() {
+    let directory = tempdir().unwrap();
+    let videos = (0..2)
+        .map(|number| create_video(directory.path(), number))
+        .collect::<Vec<_>>();
+
+    let output = run_ts(&["candidates", "family", "--json"], &videos);
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["query"], "family");
+    assert_eq!(document["indexRevision"], 0);
+    assert_eq!(
+        document["candidates"],
+        serde_json::json!([videos[0].to_string_lossy(), videos[1].to_string_lossy(),])
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_without_fixture_videos_configured_fails() {
+    let output = run_ts_with_fixture_env(&["candidates", "family"], None);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "ts candidates: The integration-test videos were not configured.\n"
+    );
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn candidates_with_no_index_reads_empty_without_creating_one() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["candidates", "family", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["query"], "family");
+    assert_eq!(document["indexRevision"], 0);
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 0);
+    assert!(output.stderr.is_empty());
+    assert!(
+        !index_database_path(home.home.path(), &home.data_home).exists(),
+        "a read-only command leaves no index behind"
+    );
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn candidates_json_matches_the_direct_provider_on_the_same_index() {
+    use toka_search::{
+        owned_index::{OwnedIndex, OwnedIndexManager},
+        providers::OwnedIndexSearchProvider,
+        search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE},
+        search_log::SearchLogContext,
+    };
+
+    // One real index under a scratch home: the folder added through the
+    // real CLI, scanned directly instead of waiting on a daemon.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let clip = media.join("clip.mp4");
+    let other = media.join("other.mp4");
+    fs::write(&clip, b"fixture video").unwrap();
+    fs::write(&other, b"fixture video").unwrap();
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    assert_eq!(folders.len(), 1);
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+
+    // A positive query narrows; a negation widens to the whole index.
+    // Both must match the direct provider exactly.
+    let provider = OwnedIndexSearchProvider::new(database);
+    for query in ["clip", "clip NOT other"] {
+        let output = run_at(&home, &["candidates", query, "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        let mut ts_paths: Vec<String> = document["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+        ts_paths.sort();
+
+        let request = SearchRequest {
+            query: query.to_owned(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Both,
+        };
+        let context = SearchLogContext::from(&request);
+        let mut direct_paths: Vec<String> = provider
+            .candidates(query, true, &context)
+            .unwrap()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        direct_paths.sort();
+
+        assert_eq!(ts_paths, direct_paths, "query: {query}");
+        assert_eq!(document["indexRevision"], provider.revision());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn stats_with_no_index_reports_empty() {
     let output = run_ts(&["stats"], &[]);
 

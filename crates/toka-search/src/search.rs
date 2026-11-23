@@ -477,6 +477,29 @@ impl SearchEngine {
         result
     }
 
+    /// The provider's raw candidate paths for `query`, with the index
+    /// revision they were read at: the unfiltered set the engine's own
+    /// field, NOT, media, and visibility passes narrow down. Recorded
+    /// renames are applied (stale names replaced, dropped files added
+    /// back), exactly as a search sees them — only the filtering is left
+    /// to the caller. `ts candidates` serves this to the app's engine,
+    /// which filters it with the viewer's own fields.
+    pub fn raw_candidates(&self, query: &str) -> Result<(Vec<PathBuf>, u64), SearchError> {
+        let request = SearchRequest {
+            query: query.to_owned(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Both,
+        };
+        let context = self.logger.context(&request, false);
+        // The whole-path set: field matching happens on top of this, and
+        // a path-only term must already be here to survive it.
+        let paths = self.candidates(query, true, &context)?;
+        Ok((paths, self.provider.revision()))
+    }
+
     /// The verbose per-search trace recorded since the last call, from
     /// searches and match counts alike. Empty unless the engine's logger
     /// was built with `SearchLogger::with_verbose_capture`.
@@ -2163,6 +2186,69 @@ mod tests {
             .unwrap();
 
         assert!(engine.snapshots.lock().unwrap().by_id.is_empty());
+    }
+
+    #[test]
+    fn raw_candidates_returns_the_unfiltered_set_with_its_revision() {
+        struct RevisionProvider {
+            paths: Vec<PathBuf>,
+        }
+        impl SearchProvider for RevisionProvider {
+            fn candidates(
+                &self,
+                _query: &str,
+                _whole_path: bool,
+                _context: &SearchLogContext,
+            ) -> Result<Vec<PathBuf>, SearchError> {
+                Ok(self.paths.clone())
+            }
+            fn revision(&self) -> u64 {
+                41
+            }
+        }
+        let paths = vec![
+            PathBuf::from("/media/archive/clip.mp4"),
+            PathBuf::from("/media/clip.mp4"),
+        ];
+        let engine = SearchEngine::new(Arc::new(RevisionProvider {
+            paths: paths.clone(),
+        }));
+
+        // A negation the engine would narrow: raw candidates keep the
+        // provider's whole set, verbatim and in order.
+        let (candidates, revision) = engine.raw_candidates("clip NOT archive").unwrap();
+
+        assert_eq!(candidates, paths);
+        assert_eq!(revision, 41);
+    }
+
+    #[test]
+    fn raw_candidates_asks_for_the_whole_path_set() {
+        let provider = Arc::new(FakeProvider::new(vec![PathBuf::from("/media/clip.mp4")]));
+        let engine = SearchEngine::new(provider.clone());
+
+        engine.raw_candidates("clip").unwrap();
+
+        assert_eq!(*provider.whole_path_asks.lock().unwrap(), [true]);
+    }
+
+    #[test]
+    fn raw_candidates_follows_recorded_renames() {
+        let directory = tempdir().unwrap();
+        let previous = directory.path().join("old.mp4");
+        let current = directory.path().join("new.mp4");
+        fs::write(&current, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![previous.clone()])));
+        let page = engine.search(request("old")).unwrap();
+        engine
+            .update_video_path(&page.results[0].id, current.clone())
+            .unwrap();
+
+        let (mut candidates, _) = engine.raw_candidates("old").unwrap();
+
+        candidates.sort();
+        candidates.dedup();
+        assert_eq!(candidates, vec![current]);
     }
 
     #[test]

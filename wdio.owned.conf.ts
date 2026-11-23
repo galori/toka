@@ -39,6 +39,17 @@ writeFileSync(
   `#!/bin/sh\nprintf '%s systemctl %s\\n' "$(date -Is)" "$*" >> '${shimLog.replaceAll("'", "'\\''")}'\nexit 0\n`,
 );
 chmodSync(shimPath, 0o755);
+// The same startup `ts install` also probes login lingering through
+// loginctl: without a shadow it would run the real `loginctl
+// enable-linger` for the developer. The probe passes `--value`, so the
+// shim answers the bare `yes` the real tool prints; anything else is a
+// no-op that succeeds.
+const loginctlShimPath = join(shimDirectory, "loginctl");
+writeFileSync(
+  loginctlShimPath,
+  `#!/bin/sh\ncase "$*" in *"show-user"*) echo yes ;; esac\nexit 0\n`,
+);
+chmodSync(loginctlShimPath, 0o755);
 process.env.PATH = `${shimDirectory}${delimiter}${process.env.PATH ?? ""}`;
 
 const videosDirectory = join(homeDirectory, "Videos");

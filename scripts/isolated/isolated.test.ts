@@ -15,9 +15,11 @@ import {
   isProcessOf,
   isolatedEnv,
   isolatedPaths,
+  loginctlShimScript,
   parseArguments,
   seedConfig,
   shimScript,
+  tsBuildInvocation,
 } from "./lib.mjs";
 
 describe("parseArguments", () => {
@@ -73,18 +75,39 @@ describe("isolatedPaths and isolatedEnv", () => {
     ).toBe("/shared/target/release/toka");
   });
 
-  it("points the XDG directories at the isolated home and puts the shim first on PATH", () => {
+  it("points HOME and the XDG directories at the isolated home and puts the shim first on PATH", () => {
     const env = isolatedEnv(paths, { PATH: "/usr/bin", HOME: "/home/u" });
+    expect(env.HOME).toBe(paths.home);
     expect(env.XDG_CONFIG_HOME).toBe(paths.config);
     expect(env.XDG_DATA_HOME).toBe(paths.data);
     expect(env.XDG_CACHE_HOME).toBe(paths.cache);
     expect(env.TMPDIR).toBe(paths.tmp);
     expect(env.PATH).toBe(`${paths.shimDir}:/usr/bin`);
-    expect(env.HOME).toBe("/home/u");
+  });
+
+  it("shadows both systemctl and loginctl in the shim dir", () => {
+    expect(paths.shim).toBe(path.join(paths.shimDir, "systemctl"));
+    expect(paths.loginctlShim).toBe(path.join(paths.shimDir, "loginctl"));
   });
 
   it("runs the indexer as ts daemon run", () => {
     expect(indexerArguments()).toEqual(["daemon", "run"]);
+  });
+
+  it("builds ts from src-tauri, where a relative CARGO_TARGET_DIR lands beside the app binary", () => {
+    const targetDir = "shared-target";
+    const withTarget = isolatedPaths("/w", { CARGO_TARGET_DIR: targetDir });
+    const build = tsBuildInvocation(withTarget);
+
+    expect(build.command).toBe("cargo");
+    expect(build.args).toEqual(["build", "--release", "-p", "ts"]);
+    // The tauri CLI builds from src-tauri, so a relative target dir
+    // resolves under it; the ts build runs from the same directory, or
+    // its binary lands where `launch` never looks.
+    expect(build.cwd).toBe(path.join("/w", "src-tauri"));
+    expect(path.join(build.cwd, targetDir, "release", "ts")).toBe(
+      withTarget.tsBinary,
+    );
   });
 
   it("keeps the ts binary beside the app binary", () => {
@@ -114,6 +137,33 @@ describe("shimScript and seedConfig", () => {
       expect(await readFile(log, "utf8")).toContain(
         "systemctl --user stop toka-search.service",
       );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports lingering as enabled instead of changing host login state", async () => {
+    await mkdir(path.resolve(".scratch"), { recursive: true });
+    const dir = await mkdtemp(path.resolve(".scratch/loginctl-test-"));
+    try {
+      const shim = path.join(dir, "loginctl");
+      await writeFile(shim, loginctlShimScript());
+      await chmod(shim, 0o755);
+      // The probe `ts install` runs, `--value` and all.
+      const probe = spawnSync(
+        shim,
+        ["show-user", "u", "-p", "Linger", "--value"],
+        {
+          encoding: "utf8",
+        },
+      );
+      expect(probe.status).toBe(0);
+      expect(probe.stdout).toBe("yes\n");
+      const enable = spawnSync(shim, ["enable-linger", "u"], {
+        encoding: "utf8",
+      });
+      expect(enable.status).toBe(0);
+      expect(enable.stdout).toBe("");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -211,6 +261,7 @@ setInterval(() => {}, 1000);
       );
       expect(indexer.argv).toEqual(["daemon", "run"]);
       expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
+      expect(indexer.env.HOME).toBe(home);
       expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
 
       const config = JSON.parse(
@@ -221,6 +272,10 @@ setInterval(() => {}, 1000);
       );
       expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
       await stat(path.join(home, "fixtures/a.mp4"));
+      // Both service shims wait on PATH, so a startup `ts install`
+      // cannot reach the host's systemd or login state.
+      await stat(path.join(home, "bin/systemctl"));
+      await stat(path.join(home, "bin/loginctl"));
 
       expect(run("launch", "--detach").status).not.toBe(0);
 

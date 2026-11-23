@@ -9,7 +9,7 @@
 #[cfg(any(target_os = "linux", test))]
 use crate::ts_client;
 use crate::ts_client::TsOutput;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::{ffi::OsString, io::Write};
 #[cfg(target_os = "linux")]
@@ -25,8 +25,6 @@ pub trait Host {
     /// command. A stale pre-`ts` indexer counts as one: it holds the index
     /// lock the restarted service needs.
     fn instances(&mut self) -> Vec<u32>;
-    /// This executable.
-    fn executable(&self) -> PathBuf;
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
     /// Restarts the shared indexer service through `ts restart`.
     fn restart_indexer(&mut self) -> Result<ts_client::ServiceReport, String>;
@@ -59,7 +57,7 @@ pub fn restart(host: &mut impl Host) -> Result<Vec<String>, String> {
                 // indexer half is a note and the app restart still exits 0,
                 // as it did before `ts`.
                 if error.contains("is not installed") {
-                    actions.push(format!("indexer service is not installed: {error}"));
+                    actions.push(format!("indexer restart skipped: {error}"));
                 } else {
                     failures.push(error);
                 }
@@ -211,10 +209,6 @@ where
         find_instances(Path::new("/proc"), &self.executable, std::process::id())
     }
 
-    fn executable(&self) -> PathBuf {
-        self.executable.clone()
-    }
-
     fn terminate(&mut self, pid: u32) -> Result<(), String> {
         let pid_t = pid as libc::pid_t;
         // SAFETY: plain signal delivery to a process id we just discovered.
@@ -268,7 +262,6 @@ mod tests {
     use super::*;
 
     struct Fake {
-        executable: PathBuf,
         instances: Vec<u32>,
         indexer: Result<ts_client::ServiceReport, String>,
         calls: Vec<String>,
@@ -277,7 +270,6 @@ mod tests {
     impl Fake {
         fn new(instances: Vec<u32>) -> Self {
             Self {
-                executable: "/installed/toka".into(),
                 instances,
                 indexer: Ok(ts_client::ServiceReport {
                     actions: vec![ts_client::ServiceAction {
@@ -294,9 +286,6 @@ mod tests {
     impl Host for Fake {
         fn instances(&mut self) -> Vec<u32> {
             self.instances.clone()
-        }
-        fn executable(&self) -> PathBuf {
-            self.executable.clone()
         }
         fn terminate(&mut self, pid: u32) -> Result<(), String> {
             self.calls.push(format!("terminate {pid}"));
@@ -394,9 +383,6 @@ mod tests {
         impl Host for Stubborn {
             fn instances(&mut self) -> Vec<u32> {
                 self.0.instances()
-            }
-            fn executable(&self) -> PathBuf {
-                self.0.executable()
             }
             fn terminate(&mut self, pid: u32) -> Result<(), String> {
                 Err(format!("could not stop process {pid}"))

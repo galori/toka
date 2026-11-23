@@ -278,7 +278,7 @@ pub fn run_cli(args: &[OsString]) -> Result<TsOutput, String> {
 /// the typed calls below.
 pub(crate) fn timeout_for(command: &str) -> Duration {
     match command {
-        "search" => TIMEOUT_SEARCH,
+        "search" | "candidates" => TIMEOUT_SEARCH,
         "folders" => TIMEOUT_FOLDERS,
         "stats" => TIMEOUT_STATS,
         "status" => TIMEOUT_STATUS,
@@ -389,38 +389,30 @@ fn string_list(
 }
 
 /// Every path matching `query`, with the index revision the search saw:
-/// the candidate superset the engine then filters by fields, media type,
-/// and add-ons exactly as it filtered provider candidates before.
+/// the raw OR-widened set the engine then filters by fields, media type,
+/// and add-ons exactly as it filtered provider candidates before. `ts
+/// candidates` applies no field or NOT filtering of its own, so a
+/// negation the viewer's fields would keep is never dropped inside `ts`.
 pub fn search_candidates(query: &str) -> Result<(Vec<PathBuf>, u64), String> {
     let args = [
-        OsString::from("search"),
+        OsString::from("candidates"),
         OsString::from("--json"),
         OsString::from("--"),
         OsString::from(query),
     ];
-    let document = run_json("search", &args, TIMEOUT_SEARCH)?;
-    let results = field(&document, "search", "results")?;
-    let results = results
-        .as_array()
-        .ok_or_else(|| "`ts search` answered with a non-list `results`.".to_owned())?;
-    let mut paths = Vec::with_capacity(results.len());
-    for hit in results {
-        let path = hit
-            .get("path")
-            .and_then(|path| path.as_str())
-            .ok_or_else(|| "`ts search` answered a hit without `path`.".to_owned())?;
-        paths.push(PathBuf::from(path));
-    }
-    let revision = field(&document, "search", "indexRevision")?
+    let document = run_json("candidates", &args, TIMEOUT_SEARCH)?;
+    let candidates = string_list(&document, "candidates", "candidates")?;
+    let paths = candidates.into_iter().map(PathBuf::from).collect();
+    let revision = field(&document, "candidates", "indexRevision")?
         .as_u64()
-        .ok_or_else(|| "`ts search` answered without a numeric `indexRevision`.".to_owned())?;
+        .ok_or_else(|| "`ts candidates` answered without a numeric `indexRevision`.".to_owned())?;
     Ok((paths, revision))
 }
 
-/// Maps a `ts search` failure back to the search error it reports. Only
-/// an empty query names a variant — the engine validates everything else
-/// before spawning — so anything else is a provider failure carrying
-/// `ts`'s own message, exactly as the owned-index provider did.
+/// Maps a `ts candidates` failure back to the search error it reports.
+/// Only an empty query names a variant — the engine validates everything
+/// else before spawning — so anything else is a provider failure
+/// carrying `ts`'s own message, exactly as the owned-index provider did.
 fn search_error_from_ts(message: String) -> SearchError {
     if message == SearchError::InvalidQuery.to_string() {
         SearchError::InvalidQuery
@@ -430,11 +422,11 @@ fn search_error_from_ts(message: String) -> SearchError {
 }
 
 /// A search provider that shells out to `ts`: candidates come from one
-/// `ts search --json` per search, visibility rechecks against one `ts
-/// folders list --json`, and the revision rides along with the search.
-/// The engine on top keeps its snapshots, shuffling, result ids, rename
-/// tracking, and search logging exactly as before — only the index reads
-/// moved across the process boundary.
+/// `ts candidates --json` per search, visibility rechecks against one
+/// `ts folders list --json`, and the revision rides along with the
+/// candidates. The engine on top keeps its snapshots, shuffling, result
+/// ids, rename tracking, and search logging exactly as before — only the
+/// index reads moved across the process boundary.
 pub struct TsSearchProvider {
     revision: Mutex<Option<u64>>,
 }
@@ -460,8 +452,9 @@ impl SearchProvider for TsSearchProvider {
         _whole_path: bool,
         _context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
-        // `ts search` always matches with every field on every medium, so
-        // its answers are the superset any engine request filters down.
+        // `ts candidates` always covers whole paths through the full-text
+        // index, like the owned provider it replaces — there is no
+        // narrower set to ask for, so the flag stays unused.
         match search_candidates(query) {
             Ok((paths, revision)) => {
                 *self.revision.lock().unwrap() = Some(revision);
@@ -729,8 +722,16 @@ pub fn reset_applied_from_output(output: &TsOutput) -> Result<ResetApplied, Stri
             return Err(error);
         }
     }
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("`ts reset` answered with unreadable JSON: {error}"))?;
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        // An exit-1 reset with no document is a planning error whose
+        // reason `ts` printed on stderr: keep it, or the failure reads
+        // as a parse bug instead of what `ts` refused.
+        let mut message = format!("`ts reset` answered with unreadable JSON: {error}");
+        if !String::from_utf8_lossy(&output.stderr).trim().is_empty() {
+            message.push_str(&format!(" ({})", command_error("reset", output)));
+        }
+        message
+    })?;
     check_schema("reset", &document)?;
     let indexer_stopped = field(&document, "reset", "indexerStopped")?
         .as_bool()
@@ -810,16 +811,50 @@ pub fn service_report_from_output(
 
 /// Installs the indexer service idempotently: what the app ensures at
 /// startup so the first launch after upgrade works with no user action.
+/// A service that is already installed and running is left alone —
+/// opening a worktree build must not repoint the user's service at the
+/// worktree copy, and upgrades converge through the installer's explicit
+/// `ts install` plus restart. Any probe failure installs exactly as
+/// before (fail-open).
 pub fn ensure_installed() -> Result<ServiceReport, String> {
+    if service_is_healthy() {
+        return Ok(ServiceReport {
+            actions: vec![ServiceAction {
+                message: "indexer service already installed and running".to_owned(),
+                changed: false,
+            }],
+            error: None,
+        });
+    }
     let args = [OsString::from("install"), OsString::from("--json")];
     service_report_from_output("install", &run(&args, TIMEOUT_SERVICE)?)
 }
 
+/// Whether `ts status --json` reports an installed, running service.
+/// The document parses on any exit status (a live service whose daemon
+/// has not heartbeated yet still exits 3); anything unreadable is not
+/// healthy, and the caller installs.
+fn service_is_healthy() -> bool {
+    let args = [OsString::from("status"), OsString::from("--json")];
+    let Ok(output) = run(&args, TIMEOUT_STATUS) else {
+        return false;
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    if check_schema("status", &document).is_err() {
+        return false;
+    }
+    document.get("serviceInstalled") == Some(&serde_json::Value::Bool(true))
+        && document.get("serviceRunning") == Some(&serde_json::Value::Bool(true))
+}
+
 /// Serializes the tests that mutate the process environment (`TS_BIN`,
-/// `PATH`, `TOKA_E2E_VIDEOS`, `XDG_CACHE_HOME`, `TMPDIR`): parallel tests
-/// share one environment, so each holds the lock while it swaps variables
-/// in and back out. One lock for the whole crate: `ts_client`, `cli`, and
-/// `lib` tests all spawn or resolve through the environment.
+/// `PATH`, `TOKA_E2E_VIDEOS`, `XDG_CACHE_HOME`, `HOME`, `TMPDIR`):
+/// parallel tests share one environment, so each holds the lock while it
+/// swaps variables in and back out. One lock for the whole crate:
+/// `ts_client`, `cli`, and `lib` tests all spawn or resolve through the
+/// environment.
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::ffi::{OsStr, OsString};
@@ -903,6 +938,7 @@ mod tests {
     #[test]
     fn timeouts_give_searches_seconds_and_freshness_minutes() {
         assert_eq!(timeout_for("search"), TIMEOUT_SEARCH);
+        assert_eq!(timeout_for("candidates"), TIMEOUT_SEARCH);
         assert_eq!(timeout_for("folders"), TIMEOUT_FOLDERS);
         assert_eq!(timeout_for("stats"), TIMEOUT_STATS);
         assert_eq!(timeout_for("status"), TIMEOUT_STATUS);
@@ -1246,6 +1282,41 @@ mod tests {
     }
 
     #[test]
+    fn reset_without_a_document_keeps_ts_stderr_reason() {
+        // An exit-1 reset that printed no JSON is a planning error: the
+        // error keeps `ts`'s own reason instead of only naming the parse.
+        let error = reset_applied_from_output(&output(
+            1,
+            "",
+            "ts reset: refusing to remove /state/index.sqlite3: a directory occupies this file's path\n",
+        ))
+        .unwrap_err();
+        assert!(error.contains("unreadable JSON"), "{error}");
+        assert!(
+            error.contains(
+                "refusing to remove /state/index.sqlite3: a directory occupies this file's path"
+            ),
+            "{error}"
+        );
+
+        // Nothing on stderr either: the parse error stands alone.
+        let error = reset_applied_from_output(&output(1, "", "")).unwrap_err();
+        assert!(error.contains("unreadable JSON"), "{error}");
+        assert!(!error.contains('('), "{error}");
+
+        // A valid exit-1 report still decodes to its stop flag and lists.
+        let applied = reset_applied_from_output(&output(
+            1,
+            r#"{"schema": 1, "indexerStopped": true, "removed": ["/a"], "failures": ["nope"]}"#,
+            "ts reset: nope\n",
+        ))
+        .unwrap();
+        assert!(applied.indexer_stopped);
+        assert_eq!(applied.removed, vec![PathBuf::from("/a")]);
+        assert_eq!(applied.failures, vec!["nope".to_owned()]);
+    }
+
+    #[test]
     fn service_reports_carry_actions_and_partial_failures() {
         let report = service_report_from_output(
             "restart",
@@ -1446,16 +1517,17 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         }
     }
 
-    /// A `ts` answering one search and the folders behind it: the search
-    /// asserts its argv (flags before `--`, the query verbatim after it).
+    /// A `ts` answering raw candidates and the folders behind them:
+    /// the candidates call asserts its argv (flags before `--`, the query
+    /// verbatim after it).
     #[cfg(unix)]
-    fn search_shim(directory: &Path, hits: &str, revision: u64) -> PathBuf {
+    fn candidates_shim(directory: &Path, hits: &str, revision: u64) -> PathBuf {
         let folders = folders_document();
         write_shim(
             directory,
             "ts",
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = search ]; then if [ \"$2\" != --json ] || [ \"$3\" != -- ] || [ -z \"$4\" ]; then echo \"unexpected search argv: $*\" >&2; exit 9; fi\ncat <<'EOF'\n{{\"schema\": 1, \"query\": \"clip\", \"page\": 1, \"pageSize\": 3, \"totalResults\": 3, \"totalPages\": 1, \"indexRevision\": {revision}, \"results\": [{hits}]}}\nEOF\nelif [ \"$1\" = folders ]; then cat <<'EOF'\n{folders}\nEOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
+                "#!/bin/sh\nif [ \"$1\" = candidates ]; then if [ \"$2\" != --json ] || [ \"$3\" != -- ] || [ -z \"$4\" ]; then echo \"unexpected candidates argv: $*\" >&2; exit 9; fi\ncat <<'EOF'\n{{\"schema\": 1, \"query\": \"clip\", \"indexRevision\": {revision}, \"candidates\": [{hits}]}}\nEOF\nelif [ \"$1\" = folders ]; then cat <<'EOF'\n{folders}\nEOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
             ),
         )
     }
@@ -1479,9 +1551,9 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         use std::sync::Arc;
         use toka_search::search::SearchEngine;
         let directory = tempfile::tempdir().unwrap();
-        let shim = search_shim(
+        let shim = candidates_shim(
             directory.path(),
-            r#"{"path": "/media/movies/clip.mp4"}, {"path": "/media/movies/.hidden-clip.mp4"}, {"path": "/elsewhere/clip-elsewhere.mp4"}"#,
+            r#""/media/movies/clip.mp4", "/media/movies/.hidden-clip.mp4", "/elsewhere/clip-elsewhere.mp4""#,
             7,
         );
         let _env = use_ts(&shim);
@@ -1496,6 +1568,176 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         assert_eq!(page.results[0].file_name, "clip.mp4");
         assert_eq!(page.index_revision, 7);
         assert_eq!(engine.match_count(search_request("clip")).unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_backed_engine_matches_the_direct_engine_over_one_index() {
+        use std::sync::Arc;
+        use toka_search::{
+            owned_index::{OwnedIndex, OwnedIndexManager},
+            providers::OwnedIndexSearchProvider,
+            search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
+            search_log::SearchLogContext,
+        };
+
+        // One real index both engines read: the direct engine through its
+        // in-process provider, the `ts`-backed engine through a shim whose
+        // candidates answers are derived from that same provider — exactly
+        // what `ts candidates` serves (proven wire-identical by the `ts`
+        // integration test). A negation the viewer's fields would keep
+        // must survive in both.
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("media");
+        std::fs::create_dir_all(media.join("archive")).unwrap();
+        for name in [
+            "archive/clip.mp4",
+            "clip.mp4",
+            "talk [beach].mp4",
+            "beach-day.mp4",
+        ] {
+            std::fs::write(media.join(name), b"fixture video").unwrap();
+        }
+        let root = media.canonicalize().unwrap();
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        let state = manager.add_folder(&root).unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&state.folders[0].id, &root, |_| {})
+            .unwrap();
+        let direct_provider = OwnedIndexSearchProvider::new(database);
+        let revision = direct_provider.revision();
+
+        let folders = serde_json::json!({
+            "schema": 1,
+            "folders": serde_json::to_value(manager.folders().unwrap()).unwrap(),
+        });
+        let queries = ["clip NOT archive", "NOT beach", "beach", "archive", "clip"];
+        let mut cases = String::new();
+        for query in queries {
+            let request = SearchRequest {
+                query: query.to_owned(),
+                page: 1,
+                page_size: PAGE_SIZE,
+                search_id: None,
+                fields: SearchFields::default(),
+                media_type: MediaType::Videos,
+            };
+            let context = SearchLogContext::from(&request);
+            let derived = direct_provider.candidates(query, true, &context).unwrap();
+            let document = serde_json::json!({
+                "schema": 1,
+                "query": query,
+                "indexRevision": revision,
+                "candidates": derived
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            });
+            cases.push_str(&format!(
+                "    \"{query}\") cat <<'EOF'\n{document}\nEOF\n      ;;\n"
+            ));
+        }
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = candidates ]; then if [ \"$2\" != --json ] || [ \"$3\" != -- ]; then echo \"unexpected candidates argv: $*\" >&2; exit 9; fi\n  case \"$4\" in\n{cases}    *) echo \"unexpected query: $4\" >&2; exit 9;;\n  esac\nelif [ \"$1\" = folders ]; then cat <<'EOF'\n{folders}\nEOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
+            ),
+        );
+        let _env = use_ts(&shim);
+
+        let wired = SearchEngine::new(Arc::new(TsSearchProvider::new()));
+        let direct = SearchEngine::new(Arc::new(OwnedIndexSearchProvider::new(
+            directory.path().join("state").join("index.sqlite3"),
+        )));
+        let names = |page: &toka_search::search::SearchPage| {
+            let mut names: Vec<String> = page
+                .results
+                .iter()
+                .map(|result| result.file_name.clone())
+                .collect();
+            names.sort();
+            names
+        };
+        // Both bots' NOT examples plus positive field-restriction cases:
+        // `clip NOT archive` with Path disabled keeps the archived clip
+        // (the path-only term cannot exclude under these fields), and
+        // filename-only `NOT beach` keeps the tag-only match.
+        let all_fields = SearchFields::default();
+        for (query, fields, expected) in [
+            (
+                "clip NOT archive",
+                SearchFields {
+                    tags: true,
+                    file_name: true,
+                    path: false,
+                },
+                vec!["clip.mp4", "clip.mp4"],
+            ),
+            (
+                "NOT beach",
+                SearchFields {
+                    tags: false,
+                    file_name: true,
+                    path: false,
+                },
+                vec!["clip.mp4", "clip.mp4", "talk [beach].mp4"],
+            ),
+            (
+                "beach",
+                SearchFields {
+                    tags: false,
+                    file_name: true,
+                    path: false,
+                },
+                vec!["beach-day.mp4"],
+            ),
+            (
+                "archive",
+                SearchFields {
+                    tags: false,
+                    file_name: false,
+                    path: true,
+                },
+                vec!["clip.mp4"],
+            ),
+            ("clip", all_fields, vec!["clip.mp4", "clip.mp4"]),
+        ] {
+            let request = SearchRequest {
+                query: query.to_owned(),
+                page: 1,
+                page_size: PAGE_SIZE,
+                search_id: None,
+                fields,
+                media_type: MediaType::Videos,
+            };
+            let wired_page = wired.search(request.clone()).unwrap();
+            let direct_page = direct.search(request.clone()).unwrap();
+            assert_eq!(
+                names(&wired_page),
+                names(&direct_page),
+                "query: {query} ({fields:?})"
+            );
+            // The expected hits pin the semantics, not just the parity:
+            // with the old full-search wire format the first two cases
+            // lost a hit inside `ts`.
+            let mut expected: Vec<String> = expected.into_iter().map(str::to_owned).collect();
+            expected.sort();
+            assert_eq!(names(&wired_page), expected, "query: {query}");
+            assert_eq!(
+                wired.match_count(request.clone()).unwrap(),
+                direct.match_count(request.clone()).unwrap(),
+                "match count: {query}"
+            );
+            assert_eq!(
+                wired.match_count(request.clone()).unwrap(),
+                expected.len(),
+                "match count: {query}"
+            );
+            assert_eq!(wired_page.index_revision, direct_page.index_revision);
+        }
     }
 
     #[cfg(unix)]
@@ -1564,9 +1806,9 @@ EOF
             directory.path(),
             "ts",
             r#"#!/bin/sh
-if [ "$1" != search ] || [ "$2" != --json ] || [ "$3" != -- ] || [ "$4" != "--dash" ]; then echo "unexpected argv: $*" >&2; exit 9; fi
+if [ "$1" != candidates ] || [ "$2" != --json ] || [ "$3" != -- ] || [ "$4" != "--dash" ]; then echo "unexpected argv: $*" >&2; exit 9; fi
 cat <<'EOF'
-{"schema": 1, "query": "--dash", "page": 1, "pageSize": 0, "totalResults": 0, "totalPages": 0, "indexRevision": 1, "results": []}
+{"schema": 1, "query": "--dash", "indexRevision": 1, "candidates": []}
 EOF
 "#,
         );
@@ -1580,14 +1822,14 @@ EOF
 
     #[cfg(unix)]
     #[test]
-    fn ts_search_failures_surface_as_provider_errors() {
+    fn ts_candidates_failures_surface_as_provider_errors() {
         use std::sync::Arc;
         use toka_search::search::SearchEngine;
         let directory = tempfile::tempdir().unwrap();
         let shim = write_shim(
             directory.path(),
             "ts",
-            "#!/bin/sh\necho 'ts search: Toka could not read its search index.' >&2\nexit 1\n",
+            "#!/bin/sh\necho 'ts candidates: Toka could not read its search index.' >&2\nexit 1\n",
         );
         let _env = use_ts(&shim);
         let engine = SearchEngine::new(Arc::new(TsSearchProvider::new()));
@@ -1627,7 +1869,7 @@ EOF
         use std::sync::Arc;
         use toka_search::search::SearchEngine;
         let directory = tempfile::tempdir().unwrap();
-        let shim = search_shim(directory.path(), r#"{"path": "/media/movies/clip.mp4"}"#, 7);
+        let shim = candidates_shim(directory.path(), r#""/media/movies/clip.mp4""#, 7);
         let _env = use_ts(&shim);
         let provider = Arc::new(TsSearchProvider::new());
         let engine = SearchEngine::new(provider.clone());
@@ -1722,6 +1964,97 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         let error = sync_path(Path::new("/media/clip.mp4")).unwrap_err();
 
         assert_eq!(error, "Toka could not use its search index: busy.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_installed_skips_install_when_the_service_is_healthy() {
+        // A healthy service is left alone: the probe reports installed
+        // and running, so `install` must never run (the shim fails it).
+        let directory = tempfile::tempdir().unwrap();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            r#"#!/bin/sh
+if [ "$1" = status ] && [ "$2" = --json ]; then cat <<'EOF'
+{"schema": 1, "running": true, "serviceInstalled": true, "serviceRunning": true}
+EOF
+else echo "install must not run: $*" >&2; exit 9; fi
+"#,
+        );
+        let _env = use_ts(&shim);
+
+        let report = ensure_installed().unwrap();
+
+        assert_eq!(report.error, None);
+        assert_eq!(report.actions.len(), 1);
+        assert!(!report.actions[0].changed);
+        assert!(
+            report.actions[0]
+                .message
+                .contains("already installed and running"),
+            "{}",
+            report.actions[0].message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_installed_proceeds_unless_the_service_is_healthy() {
+        // Anything but installed-and-running installs exactly as before:
+        // a stopped or missing service, unknown fields, a failed probe,
+        // or an unreadable document all fail open to `install`.
+        for (name, status_body) in [
+            (
+                "stopped",
+                r#"{"schema": 1, "running": false, "serviceInstalled": true, "serviceRunning": false}"#,
+            ),
+            (
+                "missing",
+                r#"{"schema": 1, "running": false, "serviceInstalled": false, "serviceRunning": null}"#,
+            ),
+            (
+                "unknown",
+                r#"{"schema": 1, "running": false, "serviceInstalled": null, "serviceRunning": null}"#,
+            ),
+            ("unreadable", "not json"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let shim = write_shim(
+                directory.path(),
+                "ts",
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = status ]; then cat <<'EOF'\n{status_body}\nEOF\nelif [ \"$1\" = install ] && [ \"$2\" = --json ]; then cat <<'EOF'\n{{\"schema\": 1, \"command\": \"install\", \"actions\": [{{\"message\": \"installed for {name}\", \"changed\": true}}]}}\nEOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
+                ),
+            );
+            let _env = use_ts(&shim);
+
+            let report = ensure_installed().unwrap();
+
+            assert_eq!(report.actions.len(), 1, "{name}: the install must have run");
+            assert_eq!(report.actions[0].message, format!("installed for {name}"));
+            assert!(report.actions[0].changed);
+        }
+
+        // A probe that fails outright (no document at all) installs too.
+        let directory = tempfile::tempdir().unwrap();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            r#"#!/bin/sh
+if [ "$1" = status ]; then echo "ts status: no service manager" >&2; exit 1
+elif [ "$1" = install ]; then cat <<'EOF'
+{"schema": 1, "command": "install", "actions": [{"message": "installed after probe failure", "changed": true}]}
+EOF
+else echo "unexpected argv: $*" >&2; exit 9; fi
+"#,
+        );
+        let _env = use_ts(&shim);
+
+        let report = ensure_installed().unwrap();
+
+        assert_eq!(report.actions.len(), 1);
+        assert_eq!(report.actions[0].message, "installed after probe failure");
     }
 
     #[cfg(unix)]

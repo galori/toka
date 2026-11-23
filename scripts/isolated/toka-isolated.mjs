@@ -25,10 +25,12 @@ import {
   isSupervisorOf,
   isolatedEnv,
   isolatedPaths,
+  loginctlShimScript,
   parseArguments,
   readState,
   seedConfig,
   shimScript,
+  tsBuildInvocation,
 } from "./lib.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -141,8 +143,9 @@ async function build(flags) {
   // The search helper beside the app: the isolated app resolves it as its
   // sibling, and the isolated indexer runs from it.
   if (status === 0) {
-    const ts = spawnSync("cargo", ["build", "--release", "-p", "ts"], {
-      cwd: worktree,
+    const tsBuild = tsBuildInvocation(paths);
+    const ts = spawnSync(tsBuild.command, tsBuild.args, {
+      cwd: tsBuild.cwd,
       env,
       stdio: "inherit",
     });
@@ -177,6 +180,8 @@ function prepareHome(paths, flags) {
   }
   writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
+  writeFileSync(paths.loginctlShim, loginctlShimScript());
+  chmodSync(paths.loginctlShim, 0o755);
   if (flags["no-seed"] || existsSync(paths.indexFolders)) return;
   const source = path.resolve(
     paths.worktree,
@@ -426,10 +431,15 @@ function printEnv(flags) {
   mkdirSync(paths.runDir, { recursive: true });
   writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
+  writeFileSync(paths.loginctlShim, loginctlShimScript());
+  chmodSync(paths.loginctlShim, 0o755);
   const env = isolatedEnv(paths, {});
   mkdirSync(paths.tmp, { recursive: true });
   const quoted = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  // HOME is exported too: without it a shell eval'ing this would still
+  // resolve the real home, and the toka CLI would act on it.
   for (const key of [
+    "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",

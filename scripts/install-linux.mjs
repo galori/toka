@@ -159,17 +159,36 @@ export function releaseDir(env = process.env) {
   );
 }
 
-const runTsInstall = (installedTsPath) => {
-  const result = spawnSync(installedTsPath, ["install"], {
+export const runTsInstall = (installedTsPath) => {
+  const installed = spawnSync(installedTsPath, ["install"], {
     stdio: "inherit",
   });
-  if (result.error) {
+  if (installed.error) {
     console.warn(
-      `Could not run ts install: ${result.error.message}. The app will retry at startup.`,
+      `Could not run ts install: ${installed.error.message}. The app will retry at startup.`,
     );
-  } else if (result.status !== 0) {
+    return;
+  }
+  if (installed.status !== 0) {
     console.warn(
-      `ts install exited with ${result.status}. The app will retry at startup.`,
+      `ts install exited with ${installed.status}. The app will retry at startup.`,
+    );
+    return;
+  }
+  // An update replaced the binary under a running daemon: `ts install`
+  // alone reports "already running" and leaves the old daemon on it, so
+  // restart onto the new binary. Warn-and-continue like the install: a
+  // failed restart never fails the install.
+  const restarted = spawnSync(installedTsPath, ["restart"], {
+    stdio: "inherit",
+  });
+  if (restarted.error) {
+    console.warn(
+      `Could not run ts restart: ${restarted.error.message}. The running indexer keeps the previous binary until the next restart.`,
+    );
+  } else if (restarted.status !== 0) {
+    console.warn(
+      `ts restart exited with ${restarted.status}. The running indexer keeps the previous binary until the next restart.`,
     );
   }
 };
