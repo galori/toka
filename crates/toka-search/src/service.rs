@@ -739,8 +739,21 @@ fn systemctl_error(args: &[&str], result: &CommandResult) -> String {
 /// mount pattern doubles the temp-dir check for AppImages launched with
 /// a custom `TMPDIR`.
 fn is_ephemeral_executable(executable: &Path, temp_dir: &Path) -> bool {
-    if !temp_dir.as_os_str().is_empty() && executable.starts_with(temp_dir) {
-        return true;
+    if !temp_dir.as_os_str().is_empty() {
+        if executable.starts_with(temp_dir) {
+            return true;
+        }
+        // A symlinked temp dir defeats the lexical check when the
+        // invocation spelling differs (macOS /var -> /private/var):
+        // compare canonical paths as a fallback. Unresolvable paths
+        // stay non-ephemeral — a missing executable fails elsewhere.
+        if let (Ok(canonical), Ok(canonical_temp)) =
+            (executable.canonicalize(), temp_dir.canonicalize())
+        {
+            if canonical.starts_with(canonical_temp) {
+                return true;
+            }
+        }
     }
     let text = executable.to_string_lossy();
     text.starts_with("/tmp/.mount_") || text.ends_with(" (deleted)")
@@ -3282,6 +3295,22 @@ mod tests {
         ));
         assert!(!is_ephemeral_executable(Path::new("/tmpfoo/ts"), temp));
         assert!(!is_ephemeral_executable(Path::new("/usr/bin/ts"), temp));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ephemeral_check_canonicalizes_a_symlinked_temp_dir() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let real = sandbox.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("ts"), b"fake").unwrap();
+        let alias = sandbox.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // Spelled through the symlink, the executable lexically misses
+        // the temp dir — but canonically it sits inside it.
+        let spelled = alias.join("ts");
+        assert!(!spelled.starts_with(&real));
+        assert!(is_ephemeral_executable(&spelled, &real));
     }
 
     #[test]
