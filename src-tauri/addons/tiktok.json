@@ -8,7 +8,7 @@
   "actions": [
     {
       "id": "creator-search",
-      "label": "Show this creator in Toka",
+      "label": "Toka search",
       "steps": [
         {
           "type": "openRelatedSearch",
@@ -21,7 +21,7 @@
     },
     {
       "id": "creator-profile",
-      "label": "Open this creator on TikTok",
+      "label": "Tiktok profile",
       "steps": [
         {
           "type": "openUrl",

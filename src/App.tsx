@@ -1408,9 +1408,9 @@ function Player({
     event.stopPropagation();
     const toggleShortcut =
       event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
-    if (event.key === "Escape" || event.key === "Tab" || toggleShortcut) {
-      if (event.key !== "Tab") event.preventDefault();
-      closeAddonMenu(event.key !== "Tab");
+    if (event.key === "Escape" || toggleShortcut) {
+      event.preventDefault();
+      closeAddonMenu(true);
       return;
     }
     const actions = Array.from(
@@ -1418,7 +1418,10 @@ function Player({
         '[role="menuitem"]:not(:disabled)',
       ),
     );
-    if (!actions.length) return;
+    if (!actions.length) {
+      if (event.key === "Tab") closeAddonMenu(false);
+      return;
+    }
     const current = actions.indexOf(
       document.activeElement as HTMLButtonElement,
     );
@@ -1428,6 +1431,11 @@ function Player({
       next = (current - 1 + actions.length) % actions.length;
     else if (event.key === "Home") next = 0;
     else if (event.key === "End") next = actions.length - 1;
+    else if (event.key === "Tab") {
+      if (event.shiftKey)
+        next = current <= 0 ? actions.length - 1 : current - 1;
+      else next = (current + 1) % actions.length;
+    }
     if (next === undefined) return;
     event.preventDefault();
     actions[next].focus();
