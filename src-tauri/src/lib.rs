@@ -769,8 +769,12 @@ fn open_parent_folder_in_new_window(
 fn parent_folder_of(path: &std::path::Path) -> Result<std::path::PathBuf, CommandError> {
     // Launches keep the path as given, so a relative launch stays relative:
     // resolve it first, or the parent of a relative folder is wrongly empty.
-    let absolute = absolute_lexical(path);
-    let folder = folder_of(&absolute)?;
+    let absolute = to_absolute(path);
+    // Canonical when possible, so `..` resolves through symlinks exactly as
+    // the filesystem does; lexical otherwise, so a video that moved since it
+    // was indexed can still open somewhere sensible.
+    let resolved = std::fs::canonicalize(&absolute).unwrap_or_else(|_| absolute_lexical(&absolute));
+    let folder = folder_of(&resolved)?;
     folder
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -781,16 +785,21 @@ fn parent_folder_of(path: &std::path::Path) -> Result<std::path::PathBuf, Comman
         })
 }
 
-/// An absolute path with `.` and `..` resolved lexically, without touching
-/// the disk (which may have moved on since the video was indexed).
-fn absolute_lexical(path: &std::path::Path) -> std::path::PathBuf {
-    let absolute = if path.is_absolute() {
+/// The path made absolute without resolving `.` or `..`, so canonicalization
+/// below still sees symlinks before any parent segment.
+fn to_absolute(path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(path)
-    };
+    }
+}
+
+/// An absolute path with `.` and `..` resolved lexically, without touching
+/// the disk (which may have moved on since the video was indexed).
+fn absolute_lexical(absolute: &std::path::Path) -> std::path::PathBuf {
     let mut normalized = std::path::PathBuf::new();
     for component in absolute.components() {
         match component {
@@ -1792,6 +1801,33 @@ mod tests {
             parent_folder_of(Path::new("/Playlists/Summer/../party.mkv")).unwrap(),
             Path::new("/")
         );
+    }
+
+    #[test]
+    fn a_moved_video_falls_back_to_the_lexical_parent() {
+        assert_eq!(
+            parent_folder_of(Path::new("/no/such/dir/video.mp4")).unwrap(),
+            Path::new("/no/such")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dot_dot_through_a_symlink_follows_the_filesystem() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("library").join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, root.path().join("link")).unwrap();
+        // The file exists, as a playing video does when the action runs.
+        std::fs::write(root.path().join("library").join("clip.mp4"), b"x").unwrap();
+
+        // Physically `link/..` is `library`, not the root the link sits in.
+        let video = root.path().join("link").join("..").join("clip.mp4");
+        let expected = std::fs::canonicalize(root.path()).unwrap();
+
+        assert_eq!(parent_folder_of(&video).unwrap(), expected);
     }
 
     #[test]

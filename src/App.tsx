@@ -1520,12 +1520,17 @@ function Player({
   // One folder up from the video holds the folders around it. A second Toka
   // launched there shows them all, leaving this playlist where it was.
   const [parentFolderError, setParentFolderError] = useState<string>();
+  // Which video a parent-folder request was made for: a rejection that lands
+  // after playback has moved on belongs to the old video, not the new one.
+  const parentFolderVideo = useRef(video.id);
   const openParentFolder = async () => {
+    const requested = video.id;
     setParentFolderError(undefined);
     try {
-      await openParentFolderInNewWindow(video.id);
+      await openParentFolderInNewWindow(requested);
     } catch (reason) {
-      setParentFolderError(errorMessage(reason));
+      if (parentFolderVideo.current === requested)
+        setParentFolderError(errorMessage(reason));
     }
   };
   // Ctrl+Shift+P keeps clear of the Ctrl+P that searches paths and the Ctrl+N
@@ -1545,6 +1550,7 @@ function Player({
   // The error names the video that was showing when it failed; a new video
   // starts with a clean slate rather than inheriting it.
   useEffect(() => {
+    parentFolderVideo.current = video.id;
     setParentFolderError(undefined);
   }, [video.id]);
   const copyPath = async () => {
