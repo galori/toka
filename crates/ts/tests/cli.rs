@@ -412,7 +412,6 @@ fn read_only_commands_create_no_state_without_an_index() {
     assert!(files_under(home.path()).is_empty());
 }
 
-#[cfg(not(feature = "fixtures"))]
 fn files_under(directory: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut pending = vec![directory.to_path_buf()];
@@ -441,4 +440,392 @@ fn version_flag_prints_the_ts_version() {
         "{version}"
     );
     assert!(output.stderr.is_empty());
+}
+
+/// A scratch HOME shared across several `ts` runs, so one run's writes
+/// are the next run's reads — exactly how the daemon sees them.
+struct ScratchHome {
+    home: tempfile::TempDir,
+    data_home: PathBuf,
+}
+
+fn scratch_home() -> ScratchHome {
+    let home = tempdir().unwrap();
+    let data_home = home.path().join("data");
+    fs::create_dir_all(&data_home).unwrap();
+    ScratchHome { home, data_home }
+}
+
+fn run_at(home: &ScratchHome, arguments: &[&str]) -> Output {
+    run_ts_with_home(arguments, home.home.path(), &home.data_home, None)
+}
+
+fn create_image(directory: &Path, name: &str) -> PathBuf {
+    let path = directory.join(name);
+    fs::write(&path, b"fixture image").unwrap();
+    path
+}
+
+#[test]
+fn folders_add_then_list_shows_the_new_folder() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Added {}\n", media.display())
+    );
+    assert!(output.stderr.is_empty());
+
+    // A second process reads what the first wrote: the `roots` row the
+    // daemon's reconcile picks up. Nothing scans here — no daemon runs in
+    // the test — so the folder stays pending.
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    let folders = document["folders"].as_array().unwrap();
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0]["path"], media.to_string_lossy().into_owned());
+    assert_eq!(folders[0]["status"], "pending");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_add_json_is_a_versioned_document() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_add_twice_is_an_error() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "ts folders add: That folder is already covered by a Toka search folder.\n"
+    );
+}
+
+#[test]
+fn folders_add_of_a_missing_folder_is_an_error() {
+    let home = scratch_home();
+    let missing = home.home.path().join("no-such-folder");
+    let missing_argument = missing.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &missing_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("ts folders add: Toka could not open that folder: "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn folders_remove_after_add_empties_the_list() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_at(&home, &["folders", "remove", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Removed {}\n", media.display())
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["folders", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_remove_json_is_a_versioned_document() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_at(&home, &["folders", "remove", &media_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 0);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn folders_remove_of_an_unknown_folder_is_an_error() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "remove", &media_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("ts folders remove: {media_argument} is not one of Toka's search folders.\n")
+    );
+}
+
+#[test]
+fn folders_remove_finds_a_folder_deleted_from_disk() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    fs::remove_dir(&media).unwrap();
+
+    let output = run_at(&home, &["folders", "remove", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("Removed {}\n", media.display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+/// Where the child resolves the index: dirs honors XDG_DATA_HOME on
+/// Linux but derives it from HOME on macOS.
+fn scratch_database(home: &ScratchHome) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let database = home
+        .home
+        .path()
+        .join("Library/Application Support")
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    #[cfg(not(target_os = "macos"))]
+    let database = home
+        .data_home
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    database
+}
+
+fn stats_videos(home: &ScratchHome) -> serde_json::Value {
+    let output = run_at(home, &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap()
+}
+
+#[test]
+fn sync_path_indexes_a_file_added_after_the_scan() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+    create_video(&media, 0);
+
+    // The folder goes in through the CLI; the scan stands in for the
+    // daemon, which has no test double in this phase.
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = scratch_database(&home);
+    let manager = OwnedIndexManager::under(database.clone());
+    let state = manager.folders().unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&state[0].id, &state[0].path, |_| {})
+        .unwrap();
+    assert_eq!(stats_videos(&home)["videos"], 1);
+
+    let added = create_video(&media, 1);
+    let added_argument = added.to_string_lossy().into_owned();
+    let output = run_at(&home, &["sync-path", &added_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    assert_eq!(stats_videos(&home)["videos"], 2);
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn sync_rename_moves_a_file_to_its_new_name() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    let media_argument = media.to_string_lossy().into_owned();
+    let clip = create_video(&media, 0);
+
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = scratch_database(&home);
+    let manager = OwnedIndexManager::under(database.clone());
+    let state = manager.folders().unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&state[0].id, &state[0].path, |_| {})
+        .unwrap();
+
+    // Tagging renames the file on disk; the app then tells the index the
+    // file moved. Without the sync the new name is unsearchable.
+    let renamed = media.join("family-trip-00-tagged.mp4");
+    fs::rename(&clip, &renamed).unwrap();
+    let output = run_at(&home, &["search", "tagged"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+
+    let from = clip.to_string_lossy().into_owned();
+    let to = renamed.to_string_lossy().into_owned();
+    let output = run_at(&home, &["sync-rename", &from, &to]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["search", "tagged"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\n", renamed.display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn sync_commands_with_no_index_are_silent_noops() {
+    let home = scratch_home();
+
+    for arguments in [
+        vec!["sync-path", "/media/movies/clip.mp4"],
+        vec!["sync-rename", "/media/old.mp4", "/media/new.mp4"],
+    ] {
+        let output = run_at(&home, &arguments);
+        assert_eq!(output.status.code(), Some(0), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+    // Syncing must never create an index on its own, exactly as in the
+    // app: only a folder add brings the database into being.
+    assert!(files_under(home.home.path()).is_empty());
+}
+
+#[test]
+fn thumbnail_of_an_image_prints_itself() {
+    let home = scratch_home();
+    let image = create_image(home.home.path(), "photo.jpg");
+    let image_argument = image.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["thumbnail", &image_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{image_argument}\n")
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["thumbnail", &image_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["thumbnail"], image_argument);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn thumbnail_of_an_undecodable_video_is_an_error() {
+    let home = scratch_home();
+    let clip = create_video(home.home.path(), 0);
+    // Not a video at all: ffmpeg fails, or is not even there. Either
+    // way no thumbnail comes back.
+    let clip_argument = clip.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["thumbnail", &clip_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("ts thumbnail: Toka could not make a thumbnail for {clip_argument}.\n")
+    );
+}
+
+#[test]
+fn preview_of_an_image_prints_itself() {
+    let home = scratch_home();
+    let image = create_image(home.home.path(), "photo.jpg");
+    let image_argument = image.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["preview", &image_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{image_argument}\n")
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = run_at(&home, &["preview", &image_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["previews"], serde_json::json!([image_argument]));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn preview_of_an_undecodable_video_is_an_error() {
+    let home = scratch_home();
+    let clip = create_video(home.home.path(), 0);
+    let clip_argument = clip.to_string_lossy().into_owned();
+
+    let output = run_at(&home, &["preview", &clip_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("ts preview: Toka could not make a preview for {clip_argument}.\n")
+    );
 }
