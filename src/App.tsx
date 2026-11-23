@@ -11,6 +11,7 @@ import {
   useState,
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -1864,6 +1865,27 @@ function Player({
 
   // A click on the picture does what the play button does, as in most players.
   const togglePlayback = () => (playingBack ? pause() : play());
+  // Linux paints the picture in a native surface above the page, where a
+  // click can stop before it reaches the player. The backend forwards that
+  // click as an event so it still runs the toggle above.
+  const togglePlaybackRef = useRef(togglePlayback);
+  useEffect(() => {
+    togglePlaybackRef.current = togglePlayback;
+  });
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let active = true;
+    void listen("native-video-click", () => {
+      togglePlaybackRef.current();
+    }).then((unlisten) => {
+      if (active) stop = unlisten;
+      else unlisten();
+    });
+    return () => {
+      active = false;
+      stop?.();
+    };
+  }, []);
 
   // Typing a tag needs the viewer's attention, so the picture waits for them.
   const openTagField = (folder = false) => {
