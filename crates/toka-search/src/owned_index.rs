@@ -475,6 +475,25 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether a roots row other than `root_id` already holds `path`: the
+/// aliased-twin layout the migration deliberately preserves instead of
+/// merging. Takes the connection so both plain reads and the migration's
+/// write transaction (which derefs to one) share this check.
+fn another_root_holds(
+    connection: &Connection,
+    root_id: &str,
+    path: &Path,
+) -> Result<bool, OwnedIndexError> {
+    let collision: Option<String> = connection
+        .query_row(
+            "SELECT id FROM roots WHERE path = ?1 AND id != ?2",
+            params![path_bytes(path), root_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(collision.is_some())
+}
+
 impl OwnedIndexUpdates {
     // Unconditional (not just `cfg(test)`): the app's tests build updates too,
     // and this crate compiles without `cfg(test)` when they do.
@@ -517,19 +536,28 @@ impl OwnedIndexUpdates {
         };
         let path = canonical_spelling(path);
         let mut index = OwnedIndex::open(database)?;
+        // Recorded roots are canonical in production (`add_folder`
+        // stores nothing else); a row that is not — re-pointed
+        // through a symlinked parent, say — migrates to the
+        // canonical spelling on first touch, so lookups and storage
+        // never disagree about one file for long. Heal in memory
+        // first and migrate only the roots this sync matches, so an
+        // unmatched sync leaves the index untouched.
+        let roots = index.roots()?;
+        let healed_roots: Vec<(String, PathBuf, PathBuf)> = roots
+            .into_iter()
+            .map(|(id, root)| {
+                let healed = canonical_spelling(&root);
+                (id, root, healed)
+            })
+            .collect();
         let mut matched = false;
-        for (root_id, root) in index.roots()? {
-            // Recorded roots are canonical in production (`add_folder`
-            // stores nothing else); a row that is not — re-pointed
-            // through a symlinked parent, say — migrates to the
-            // canonical spelling on first touch, so lookups and storage
-            // never disagree about one file for long.
-            let healed = canonical_spelling(&root);
-            if healed != root {
-                index.migrate_root_spelling(&root_id, &root, &healed)?;
-            }
-            if path.starts_with(&healed) {
-                index.synchronize_path(&root_id, &healed, &path)?;
+        for (root_id, recorded, healed) in &healed_roots {
+            if path.starts_with(healed) {
+                if *healed != *recorded {
+                    index.migrate_root_spelling(root_id, recorded, healed)?;
+                }
+                index.synchronize_path(root_id, healed, &path)?;
                 matched = true;
             }
         }
@@ -551,22 +579,35 @@ impl OwnedIndexUpdates {
         let from = canonical_spelling(from);
         let to = canonical_spelling(to);
         let mut index = OwnedIndex::open(database)?;
-        let mut healed_roots = Vec::new();
-        for (id, root) in index.roots()? {
-            // Same migration as `synchronize_path`: one path identity
-            // for lookups and storage, whichever sync touches it first.
-            let healed = canonical_spelling(&root);
-            if healed != root {
-                index.migrate_root_spelling(&id, &root, &healed)?;
-            }
-            healed_roots.push((id, healed));
-        }
-        let matched = healed_roots
+        // Same migration as `synchronize_path`: one path identity
+        // for lookups and storage, whichever sync touches it first —
+        // but only for the root this rename matches, so an unmatched
+        // rename migrates nothing.
+        let roots = index.roots()?;
+        let healed_roots: Vec<(String, PathBuf, PathBuf)> = roots
             .into_iter()
-            .find(|(_, root)| from == *root || (from.starts_with(root) && to.starts_with(root)));
+            .map(|(id, root)| {
+                let healed = canonical_spelling(&root);
+                (id, root, healed)
+            })
+            .collect();
+        // Exact before containing: renaming a nested watched root must
+        // resolve to its own row, not to whichever containing root the
+        // id order happens to list first.
+        let matched = healed_roots
+            .iter()
+            .find(|(_, _, healed)| from == *healed)
+            .or_else(|| {
+                healed_roots
+                    .iter()
+                    .find(|(_, _, healed)| from.starts_with(healed) && to.starts_with(healed))
+            });
         match matched {
-            Some((root_id, root)) => {
-                index.synchronize_rename(&root_id, &root, &from, &to)?;
+            Some((root_id, recorded, healed)) => {
+                if *healed != *recorded {
+                    index.migrate_root_spelling(root_id, recorded, healed)?;
+                }
+                index.synchronize_rename(root_id, healed, &from, &to)?;
                 Ok(SyncOutcome::Matched)
             }
             None => Ok(SyncOutcome::Unmatched),
@@ -1377,7 +1418,9 @@ impl OwnedIndex {
     /// still references keeps its spelling (that root still matches it);
     /// the next scan prunes whatever duplicates remain. When another root
     /// already holds the canonical spelling, the write is skipped and the
-    /// caller keeps matching transiently on the healed spelling.
+    /// caller keeps matching transiently on the healed spelling. The root
+    /// update is conditional on the recorded spelling: a row a concurrent
+    /// rename re-pointed after we read it keeps its newer spelling.
     fn migrate_root_spelling(
         &mut self,
         root_id: &str,
@@ -1392,14 +1435,7 @@ impl OwnedIndex {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let collision: Option<String> = transaction
-            .query_row(
-                "SELECT id FROM roots WHERE path = ?1 AND id != ?2",
-                params![path_bytes(canonical), root_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if collision.is_some() {
+        if another_root_holds(&transaction, root_id, canonical)? {
             return Ok(());
         }
         let files: Vec<(i64, PathBuf)> = {
@@ -1419,15 +1455,25 @@ impl OwnedIndex {
             [root_id],
             |row| row.get(0),
         )?;
-        transaction.execute(
-            "UPDATE roots SET path = ?2, display_path = ?3, updated_at_ns = ?4 WHERE id = ?1",
+        // The recorded spelling was read before this transaction; a
+        // concurrent rename may have re-pointed the row since. The root
+        // update only lands when the row still holds what we read —
+        // otherwise the newer spelling wins, the transaction rolls back
+        // uncommitted, and the next sync heals whatever is still stale.
+        let changed = transaction.execute(
+            "UPDATE roots SET path = ?2, display_path = ?3, updated_at_ns = ?4
+             WHERE id = ?1 AND path = ?5",
             params![
                 root_id,
                 path_bytes(canonical),
                 canonical.to_string_lossy(),
-                now_ns()
+                now_ns(),
+                path_bytes(recorded),
             ],
         )?;
+        if changed == 0 {
+            return Ok(());
+        }
         for (file_id, old_path) in files {
             let Ok(relative) = old_path.strip_prefix(recorded) else {
                 continue;
@@ -1591,9 +1637,18 @@ impl OwnedIndex {
     {
         // A stale watcher can hand a pre-migration spelling back in: walk
         // and store the canonical spelling so a repair scan never reverts
-        // a migrated roots row.
+        // a migrated roots row — unless another root already holds the
+        // canonical spelling (an aliased twin the migration preserves).
+        // Then `begin_scan` would fail UNIQUE on the roots row, so the
+        // scan keeps the as-recorded spelling and stays usable.
         let canonical = canonical_spelling(root);
-        let root = &canonical;
+        let scan_spelling =
+            if canonical != *root && another_root_holds(&self.connection, root_id, &canonical)? {
+                root.to_path_buf()
+            } else {
+                canonical
+            };
+        let root = &scan_spelling;
         let (generation, mut progress) = self.begin_scan(root_id, root)?;
         on_progress(&progress);
         let mut pending = VecDeque::from([root.to_path_buf()]);
@@ -3218,6 +3273,98 @@ mod tests {
             .unwrap()
     }
 
+    /// Records `path` as indexed under `root_id`, as a pre-canonical scan
+    /// would have left it: one files row plus its root_files link. A real
+    /// scan cannot build this state — it heals the roots row it walks —
+    /// so legacy-row tests insert it directly.
+    fn index_legacy_file_row(index: &OwnedIndex, root_id: &str, path: &Path) {
+        let metadata = std::fs::metadata(path).unwrap();
+        let file = IndexedFile::read(path.to_path_buf(), metadata).unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO files (
+                    path, display_path, file_name, extension, media_type,
+                    size_bytes, created_at_ns, modified_at_ns,
+                    file_name_search, tags_search, folders_search
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    file.path_bytes,
+                    file.path.to_string_lossy(),
+                    file.file_name_bytes,
+                    file.extension,
+                    file.media_type,
+                    file.size_bytes,
+                    file.created_at_ns,
+                    file.modified_at_ns,
+                    file.file_name_search,
+                    file.tags_search,
+                    file.folders_search,
+                ],
+            )
+            .unwrap();
+        let file_id: i64 = index
+            .connection
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1",
+                [path_bytes(path)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO root_files (root_id, file_id, scan_generation)
+                 VALUES (?1, ?2, 0)",
+                params![root_id, file_id],
+            )
+            .unwrap();
+    }
+
+    /// Every row a migration could rewrite, plus the revision: an unmatched
+    /// sync must leave all of it byte-identical. `quote` renders each value
+    /// in its storage form, so blobs, nulls, and timestamps compare exactly.
+    fn dump_index_state(index: &OwnedIndex) -> Vec<String> {
+        let dump_table = |sql: &str| -> Vec<String> {
+            index
+                .connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let mut dump = vec![format!("revision {}", index.revision().unwrap())];
+        dump.extend(dump_table(
+            "SELECT 'meta ' || quote(key) || ' ' || quote(value)
+             FROM schema_meta ORDER BY key",
+        ));
+        dump.extend(dump_table(
+            "SELECT 'root ' || quote(id) || ' ' || quote(path) || ' '
+                || quote(display_path) || ' ' || quote(mount_target) || ' '
+                || quote(mount_source) || ' ' || quote(mount_uuid) || ' '
+                || quote(state) || ' ' || quote(scan_generation) || ' '
+                || quote(created_at_ns) || ' ' || quote(updated_at_ns)
+             FROM roots ORDER BY id",
+        ));
+        dump.extend(dump_table(
+            "SELECT 'file ' || quote(id) || ' ' || quote(path) || ' '
+                || quote(display_path) || ' ' || quote(file_name) || ' '
+                || quote(extension) || ' ' || quote(media_type) || ' '
+                || quote(size_bytes) || ' ' || quote(created_at_ns) || ' '
+                || quote(modified_at_ns) || ' ' || quote(file_name_search) || ' '
+                || quote(tags_search) || ' ' || quote(folders_search)
+             FROM files ORDER BY id",
+        ));
+        dump.extend(dump_table(
+            "SELECT 'link ' || quote(root_id) || ' ' || quote(file_id) || ' '
+                || quote(scan_generation)
+             FROM root_files ORDER BY root_id, file_id",
+        ));
+        dump
+    }
+
     #[test]
     fn app_mutations_update_the_owned_index_before_returning() {
         let directory = tempdir().unwrap();
@@ -3603,6 +3750,45 @@ mod tests {
     }
 
     #[test]
+    fn renaming_a_nested_root_moves_the_exact_root_row() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("watched");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("clip.mp4"), b"video").unwrap();
+        let parent = parent.canonicalize().unwrap();
+        let child = parent.join("child");
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        // The container sorts first by id: without exact-before-containing
+        // selection the rename would resolve to it and strand the child row.
+        index.insert_root("a-parent", &parent).unwrap();
+        index.insert_root("z-child", &child).unwrap();
+        index.scan_root("a-parent", &parent, |_| {}).unwrap();
+        index.scan_root("z-child", &child, |_| {}).unwrap();
+        drop(index);
+
+        let renamed = parent.join("renamed");
+        std::fs::rename(&child, &renamed).unwrap();
+        let updates = OwnedIndexUpdates::new(database.clone());
+        assert_eq!(
+            updates.synchronize_rename(&child, &renamed).unwrap(),
+            SyncOutcome::Matched
+        );
+
+        let observer = OwnedIndex::open(&database).unwrap();
+        let roots = observer.roots().unwrap();
+        assert!(roots.contains(&("a-parent".to_string(), parent.clone())));
+        assert!(
+            roots.contains(&("z-child".to_string(), renamed.clone())),
+            "the child roots row must follow its directory: {roots:?}"
+        );
+        let paths = indexed_display_paths(&observer);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(renamed.join("clip.mp4").to_string_lossy().as_ref()));
+    }
+
+    #[test]
     fn sync_path_matches_recorded_roots_that_predate_canonical_storage() {
         // A roots row recorded under a non-canonical spelling (a root
         // re-pointed through a symlinked parent, say) still matches: the
@@ -3736,11 +3922,23 @@ mod tests {
         // until the next path sync re-links it — the pre-migration
         // transient behavior for twins, not a second error.
         let roots = observer.roots().unwrap();
-        assert!(roots.contains(&("legacy".to_string(), link)));
-        assert!(roots.contains(&("canonical".to_string(), canonical_real)));
+        assert!(roots.contains(&("legacy".to_string(), link.clone())));
+        assert!(roots.contains(&("canonical".to_string(), canonical_real.clone())));
         let paths = indexed_display_paths(&observer);
         assert_eq!(paths.len(), 1);
         assert!(paths.contains(renamed.to_string_lossy().as_ref()));
+        drop(observer);
+
+        // Both twins stay scannable: the alias scan keeps its recorded
+        // spelling instead of failing UNIQUE against the canonical twin.
+        let mut scanner = OwnedIndex::open(&database).unwrap();
+        scanner.scan_root("legacy", &link, |_| {}).unwrap();
+        scanner
+            .scan_root("canonical", &canonical_real, |_| {})
+            .unwrap();
+        let roots = scanner.roots().unwrap();
+        assert!(roots.contains(&("legacy".to_string(), link)));
+        assert!(roots.contains(&("canonical".to_string(), canonical_real)));
     }
 
     #[cfg(unix)]
@@ -3962,6 +4160,43 @@ mod tests {
         assert_eq!(links, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_skips_a_root_repointed_after_it_was_read() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let clip = real.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let canonical_real = real.canonicalize().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &link).unwrap();
+        index_legacy_file_row(&index, "root", &link.join("clip.mp4"));
+
+        // A concurrent rename lands between the caller's roots() read and
+        // the migration's commit: the row no longer holds `link`.
+        let moved = directory.path().join("moved");
+        index
+            .connection
+            .execute(
+                "UPDATE roots SET path = ?1, display_path = ?2 WHERE id = 'root'",
+                params![path_bytes(&moved), moved.to_string_lossy()],
+            )
+            .unwrap();
+        let before = dump_index_state(&index);
+
+        // The migration still believes the recorded spelling is `link`;
+        // the conditional update must match no row and change nothing.
+        index
+            .migrate_root_spelling("root", &link, &canonical_real)
+            .unwrap();
+        assert_eq!(dump_index_state(&index), before);
+        assert_eq!(index.roots().unwrap(), vec![("root".to_string(), moved)]);
+    }
+
     #[test]
     fn sync_outcomes_report_whether_a_watched_folder_matched() {
         let directory = tempdir().unwrap();
@@ -4001,6 +4236,44 @@ mod tests {
             missing.synchronize_rename(&clip, &renamed).unwrap(),
             SyncOutcome::NoIndex
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unmatched_syncs_leave_a_legacy_index_untouched() {
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let clip = real.join("clip.mp4");
+        std::fs::write(&clip, b"video").unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &link).unwrap();
+        index_legacy_file_row(&index, "root", &link.join("clip.mp4"));
+        let before = dump_index_state(&index);
+        drop(index);
+
+        // Neither unmatched sync may migrate the legacy row it never
+        // matched, nor bump the revision doing it.
+        let updates = OwnedIndexUpdates::new(database.clone());
+        let elsewhere = directory.path().join("elsewhere.mp4");
+        std::fs::write(&elsewhere, b"video").unwrap();
+        assert_eq!(
+            updates.synchronize_path(&elsewhere).unwrap(),
+            SyncOutcome::Unmatched
+        );
+        assert_eq!(
+            updates
+                .synchronize_rename(&elsewhere, &directory.path().join("moved.mp4"))
+                .unwrap(),
+            SyncOutcome::Unmatched
+        );
+
+        let observer = OwnedIndex::open(&database).unwrap();
+        assert_eq!(dump_index_state(&observer), before);
+        assert_eq!(observer.roots().unwrap(), vec![("root".to_string(), link)]);
     }
 
     #[test]
