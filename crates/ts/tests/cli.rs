@@ -31,17 +31,40 @@ fn ts_command(
     fixture_videos: Option<OsString>,
     cwd: Option<&Path>,
 ) -> Command {
+    ts_command_for_binary(
+        Path::new(env!("CARGO_BIN_EXE_ts")),
+        arguments,
+        home,
+        data_home,
+        fixture_videos,
+        cwd,
+    )
+}
+
+/// [`ts_command`] running a staged copy of the binary instead of the test
+/// target itself, so installs from metacharacter paths are testable.
+fn ts_command_for_binary(
+    binary: &Path,
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    fixture_videos: Option<OsString>,
+    cwd: Option<&Path>,
+) -> Command {
     // A scratch temp space too, so even cache reads cannot escape the
     // test's directories.
     let scratch = home.join("tmp");
     fs::create_dir_all(&scratch).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ts"));
+    let mut command = Command::new(binary);
     command
         .args(arguments)
         .env("HOME", home)
         .env("XDG_DATA_HOME", data_home)
-        .env("TMPDIR", &scratch);
+        .env("TMPDIR", &scratch)
+        // The daemon lock follows the runtime dir, so point it at scratch
+        // too: no test may lock (or create files) in the real one.
+        .env("TOKA_RUNTIME_DIR", scratch.join("runtime"));
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -818,6 +841,19 @@ fn run_at_in(home: &ScratchHome, cwd: &Path, arguments: &[&str]) -> Output {
         None,
         Some(cwd),
     )
+}
+
+/// The thumbnail cache dir a scratch child resolves: its scratch TMPDIR
+/// plus the uid-scoped cache name, mirroring
+/// `toka_search::thumbnails::cache_output_root` under the child's
+/// environment. The child runs as this user, so its uid is ours.
+fn thumbnail_cache_dir(home: &Path) -> PathBuf {
+    use toka_search::service::{Host, SystemHost};
+    let uid = SystemHost::for_query().map(|host| host.uid()).unwrap_or(0);
+    home.join("tmp").join(format!(
+        "{}-{uid}",
+        toka_search::config::THUMBNAIL_CACHE_DIR_NAME
+    ))
 }
 
 fn create_image(directory: &Path, name: &str) -> PathBuf {
@@ -1623,11 +1659,7 @@ fn same_named_files_in_different_directories_keep_distinct_cache_entries(command
         assert!(output.stdout.is_empty());
     }
 
-    let cache = home
-        .home
-        .path()
-        .join("tmp")
-        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let cache = thumbnail_cache_dir(home.home.path());
     let markers = fs::read_dir(&cache)
         .unwrap()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -1727,11 +1759,7 @@ fn thumbnail_with_an_empty_path_is_a_usage_error() {
     assert!(stderr.contains("Usage: ts thumbnail"), "{stderr}");
 
     // The generator never ran, so no cache entry exists.
-    let cache = home
-        .home
-        .path()
-        .join("tmp")
-        .join(toka_search::config::THUMBNAIL_CACHE_DIR_NAME);
+    let cache = thumbnail_cache_dir(home.home.path());
     let entries = fs::read_dir(&cache)
         .map(|entries| entries.count())
         .unwrap_or(0);
@@ -2402,5 +2430,1351 @@ fn a_second_daemon_on_the_same_index_exits_with_an_error() {
             String::from_utf8(output.stderr).unwrap(),
             "ts daemon run: Another Toka indexer daemon is already running.\n"
         );
+    });
+}
+
+/// A scratch home whose service managers are shims, in the style of the
+/// isolated-run `systemctl` shim: `systemctl`, `launchctl`, and `loginctl`
+/// resolve to scripts that log every call and answer from state files
+/// under the scratch home, so service tests never enable, start, or even
+/// query the real user services.
+#[cfg(unix)]
+struct ShimHome {
+    scratch: ScratchHome,
+    shim_dir: PathBuf,
+    log: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+const SYSTEMCTL_SHIM: &str = r#"#!/bin/sh
+# Installed by the ts service tests: a ts under test must never control
+# the real user services. Logs every call and answers from state files.
+echo "systemctl $*" >> "$TS_SHIM_LOG"
+if [ -n "$TS_SHIM_FAIL" ]; then
+  case "$*" in *"$TS_SHIM_FAIL"*) echo "injected failure" >&2; exit 1;; esac
+fi
+verb="$2"
+unit=""
+for arg in "$@"; do unit="$arg"; done
+unitdir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+active="$TS_SHIM_STATE/active_$unit"
+enabled="$TS_SHIM_STATE/enabled_$unit"
+case "$verb" in
+  is-active)
+    if [ -f "$TS_SHIM_STATE/word_$unit" ]; then cat "$TS_SHIM_STATE/word_$unit"; exit 3;
+    elif [ "$(cat "$active" 2>/dev/null)" = "1" ]; then echo "active"; exit 0;
+    elif [ "$(cat "$TS_SHIM_STATE/activating_$unit" 2>/dev/null)" = "1" ]; then echo "activating"; exit 3;
+    elif [ ! -f "$unitdir/$unit" ] && [ ! -f "$HOME/.config/systemd/user/$unit" ]; then echo "inactive"; exit 4;
+    else echo "inactive"; exit 3; fi;;
+  is-enabled)
+    if [ "$(cat "$enabled" 2>/dev/null)" = "1" ]; then echo "enabled"; exit 0;
+    else echo "disabled"; exit 1; fi;;
+  show)
+    line=$(grep '^ExecStart=' "$unitdir/$unit" 2>/dev/null | head -n 1)
+    exe=$(printf '%s' "$line" | sed -n 's/^ExecStart="\(.*\)" daemon run$/\1/p')
+    # Real systemctl reports the decoded path, as the unit-test fake's
+    # show_exec_start does: unescape first, then fold %% to %.
+    exe=$(printf '%s' "$exe" | sed -e 's/\\"/"/g' -e 's/\\\\/\\/g' -e 's/%%/%/g')
+    if [ -n "$exe" ]; then echo "ExecStart={ path=$exe ; argv[]=$exe daemon run ; ignore_errors=no }";
+    else echo "ExecStart="; fi;;
+  start) echo 1 > "$active"; rm -f "$TS_SHIM_STATE/activating_$unit";;
+  stop) echo 0 > "$active"; rm -f "$TS_SHIM_STATE/activating_$unit";;
+  enable) echo 1 > "$enabled";;
+  disable) echo 0 > "$enabled";;
+  daemon-reload) ;;
+esac
+exit 0
+"#;
+
+#[cfg(unix)]
+const LAUNCHCTL_SHIM: &str = r#"#!/bin/sh
+# Installed by the ts service tests: a ts under test must never control
+# the real launchd agents. Logs every call and answers from state files.
+echo "launchctl $*" >> "$TS_SHIM_LOG"
+if [ -n "$TS_SHIM_FAIL" ]; then
+  case "$*" in *"$TS_SHIM_FAIL"*) echo "injected failure" >&2; exit 1;; esac
+fi
+case "$1" in
+  print)
+    if [ "$(cat "$TS_SHIM_STATE/bootstrapped" 2>/dev/null)" = "1" ]; then
+      if [ "$(cat "$TS_SHIM_STATE/job_running" 2>/dev/null)" = "1" ]; then job="running";
+      else job="exited"; fi
+      printf '%s = {\n\tstate = %s;\n' "$2" "$job"
+      if [ -f "$TS_SHIM_STATE/program" ]; then printf '\tprogram = %s;\n' "$(cat "$TS_SHIM_STATE/program")"; fi
+      printf '}\n'
+      exit 0
+    else
+      echo "Could not find service $2 in domain" >&2; exit 1
+    fi;;
+  bootstrap)
+    echo 1 > "$TS_SHIM_STATE/bootstrapped"; echo 1 > "$TS_SHIM_STATE/job_running"
+    exe=$(grep -A3 '<key>ProgramArguments</key>' "$3" 2>/dev/null | grep '<string>' | head -n 1 | sed 's/.*<string>//;s/<\/string>.*//')
+    # Real launchd reports the decoded path: entities unescaped (&lt;
+    # and &gt; first, &amp; last), as xml_unescape does.
+    exe=$(printf '%s' "$exe" | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&amp;/\&/g')
+    if [ -n "$exe" ]; then printf '%s' "$exe" > "$TS_SHIM_STATE/program"; else rm -f "$TS_SHIM_STATE/program"; fi;;
+  bootout) echo 0 > "$TS_SHIM_STATE/bootstrapped"; echo 0 > "$TS_SHIM_STATE/job_running";;
+  kickstart)
+    if [ "$(cat "$TS_SHIM_STATE/bootstrapped" 2>/dev/null)" = "1" ]; then
+      echo 1 > "$TS_SHIM_STATE/job_running"; exit 0
+    else echo "Could not find service" >&2; exit 1; fi;;
+esac
+exit 0
+"#;
+
+#[cfg(unix)]
+const LOGINCTL_SHIM: &str = r#"#!/bin/sh
+# Installed by the ts service tests: lingering answers come from a state
+# file, never from the real login manager.
+echo "loginctl $*" >> "$TS_SHIM_LOG"
+if [ -n "$TS_SHIM_FAIL" ]; then
+  case "$*" in *"$TS_SHIM_FAIL"*) echo "injected failure" >&2; exit 1;; esac
+fi
+case "$1" in
+  show-user) [ "$(cat "$TS_SHIM_STATE/lingering" 2>/dev/null)" = "1" ] && echo yes || echo no;;
+  enable-linger) echo 1 > "$TS_SHIM_STATE/lingering";;
+esac
+exit 0
+"#;
+
+#[cfg(unix)]
+fn shim_home() -> ShimHome {
+    let scratch = scratch_home();
+    let shim_dir = scratch.home.path().join("shim");
+    let state = scratch.home.path().join("shim-state");
+    fs::create_dir_all(&shim_dir).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    for (name, script) in [
+        ("systemctl", SYSTEMCTL_SHIM),
+        ("launchctl", LAUNCHCTL_SHIM),
+        ("loginctl", LOGINCTL_SHIM),
+    ] {
+        let path = shim_dir.join(name);
+        fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let log = scratch.home.path().join("shim.log");
+    ShimHome {
+        scratch,
+        shim_dir,
+        log,
+        state,
+    }
+}
+
+#[cfg(unix)]
+impl ShimHome {
+    fn home(&self) -> &Path {
+        self.scratch.home.path()
+    }
+
+    fn calls(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+fn run_shimmed(home: &ShimHome, arguments: &[&str]) -> Output {
+    run_shimmed_with_fail(home, arguments, None, &[])
+}
+
+/// Like [`run_shimmed`], but every shimmed invocation whose arguments
+/// contain `fail` exits 1, so failure paths are testable. Extra
+/// environment entries override the harness defaults per run.
+#[cfg(unix)]
+fn run_shimmed_with_fail(
+    home: &ShimHome,
+    arguments: &[&str],
+    fail: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    spawn_and_wait(shimmed_command(
+        home,
+        Path::new(env!("CARGO_BIN_EXE_ts")),
+        arguments,
+        fail,
+        extra_env,
+    ))
+}
+
+/// The shimmed [`Command`] behind [`run_shimmed_with_fail`], split out so
+/// tests can stage another binary in place of the test target, or spawn
+/// overlapping installs from threads.
+#[cfg(unix)]
+fn shimmed_command(
+    home: &ShimHome,
+    binary: &Path,
+    arguments: &[&str],
+    fail: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Command {
+    let mut command = ts_command_for_binary(
+        binary,
+        arguments,
+        home.scratch.home.path(),
+        &home.scratch.data_home,
+        None,
+        None,
+    );
+    let path = std::env::var("PATH").unwrap_or_default();
+    command.env("PATH", format!("{}:{path}", home.shim_dir.display()));
+    command.env("TS_SHIM_LOG", &home.log);
+    command.env("TS_SHIM_STATE", &home.state);
+    // A fixture login name: lingering flows must not depend on the
+    // developer's own USER.
+    command.env("USER", "tester");
+    // A scratch config home under the scratch home itself: without this
+    // the child inherits the developer's own XDG_CONFIG_HOME and can
+    // write its unit file into the real config. Explicit per-run
+    // overrides still win: they apply after.
+    command.env("XDG_CONFIG_HOME", home.home().join(".config"));
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    match fail {
+        Some(pattern) => {
+            command.env("TS_SHIM_FAIL", pattern);
+        }
+        None => {
+            command.env_remove("TS_SHIM_FAIL");
+        }
+    }
+    command
+}
+
+/// Spawns a built [`Command`] with piped output and waits for it.
+#[cfg(unix)]
+fn spawn_and_wait(mut command: Command) -> Output {
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_exit(child)
+}
+
+/// A copy of the test target staged under `dir_name` in the scratch home,
+/// so installs run from paths the shell and the service files escape.
+#[cfg(unix)]
+fn staged_binary(home: &ShimHome, dir_name: &str) -> PathBuf {
+    let dir = home.home().join(dir_name);
+    fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("ts");
+    fs::copy(env!("CARGO_BIN_EXE_ts"), &binary).unwrap();
+    binary
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn shim_unit_file(home: &ShimHome) -> PathBuf {
+    home.home().join(".config/systemd/user/toka-search.service")
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn shim_legacy_unit_file(home: &ShimHome) -> PathBuf {
+    home.home()
+        .join(".config/systemd/user/toka-indexer.service")
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+fn shim_plist_file(home: &ShimHome) -> PathBuf {
+    home.home().join("Library/LaunchAgents/app.toka.ts.plist")
+}
+
+#[cfg(unix)]
+fn shim_link(home: &ShimHome) -> PathBuf {
+    home.home().join(".local/bin/ts")
+}
+
+#[cfg(unix)]
+#[test]
+fn the_systemctl_shim_answers_absent_for_never_loaded_units() {
+    // Pins the shim's never-loaded answers without a `ts` run: exit-4
+    // `inactive` from `is-active`, an empty `ExecStart=` from `show` — the
+    // words real systemctl uses for a unit it never loaded since systemd
+    // 258.
+    let dir = tempdir().unwrap();
+    let shim = dir.path().join("systemctl");
+    fs::write(&shim, SYSTEMCTL_SHIM).unwrap();
+    let home = dir.path().join("home");
+    let xdg = dir.path().join("xdg");
+    let state = dir.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&xdg).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let log = dir.path().join("shim.log");
+    let run = |args: &[&str]| {
+        Command::new("sh")
+            .arg(&shim)
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("TS_SHIM_STATE", &state)
+            .env("TS_SHIM_LOG", &log)
+            .env_remove("TS_SHIM_FAIL")
+            .output()
+            .unwrap()
+    };
+
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(probe.status.code(), Some(4));
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inactive\n");
+
+    let show = run(&["--user", "show", "-p", "ExecStart", "toka-search.service"]);
+    assert_eq!(String::from_utf8(show.stdout).unwrap(), "ExecStart=\n");
+
+    // A pinned word wins outright, and a unit file the manager would
+    // load on demand reads as loaded-but-stopped.
+    fs::write(state.join("word_toka-search.service"), "inaktiv\n").unwrap();
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inaktiv\n");
+    fs::remove_file(state.join("word_toka-search.service")).unwrap();
+
+    let unit = xdg.join("systemd/user/toka-search.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Unit]\n").unwrap();
+    let probe = run(&["--user", "is-active", "toka-search.service"]);
+    assert_eq!(probe.status.code(), Some(3));
+    assert_eq!(String::from_utf8(probe.stdout).unwrap(), "inactive\n");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn install_writes_enables_and_starts_the_systemd_unit() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let unit = fs::read_to_string(shim_unit_file(&home)).unwrap();
+    assert!(
+        unit.contains(&format!(
+            "ExecStart=\"{}\" daemon run",
+            env!("CARGO_BIN_EXE_ts")
+        )),
+        "{unit}"
+    );
+    for line in [
+        "Description=Toka search indexer",
+        "Type=exec",
+        "Restart=on-failure",
+        "RestartSec=2",
+        "Nice=10",
+        "IOSchedulingClass=idle",
+        "WantedBy=default.target",
+    ] {
+        assert!(unit.contains(line), "{unit}");
+    }
+    let calls = home.calls();
+    for verb in [
+        "daemon-reload",
+        "enable toka-search",
+        "start toka-search",
+        "enable-linger",
+    ] {
+        assert!(calls.contains(verb), "{calls}");
+    }
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn install_is_idempotent() {
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("already"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    // Convergence checks only: nothing enabled, started, or reloaded twice.
+    let calls = home.calls();
+    assert_eq!(calls.matches("enable toka-search").count(), 1, "{calls}");
+    assert_eq!(calls.matches("start toka-search").count(), 1, "{calls}");
+    assert_eq!(calls.matches("daemon-reload").count(), 1, "{calls}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn repeat_install_from_a_percent_dir_reports_already_installed() {
+    // The unit escapes the executable's `%` as `%%`; the manager reports
+    // the decoded path back, so a repeat install sees the same executable
+    // — no takeover, no restart.
+    let home = shim_home();
+    let binary = staged_binary(&home, "100%");
+    let install = || spawn_and_wait(shimmed_command(&home, &binary, &["install"], None, &[]));
+
+    let output = install();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = install();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("taking over"), "{stdout}");
+    assert!(stdout.contains("already"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("start toka-search").count(), 1, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn install_migrates_the_old_service() {
+    let home = shim_home();
+    let legacy = shim_legacy_unit_file(&home);
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, "[Unit]\n").unwrap();
+    fs::write(home.state.join("active_toka-indexer.service"), "1").unwrap();
+    fs::write(home.state.join("enabled_toka-indexer.service"), "1").unwrap();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!legacy.exists());
+    assert!(shim_unit_file(&home).is_file());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("stopped the old toka-indexer.service"),
+        "{stdout}"
+    );
+    let calls = home.calls();
+    assert!(calls.contains("stop toka-indexer.service"), "{calls}");
+    assert!(calls.contains("disable toka-indexer.service"), "{calls}");
+    let stop = calls.find("stop toka-indexer").unwrap();
+    let start = calls.find("start toka-search").unwrap();
+    assert!(stop < start, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn install_respects_xdg_config_home() {
+    let home = shim_home();
+    let config = home
+        .home()
+        .join("xdg-config")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_CONFIG_HOME", config.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        Path::new(&config)
+            .join("systemd/user/toka-search.service")
+            .is_file(),
+        "the unit lands under XDG_CONFIG_HOME"
+    );
+    assert!(
+        !shim_unit_file(&home).exists(),
+        "nothing lands under ~/.config"
+    );
+
+    // Status finds it there too.
+    let output = run_shimmed_with_fail(
+        &home,
+        &["status"],
+        None,
+        &[("XDG_CONFIG_HOME", config.as_str())],
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Service:  installed"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn install_fails_when_the_manager_refuses_to_start() {
+    let home = shim_home();
+
+    let output = run_shimmed_with_fail(&home, &["install"], Some("start toka-search.service"), &[]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ts install: systemctl"), "{stderr}");
+    // The failure still prints what completed before it.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("wrote ~/"), "{stdout}");
+    assert!(stdout.contains("enabled toka-search.service"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn fresh_install_with_never_loaded_units_starts_without_bogus_stops() {
+    // The shim answers real systemctl's exit-4 `inactive` for units it
+    // never loaded: a fresh install starts the service without stopping
+    // the absent first.
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("started toka-search.service"), "{stdout}");
+    assert!(!stdout.contains("restarted"), "{stdout}");
+    assert!(!stdout.contains("stopped"), "{stdout}");
+    let calls = home.calls();
+    assert!(!calls.contains("stop"), "{calls}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn stop_with_an_unreadable_word_and_a_file_fails_closed() {
+    // A pinned `unknown` — or a localized word — with a unit file
+    // installed: a lingering service may still run there, so stop errors
+    // instead of claiming convergence.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    for word in ["unknown", "inaktiv"] {
+        fs::write(
+            home.state.join("word_toka-search.service"),
+            format!("{word}\n"),
+        )
+        .unwrap();
+
+        let output = run_shimmed(&home, &["stop"]);
+
+        assert_eq!(output.status.code(), Some(1), "{word}");
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("could not ask systemd"),
+            "{word}"
+        );
+    }
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn uninstall_stops_and_removes_the_unit_idempotently() {
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_shimmed(&home, &["uninstall"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!shim_unit_file(&home).exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped toka-search.service"), "{stdout}");
+    assert!(stdout.contains("removed ~/"), "{stdout}");
+    let calls = home.calls();
+    assert!(calls.contains("stop toka-search.service"), "{calls}");
+    assert!(calls.contains("disable toka-search.service"), "{calls}");
+
+    let output = run_shimmed(&home, &["uninstall"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("toka-search.service is not installed"),
+        "{stdout}"
+    );
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn start_stop_and_restart_converge_with_honest_exit_codes() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("not installed"));
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(1));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("nothing to stop"),
+        "stopping what was never installed succeeds"
+    );
+
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("already stopped"));
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("already running"));
+    // Restart while stopped still ends up running.
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("already stopped"), "{stdout}");
+    assert!(stdout.contains("started toka-search.service"), "{stdout}");
+    // Restart while running stops first, then starts.
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped toka-search.service"), "{stdout}");
+    assert!(stdout.contains("started toka-search.service"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn status_reports_the_systemd_service_matrix() {
+    let home = shim_home();
+
+    // Neither a unit nor a daemon: honestly not installed.
+    let output = run_shimmed(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Service:  not installed\n"), "{stdout}");
+    let output = run_shimmed(&home, &["status", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["serviceInstalled"], false);
+    assert!(document["serviceEnabled"].is_null());
+    assert!(document["serviceRunning"].is_null());
+
+    // Installed and running.
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Service:  installed, enabled, running\n"),
+        "{stdout}"
+    );
+    let output = run_shimmed(&home, &["status", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["serviceInstalled"], true);
+    assert_eq!(document["serviceEnabled"], true);
+    assert_eq!(document["serviceRunning"], true);
+
+    // Installed but stopped.
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Service:  installed, enabled, stopped\n"),
+        "{stdout}"
+    );
+
+    let output = run_shimmed(&home, &["uninstall"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Service:  not installed\n"));
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_writes_and_bootstraps_the_agent() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plist = fs::read_to_string(shim_plist_file(&home)).unwrap();
+    assert!(plist.contains("<string>app.toka.ts</string>"), "{plist}");
+    assert!(
+        plist.contains(&format!("<string>{}</string>", env!("CARGO_BIN_EXE_ts"))),
+        "{plist}"
+    );
+    assert!(plist.contains("<string>daemon</string>"), "{plist}");
+    assert!(plist.contains("<string>run</string>"), "{plist}");
+    for key in ["KeepAlive", "RunAtLoad", "ProcessType", "LowPriorityIO"] {
+        assert!(plist.contains(&format!("<key>{key}</key>")), "{plist}");
+    }
+    // launchd agents inherit a minimal PATH: the plist pins one that
+    // covers both Homebrew prefixes so background thumbnails find ffmpeg.
+    assert!(
+        plist.contains("<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>"),
+        "{plist}"
+    );
+    assert!(plist.contains("<string>Background</string>"), "{plist}");
+    let calls = home.calls();
+    assert!(calls.contains("bootstrap"), "{calls}");
+    assert!(!calls.contains("systemctl"), "{calls}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_is_idempotent() {
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("already"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_without_a_reported_program_reports_already_running() {
+    // Old `launchctl print` output names no program: with the plist
+    // current and no marker set, the install takes the fast path — the
+    // program line is never consulted.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    fs::remove_file(home.state.join("program")).unwrap();
+
+    let output = run_shimmed(&home, &["install"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("already running"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("bootout").count(), 0, "{calls}");
+    assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn repeat_install_from_an_ampersand_dir_stays_converged() {
+    // The plist escapes the executable's `&` as `&amp;`; the manager
+    // reports the decoded path back, so a repeat install sees the same
+    // executable and never reloads an unchanged agent.
+    let home = shim_home();
+    let binary = staged_binary(&home, "A&B");
+    let install = || spawn_and_wait(shimmed_command(&home, &binary, &["install"], None, &[]));
+
+    let output = install();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(home.state.join("program")).unwrap(),
+        binary.to_string_lossy().into_owned(),
+        "the shim records the decoded loaded program"
+    );
+
+    let output = install();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("taking over"), "{stdout}");
+    assert!(stdout.contains("already running"), "{stdout}");
+    assert!(!stdout.contains("wrote ~/"), "{stdout}");
+    let calls = home.calls();
+    assert_eq!(calls.matches("bootout").count(), 0, "{calls}");
+    assert_eq!(calls.matches("bootstrap").count(), 1, "{calls}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn retry_without_a_reported_program_completes_the_pending_reload() {
+    // Old `launchctl print` output names no program, and the executable
+    // never moves — only a pinned `XDG_DATA_HOME` changes the plist. A
+    // bootout failure leaves the marker set; the program-less retry still
+    // reloads, driven by the marker alone.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let data = home.home().join("data-two").to_string_lossy().into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        Some("bootout"),
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    // Old launchctl from here on: the retry's `print` names no program.
+    fs::remove_file(home.state.join("program")).unwrap();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
+    assert!(!stdout.contains("already running"), "{stdout}");
+    let plist = fs::read_to_string(shim_plist_file(&home)).unwrap();
+    assert!(
+        plist.contains(&format!("<string>{data}</string>")),
+        "the retry pins data-two's absolute path, not the old value:\n{plist}"
+    );
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_failing_at_bootstrap_reports_the_bootout() {
+    // The bootout succeeds, then the bootstrap fails: the partial report
+    // names the stop instead of omitting it, and a retry completes the
+    // pending reload.
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let data = home.home().join("data-two").to_string_lossy().into_owned();
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        Some("bootstrap"),
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ts install: launchctl"), "{stderr}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+
+    let output = run_shimmed_with_fail(
+        &home,
+        &["install"],
+        None,
+        &[("XDG_DATA_HOME", data.as_str())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn install_fails_when_the_manager_refuses_to_bootstrap() {
+    let home = shim_home();
+
+    let output = run_shimmed_with_fail(&home, &["install"], Some("bootstrap"), &[]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("ts install: launchctl"), "{stderr}");
+    // The failure still prints what completed before it.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("wrote ~/"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn uninstall_bootouts_and_removes_the_agent_idempotently() {
+    let home = shim_home();
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_shimmed(&home, &["uninstall"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!shim_plist_file(&home).exists());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+    assert!(stdout.contains("removed ~/"), "{stdout}");
+    assert!(home.calls().contains("bootout"), "{}", home.calls());
+
+    let output = run_shimmed(&home, &["uninstall"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("app.toka.ts is not installed"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn start_stop_and_restart_converge_with_honest_exit_codes() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("not installed"));
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(1));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("nothing to stop"),
+        "stopping what was never installed succeeds"
+    );
+
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("already stopped"));
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["start"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("already running"));
+    // Restart while stopped still ends up running.
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("already stopped"), "{stdout}");
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
+    // Restart while running unloads first, then loads.
+    let output = run_shimmed(&home, &["restart"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("stopped app.toka.ts"), "{stdout}");
+    assert!(stdout.contains("started app.toka.ts"), "{stdout}");
+}
+
+#[cfg(all(unix, target_os = "macos"))]
+#[test]
+fn status_reports_the_agent_matrix() {
+    let home = shim_home();
+
+    // Neither an agent nor a daemon: honestly not installed.
+    let output = run_shimmed(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Service:  not installed\n"), "{stdout}");
+    let output = run_shimmed(&home, &["status", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["serviceInstalled"], false);
+    assert!(document["serviceEnabled"].is_null());
+    assert!(document["serviceRunning"].is_null());
+
+    // Installed and running.
+    let output = run_shimmed(&home, &["install"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Service:  installed, enabled, running\n"),
+        "{stdout}"
+    );
+    let output = run_shimmed(&home, &["status", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["serviceInstalled"], true);
+    assert_eq!(document["serviceEnabled"], true);
+    assert_eq!(document["serviceRunning"], true);
+
+    // Installed but stopped: unloaded, so not enabled, with running
+    // unknown — a hand-started daemon may still run there.
+    let output = run_shimmed(&home, &["stop"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Service:  installed, disabled\n"),
+        "{stdout}"
+    );
+
+    let output = run_shimmed(&home, &["uninstall"]);
+    assert_eq!(output.status.code(), Some(0));
+    let output = run_shimmed(&home, &["status"]);
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Service:  not installed\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn install_with_link_links_and_uninstall_removes_it() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install", "--link"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_link(shim_link(&home)).unwrap(),
+        PathBuf::from(env!("CARGO_BIN_EXE_ts"))
+    );
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("linked ~/.local/bin/ts"),);
+
+    let output = run_shimmed(&home, &["install", "--link"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("already linked"),);
+
+    let output = run_shimmed(&home, &["uninstall"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(fs::symlink_metadata(shim_link(&home)).is_err());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("removed ~/.local/bin/ts"),);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_commands_report_versioned_json() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["install", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["command"], "install");
+    assert!(!document["actions"].as_array().unwrap().is_empty());
+
+    for command in ["restart", "start", "stop"] {
+        let output = run_shimmed(&home, &[command, "--json"]);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1, "{command}");
+        assert_eq!(document["command"], command, "{command}");
+    }
+
+    let output = run_shimmed(&home, &["uninstall", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["command"], "uninstall");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_purge_removes_data_but_keeps_media() {
+    let home = shim_home();
+    // A real index, through the real command.
+    let media = home.home().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let clip = create_video(&media, 0);
+    let media_argument = media.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_shimmed(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    #[cfg(target_os = "macos")]
+    let index_dir = home.home().join("Library/Application Support/toka");
+    #[cfg(not(target_os = "macos"))]
+    let index_dir = home.scratch.data_home.join("toka");
+    assert!(index_dir.join("index.sqlite3").is_file());
+    // Logs and thumbnail cache markers where the child resolves them.
+    #[cfg(target_os = "macos")]
+    let logs_dir = home.home().join("Library/Logs/app.toka.desktop");
+    #[cfg(not(target_os = "macos"))]
+    let logs_dir = home.scratch.data_home.join("app.toka.desktop/logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    fs::write(logs_dir.join("search.log"), b"log").unwrap();
+    let cache_dir = thumbnail_cache_dir(home.home());
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("thumb.jpg"), b"thumb").unwrap();
+    // Foreign content inside the index directory: purge deletes only
+    // known index files, so this always survives.
+    let foreign = index_dir.join("my-media-clip.mp4");
+    fs::write(&foreign, b"video").unwrap();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !index_dir.join("index.sqlite3").exists(),
+        "the index is purged"
+    );
+    assert!(foreign.is_file(), "foreign index-dir content survives");
+    assert!(index_dir.is_dir(), "the index directory itself survives");
+    assert!(!logs_dir.exists(), "the logs are purged");
+    assert!(!cache_dir.exists(), "the thumbnail cache is purged");
+    assert!(clip.is_file(), "media is never purged");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("removed ~/"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_purge_refuses_a_directory_at_an_index_file_path() {
+    // A directory sitting at an index-artifact path, holding media: the
+    // purge refuses it with a clear error and removes nothing else
+    // either — not even the legitimate index file beside it.
+    let home = shim_home();
+    #[cfg(target_os = "macos")]
+    let index_dir = home.home().join("Library/Application Support/toka");
+    #[cfg(not(target_os = "macos"))]
+    let index_dir = home.scratch.data_home.join("toka");
+    fs::create_dir_all(&index_dir).unwrap();
+    let sibling = index_dir.join("index.sqlite3");
+    fs::write(&sibling, b"db").unwrap();
+    let artifact = index_dir.join("search-renames.json");
+    fs::create_dir(&artifact).unwrap();
+    let media = artifact.join("clip.mp4");
+    fs::write(&media, b"video").unwrap();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("refusing to remove"), "{stderr}");
+    assert!(stderr.contains("search-renames.json"), "{stderr}");
+    assert!(media.is_file(), "media inside survives");
+    assert!(sibling.is_file(), "the index file survives too");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_purge_reports_nothing_to_do() {
+    // The purge's own lock check must not plant the legacy lock it checks:
+    // through the real CLI, a second purge reports nothing to do instead
+    // of deleting and reporting a file the purge created.
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("no index data to remove"), "{stdout}");
+    assert!(!stdout.contains("daemon.lock"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_purge_removes_the_daemon_log() {
+    let home = shim_home();
+    #[cfg(target_os = "macos")]
+    let log = home
+        .home()
+        .join("Library/Application Support/app.toka.desktop/logs/indexer.log");
+    #[cfg(not(target_os = "macos"))]
+    let log = home
+        .scratch
+        .data_home
+        .join("app.toka.desktop/logs/indexer.log");
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(&log, b"log").unwrap();
+    // A neighbor the file-only target must leave alone: on macOS the
+    // daemon log sits outside the wholesale search-log folder, so only the
+    // log itself goes.
+    #[cfg(target_os = "macos")]
+    let neighbor = log.parent().unwrap().join("other.log");
+    #[cfg(target_os = "macos")]
+    fs::write(&neighbor, b"other").unwrap();
+
+    let output = run_shimmed(&home, &["uninstall", "--purge-data"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!log.exists(), "the daemon log is purged");
+    #[cfg(target_os = "macos")]
+    assert!(neighbor.is_file(), "neighbors of the daemon log survive");
+}
+
+#[cfg(unix)]
+#[test]
+fn overlapping_installs_serialize_and_converge() {
+    // Two installers at once: the second waits on the install lock, then
+    // sees the first installer's converged state — exactly one writes the
+    // service file, and the other reports it already up to date.
+    let home = shim_home();
+    let binary = Path::new(env!("CARGO_BIN_EXE_ts"));
+    let first = shimmed_command(&home, binary, &["install"], None, &[]);
+    let second = shimmed_command(&home, binary, &["install"], None, &[]);
+    let (first, second) = thread::scope(|scope| {
+        let running = scope.spawn(|| spawn_and_wait(first));
+        let waiting = scope.spawn(|| spawn_and_wait(second));
+        (running.join().unwrap(), waiting.join().unwrap())
+    });
+
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let combined =
+        String::from_utf8(first.stdout).unwrap() + &String::from_utf8(second.stdout).unwrap();
+    assert_eq!(
+        combined.matches("wrote ~/").count(),
+        1,
+        "exactly one installer writes:\n{combined}"
+    );
+    assert!(
+        combined.contains("service file already up to date"),
+        "the other sees converged state:\n{combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn service_help_and_usage_touch_nothing() {
+    let home = scratch_home();
+    for (command, usage) in [
+        ("install", "Usage: ts install [--link] [--json]"),
+        ("uninstall", "Usage: ts uninstall [--purge-data] [--json]"),
+        ("restart", "Usage: ts restart [--json]"),
+        ("start", "Usage: ts start [--json]"),
+        ("stop", "Usage: ts stop [--json]"),
+    ] {
+        let output = run_at(&home, &[command, "--help"]);
+        assert_eq!(output.status.code(), Some(0), "{command}");
+        assert!(
+            String::from_utf8(output.stdout).unwrap().contains(usage),
+            "{command}"
+        );
+        let output = run_at(&home, &[command, "--bogus"]);
+        assert_eq!(output.status.code(), Some(2), "{command}");
+        assert!(
+            String::from_utf8(output.stderr).unwrap().contains(usage),
+            "{command}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_daemon_lock_lives_in_the_runtime_dir() {
+    let home = scratch_home();
+
+    with_daemon(&home, || {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never started"
+        );
+
+        // The primary lock sits in the runtime dir, far from the reset's
+        // reach; the legacy one stays beside the index for old
+        // supervisors.
+        let runtime = home.home.path().join("tmp/runtime");
+        let locks = fs::read_dir(&runtime)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(locks.len(), 1, "{locks:?}");
+        assert!(
+            locks[0].to_string_lossy().starts_with("daemon-"),
+            "{locks:?}"
+        );
+        let database = scratch_database(&home);
+        assert!(database.with_file_name("daemon.lock").is_file());
+        for entry in fs::read_dir(database.parent().unwrap()).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with("daemon-"),
+                "no primary lock beside the index: {name}"
+            );
+        }
     });
 }

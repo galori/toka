@@ -73,11 +73,29 @@ impl IndexLogger {
 use crate::config::INDEXER_SERVICE_NAME as INDEXER_SERVICE;
 
 #[cfg(not(feature = "e2e"))]
-pub(crate) fn ensure_indexer_with_runner<F>(mut run: F) -> Result<(), String>
+pub(crate) fn ensure_indexer_with_runner<F>(
+    home: Option<&Path>,
+    config_dir: Option<&Path>,
+    mut run: F,
+) -> Result<(), String>
 where
     F: FnMut(&[&str]) -> io::Result<ExitStatus>,
 {
-    let arguments = ["--user", "start", INDEXER_SERVICE];
+    // The `ts` service owns the daemon now; the legacy one only still
+    // exists where `ts install` has not migrated it away yet. The new
+    // unit lives under the config directory (`XDG_CONFIG_HOME` when
+    // set); the legacy one stays where the old installer wrote it, under
+    // `~/.config`. A home with neither installed (or no home at all)
+    // still attempts the new service, so a missing install fails loudly
+    // instead of silently starting nothing.
+    let ts_present = config_dir.is_some_and(|dir| crate::service::unit_path(dir).is_file());
+    let legacy_present = home.is_some_and(|home| crate::service::legacy_unit_path(home).is_file());
+    let service = if ts_present || !legacy_present {
+        crate::config::TS_SERVICE_NAME
+    } else {
+        INDEXER_SERVICE
+    };
+    let arguments = ["--user", "start", service];
     let status = run(&arguments)
         .map_err(|error| format!("Toka could not start its indexer service: {error}"))?;
     if status.success() {
@@ -91,8 +109,12 @@ where
 
 #[cfg(not(feature = "e2e"))]
 pub fn ensure_indexer() {
+    let home = dirs::home_dir();
+    let config = dirs::config_dir();
     if let Err(message) =
-        ensure_indexer_with_runner(|arguments| Command::new("systemctl").args(arguments).status())
+        ensure_indexer_with_runner(home.as_deref(), config.as_deref(), |arguments| {
+            Command::new("systemctl").args(arguments).status()
+        })
     {
         eprintln!("{message}");
     }
@@ -119,25 +141,10 @@ pub(crate) fn indexer_running() -> Option<bool> {
     None
 }
 
-/// Stops the indexer service so it cannot recreate state while it is deleted.
-/// The next Toka launch starts it again.
-#[cfg(not(feature = "e2e"))]
-pub fn stop_indexer() -> Result<(), String> {
-    let status = Command::new("systemctl")
-        .args(["--user", "stop", INDEXER_SERVICE])
-        .status()
-        .map_err(|error| format!("could not stop the indexer service: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the indexer service could not be stopped (systemctl exited with {status})"
-        ))
-    }
-}
-
-/// Where the indexer daemon writes its log: beside the search log.
-fn indexer_log_path() -> Result<PathBuf, String> {
+/// Where the indexer daemon writes its log: beside the search log on Linux,
+/// under `~/Library/Application Support` on macOS — outside the search-log
+/// folder purge removes wholesale there, so purge names it separately.
+pub(crate) fn indexer_log_path() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|directory| {
             directory
@@ -255,33 +262,312 @@ pub fn run_daemon() -> Result<(), String> {
 /// same lock, so whichever starts second yields to the first.
 #[cfg(unix)]
 pub(crate) struct DaemonLock {
-    _file: fs::File,
+    _primary: fs::File,
+    _legacy: fs::File,
 }
 
 #[cfg(not(unix))]
 pub(crate) struct DaemonLock;
 
+/// Where the primary daemon lock lives: a runtime directory, never the
+/// index folder. `TOKA_RUNTIME_DIR` wins when set (tests and isolated runs
+/// point it at scratch); otherwise Linux uses `XDG_RUNTIME_DIR/toka`, and
+/// macOS — like the Linux fallback — uses the cache folder's `toka`
+/// directory, which no reset deletes (resets delete `app.toka.desktop`,
+/// never `toka`). A missing home falls back to a per-user directory under
+/// the temporary directory, since that fallback is shared across users.
+#[cfg(unix)]
+pub(crate) fn daemon_runtime_dir() -> PathBuf {
+    let override_dir = std::env::var_os("TOKA_RUNTIME_DIR").map(PathBuf::from);
+    #[cfg(target_os = "linux")]
+    let xdg_runtime = dirs::runtime_dir();
+    #[cfg(not(target_os = "linux"))]
+    let xdg_runtime: Option<PathBuf> = None;
+    resolve_runtime_dir(
+        override_dir,
+        xdg_runtime,
+        dirs::cache_dir(),
+        std::env::temp_dir(),
+        current_uid(),
+    )
+}
+
+/// [`daemon_runtime_dir`] with the environment passed in, so the
+/// precedence is unit-testable without touching the process environment.
+/// The temporary-directory fallback carries the user id: without it every
+/// user would share one `$TMPDIR/toka`, and the first to create it would
+/// lock the rest out.
+#[cfg(unix)]
+fn resolve_runtime_dir(
+    override_dir: Option<PathBuf>,
+    xdg_runtime: Option<PathBuf>,
+    cache: Option<PathBuf>,
+    temp: PathBuf,
+    uid: u32,
+) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return dir;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = xdg_runtime {
+        return dir.join("toka");
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = xdg_runtime;
+    if let Some(dir) = cache {
+        return dir.join("toka");
+    }
+    temp.join(format!("toka-{uid}"))
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: `getuid` takes no arguments and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// Creates the runtime directory and pins it to this user: mode 0700, not
+/// a symlink, owned by `uid`. The temporary-directory fallback is world
+/// writable, so without the ownership check another user's pre-created
+/// directory — or pre-created lock files — would lock this user out or
+/// collect their locks.
+///
+/// Residual TOCTOU, documented rather than rebuilt: a rename-swap after
+/// the final verification still redirects the locks taken next. It needs
+/// a world-writable temporary parent, a local attacker, and microsecond
+/// timing — and it only misplaces locks (denial of service), never
+/// grants access — so fd-pinning the directory was judged
+/// disproportionate. Unexploitable deterministically in-test, hence no
+/// test.
+#[cfg(unix)]
+fn ensure_runtime_dir(dir: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    if fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is a symlink",
+            dir.display()
+        ));
+    }
+    fs::create_dir_all(dir)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    // The pre-check above races a concurrent swap — creation and chmod
+    // both follow links — so the directory is verified AFTER creation:
+    // what exists now must be this user's real directory, never a link
+    // planted between the two calls.
+    verified_runtime_metadata(dir, uid)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    // And once more after the chmod, so a swap between the chmod and the
+    // first verification cannot hand back a link with trusted contents.
+    let metadata = verified_runtime_metadata(dir, uid)?;
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} changed while it was secured",
+            dir.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The runtime directory this instant: a real directory (never a link)
+/// owned by `uid`. Called after every filesystem step above, so a swap
+/// between the steps cannot redirect the locks.
+#[cfg(unix)]
+fn verified_runtime_metadata(dir: &Path, uid: u32) -> Result<fs::Metadata, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(dir)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is a symlink",
+            dir.display()
+        ));
+    }
+    if metadata.uid() != uid {
+        return Err(format!(
+            "Toka could not lock its indexer daemon: {} is owned by another user",
+            dir.display()
+        ));
+    }
+    Ok(metadata)
+}
+
+/// FNV-1a 64-bit, naming one lock file per index: the name must be stable
+/// for one database across processes and upgrades, distinct across
+/// indexes, and short no matter how deep the database path runs.
+#[cfg(unix)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// The primary lock file for one index. The database identity is
+/// normalized before hashing: `/data` and `/data/.` name one index and
+/// must meet on one lock, or two supervisors would split after a reset
+/// unlinks the legacy lock they shared.
+#[cfg(unix)]
+fn lock_file_name(database: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let identity = crate::owned_index::canonical_spelling(database);
+    format!(
+        "daemon-{:016x}.lock",
+        fnv1a64(identity.as_os_str().as_bytes())
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn daemon_lock_path(database: &Path) -> PathBuf {
+    daemon_runtime_dir().join(lock_file_name(database))
+}
+
+/// The beside-the-index lock file supervisors from before the runtime-dir
+/// move take: new code co-takes it during the upgrade, and purge/reset
+/// delete it as a known index file.
+pub(crate) const LEGACY_DAEMON_LOCK_FILE_NAME: &str = "daemon.lock";
+
 /// Tries the daemon lock without blocking: `Ok(None)` when another
 /// supervisor already runs on this index, so the caller yields instead of
 /// queueing behind it forever.
+///
+/// The primary lock lives in the runtime directory, deliberately outside
+/// every path a reset deletes. A lock beside the index breaks silently
+/// under `flock` + `unlink`: resetting while a supervisor holds the lock
+/// unlinks the file out from under it, and the next starter locks a fresh
+/// file — two supervisors, no error. Stopping before the reset (and
+/// refusing to delete when the stop fails) closes the steady-state hole,
+/// but not a supervisor that (re)starts mid-reset: a daemon revived by
+/// `Restart=on-failure` after `kill -9`, by launchd `KeepAlive`, or by a
+/// concurrent hand start locks a file the reset then unlinks, and the
+/// starter after that locks another fresh one. A lock the reset never
+/// unlinks has no such race: every contender meets on the same inode.
+///
+/// The beside-the-index `daemon.lock` is still taken too, so a supervisor
+/// from before this move and one from after it cannot both run during the
+/// upgrade: old code takes only the legacy lock, new code takes both, and
+/// either side yields when the other holds it. Both locks drop together
+/// with the guard.
+///
+/// Pre-delete checks (purge, reset) refuse while EITHER lock is held, so an
+/// old hand-run supervisor blocks a reset instead of losing its lock file
+/// mid-run. A residual upgrade-window race remains: an old binary started
+/// after the check but before the deletion takes a legacy lock the
+/// deletion then unlinks, and the next starter locks a fresh file — two
+/// supervisors, no error. The window closes once old binaries stop
+/// running; new binaries meet on the primary lock, which no reset unlinks.
 #[cfg(unix)]
 pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLock>, String> {
-    let path = database.with_file_name("daemon.lock");
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    let path = daemon_lock_path(database);
+    if let Some(runtime) = path.parent() {
+        ensure_runtime_dir(runtime, current_uid())?;
+    }
+    let Some(primary) = lock_file(&path)? else {
+        return Ok(None);
+    };
+    // The legacy lock's parent is ensured here, not just by the callers:
+    // a reset may have wiped it while this supervisor was starting.
+    crate::owned_index::ensure_index_parent(database)?;
+    let Some(legacy) = lock_file(&database.with_file_name(LEGACY_DAEMON_LOCK_FILE_NAME))? else {
+        return Ok(None);
+    };
+    Ok(Some(DaemonLock {
+        _primary: primary,
+        _legacy: legacy,
+    }))
+}
+
+/// Whether another supervisor holds the daemon lock on `database` right
+/// now: either the primary runtime lock or the legacy beside-the-index
+/// one, since an old supervisor takes only the legacy lock. Purge and
+/// reset refuse while either is held, so a live supervisor — managed or
+/// hand-started — never watches its index vanish.
+///
+/// The probe creates nothing: only a supervisor that actually takes the
+/// lock creates its file. A probe that created the legacy lock would plant
+/// a `daemon.lock` that purge then deletes and reports, so a second purge
+/// could never report nothing-to-do.
+#[cfg(unix)]
+pub(crate) fn daemon_lock_held(database: &Path) -> Result<bool, String> {
+    let path = daemon_lock_path(database);
+    if let Some(runtime) = path.parent() {
+        ensure_runtime_dir(runtime, current_uid())?;
+    }
+    if lock_held_existing(&path)? {
+        return Ok(true);
+    }
+    crate::owned_index::ensure_index_parent(database)?;
+    lock_held_existing(&database.with_file_name(LEGACY_DAEMON_LOCK_FILE_NAME))
+}
+
+/// No-op lock where `flock` does not exist (see
+/// [`try_acquire_daemon_lock`]): nothing can hold it.
+#[cfg(not(unix))]
+pub(crate) fn daemon_lock_held(_database: &Path) -> Result<bool, String> {
+    Ok(false)
+}
+
+/// Whether `path`'s lock is held right now, without creating the file: a
+/// missing lock file is never held.
+#[cfg(unix)]
+fn lock_held_existing(path: &Path) -> Result<bool, String> {
+    let file = match fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!("Toka could not lock its indexer daemon: {error}"));
+        }
+    };
+    flock_held(&file)
+}
+
+/// Whether `file` is locked by another supervisor: a non-blocking
+/// exclusive `flock` that reports contention instead of waiting for it.
+#[cfg(unix)]
+fn flock_held(file: &fs::File) -> Result<bool, String> {
     use std::os::fd::AsRawFd;
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Ok(None);
+            return Ok(true);
         }
         return Err(format!("Toka could not lock its indexer daemon: {error}"));
     }
-    Ok(Some(DaemonLock { _file: file }))
+    Ok(false)
+}
+
+/// Opens and exclusively locks one lock file without blocking: `Ok(None)`
+/// when another supervisor holds it.
+#[cfg(unix)]
+fn lock_file(path: &Path) -> Result<Option<fs::File>, String> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
+    if flock_held(&file)? {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+/// Points the daemon lock at a per-process scratch dir, so lock tests
+/// neither touch the real runtime dir nor contend with a live daemon. Set
+/// once, never unset: every lock-acquiring test calls this first, and the
+/// per-index file names keep tests apart within the shared dir.
+#[cfg(all(test, unix))]
+pub(crate) fn test_runtime_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("toka-test-runtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TOKA_RUNTIME_DIR", &dir);
+        dir
+    })
+    .clone()
 }
 
 /// No-op lock where `flock` does not exist: non-Unix platforms run a
@@ -362,6 +648,10 @@ pub(crate) fn path_available(path: &Path, expected: Option<&MountIdentity>) -> b
 pub(crate) struct ThumbnailWorker {
     sender: mpsc::Sender<PathBuf>,
     pending: Arc<AtomicU64>,
+    // Folders currently awaiting generation, mirroring `pending`: the
+    // heartbeat scopes the thumbnail count to online roots, which needs
+    // the queued paths, not just their number.
+    queued: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl ThumbnailWorker {
@@ -383,31 +673,63 @@ impl ThumbnailWorker {
         let (sender, receiver): (mpsc::Sender<PathBuf>, mpsc::Receiver<PathBuf>) = mpsc::channel();
         let pending = Arc::new(AtomicU64::new(0));
         let worker_pending = Arc::clone(&pending);
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let worker_queued = Arc::clone(&queued);
         std::thread::Builder::new()
             .name("toka-thumbnail-worker".into())
             .spawn(move || {
                 while let Ok(folder) = receiver.recv() {
                     generator(&folder);
+                    forget_queued(&worker_queued, &folder);
                     worker_pending.fetch_sub(1, Ordering::Relaxed);
                 }
             })
             .expect("Toka could not start its thumbnail worker");
-        Self { sender, pending }
+        Self {
+            sender,
+            pending,
+            queued,
+        }
     }
 
     pub(crate) fn enqueue(&self, folder: &Path) {
         // Reserve first: the worker's matching decrement runs only after
         // this folder is received, so the count can never dip below zero.
         self.pending.fetch_add(1, Ordering::Relaxed);
+        self.queued.lock().unwrap().push(folder.to_path_buf());
         if self.sender.send(folder.to_path_buf()).is_err() {
             // The worker is gone; the folder will never generate.
+            forget_queued(&self.queued, folder);
             self.pending.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     /// Folders still waiting for (or undergoing) thumbnail generation.
+    #[cfg(test)]
     pub(crate) fn pending_count(&self) -> u64 {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Folders awaiting generation outside `offline_roots`: queued work
+    /// for missing storage waits with its root and never holds the
+    /// queue, so the heartbeat counts it as `offline_roots` instead.
+    pub(crate) fn pending_count_excluding(&self, offline_roots: &[PathBuf]) -> u64 {
+        self.queued
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|folder| !offline_roots.iter().any(|root| folder.starts_with(root)))
+            .count() as u64
+    }
+}
+
+/// Drops one queued thumbnail folder after it generated (or when the
+/// worker is gone and it never will), keeping the tracked queue beside
+/// the atomic count.
+fn forget_queued(queued: &Mutex<Vec<PathBuf>>, folder: &Path) {
+    let mut queued = queued.lock().unwrap();
+    if let Some(position) = queued.iter().position(|queued| queued == folder) {
+        queued.swap_remove(position);
     }
 }
 
@@ -522,8 +844,25 @@ impl OwnedSupervisor {
                 return;
             }
         };
-        let (activity, current_root, current_path) = self.current_activity(&index);
-        let queue = match index.daemon_queue_counts(self.thumbnails.pending_count()) {
+        // Offline roots are not actionable work in any count: the
+        // thumbnail backlog is live, so the heartbeat scopes it here
+        // while the database counts scope themselves. An unreadable roots
+        // table scopes nothing — the queue query below fails the same way
+        // and the beat is skipped.
+        let offline_roots: Vec<PathBuf> = index
+            .roots_with_state()
+            .map(|roots| {
+                roots
+                    .into_iter()
+                    .filter(|(_, _, state)| state == "offline")
+                    .map(|(_, path, _)| path)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let pending_thumbnails = self.thumbnails.pending_count_excluding(&offline_roots);
+        let (activity, current_root, current_path) =
+            self.current_activity(&index, pending_thumbnails);
+        let queue = match index.daemon_queue_counts(pending_thumbnails) {
             Ok(queue) => queue,
             Err(error) => {
                 self.logger
@@ -554,6 +893,7 @@ impl OwnedSupervisor {
     fn current_activity(
         &self,
         index: &OwnedIndex,
+        pending_thumbnails: u64,
     ) -> (DaemonActivity, Option<PathBuf>, Option<PathBuf>) {
         let mut repairing = None;
         for entry in self.watchers.values() {
@@ -582,7 +922,7 @@ impl OwnedSupervisor {
         if let Some((root, path)) = repairing {
             return (DaemonActivity::Repairing, Some(root), path);
         }
-        if self.thumbnails.pending_count() > 0 {
+        if pending_thumbnails > 0 {
             return (DaemonActivity::Thumbnails, None, None);
         }
         if all_roots_offline(index) {
@@ -854,6 +1194,32 @@ mod tests {
         fs::write(root.join(name), b"media").unwrap();
     }
 
+    /// A tree that scans slowly without ever committing a batch: one clip
+    /// per top-level folder (100 files never fill the 128-file batch)
+    /// under twenty thousand directories, so aborting mid-scan always
+    /// strands seen-but-uncommitted files. Every top-level folder holds a
+    /// clip, so whichever one the filesystem lists first, the second
+    /// directory's savepoint already shows indexable work.
+    fn write_slow_tree(root: &Path) {
+        for top in 0..100 {
+            let folder = root.join(format!("top-{top:02}"));
+            std::fs::create_dir(&folder).unwrap();
+            write_media(&folder, "clip.mp4");
+            for leaf in 0..200 {
+                std::fs::create_dir(folder.join(format!("leaf-{leaf:03}"))).unwrap();
+            }
+        }
+    }
+
+    /// Whether the root's latest scan run has classified files it has not
+    /// committed yet: the mid-scan point a delete synchronizes with.
+    fn scan_shows_indexable_work(database: &Path, root_id: &str) -> bool {
+        OwnedIndex::open(database)
+            .ok()
+            .and_then(|index| index.scan_progress(root_id).ok().flatten())
+            .is_some_and(|progress| progress.files_indexable > 0)
+    }
+
     #[test]
     fn reconcile_wake_ups_settle_instead_of_triggering_passes() {
         let last_pass = Instant::now();
@@ -876,10 +1242,51 @@ mod tests {
 
     #[cfg(not(feature = "e2e"))]
     #[test]
-    fn starts_the_user_indexer_service_when_toka_launches() {
+    fn starts_the_ts_service_once_it_is_installed() {
+        // The new unit lives under the config directory, which may diverge
+        // from `~/.config` when `XDG_CONFIG_HOME` is set.
+        for config in [".config", "xdg-config"] {
+            let home = tempdir().unwrap();
+            let config = home.path().join(config);
+            let unit = crate::service::unit_path(&config);
+            fs::create_dir_all(unit.parent().unwrap()).unwrap();
+            fs::write(&unit, b"[Unit]").unwrap();
+            let mut commands: Vec<Vec<String>> = Vec::new();
+
+            ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
+                commands.push(
+                    arguments
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect(),
+                );
+                std::process::Command::new("true").status()
+            })
+            .unwrap();
+
+            assert_eq!(
+                commands,
+                vec![vec![
+                    "--user".to_owned(),
+                    "start".to_owned(),
+                    "toka-search.service".to_owned(),
+                ]],
+                "{config:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "e2e"))]
+    #[test]
+    fn falls_back_to_the_legacy_service_until_ts_migrates_it() {
+        let home = tempdir().unwrap();
+        let config = home.path().join(".config");
+        let legacy = crate::service::legacy_unit_path(home.path());
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, b"[Unit]").unwrap();
         let mut commands: Vec<Vec<String>> = Vec::new();
 
-        ensure_indexer_with_runner(|arguments| {
+        ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
             commands.push(
                 arguments
                     .iter()
@@ -900,13 +1307,46 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "e2e"))]
+    #[test]
+    fn attempts_the_ts_service_when_nothing_is_installed() {
+        let home = tempdir().unwrap();
+        let config = home.path().join(".config");
+        for missing in [(Some(home.path()), Some(config.as_path())), (None, None)] {
+            let mut commands: Vec<Vec<String>> = Vec::new();
+
+            ensure_indexer_with_runner(missing.0, missing.1, |arguments| {
+                commands.push(
+                    arguments
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect(),
+                );
+                std::process::Command::new("true").status()
+            })
+            .unwrap();
+
+            // A missing install fails loudly on the new service instead of
+            // silently starting nothing.
+            assert_eq!(
+                commands,
+                vec![vec![
+                    "--user".to_owned(),
+                    "start".to_owned(),
+                    "toka-search.service".to_owned(),
+                ]],
+                "{missing:?}"
+            );
+        }
+    }
+
     #[test]
     fn reconcile_starts_a_watcher_and_rows_appear() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
 
         let mut supervisor = test_supervisor(database, quiet_thumbnails());
@@ -942,7 +1382,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -966,7 +1406,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
         let log = directory.path().join("indexer.log");
@@ -1016,7 +1456,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1048,7 +1488,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1091,7 +1531,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1167,7 +1607,7 @@ mod tests {
         fs::create_dir(&second).unwrap();
         write_media(&first, "a.mp4");
         write_media(&second, "b.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&first).unwrap();
         manager.add_folder(&second).unwrap();
@@ -1287,12 +1727,38 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_counts_exclude_folders_under_offline_roots() {
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |_| {
+            let _ = release_receiver.recv();
+        });
+        thumbnails.enqueue(Path::new("/media/online"));
+        thumbnails.enqueue(Path::new("/media/offline"));
+        // Both folders count while the worker is blocked generating the
+        // first; the offline one leaves the scoped count only.
+        assert_eq!(thumbnails.pending_count(), 2);
+        assert_eq!(
+            thumbnails.pending_count_excluding(&[PathBuf::from("/media/offline")]),
+            1
+        );
+        assert_eq!(thumbnails.pending_count_excluding(&[]), 2);
+
+        drop(release);
+        assert!(
+            poll_until(Duration::from_secs(10), || thumbnails.pending_count() == 0),
+            "expected the backlog to drain"
+        );
+        // The tracked queue drains beside the atomic count.
+        assert_eq!(thumbnails.pending_count_excluding(&[]), 0);
+    }
+
+    #[test]
     fn heartbeat_publishes_liveness_and_follows_a_scan_to_idle() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1351,7 +1817,7 @@ mod tests {
         for number in 0..2000 {
             write_media(&media, &format!("clip-{number:05}.mp4"));
         }
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let root_id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1422,7 +1888,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1460,17 +1926,66 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        write_slow_tree(&media);
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
-        manager.add_folder(&media).unwrap();
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
         let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 1);
-        fs::remove_dir_all(&media).unwrap();
+        // The storage vanishes mid-scan, never in a race with it: the scan
+        // has demonstrably classified files it has not committed, with
+        // thousands of directories still ahead of it. The mismatch is
+        // recorded — not deleted — first, so the tree stays intact while
+        // the pass stops the worker: renaming first would let a loaded
+        // machine drain the missing directories (which fail fast, with no
+        // savepoints) and finish the scan before the stop lands.
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                scan_shows_indexable_work(&database, &id)
+            }),
+            "expected the scan to show indexable work before the delete"
+        );
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                Some(Path::new("/nonexistent-mount-target")),
+                Some("nonexistent-source"),
+                None,
+            )
+            .unwrap();
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 0);
+        // The storage really is gone, too — after the offline marking, so
+        // the removal's timing cannot race the scan.
+        fs::rename(&media, directory.path().join("media-gone")).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        // The aborted run really did strand work: still `scanning`, files
+        // seen but none committed. The queue below excludes it anyway.
+        let progress = OwnedIndex::open(&database)
+            .unwrap()
+            .scan_progress(&id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Scanning);
+        assert!(progress.files_indexable > 0);
+        assert_eq!(progress.files_indexed, 0);
+
+        // Drain the thumbnail backlog before asserting an empty queue:
+        // files committed before the abort enqueue generation the quiet
+        // worker may not have collected yet, and the heartbeat would
+        // count them. The bound guards a stuck worker, not a slow one.
+        assert!(
+            poll_until(Duration::from_secs(30), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain after the stop"
+        );
 
         supervisor.publish_heartbeat();
         let status = crate::daemon_state::read_status(&database).unwrap();
@@ -1487,12 +2002,188 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_reports_waiting_when_a_completed_root_goes_offline() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+
+        // Thumbnails block, so the completed scan's queued folder is
+        // still outstanding when the root goes offline: raw count 1,
+        // deterministically.
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let thumbnails = ThumbnailWorker::with_generator(move |_| {
+            let _ = release_receiver.recv();
+        });
+        let mut supervisor = test_supervisor(database.clone(), thumbnails);
+        supervisor.reconcile();
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+            }),
+            "expected the scan to complete before the delete"
+        );
+        // The enqueue strictly precedes Watching, but the count crosses
+        // threads on a relaxed atomic: poll for its arrival instead of
+        // asserting a visibility lag cannot happen.
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 1),
+            "expected the completed scan to queue one thumbnail folder"
+        );
+
+        fs::remove_dir_all(&media).unwrap();
+        supervisor.reconcile();
+        assert_eq!(supervisor.active_count(), 0);
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert!(status.running);
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
+        );
+        assert_eq!(status.queue.pending_roots, 0);
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 1);
+
+        drop(release);
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain"
+        );
+    }
+
+    #[test]
+    fn remount_and_rescan_returns_an_offline_root_to_idle() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_slow_tree(&media);
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
+
+        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+        supervisor.reconcile();
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                scan_shows_indexable_work(&database, &id)
+            }),
+            "expected the scan to show indexable work before the delete"
+        );
+        // Recorded — not deleted — first, as above: the tree stays intact
+        // while the pass stops the worker mid-scan.
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                Some(Path::new("/nonexistent-mount-target")),
+                Some("nonexistent-source"),
+                None,
+            )
+            .unwrap();
+        supervisor.reconcile();
+        fs::rename(&media, directory.path().join("media-gone")).unwrap();
+        supervisor.reconcile();
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::OfflineWaiting)
+        );
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 1);
+
+        // The storage returns with a small tree on the same mount; the
+        // rescan supersedes the aborted run and the daemon returns to idle
+        // with nothing queued.
+        fs::remove_dir_all(directory.path().join("media-gone")).unwrap();
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let current = mount_identity(&media);
+        OwnedIndex::open(&database)
+            .unwrap()
+            .record_mount(
+                &id,
+                current.as_ref().map(|mount| mount.target.as_path()),
+                current.as_ref().map(|mount| mount.source.as_str()),
+                current.as_ref().and_then(|mount| mount.uuid.as_deref()),
+            )
+            .unwrap();
+        // Gate on the rescan's first committed batch: Watching is also
+        // the pre-start state, so polling for it alone can pass before
+        // the worker runs a single file. The gate proves the scan
+        // started; only then does Watching prove it finished.
+        use std::sync::mpsc;
+        let (gated_tx, gated_rx) = mpsc::channel::<()>();
+        crate::owned_index::with_global_sync_probe(
+            &id,
+            move |site| {
+                if site == crate::owned_index::SyncProbeSite::ScanBatchCommitted {
+                    let _ = gated_tx.send(());
+                }
+            },
+            || {
+                supervisor.reconcile();
+                assert_eq!(supervisor.active_count(), 1);
+                gated_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the rescan must commit a first batch");
+            },
+        );
+        // The gate proved the scan ran, so Watching now proves it
+        // finished — the pre-start alias is gone.
+        assert!(
+            poll_until(Duration::from_secs(30), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+            }),
+            "expected the rescan to complete after the remount"
+        );
+        // The rescan queued thumbnails for an online root: let the quiet
+        // worker drain them before asserting an empty queue.
+        assert!(
+            poll_until(Duration::from_secs(10), || supervisor
+                .thumbnails
+                .pending_count()
+                == 0),
+            "expected the thumbnail backlog to drain after the rescan"
+        );
+
+        supervisor.publish_heartbeat();
+        let status = crate::daemon_state::read_status(&database).unwrap();
+        assert_eq!(
+            status.activity,
+            Some(crate::daemon_state::DaemonActivity::Idle)
+        );
+        assert!(status.queue.is_empty());
+        assert_eq!(status.offline_roots, 0);
+    }
+
+    #[test]
     fn heartbeat_reports_thumbnail_work_while_scans_are_idle() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
 
@@ -1545,7 +2236,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database);
         manager.add_folder(&media).unwrap();
 
@@ -1559,7 +2250,7 @@ mod tests {
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
         write_media(&media, "clip.mp4");
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1589,7 +2280,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         let id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
@@ -1642,5 +2333,295 @@ mod tests {
         moved.target = PathBuf::from("/nonexistent-mount-target");
         assert!(!path_available(&media, Some(&moved)));
         assert!(!path_available(&media.join("missing"), Some(&current)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_dir_prefers_the_override_then_the_platform_dir() {
+        let dir = |path: &str| Some(PathBuf::from(path));
+        // The override wins everywhere, exactly as given.
+        assert_eq!(
+            resolve_runtime_dir(
+                dir("/scratch/runtime"),
+                dir("/run/1"),
+                dir("/c"),
+                "/tmp".into(),
+                1000
+            ),
+            PathBuf::from("/scratch/runtime")
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            resolve_runtime_dir(
+                None,
+                dir("/run/1000"),
+                dir("/home/u/.cache"),
+                "/tmp".into(),
+                1000
+            ),
+            PathBuf::from("/run/1000/toka")
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            resolve_runtime_dir(
+                None,
+                dir("/run/1000"),
+                dir("/Users/u/Library/Caches"),
+                "/tmp".into(),
+                501
+            ),
+            PathBuf::from("/Users/u/Library/Caches/toka")
+        );
+        // No platform dir at all: the cache, then a per-user temporary dir.
+        assert_eq!(
+            resolve_runtime_dir(None, None, dir("/home/u/.cache"), "/tmp".into(), 1000),
+            PathBuf::from("/home/u/.cache/toka")
+        );
+        assert_eq!(
+            resolve_runtime_dir(None, None, None, "/tmp".into(), 1000),
+            PathBuf::from("/tmp/toka-1000")
+        );
+        assert_eq!(
+            resolve_runtime_dir(None, None, None, "/tmp".into(), 1001),
+            PathBuf::from("/tmp/toka-1001")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runtime_dir_is_pinned_to_its_user() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempdir().unwrap();
+        let uid = current_uid();
+
+        // Created missing, and narrowed to 0700 even when it exists wider.
+        // The secured result is a real directory owned by this user — read
+        // back through `symlink_metadata`, never a following call.
+        let fresh = directory.path().join("fresh");
+        ensure_runtime_dir(&fresh, uid).unwrap();
+        let secured = fs::symlink_metadata(&fresh).unwrap();
+        assert!(!secured.file_type().is_symlink());
+        assert_eq!(secured.uid(), uid);
+        assert_eq!(secured.permissions().mode() & 0o777, 0o700);
+        let wide = directory.path().join("wide");
+        fs::create_dir(&wide).unwrap();
+        fs::set_permissions(&wide, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_runtime_dir(&wide, uid).unwrap();
+        assert_eq!(
+            fs::metadata(&wide).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        // Another user's directory is refused, not joined: with a faked uid
+        // this own-user directory reads as someone else's.
+        let error = ensure_runtime_dir(&fresh, uid.wrapping_add(1)).unwrap_err();
+        assert!(error.contains("owned by another user"), "{error}");
+
+        // So is a symlink, which would redirect the locks elsewhere.
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&fresh, &link).unwrap();
+        let error = ensure_runtime_dir(&link, uid).unwrap_err();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_sees_a_primary_supervisor() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        assert!(
+            !daemon_lock_held(&database).unwrap(),
+            "no supervisor holds the lock yet"
+        );
+        let _daemon = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        assert!(daemon_lock_held(&database).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_creates_no_lock_files() {
+        // The probe must not plant the legacy lock it checks: purge would
+        // then delete and report a file the purge itself created, and a
+        // second purge could never report nothing-to-do.
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        assert!(!daemon_lock_held(&database).unwrap());
+
+        assert!(
+            !database.with_file_name("daemon.lock").exists(),
+            "probing must not create the legacy lock"
+        );
+        assert!(
+            !daemon_lock_path(&database).exists(),
+            "probing must not create the primary lock either"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_held_lock_check_sees_a_legacy_only_supervisor() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // An old supervisor, which takes only the beside-the-index lock.
+        let legacy = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(database.with_file_name("daemon.lock"))
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        assert!(
+            daemon_lock_held(&database).unwrap(),
+            "a legacy-only lock must still block a purge or reset"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_paths_are_stable_per_index_and_distinct_across_indexes() {
+        let runtime = test_runtime_dir();
+        let first = runtime.join("a").join("index.sqlite3");
+        let second = runtime.join("b").join("index.sqlite3");
+
+        assert_eq!(daemon_lock_path(&first), daemon_lock_path(&first));
+        assert_ne!(daemon_lock_path(&first), daemon_lock_path(&second));
+        assert!(daemon_lock_path(&first).starts_with(&runtime));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_database_spellings_share_one_lock() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let dotted = directory.path().join(".").join("index.sqlite3");
+
+        assert_eq!(
+            daemon_lock_path(&database),
+            daemon_lock_path(&dotted),
+            "spellings of one index must meet on one lock"
+        );
+
+        // And supervision actually meets there: a supervisor started
+        // through one spelling blocks the other.
+        let _daemon = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        assert!(
+            try_acquire_daemon_lock(&dotted).unwrap().is_none(),
+            "the aliased spelling must yield"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquiring_locks_the_runtime_file_and_the_legacy_file() {
+        use std::os::fd::AsRawFd;
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        let guard = try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("first acquisition wins");
+
+        // The primary lock lives outside the index folder, so a reset
+        // never unlinks it; the legacy one stays beside the index for
+        // supervisors from before the move.
+        assert!(daemon_lock_path(&database).is_file());
+        assert!(!daemon_lock_path(&database).starts_with(directory.path()));
+        assert!(database.with_file_name("daemon.lock").is_file());
+        assert!(
+            try_acquire_daemon_lock(&database).unwrap().is_none(),
+            "a second supervisor yields while the first holds the lock"
+        );
+        // Both files are really locked, not merely present: a fresh
+        // open of either refuses a non-blocking exclusive lock.
+        let _guard = guard;
+        for path in [
+            daemon_lock_path(&database),
+            database.with_file_name("daemon.lock"),
+        ] {
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(held, -1, "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_lock_held_by_an_old_supervisor_blocks_a_new_one() {
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // An old supervisor, which takes only the beside-the-index lock.
+        let legacy = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(database.with_file_name("daemon.lock"))
+            .unwrap();
+        use std::os::fd::AsRawFd;
+        assert_eq!(
+            unsafe { libc::flock(legacy.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+
+        assert!(
+            try_acquire_daemon_lock(&database).unwrap().is_none(),
+            "the new supervisor must yield to the legacy lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_indexes_gate_on_their_locks_concurrently_and_both_proceed() {
+        // The daemon lock gates per index (and per user, through the
+        // uid-scoped runtime dir): two supervisors gating concurrently on
+        // different indexes both proceed — neither blocks the other.
+        test_runtime_dir();
+        let directory = tempdir().unwrap();
+        let databases = [
+            directory.path().join("a").join("index.sqlite3"),
+            directory.path().join("b").join("index.sqlite3"),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = databases
+            .into_iter()
+            .map(|database| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let guard = try_acquire_daemon_lock(&database).unwrap();
+                    assert!(guard.is_some(), "each index gates on its own lock");
+                    // Held past the other's acquisition, so the two locks
+                    // really overlap.
+                    barrier.wait();
+                    drop(guard);
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }

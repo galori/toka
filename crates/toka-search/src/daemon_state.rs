@@ -122,8 +122,16 @@ pub struct DaemonStatus {
     /// than published with the heartbeat, and never queued work: `ts
     /// status --watch` exits with offline folders outstanding.
     pub offline_roots: u64,
-    /// Whether the indexer service is running. `None` where no service
-    /// manager reports it (today: everywhere but Linux).
+    /// Whether the `ts` service is installed (a systemd unit on Linux, a
+    /// launchd agent on macOS). `None` where that cannot be known: no
+    /// home directory to look in, or no service manager on this
+    /// platform.
+    pub service_installed: Option<bool>,
+    /// Whether the installed service is enabled. `None` where nothing is
+    /// installed, or where the manager cannot say.
+    pub service_enabled: Option<bool>,
+    /// Whether the indexer service is running. `None` where nothing is
+    /// installed, or where no service manager reports it.
     pub service_running: Option<bool>,
 }
 
@@ -156,11 +164,27 @@ pub(crate) struct DaemonStateRow {
 /// instead of being created. (SQLite may still touch `-wal`/`-shm`
 /// sidecars beside the database while reading.)
 pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
-    // systemd only exists on Linux; elsewhere there is no service to ask.
-    #[cfg(any(target_os = "linux", test))]
-    let service_running = crate::indexer_daemon::indexer_running();
-    #[cfg(not(any(target_os = "linux", test)))]
-    let service_running: Option<bool> = None;
+    read_status_with_service(database, query_current_service())
+}
+
+/// The `ts` service state, through this platform's manager. A host that
+/// cannot even be described (no home directory) reads as unknown, never
+/// as an error: service info is auxiliary to the daemon report. The
+/// probe never resolves the executable, so an unresolvable current
+/// executable cannot flip an installed service to unknown.
+fn query_current_service() -> crate::service::ServiceState {
+    crate::service::SystemHost::for_query()
+        .map(|mut host| crate::service::query(&mut host))
+        .unwrap_or(crate::service::ServiceState::unknown())
+}
+
+/// [`read_status`] with the service state passed in, so tests assert the
+/// field mapping against a fixed state instead of racing two live
+/// manager reads.
+pub(crate) fn read_status_with_service(
+    database: &Path,
+    service: crate::service::ServiceState,
+) -> Result<DaemonStatus, String> {
     let stopped = |offline_roots: u64| DaemonStatus {
         running: false,
         pid: None,
@@ -171,7 +195,9 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         current_path: None,
         queue: DaemonQueue::default(),
         offline_roots,
-        service_running,
+        service_installed: service.installed,
+        service_enabled: service.enabled,
+        service_running: service.running,
     };
     // A missing index is a stopped daemon, not an error; anything else
     // uses the shared read taxonomy so the exit codes cannot drift.
@@ -204,7 +230,9 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots,
-            service_running,
+            service_installed: service.installed,
+            service_enabled: service.enabled,
+            service_running: service.running,
         });
     }
     Ok(DaemonStatus {
@@ -217,7 +245,9 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         current_path: row.current_path,
         queue: row.queue,
         offline_roots,
-        service_running,
+        service_installed: service.installed,
+        service_enabled: service.enabled,
+        service_running: service.running,
     })
 }
 
@@ -271,15 +301,7 @@ pub fn render(status: &DaemonStatus) -> String {
         }
         let _ = writeln!(out, "{line}");
         render_offline_line(&mut out, status.offline_roots);
-        match status.service_running {
-            Some(true) => {
-                let _ = writeln!(out, "Service:  running");
-            }
-            Some(false) => {
-                let _ = writeln!(out, "Service:  not running");
-            }
-            None => {}
-        }
+        render_service_line(&mut out, status);
         return out;
     }
     let mut line = "Daemon:   running".to_owned();
@@ -336,16 +358,39 @@ pub fn render(status: &DaemonStatus) -> String {
         let _ = writeln!(out, "Queue:    {} still to index", parts.join(" / "));
     }
     render_offline_line(&mut out, status.offline_roots);
-    match status.service_running {
-        Some(true) => {
-            let _ = writeln!(out, "Service:  running");
+    render_service_line(&mut out, status);
+    out
+}
+
+/// The service line, shared by the running and stopped reports: whether
+/// the `ts` service is installed, and — once installed — whether the
+/// manager has it enabled and running. Unknown halves are omitted, never
+/// guessed at; an unknowable install state reads as unknown.
+fn render_service_line(out: &mut String, status: &DaemonStatus) {
+    use std::fmt::Write as _;
+    match status.service_installed {
+        None => {
+            let _ = writeln!(out, "Service:  unknown");
+            return;
         }
         Some(false) => {
-            let _ = writeln!(out, "Service:  not running");
+            let _ = writeln!(out, "Service:  not installed");
+            return;
         }
+        Some(true) => {}
+    }
+    let mut parts = vec!["installed"];
+    match status.service_enabled {
+        Some(true) => parts.push("enabled"),
+        Some(false) => parts.push("disabled"),
         None => {}
     }
-    out
+    match status.service_running {
+        Some(true) => parts.push("running"),
+        Some(false) => parts.push("stopped"),
+        None => {}
+    }
+    let _ = writeln!(out, "Service:  {}", parts.join(", "));
 }
 
 /// The offline line, shared by the running and stopped reports: folders
@@ -419,6 +464,8 @@ mod tests {
                 pending_thumbnails: 3,
             },
             offline_roots: 0,
+            service_installed: Some(true),
+            service_enabled: Some(true),
             service_running: Some(true),
         }
     }
@@ -533,13 +580,31 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_the_indexer_service_state() {
+    fn status_copies_the_service_state_verbatim() {
         let (_directory, database) = open_database();
+        // Fixed states, never live manager reads: reading the manager
+        // twice (once here, once in the assertion) races a stop between
+        // the two reads. Live-manager coverage lives in the `ts status`
+        // integration tests.
+        for service in [
+            crate::service::ServiceState::unknown(),
+            crate::service::ServiceState {
+                installed: Some(false),
+                enabled: None,
+                running: None,
+            },
+            crate::service::ServiceState {
+                installed: Some(true),
+                enabled: Some(true),
+                running: Some(false),
+            },
+        ] {
+            let status = read_status_with_service(&database, service).unwrap();
 
-        assert_eq!(
-            read_status(&database).unwrap().service_running,
-            crate::indexer_daemon::indexer_running()
-        );
+            assert_eq!(status.service_installed, service.installed);
+            assert_eq!(status.service_enabled, service.enabled);
+            assert_eq!(status.service_running, service.running);
+        }
     }
 
     #[test]
@@ -721,6 +786,8 @@ mod tests {
         status.current_path = None;
         status.queue = DaemonQueue::default();
         status.offline_roots = 1;
+        status.service_installed = Some(false);
+        status.service_enabled = None;
         status.service_running = None;
 
         let text = render(&status);
@@ -743,6 +810,8 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 1,
+            service_installed: Some(true),
+            service_enabled: Some(true),
             service_running: Some(false),
         };
         let text = render(&stopped);
@@ -766,6 +835,8 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
+            service_installed: Some(false),
+            service_enabled: None,
             service_running: None,
         };
 
@@ -777,6 +848,22 @@ mod tests {
         assert!(json["currentRoot"].is_null());
         assert!(json["currentPath"].is_null());
         assert_eq!(json["queue"]["pendingRoots"], 0);
+        assert_eq!(json["serviceInstalled"], false);
+        assert!(json["serviceEnabled"].is_null());
+        assert!(json["serviceRunning"].is_null());
+    }
+
+    #[test]
+    fn unknown_service_state_serializes_as_null() {
+        let mut status = running_status();
+        status.service_installed = None;
+        status.service_enabled = None;
+        status.service_running = None;
+
+        let json = serde_json::to_value(status).unwrap();
+
+        assert!(json["serviceInstalled"].is_null());
+        assert!(json["serviceEnabled"].is_null());
         assert!(json["serviceRunning"].is_null());
     }
 
@@ -808,7 +895,10 @@ mod tests {
             text.contains("Queue:    2 folders / 15 files / 3 thumbnails still to index\n"),
             "{text}"
         );
-        assert!(text.contains("Service:  running\n"), "{text}");
+        assert!(
+            text.contains("Service:  installed, enabled, running\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -818,6 +908,8 @@ mod tests {
         status.current_root = None;
         status.current_path = None;
         status.queue = DaemonQueue::default();
+        status.service_installed = Some(false);
+        status.service_enabled = None;
         status.service_running = None;
 
         let text = render(&status);
@@ -826,7 +918,49 @@ mod tests {
         assert!(!text.contains("Folder:"), "{text}");
         assert!(!text.contains("Current:"), "{text}");
         assert!(!text.contains("Queue:"), "{text}");
-        assert!(!text.contains("Service:"), "{text}");
+        assert!(text.contains("Service:  not installed\n"), "{text}");
+    }
+
+    #[test]
+    fn service_line_covers_the_installed_matrix() {
+        for (installed, enabled, running, expected) in [
+            (None, None, None, "Service:  unknown\n"),
+            (Some(false), None, None, "Service:  not installed\n"),
+            (
+                Some(true),
+                Some(true),
+                Some(true),
+                "Service:  installed, enabled, running\n",
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some(false),
+                "Service:  installed, enabled, stopped\n",
+            ),
+            (
+                Some(true),
+                Some(false),
+                Some(false),
+                "Service:  installed, disabled, stopped\n",
+            ),
+            (
+                Some(true),
+                Some(false),
+                None,
+                "Service:  installed, disabled\n",
+            ),
+            (Some(true), None, None, "Service:  installed\n"),
+        ] {
+            let mut status = running_status();
+            status.service_installed = installed;
+            status.service_enabled = enabled;
+            status.service_running = running;
+
+            let text = render(&status);
+
+            assert!(text.contains(expected), "{text}");
+        }
     }
 
     #[test]
@@ -841,6 +975,8 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
+            service_installed: Some(true),
+            service_enabled: Some(true),
             service_running: Some(false),
         };
 
@@ -850,7 +986,10 @@ mod tests {
             text.contains("Daemon:   not running (last heartbeat 5m ago, pid 1234)\n"),
             "{text}"
         );
-        assert!(text.contains("Service:  not running\n"), "{text}");
+        assert!(
+            text.contains("Service:  installed, enabled, stopped\n"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -865,10 +1004,15 @@ mod tests {
             current_path: None,
             queue: DaemonQueue::default(),
             offline_roots: 0,
+            service_installed: Some(false),
+            service_enabled: None,
             service_running: None,
         };
 
-        assert_eq!(render(&status), "Daemon:   not running\n");
+        assert_eq!(
+            render(&status),
+            "Daemon:   not running\nService:  not installed\n"
+        );
     }
 
     #[test]

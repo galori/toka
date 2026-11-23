@@ -5,10 +5,12 @@
 //! only ever touches processes (and the systemd indexer service) that belong
 //! to the executable that was called.
 
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::{io::Write, path::PathBuf};
+#[cfg(target_os = "linux")]
+use toka_search::service::parse_service_executable;
+use toka_search::service::same_executable;
 
 #[cfg(target_os = "linux")]
 use std::{fs, process::Command, thread, time::Duration};
@@ -90,23 +92,6 @@ pub fn restart(host: &mut impl Host) -> Result<Vec<String>, String> {
     } else {
         Err(failures.join("\n"))
     }
-}
-
-fn same_executable(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
-    }
-}
-
-/// Pulls the program path out of `systemctl show -p ExecStart` output, which
-/// looks like `ExecStart={ path=/bin/toka ; argv[]=/bin/toka --indexer ; ... }`.
-pub fn parse_service_executable(show_output: &str) -> Option<PathBuf> {
-    let start = show_output.find("path=")? + "path=".len();
-    let rest = &show_output[start..];
-    let end = rest.find(" ;").unwrap_or(rest.len());
-    let path = rest[..end].trim();
-    (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 /// The `restart` subcommand entry point.
@@ -442,16 +427,6 @@ mod tests {
 
         assert_eq!(error, "could not stop process 40");
         assert_eq!(host.0.calls, ["restart-service", "spawn-app"]);
-    }
-
-    #[test]
-    fn parses_the_program_path_from_systemctl_show() {
-        let output = "ExecStart={ path=/home/me/.local/bin/toka ; argv[]=/home/me/.local/bin/toka --indexer ; ignore_errors=no }\n";
-        assert_eq!(
-            parse_service_executable(output),
-            Some(PathBuf::from("/home/me/.local/bin/toka"))
-        );
-        assert_eq!(parse_service_executable("ExecStart=\n"), None);
     }
 
     #[cfg(target_os = "linux")]

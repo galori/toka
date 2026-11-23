@@ -20,6 +20,8 @@ use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
 #[cfg(target_os = "linux")]
 use toka_search::indexer_daemon;
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+use toka_search::service;
 use toka_search::{
     index_stats,
     owned_index::{self, IndexUpdates, OwnedIndexUpdates},
@@ -1349,22 +1351,27 @@ fn addon_directory(
 /// add-ons.
 #[cfg(not(mobile))]
 fn reset_plan() -> Result<reset::ResetPlan, String> {
-    let mut paths = Vec::new();
-    // The owned index, the search rename overlay, and the folder the indexer
-    // keeps its state in.
-    if let Some(directory) = owned_index::database_path()?.parent() {
-        paths.push(directory.to_path_buf());
-    }
-    paths.push(thumbnails::cache_output_root());
+    // The index's known files — never the directory itself, so foreign
+    // content stored there always survives. File-only targets, so a
+    // directory at one of their paths refuses instead of deleting.
+    let mut paths: Vec<reset::ResetTarget> =
+        owned_index::index_data_files(&owned_index::database_path()?)
+            .into_iter()
+            .map(reset::ResetTarget::file)
+            .collect();
+    paths.push(reset::ResetTarget::dir(thumbnails::cache_output_root()));
     if let Some(cache) = dirs::cache_dir() {
-        paths.push(cache.join("app.toka.desktop"));
+        paths.push(reset::ResetTarget::dir(cache.join("app.toka.desktop")));
     }
     paths.extend(search_log::reset_paths());
     #[allow(unused_mut)]
     let mut plan = reset::ResetPlan::new(paths);
-    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
+    // The indexer stops before anything is deleted, on both platforms that
+    // run it as a service — and the reset fails closed when the stop does,
+    // so a surviving supervisor never watches its state vanish.
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
     {
-        plan.stop_indexer = Some(indexer_daemon::stop_indexer);
+        plan.stop_indexer = Some(service::stop_indexer_services);
     }
     Ok(plan)
 }
@@ -1866,7 +1873,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let sample = root.join("sample.mp4");
         std::fs::write(&sample, b"sample video").unwrap();
-        let database = directory.path().join("index.sqlite3");
+        let database = directory.path().join("state").join("index.sqlite3");
         let manager = owned_index::OwnedIndexManager::under(database.clone());
         let state = manager.add_folder(&root).unwrap();
         let folder_id = &state.folders[0].id;
@@ -1978,5 +1985,19 @@ mod tests {
         assert_eq!(update.tagged.len(), 1);
         assert_eq!(update.failed, 1);
         assert!(update.problem.is_some());
+    }
+
+    /// The reset stops the indexer service before deleting anything, on
+    /// both platforms that run it — so a surviving supervisor fails the
+    /// reset instead of watching its state vanish.
+    #[cfg(not(mobile))]
+    #[test]
+    fn reset_stops_the_indexer_before_deleting() {
+        let plan = reset_plan().unwrap();
+
+        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+        assert!(plan.stop_indexer.is_some());
+        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e"))))]
+        assert!(plan.stop_indexer.is_none());
     }
 }
