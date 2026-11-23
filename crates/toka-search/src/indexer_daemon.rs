@@ -1252,6 +1252,21 @@ mod tests {
             }),
             "expected the watcher to index the new folder"
         );
+        // The committed count lands before the worker finishes: it may
+        // still be marking the run ready or waiting on thumbnail
+        // generation. Only a settled worker (watching, nothing pending)
+        // reads idle.
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+                    && supervisor.thumbnails.pending_count() == 0
+            }),
+            "expected the watcher to settle to watching with no thumbnails pending"
+        );
         supervisor.publish_heartbeat();
         let status = crate::daemon_state::read_status(&database).unwrap();
         assert_eq!(

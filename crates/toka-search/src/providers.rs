@@ -15,10 +15,11 @@ impl OwnedIndexSearchProvider {
         }
     }
 
-    /// A provider for `ts` searches that must change nothing: every open
-    /// is read-only, so a version 1 database is never migrated and stays
-    /// usable by a version 1 app. The app keeps the migrating
-    /// [`OwnedIndexSearchProvider::new`].
+    /// A provider for `ts` searches that must leave the index unchanged:
+    /// every open is read-only, so a version 1 database is never
+    /// migrated and stays usable by a version 1 app. The app keeps the
+    /// migrating [`OwnedIndexSearchProvider::new`]. (SQLite may still
+    /// touch `-wal`/`-shm` sidecars beside the database while reading.)
     pub fn new_read_only(database: PathBuf) -> Self {
         Self {
             database,

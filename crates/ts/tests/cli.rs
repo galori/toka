@@ -1623,16 +1623,20 @@ fn daemon_run_indexes_added_folders_until_stopped() {
         // The wait pairs status with stats: an idle report alone could
         // predate the add, but idle plus two indexed videos proves the
         // daemon saw the folder and scanned it.
+        let idle_and_empty = |document: &serde_json::Value| {
+            document["running"] == true
+                && document["activity"] == "idle"
+                && document["queue"]["pendingRoots"] == 0
+                && document["queue"]["filesRemaining"] == 0
+                && document["queue"]["pendingRepairs"] == 0
+                && document["queue"]["pendingThumbnails"] == 0
+        };
         let deadline = Instant::now() + Duration::from_secs(60);
         let (finished, last_status, last_videos) = loop {
             let output = run_at(&home, &["status", "--json"]);
             let status_text = String::from_utf8_lossy(&output.stdout).into_owned();
             let idle = serde_json::from_str::<serde_json::Value>(&status_text)
-                .map(|document| {
-                    document["running"] == true
-                        && document["activity"] == "idle"
-                        && document["queue"]["pendingRoots"] == 0
-                })
+                .map(|document| idle_and_empty(&document))
                 .unwrap_or(false);
             let videos_text = if idle {
                 let output = run_at(&home, &["stats", "--json"]);
@@ -1645,7 +1649,27 @@ fn daemon_run_indexes_added_folders_until_stopped() {
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
                 .and_then(|document| document["videos"].as_u64());
             if videos == Some(2) {
-                break (true, status_text, videos_text);
+                // Both halves agree — but the idle heartbeat may predate
+                // the stats read (a stale pre-add beat plus committed
+                // stats would accept while the daemon is still busy).
+                // Heartbeats land every two seconds, so settling past two
+                // intervals means the next heartbeat must postdate the
+                // stats read; only a fresh idle report then proves the
+                // daemon drained its queue after indexing.
+                thread::sleep(Duration::from_secs(5));
+                let output = run_at(&home, &["status", "--json"]);
+                let verify_text = String::from_utf8_lossy(&output.stdout).into_owned();
+                let fresh_idle = serde_json::from_str::<serde_json::Value>(&verify_text)
+                    .map(|document| {
+                        idle_and_empty(&document)
+                            && document["heartbeatAgeSecs"]
+                                .as_u64()
+                                .is_some_and(|age| age <= 2)
+                    })
+                    .unwrap_or(false);
+                if fresh_idle {
+                    break (true, verify_text, videos_text);
+                }
             }
             if Instant::now() >= deadline {
                 break (false, status_text, videos_text);
@@ -1666,11 +1690,23 @@ fn daemon_run_indexes_added_folders_until_stopped() {
         assert!(document["heartbeatAgeSecs"].as_u64().unwrap() < 10);
         assert!(document["uptimeSecs"].as_u64().is_some());
 
-        let output = run_at(&home, &["status"]);
-        assert_eq!(output.status.code(), Some(0));
-        let stdout = String::from_utf8(output.stdout).unwrap();
+        // The accepted pair proved quiescence; the final report must use
+        // an observation consistent with it, not a single racy read.
+        let activity_deadline = Instant::now() + Duration::from_secs(30);
+        let stdout = loop {
+            let output = run_at(&home, &["status"]);
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            if stdout.contains("Activity: idle") {
+                break stdout;
+            }
+            assert!(
+                Instant::now() < activity_deadline,
+                "the daemon never settled back to idle; last status: {stdout}"
+            );
+            thread::sleep(Duration::from_millis(200));
+        };
         assert!(stdout.contains("Daemon:   running"), "{stdout}");
-        assert!(stdout.contains("Activity: idle"), "{stdout}");
     }));
     // Whether the body passed or failed: is the daemon still alive, what
     // did it say on stderr, and what did it log?

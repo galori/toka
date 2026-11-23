@@ -150,10 +150,11 @@ pub(crate) struct DaemonStateRow {
     pub queue: DaemonQueue,
 }
 
-/// Reads the daemon's status without changing anything: the index opens
+/// Reads the daemon's status without changing the index: the index opens
 /// read-only, so a version 1 database is never migrated and stays usable
 /// by a version 1 app, and a missing index reports a stopped daemon
-/// instead of being created.
+/// instead of being created. (SQLite may still touch `-wal`/`-shm`
+/// sidecars beside the database while reading.)
 pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
     // systemd only exists on Linux; elsewhere there is no service to ask.
     #[cfg(any(target_os = "linux", test))]
@@ -172,8 +173,21 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
         offline_roots,
         service_running,
     };
-    if !database.is_file() {
-        return Ok(stopped(0));
+    // A missing index is a stopped daemon, not an error — but any other
+    // metadata failure (permissions, I/O) must surface as one, and a
+    // non-file at the index path is a broken setup, not a stopped daemon.
+    // (`is_file` answers false for all three, which used to report every
+    // metadata failure as a stopped daemon with exit 3 instead of exit 1.)
+    match std::fs::metadata(database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(stopped(0)),
+        Err(error) => return Err(format!("Toka could not read its search index: {error}")),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "Toka's search index path is not a file: {}",
+                database.display()
+            ))
+        }
+        Ok(_) => {}
     }
     let index = crate::owned_index::OwnedIndex::open_read_only(database)
         .map_err(|error| error.to_string())?;
@@ -456,6 +470,32 @@ mod tests {
         assert_eq!(status.activity, None);
         assert!(status.queue.is_empty());
         assert!(!database.is_file(), "status must not create an index");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn status_on_a_metadata_failure_errors_instead_of_reporting_stopped() {
+        let directory = tempdir().unwrap();
+        // A component past NAME_MAX fails metadata with ENAMETOOLONG on
+        // Unix for every user — unlike chmod tricks, which root sails
+        // through.
+        let database = directory.path().join("a".repeat(300)).join("index.sqlite3");
+
+        let error = read_status(&database).unwrap_err();
+
+        assert!(
+            error.contains("could not read its search index"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn status_on_a_directory_at_the_index_path_errors_instead_of_reporting_stopped() {
+        let directory = tempdir().unwrap();
+
+        let error = read_status(directory.path()).unwrap_err();
+
+        assert!(error.contains("is not a file"), "unexpected error: {error}");
     }
 
     #[test]
