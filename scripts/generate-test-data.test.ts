@@ -55,13 +55,19 @@ describe("planTree per-folder counts", () => {
 });
 
 describe("generate", () => {
+  let out: string | undefined;
   afterEach(async () => {
-    await rm(scratch, { recursive: true, force: true });
+    // Only this test's own output: `.scratch` is shared with other test
+    // files running in parallel, so cleaning all of it would race them.
+    if (out !== undefined) {
+      await rm(out, { recursive: true, force: true });
+      out = undefined;
+    }
   });
 
   it("writes the planned files and refuses a non-empty directory", async () => {
     await mkdir(scratch, { recursive: true });
-    const out = await mkdtemp(path.join(scratch, "gen-"));
+    out = await mkdtemp(path.join(scratch, "gen-"));
     const plan = await generate({ subfolders: 5, out, seed: 2 });
     for (const { file } of plan.files) {
       expect((await stat(path.join(out, file))).size).toBeGreaterThan(0);

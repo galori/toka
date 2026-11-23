@@ -22,7 +22,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
 describe("Toka owned index", () => {
   it("indexes a folder, searches it, and plays", async () => {
     // Seed the search folder through the app's own command, the way the
-    // setup screen does. The indexer daemon (started by the wdio config with
+    // setup screen does. The `ts` daemon (started by the wdio config with
     // the same isolated home directory) scans it in the background.
     await invoke("add_index_folder", { path: videosDirectory });
 

@@ -20,14 +20,17 @@ import {
   gitWorktrees,
   indexerArguments,
   currentIndexerPid,
+  isIsolatedIndexerProcess,
   isIsolatedProcess,
   isSupervisorOf,
   isolatedEnv,
   isolatedPaths,
+  loginctlShimScript,
   parseArguments,
   readState,
   seedConfig,
   shimScript,
+  tsBuildInvocation,
 } from "./lib.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
@@ -36,10 +39,10 @@ const USAGE = `Usage: node scripts/isolated/toka-isolated.mjs <command> [flags]
 
 Runs a worktree's build of Toka with its own config, data, cache and indexer,
 beside the installed app. It never installs anything and never touches the
-installed app, ~/.config/toka, ~/.local/share/toka or toka-indexer.service.
+installed app, ~/.config/toka, ~/.local/share/toka or toka-search.service.
 
 Commands:
-  build    Build the worktree's release binary without installing it.
+  build    Build the worktree's release binaries without installing them.
   launch   Start the app and its own indexer (--detach to return immediately).
   stop     Stop the app and indexer (--clean also deletes the isolated home).
   status   Show what is running, per worktree (--all lists every worktree).
@@ -137,6 +140,17 @@ async function build(flags) {
     // The build rewrote a file that had local edits; put them back.
     writeFileSync(path.join(worktree, paths.schemaFile), schemaBackup);
   }
+  // The search helper beside the app: the isolated app resolves it as its
+  // sibling, and the isolated indexer runs from it.
+  if (status === 0) {
+    const tsBuild = tsBuildInvocation(paths);
+    const ts = spawnSync(tsBuild.command, tsBuild.args, {
+      cwd: tsBuild.cwd,
+      env,
+      stdio: "inherit",
+    });
+    if ((ts.status ?? 1) !== 0) process.exit(ts.status ?? 1);
+  }
   // Leftovers cannot be attributed to this build reliably, so report them and
   // leave killing them to the caller (AGENTS.md: check, then terminate).
   const leftovers = spawnSync("pgrep", ["-a", "-x", "rustc|cargo"], {
@@ -148,7 +162,7 @@ async function build(flags) {
     );
   }
   if (status !== 0) process.exit(status);
-  console.log(`Built (not installed): ${paths.binary}`);
+  console.log(`Built (not installed): ${paths.binary} and ${paths.tsBinary}`);
 }
 
 // --------------------------------------------------------------- launch
@@ -166,6 +180,8 @@ function prepareHome(paths, flags) {
   }
   writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
+  writeFileSync(paths.loginctlShim, loginctlShimScript());
+  chmodSync(paths.loginctlShim, 0o755);
   if (flags["no-seed"] || existsSync(paths.indexFolders)) return;
   const source = path.resolve(
     paths.worktree,
@@ -224,9 +240,9 @@ async function launch(flags) {
   requireLinux();
   const worktree = targetWorktree(flags);
   const paths = isolatedPaths(worktree);
-  if (!existsSync(paths.binary)) {
+  if (!existsSync(paths.binary) || !existsSync(paths.tsBinary)) {
     fail(
-      `No built binary at ${paths.binary}. Run: node scripts/isolated/toka-isolated.mjs build`,
+      `No built binaries at ${paths.binary} and ${paths.tsBinary}. Run: node scripts/isolated/toka-isolated.mjs build`,
     );
   }
   const supervising = process.env.TOKA_ISOLATED_SUPERVISOR === "1";
@@ -269,7 +285,7 @@ async function launch(flags) {
     supervising
       ? ["ignore", openSync(path.join(paths.runDir, name), "a"), "inherit"]
       : "inherit";
-  const indexer = spawn(paths.binary, indexerArguments(), {
+  const indexer = spawn(paths.tsBinary, indexerArguments(), {
     cwd: worktree,
     env,
     detached: true,
@@ -313,7 +329,7 @@ async function launch(flags) {
       const groups = [
         app.pid,
         [liveIndexer, indexer.pid].find(
-          (pid) => pid !== null && isIsolatedProcess(pid, paths),
+          (pid) => pid !== null && isIsolatedIndexerProcess(pid, paths),
         ),
       ].filter((pid) => pid !== undefined);
       for (const pid of groups) killGroup(pid, "SIGTERM");
@@ -347,17 +363,18 @@ async function stopOne(paths, { clean }) {
         /* gone */
       }
     }
-    const pids = [state.appPid, currentIndexerPid(paths, state)];
-    for (const pid of pids) {
-      if (isIsolatedProcess(pid, paths)) killGroup(pid, "SIGTERM");
-    }
+    const appPid = state.appPid;
+    const indexerPid = currentIndexerPid(paths, state);
+    if (isIsolatedProcess(appPid, paths)) killGroup(appPid, "SIGTERM");
+    if (isIsolatedIndexerProcess(indexerPid, paths))
+      killGroup(indexerPid, "SIGTERM");
     for (let waited = 0; waited < 5000; waited += 100) {
       if (!describeRun(paths, state).running) break;
       await sleepMs(100);
     }
-    for (const pid of pids) {
-      if (isIsolatedProcess(pid, paths)) killGroup(pid, "SIGKILL");
-    }
+    if (isIsolatedProcess(appPid, paths)) killGroup(appPid, "SIGKILL");
+    if (isIsolatedIndexerProcess(indexerPid, paths))
+      killGroup(indexerPid, "SIGKILL");
     await sleepMs(100);
     if (describeRun(paths, state).running) {
       console.error(`Could not stop ${paths.name}.`);
@@ -414,10 +431,15 @@ function printEnv(flags) {
   mkdirSync(paths.runDir, { recursive: true });
   writeFileSync(paths.shim, shimScript(paths));
   chmodSync(paths.shim, 0o755);
+  writeFileSync(paths.loginctlShim, loginctlShimScript());
+  chmodSync(paths.loginctlShim, 0o755);
   const env = isolatedEnv(paths, {});
   mkdirSync(paths.tmp, { recursive: true });
   const quoted = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+  // HOME is exported too: without it a shell eval'ing this would still
+  // resolve the real home, and the toka CLI would act on it.
   for (const key of [
+    "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",

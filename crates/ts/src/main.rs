@@ -115,10 +115,24 @@ fn read_status() -> Result<DaemonStatus, String> {
     toka_search::daemon_state::read_status(&owned_index::database_path()?)
 }
 
-/// Runs the indexer daemon in the foreground: the same supervisor loop
-/// `toka --indexer` runs, so either entry point keeps the index fresh.
+/// Runs the indexer daemon in the foreground. This is the only entry
+/// point that keeps the index fresh: the app supervises nothing itself.
 fn run_daemon() -> Result<(), String> {
     toka_search::indexer_daemon::run_daemon()
+}
+
+/// Plans (or plans and applies) a reset of the search state: the same
+/// index, log, and thumbnail targets `toka reset` removes, minus the
+/// app's own caches — and, when confirmed, the same fail-closed stop of
+/// the indexer services first.
+fn plan_and_apply_reset(confirmed: bool) -> Result<cli::ResetEffect, String> {
+    use toka_search::{reset, service};
+    let mut plan = reset::ResetPlan::new(service::reset_data_paths()?);
+    plan.stop_indexer = Some(service::stop_indexer_services);
+    if !confirmed {
+        return Ok(cli::ResetEffect::Preview(plan.targets));
+    }
+    Ok(cli::ResetEffect::Applied(reset::apply(&plan)))
 }
 
 /// Runs one service operation against the real machine. Only install
@@ -237,6 +251,7 @@ fn main() {
         read_status,
         run_daemon,
         manage_service,
+        plan_and_apply_reset,
         &mut stdout,
         &mut stderr,
     );

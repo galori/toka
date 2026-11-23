@@ -310,6 +310,189 @@ fn search_verbose_streams_the_trace_to_stderr() {
 }
 
 #[test]
+fn candidates_without_a_query_prints_usage_and_exits_with_a_usage_error() {
+    let output = run_ts(&["candidates"], &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Candidates needs a query.\nUsage: ts candidates <query> [--json]\n"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn candidates_help_prints_usage_and_exits_successfully() {
+    let output = run_ts(&["candidates", "--help"], &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        help.starts_with("Usage: ts candidates <query> [--json]\n"),
+        "{help}"
+    );
+    assert!(help.contains("OR-widened"), "{help}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_prints_every_fixture_video_unfiltered() {
+    let directory = tempdir().unwrap();
+    let videos = (0..3)
+        .map(|number| create_video(directory.path(), number))
+        .collect::<Vec<_>>();
+
+    // A negation the engine would narrow: candidates keep every video,
+    // in fixture order.
+    let output = run_ts(&["candidates", "family", "NOT", "trip-01"], &videos);
+
+    assert_eq!(output.status.code(), Some(0));
+    let expected = videos
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_json_prints_a_versioned_document() {
+    let directory = tempdir().unwrap();
+    let videos = (0..2)
+        .map(|number| create_video(directory.path(), number))
+        .collect::<Vec<_>>();
+
+    let output = run_ts(&["candidates", "family", "--json"], &videos);
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["query"], "family");
+    assert_eq!(document["indexRevision"], 0);
+    assert_eq!(
+        document["candidates"],
+        serde_json::json!([videos[0].to_string_lossy(), videos[1].to_string_lossy(),])
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(feature = "fixtures")]
+#[test]
+fn candidates_without_fixture_videos_configured_fails() {
+    let output = run_ts_with_fixture_env(&["candidates", "family"], None);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "ts candidates: The integration-test videos were not configured.\n"
+    );
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn candidates_with_no_index_reads_empty_without_creating_one() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["candidates", "family", "--json"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["query"], "family");
+    assert_eq!(document["indexRevision"], 0);
+    assert_eq!(document["candidates"].as_array().unwrap().len(), 0);
+    assert!(output.stderr.is_empty());
+    assert!(
+        !index_database_path(home.home.path(), &home.data_home).exists(),
+        "a read-only command leaves no index behind"
+    );
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn candidates_json_matches_the_direct_provider_on_the_same_index() {
+    use toka_search::{
+        owned_index::{OwnedIndex, OwnedIndexManager},
+        providers::OwnedIndexSearchProvider,
+        search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE},
+        search_log::SearchLogContext,
+    };
+
+    // One real index under a scratch home: the folder added through the
+    // real CLI, scanned directly instead of waiting on a daemon.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let clip = media.join("clip.mp4");
+    let other = media.join("other.mp4");
+    fs::write(&clip, b"fixture video").unwrap();
+    fs::write(&other, b"fixture video").unwrap();
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    assert_eq!(folders.len(), 1);
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+
+    // A positive query narrows; a negation widens to the whole index.
+    // Both must match the direct provider exactly.
+    let provider = OwnedIndexSearchProvider::new(database);
+    for query in ["clip", "clip NOT other"] {
+        let output = run_at(&home, &["candidates", query, "--json"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{query}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        let mut ts_paths: Vec<String> = document["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|path| path.as_str().unwrap().to_owned())
+            .collect();
+        ts_paths.sort();
+
+        let request = SearchRequest {
+            query: query.to_owned(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Both,
+        };
+        let context = SearchLogContext::from(&request);
+        let mut direct_paths: Vec<String> = provider
+            .candidates(query, true, &context)
+            .unwrap()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        direct_paths.sort();
+
+        assert_eq!(ts_paths, direct_paths, "query: {query}");
+        assert_eq!(document["indexRevision"], provider.revision());
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn stats_with_no_index_reports_empty() {
     let output = run_ts(&["stats"], &[]);
 
@@ -504,6 +687,343 @@ fn search_with_a_directory_at_the_index_path_errors_instead_of_searching_empty()
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
     }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_json_matches_the_direct_engine_on_the_same_index() {
+    use std::sync::Arc;
+    use toka_search::{
+        owned_index::{OwnedIndex, OwnedIndexManager},
+        providers::OwnedIndexSearchProvider,
+        search::{MediaType, SearchEngine, SearchFields},
+        search_log::SearchLogger,
+    };
+
+    // One real index under a scratch home: the folder added through the
+    // real CLI, scanned directly instead of waiting on a daemon.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    create_video(&media, 0);
+    create_video(&media, 1);
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    assert_eq!(folders.len(), 1);
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+
+    // Through `ts search --json`.
+    let output = run_at(&home, &["search", "family", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let mut ts_paths: Vec<String> = document["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["path"].as_str().unwrap().to_owned())
+        .collect();
+    ts_paths.sort();
+
+    // Through the direct engine: the same `search_all` the CLI runs,
+    // with paths resolved and sorted exactly as the CLI resolves them.
+    let engine = SearchEngine::new_with_logger(
+        Arc::new(OwnedIndexSearchProvider::new(database)),
+        Arc::new(SearchLogger::disabled()),
+    );
+    let found = engine
+        .search_all(
+            "family".to_owned(),
+            SearchFields::default(),
+            MediaType::Both,
+        )
+        .unwrap();
+    let mut direct_paths: Vec<String> = found
+        .results
+        .iter()
+        .filter_map(|result| engine.video_path(&result.id).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    direct_paths.sort();
+    direct_paths.dedup();
+
+    assert_eq!(ts_paths, direct_paths);
+    assert_eq!(document["totalResults"], found.total_results);
+    assert_eq!(document["indexRevision"], found.index_revision);
+}
+
+#[test]
+fn folders_add_and_remove_match_the_direct_manager() {
+    use toka_search::owned_index::OwnedIndexManager;
+
+    // One real index under a scratch home, mutated through the CLI and read
+    // back through the direct manager: any drift in state shape,
+    // canonicalization, or validation messages shows up as a mismatch.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let manager = OwnedIndexManager::under(database);
+
+    let output = run_at(&home, &["folders", "add", &media_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct = manager.state().unwrap();
+    assert_eq!(document["revision"], direct.revision);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_eq!(document["folders"][0]["id"], direct.folders[0].id);
+    assert_eq!(
+        document["folders"][0]["path"],
+        direct.folders[0].path.to_string_lossy().into_owned()
+    );
+    assert_eq!(document["folders"][0]["status"], "pending");
+    let id = direct.folders[0].id.clone();
+
+    // Validation errors read identically on both sides: re-adding the same
+    // folder, and adding a file instead of a folder.
+    let file = media.join("not-a-folder.mp4");
+    fs::write(&file, b"fixture video").unwrap();
+    let file_argument = file.to_string_lossy().into_owned();
+    for target in [&media_argument, &file_argument] {
+        let output = run_at(&home, &["folders", "add", target]);
+        assert_eq!(output.status.code(), Some(1), "{target}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let cli_error = stderr
+            .strip_prefix("ts folders add: ")
+            .unwrap_or(&stderr)
+            .trim_end()
+            .to_owned();
+        let direct_error = manager.add_folder(Path::new(target)).unwrap_err();
+        assert_eq!(cli_error, direct_error, "{target}");
+    }
+
+    // Remove by path through the CLI; the direct manager reads it back.
+    let output = run_at(&home, &["folders", "remove", &media_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct = manager.state().unwrap();
+    assert!(document["folders"].as_array().unwrap().is_empty());
+    assert!(direct.folders.is_empty());
+    assert_eq!(document["revision"], direct.revision);
+
+    // Removing what is gone: the direct side reports the configured error,
+    // the CLI names the path it cannot resolve.
+    let output = run_at(&home, &["folders", "remove", &media_argument]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("is not one of Toka's search folders"),
+        "{stderr}"
+    );
+    assert_eq!(
+        manager.remove_folder(&id).unwrap_err(),
+        toka_search::owned_index::OwnedIndexError::FolderNotConfigured.to_string()
+    );
+
+    // And back again by id: re-add through the CLI, remove by the id from
+    // its own document, read back through the direct manager.
+    let output = run_at(&home, &["folders", "add", &media_argument, "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let id = document["folders"][0]["id"].as_str().unwrap().to_owned();
+    let output = run_at(&home, &["folders", "remove", &id, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(manager.state().unwrap().folders.is_empty());
+}
+
+/// Like `run_at`, but with argv that need not be UTF-8: real folder paths on
+/// Linux can hold bytes no `&str` can carry.
+#[cfg(target_os = "linux")]
+fn run_at_os(home: &ScratchHome, arguments: &[OsString]) -> Output {
+    let scratch = home.home.path().join("tmp");
+    fs::create_dir_all(&scratch).unwrap();
+    let mut command = Command::new(Path::new(env!("CARGO_BIN_EXE_ts")));
+    command
+        .args(arguments)
+        .env("HOME", home.home.path())
+        .env("XDG_DATA_HOME", &home.data_home)
+        .env("TMPDIR", &scratch)
+        .env("TOKA_RUNTIME_DIR", scratch.join("runtime"));
+    command.env_remove("TS_FIXTURE_VIDEOS");
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_exit(child)
+}
+
+/// A folder whose path is not valid UTF-8 still removes: the list document
+/// can only carry its lossy spelling, but the id round-trips exactly.
+/// Linux-only: macOS filesystems reject non-UTF-8 names outright, so the
+/// setup itself cannot run there.
+#[cfg(target_os = "linux")]
+#[test]
+fn folders_remove_by_id_covers_non_utf8_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    use toka_search::owned_index::OwnedIndexManager;
+
+    let home = scratch_home();
+    let raw = home
+        .home
+        .path()
+        .join(OsString::from_vec(b"media-\xff".to_vec()));
+    fs::create_dir_all(&raw).unwrap();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let manager = OwnedIndexManager::under(database);
+
+    let output = run_at_os(
+        &home,
+        &[
+            OsString::from("folders"),
+            OsString::from("add"),
+            OsString::from("--json"),
+            OsString::from("--"),
+            raw.as_os_str().to_os_string(),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let id = document["folders"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(manager.state().unwrap().folders.len(), 1);
+
+    let output = run_at_os(
+        &home,
+        &[
+            OsString::from("folders"),
+            OsString::from("remove"),
+            OsString::from("--json"),
+            OsString::from("--"),
+            OsString::from(&id),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(manager.state().unwrap().folders.is_empty());
+}
+
+#[test]
+fn thumbnail_and_preview_match_the_direct_engine() {
+    use std::sync::Arc;
+    use toka_search::{
+        owned_index::{OwnedIndex, OwnedIndexManager},
+        providers::OwnedIndexSearchProvider,
+        search::{MediaType, SearchEngine, SearchFields},
+        search_log::SearchLogger,
+    };
+
+    // One real index under a scratch home with a scanned image: an image is
+    // its own thumbnail and preview on both sides, so the comparison needs
+    // no ffmpeg.
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let image = create_image(&media, "family-photo-00.jpg");
+    let root = media.canonicalize().unwrap();
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    assert_eq!(folders.len(), 1);
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+
+    // Through the direct engine, behind a search result id.
+    let engine = SearchEngine::new_with_logger(
+        Arc::new(OwnedIndexSearchProvider::new(database)),
+        Arc::new(SearchLogger::disabled()),
+    );
+    let found = engine
+        .search_all(
+            "family".to_owned(),
+            SearchFields::default(),
+            MediaType::Both,
+        )
+        .unwrap();
+    assert_eq!(found.results.len(), 1);
+    let id = &found.results[0].id;
+    let direct_thumbnail = engine.thumbnail_path(id).unwrap();
+    let direct_preview = engine.preview_paths(id).unwrap();
+
+    // Through `ts thumbnail` / `ts preview --json`.
+    let image_argument = image.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_at(&home, &["thumbnail", &image_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(
+        document["thumbnail"],
+        direct_thumbnail.to_string_lossy().into_owned()
+    );
+
+    let output = run_at(&home, &["preview", &image_argument, "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    let direct_preview: Vec<String> = direct_preview
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(document["previews"], serde_json::json!(direct_preview));
 }
 
 /// Writes a version-999 database at the child's index path: an index
@@ -3636,6 +4156,187 @@ fn a_second_purge_reports_nothing_to_do() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("no index data to remove"), "{stdout}");
     assert!(!stdout.contains("daemon.lock"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_preview_lists_state_and_changes_nothing() {
+    let home = shim_home();
+    let media = home.home().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_shimmed(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    #[cfg(target_os = "macos")]
+    let index = home
+        .home()
+        .join("Library/Application Support/toka/index.sqlite3");
+    #[cfg(not(target_os = "macos"))]
+    let index = home.scratch.data_home.join("toka/index.sqlite3");
+    assert!(index.is_file());
+
+    let output = run_shimmed(&home, &["reset"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Reset would remove these, if present:"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&index.to_string_lossy().into_owned()),
+        "{stdout}"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Nothing was changed. Run `ts reset --yes` to reset.\n"
+    );
+    assert!(index.is_file(), "the preview removes nothing");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_preview_json_lists_targets() {
+    let home = shim_home();
+
+    let output = run_shimmed(&home, &["reset", "--json"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert!(document["targets"].is_array());
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_with_yes_removes_state_but_keeps_media() {
+    let home = shim_home();
+    let media = home.home().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let clip = create_video(&media, 0);
+    let media_argument = media.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_shimmed(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    #[cfg(target_os = "macos")]
+    let index_dir = home.home().join("Library/Application Support/toka");
+    #[cfg(not(target_os = "macos"))]
+    let index_dir = home.scratch.data_home.join("toka");
+    #[cfg(target_os = "macos")]
+    let logs_dir = home.home().join("Library/Logs/app.toka.desktop");
+    #[cfg(not(target_os = "macos"))]
+    let logs_dir = home.scratch.data_home.join("app.toka.desktop/logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    fs::write(logs_dir.join("search.log"), b"log").unwrap();
+    let cache_dir = thumbnail_cache_dir(home.home());
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("thumb.jpg"), b"thumb").unwrap();
+    // Foreign content inside the index directory: reset deletes only
+    // known index files, so this always survives.
+    let foreign = index_dir.join("my-media-clip.mp4");
+    fs::write(&foreign, b"video").unwrap();
+
+    let output = run_shimmed(&home, &["reset", "--yes"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !index_dir.join("index.sqlite3").exists(),
+        "the index is reset"
+    );
+    assert!(foreign.is_file(), "foreign index-dir content survives");
+    assert!(index_dir.is_dir(), "the index directory itself survives");
+    assert!(!logs_dir.exists(), "the logs are reset");
+    assert!(!cache_dir.exists(), "the thumbnail cache is reset");
+    assert!(clip.is_file(), "media is never reset");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("removed "), "{stdout}");
+    assert!(stdout.contains("Toka search state was reset."), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_with_yes_json_reports_the_stop_and_the_removals() {
+    let home = shim_home();
+    let media = home.home().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_shimmed(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+
+    let output = run_shimmed(&home, &["reset", "--yes", "--json"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["indexerStopped"], true);
+    assert!(!document["removed"].as_array().unwrap().is_empty());
+    assert_eq!(document["failures"], serde_json::json!([]));
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_with_yes_refuses_while_the_daemon_holds_the_lock() {
+    // Fail closed like the stop it shares with purge: a live daemon
+    // refuses the whole reset, removing nothing.
+    let home = shim_home();
+    let media = home.home().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media_argument = media.canonicalize().unwrap().to_string_lossy().into_owned();
+    let output = run_shimmed(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    #[cfg(target_os = "macos")]
+    let index = home
+        .home()
+        .join("Library/Application Support/toka/index.sqlite3");
+    #[cfg(not(target_os = "macos"))]
+    let index = home.scratch.data_home.join("toka/index.sqlite3");
+    assert!(index.is_file());
+
+    with_daemon(&home.scratch, || {
+        // The daemon must hold the lock before the reset probes it: a
+        // status heartbeat proves it is up, not just spawned.
+        assert!(
+            wait_for_status(&home.scratch, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never reported running"
+        );
+        let output = run_shimmed(&home, &["reset", "--yes", "--json"]);
+
+        assert_eq!(output.status.code(), Some(1));
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["indexerStopped"], false);
+        assert_eq!(document["removed"], serde_json::json!([]));
+        assert_eq!(document["failures"].as_array().unwrap().len(), 1);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("ts reset: "), "{stderr}");
+        assert!(index.is_file(), "a refused reset removes nothing");
+    });
 }
 
 #[cfg(unix)]

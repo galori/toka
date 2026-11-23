@@ -13,6 +13,7 @@ import {
   installAppImage,
   installBinary,
   releaseDir,
+  runTsInstall,
 } from "./install-linux.mjs";
 
 describe("releaseDir", () => {
@@ -102,26 +103,86 @@ describe("installAppImage", () => {
   });
 });
 
+describe("runTsInstall", () => {
+  const writeFakeTs = async (dir: string, behavior: string) => {
+    const tsPath = path.join(dir, "ts");
+    const logPath = path.join(dir, "calls.log");
+    await writeFile(
+      tsPath,
+      `#!/bin/sh\necho "$1" >> "${logPath}"\n${behavior}\n`,
+    );
+    await chmod(tsPath, 0o755);
+    return { tsPath, logPath };
+  };
+  const calls = (logPath: string) =>
+    readFile(logPath, "utf8").then((text) =>
+      text.split("\n").filter((line) => line.length > 0),
+    );
+
+  it("restarts the indexer after a successful install, so updates pick up the new binary", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-ts-restart-"));
+    const { tsPath, logPath } = await writeFakeTs(root, "exit 0");
+
+    runTsInstall(tsPath);
+
+    expect(await calls(logPath)).toEqual(["install", "restart"]);
+  });
+
+  it("skips the restart when the install itself failed", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-ts-restart-"));
+    const { tsPath, logPath } = await writeFakeTs(
+      root,
+      'if [ "$1" = install ]; then exit 1; fi\nexit 0',
+    );
+
+    runTsInstall(tsPath);
+
+    expect(await calls(logPath)).toEqual(["install"]);
+  });
+
+  it("warns but never throws when the restart fails", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-ts-restart-"));
+    const { tsPath, logPath } = await writeFakeTs(
+      root,
+      'if [ "$1" = restart ]; then exit 1; fi\nexit 0',
+    );
+
+    expect(() => runTsInstall(tsPath)).not.toThrow();
+    expect(await calls(logPath)).toEqual(["install", "restart"]);
+  });
+});
+
 describe("installBinary", () => {
-  it("installs the PATH link and background indexer", async () => {
+  it("installs the ts helper beside the app and sets up its service", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "toka-linux-install-"));
     const releaseDir = path.join(root, "release");
     const homeDir = path.join(root, "home");
     const binaryPath = path.join(releaseDir, "toka");
-    const serviceCommands: string[][] = [];
+    const tsSourcePath = path.join(releaseDir, "ts");
+    const tsInstalls: string[] = [];
     await mkdir(releaseDir, { recursive: true });
     await writeFile(binaryPath, "test binary");
+    await writeFile(tsSourcePath, "test ts");
 
     await installBinary({
       binaryPath,
       homeDir,
       iconPath: path.join(root, "128x128.png"),
-      runServiceCommand: (...arguments_) => serviceCommands.push(arguments_),
+      tsSourcePath,
+      runTsInstall: (installedTsPath: string) =>
+        tsInstalls.push(installedTsPath),
     });
 
+    const installedTs = path.join(homeDir, ".local", "opt", "toka", "ts");
     expect(await readlink(path.join(homeDir, ".local", "bin", "toka"))).toBe(
       path.join(homeDir, ".local", "opt", "toka", "Toka"),
     );
+    expect(await readlink(path.join(homeDir, ".local", "bin", "ts"))).toBe(
+      installedTs,
+    );
+    await expect(readFile(installedTs, "utf8")).resolves.toBe("test ts");
+    // No unit file of the installer's own: `ts install` owns the service
+    // now, including migrating the old unit away.
     await expect(
       readFile(
         path.join(
@@ -133,14 +194,31 @@ describe("installBinary", () => {
         ),
         "utf8",
       ),
-    ).resolves.toContain(
-      `ExecStart="${path.join(homeDir, ".local", "opt", "toka", "Toka")}" --indexer`,
-    );
-    expect(serviceCommands).toEqual([
-      ["daemon-reload"],
-      ["enable", "toka-indexer.service"],
-      ["restart", "toka-indexer.service"],
-    ]);
+    ).rejects.toThrow();
+    expect(tsInstalls).toEqual([installedTs]);
+  });
+
+  it("skips the service setup when no ts binary is provided", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "toka-linux-no-ts-"));
+    const releaseDir = path.join(root, "release");
+    const homeDir = path.join(root, "home");
+    const binaryPath = path.join(releaseDir, "toka");
+    const tsInstalls: string[] = [];
+    await mkdir(releaseDir, { recursive: true });
+    await writeFile(binaryPath, "test binary");
+
+    await installBinary({
+      binaryPath,
+      homeDir,
+      iconPath: path.join(root, "128x128.png"),
+      runTsInstall: (installedTsPath: string) =>
+        tsInstalls.push(installedTsPath),
+    });
+
+    expect(tsInstalls).toEqual([]);
+    await expect(
+      readlink(path.join(homeDir, ".local", "bin", "ts")),
+    ).rejects.toThrow();
   });
 
   it("installs the unbundled executable and registers it for the current user", async () => {

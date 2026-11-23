@@ -35,6 +35,21 @@ const build = spawnSync(
 );
 if (build.status !== 0) process.exit(build.status ?? 1);
 
+// The search helper the app shells out to, built alongside the app so
+// installers and e2e runs find it next to the `toka` binary. Version
+// provenance mirrors build.rs: only a hex SHA reaches the binary.
+const gitSha = /^[0-9a-f]+$/i.test(info.gitSha ?? "") ? info.gitSha : undefined;
+const tsBuild = spawnSync("cargo", ["build", "--release", "-p", "ts"], {
+  cwd: root,
+  env: {
+    ...env,
+    TS_BUILD_VERSION: info.buildVersion,
+    ...(gitSha === undefined ? {} : { TOKA_GIT_SHA: gitSha }),
+  },
+  stdio: "inherit",
+});
+if (tsBuild.status !== 0) process.exit(tsBuild.status ?? 1);
+
 console.log(
   `Built: ${builtArtifactPath({ target, appimage: wantsAppImage }, root)}`,
 );

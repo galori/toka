@@ -6,9 +6,9 @@ pub const ADDON_SEARCH_FLAG: &str = "--toka-addon-search";
 /// Whether this process should hand its GUI launch to a detached child and
 /// exit: a release media, empty, or add-on search launch whose standard
 /// input, output, and error are all terminals, i.e. Toka was started from an
-/// interactive shell. CLI commands, the indexer service, debug builds (such
-/// as `tauri dev`), and piped or headless launches stay in this process, so
-/// their output and exit status still reach the caller.
+/// interactive shell. CLI commands, debug builds (such as `tauri dev`), and
+/// piped or headless launches stay in this process, so their output and exit
+/// status still reach the caller.
 #[cfg(any(
     test,
     all(target_os = "linux", not(feature = "e2e"), not(debug_assertions))
@@ -19,10 +19,7 @@ pub fn should_detach_gui(
     stdout_is_terminal: bool,
     stderr_is_terminal: bool,
 ) -> bool {
-    let stays_foreground = arguments
-        .get(1)
-        .is_some_and(|argument| argument == "--indexer")
-        || crate::cli::is_command(arguments);
+    let stays_foreground = crate::cli::is_command(arguments);
     !stays_foreground && stdin_is_terminal && stdout_is_terminal && stderr_is_terminal
 }
 
@@ -173,16 +170,6 @@ mod tests {
                 "{owned:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_indexer_stays_in_the_foreground_it_was_started_from() {
-        assert!(!super::should_detach_gui(
-            &arguments(["toka".into(), "--indexer".into()]),
-            true,
-            true,
-            true,
-        ));
     }
 
     #[test]

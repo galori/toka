@@ -11,13 +11,15 @@ import {
 import path from "node:path";
 import {
   indexerArguments,
-  isIsolatedProcess,
+  isIsolatedIndexerProcess,
   isProcessOf,
   isolatedEnv,
   isolatedPaths,
+  loginctlShimScript,
   parseArguments,
   seedConfig,
   shimScript,
+  tsBuildInvocation,
 } from "./lib.mjs";
 
 describe("parseArguments", () => {
@@ -73,18 +75,48 @@ describe("isolatedPaths and isolatedEnv", () => {
     ).toBe("/shared/target/release/toka");
   });
 
-  it("points the XDG directories at the isolated home and puts the shim first on PATH", () => {
+  it("points HOME and the XDG directories at the isolated home and puts the shim first on PATH", () => {
     const env = isolatedEnv(paths, { PATH: "/usr/bin", HOME: "/home/u" });
+    expect(env.HOME).toBe(paths.home);
     expect(env.XDG_CONFIG_HOME).toBe(paths.config);
     expect(env.XDG_DATA_HOME).toBe(paths.data);
     expect(env.XDG_CACHE_HOME).toBe(paths.cache);
     expect(env.TMPDIR).toBe(paths.tmp);
     expect(env.PATH).toBe(`${paths.shimDir}:/usr/bin`);
-    expect(env.HOME).toBe("/home/u");
   });
 
-  it("runs the indexer with --indexer", () => {
-    expect(indexerArguments()).toEqual(["--indexer"]);
+  it("shadows both systemctl and loginctl in the shim dir", () => {
+    expect(paths.shim).toBe(path.join(paths.shimDir, "systemctl"));
+    expect(paths.loginctlShim).toBe(path.join(paths.shimDir, "loginctl"));
+  });
+
+  it("runs the indexer as ts daemon run", () => {
+    expect(indexerArguments()).toEqual(["daemon", "run"]);
+  });
+
+  it("builds ts from src-tauri, where a relative CARGO_TARGET_DIR lands beside the app binary", () => {
+    const targetDir = "shared-target";
+    const withTarget = isolatedPaths("/w", { CARGO_TARGET_DIR: targetDir });
+    const build = tsBuildInvocation(withTarget);
+
+    expect(build.command).toBe("cargo");
+    expect(build.args).toEqual(["build", "--release", "-p", "ts"]);
+    // The tauri CLI builds from src-tauri, so a relative target dir
+    // resolves under it; the ts build runs from the same directory, or
+    // its binary lands where `launch` never looks.
+    expect(build.cwd).toBe(path.join("/w", "src-tauri"));
+    expect(path.join(build.cwd, targetDir, "release", "ts")).toBe(
+      withTarget.tsBinary,
+    );
+  });
+
+  it("keeps the ts binary beside the app binary", () => {
+    expect(paths.tsBinary).toBe(
+      "/repo/.worktrees/feature/src-tauri/target/release/ts",
+    );
+    expect(
+      isolatedPaths("/w", { CARGO_TARGET_DIR: "/shared/target" }).tsBinary,
+    ).toBe("/shared/target/release/ts");
   });
 });
 
@@ -100,15 +132,38 @@ describe("shimScript and seedConfig", () => {
         shimScript({ ...isolatedPaths(dir, {}), shimLog: log }),
       );
       await chmod(shim, 0o755);
-      const result = spawnSync(shim, [
-        "--user",
-        "stop",
-        "toka-indexer.service",
-      ]);
+      const result = spawnSync(shim, ["--user", "stop", "toka-search.service"]);
       expect(result.status).toBe(0);
       expect(await readFile(log, "utf8")).toContain(
-        "systemctl --user stop toka-indexer.service",
+        "systemctl --user stop toka-search.service",
       );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports lingering as enabled instead of changing host login state", async () => {
+    await mkdir(path.resolve(".scratch"), { recursive: true });
+    const dir = await mkdtemp(path.resolve(".scratch/loginctl-test-"));
+    try {
+      const shim = path.join(dir, "loginctl");
+      await writeFile(shim, loginctlShimScript());
+      await chmod(shim, 0o755);
+      // The probe `ts install` runs, `--value` and all.
+      const probe = spawnSync(
+        shim,
+        ["show-user", "u", "-p", "Linger", "--value"],
+        {
+          encoding: "utf8",
+        },
+      );
+      expect(probe.status).toBe(0);
+      expect(probe.stdout).toBe("yes\n");
+      const enable = spawnSync(shim, ["enable-linger", "u"], {
+        encoding: "utf8",
+      });
+      expect(enable.status).toBe(0);
+      expect(enable.stdout).toBe("");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -152,29 +207,29 @@ describe.skipIf(process.platform !== "linux")(
       spawnSync("git", ["init", "-q"], { cwd: repo });
       await mkdir(path.join(repo, "test/fixtures"), { recursive: true });
       await writeFile(path.join(repo, "test/fixtures/a.mp4"), "x");
-      // A stand-in for the real binary: records its environment and arguments,
-      // then idles like the app and the indexer do.
+      // Stand-ins for the real binaries: each records its environment and
+      // arguments, then idles like the app and the indexer do.
       const target = path.join(repo, "target");
       await mkdir(path.join(target, "release"), { recursive: true });
-      const fake = path.join(target, "release/toka");
-      // Re-exec node under the binary's own name, as a compiled binary appears
-      // in /proc/<pid>/cmdline.
-      await writeFile(
-        fake,
-        `#!/bin/bash
+      const fake = `#!/bin/bash
 exec -a "$0" node "$(dirname "$0")/fake.mjs" "$@"
-`,
-      );
+`;
+      // Re-exec node under each binary's own name, as a compiled binary
+      // appears in /proc/<pid>/cmdline.
+      for (const name of ["toka", "ts"]) {
+        const binary = path.join(target, "release", name);
+        await writeFile(binary, fake);
+        await chmod(binary, 0o755);
+      }
       await writeFile(
         path.join(target, "release/fake.mjs"),
         `import fs from "node:fs";
-const role = process.argv[2] === "--indexer" ? "indexer" : "app";
+const role = process.argv[2] === "daemon" ? "indexer" : "app";
 fs.writeFileSync(process.env.XDG_DATA_HOME + "/" + role + ".json",
   JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
 setInterval(() => {}, 1000);
 `,
       );
-      await chmod(fake, 0o755);
       env = { ...process.env, CARGO_TARGET_DIR: target };
       delete env.TOKA_ISOLATED_SUPERVISOR;
     });
@@ -204,8 +259,9 @@ setInterval(() => {}, 1000);
       const indexer = JSON.parse(
         await readFile(path.join(home, "data/indexer.json"), "utf8"),
       );
-      expect(indexer.argv).toEqual(["--indexer"]);
+      expect(indexer.argv).toEqual(["daemon", "run"]);
       expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
+      expect(indexer.env.HOME).toBe(home);
       expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
 
       const config = JSON.parse(
@@ -216,6 +272,10 @@ setInterval(() => {}, 1000);
       );
       expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
       await stat(path.join(home, "fixtures/a.mp4"));
+      // Both service shims wait on PATH, so a startup `ts install`
+      // cannot reach the host's systemd or login state.
+      await stat(path.join(home, "bin/systemctl"));
+      await stat(path.join(home, "bin/loginctl"));
 
       expect(run("launch", "--detach").status).not.toBe(0);
 
@@ -238,10 +298,10 @@ setInterval(() => {}, 1000);
         (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
       );
 
-      spawnSync(shim, ["--user", "stop", "toka-indexer.service"]);
+      spawnSync(shim, ["--user", "stop", "toka-search.service"]);
       await vi.waitFor(() => expect(() => process.kill(first, 0)).toThrow());
 
-      spawnSync(shim, ["--user", "start", "toka-indexer.service"], {
+      spawnSync(shim, ["--user", "start", "toka-search.service"], {
         env: isolatedEnv(isolatedPaths(repo, env), env),
       });
       const second = Number(
@@ -249,7 +309,9 @@ setInterval(() => {}, 1000);
       );
       expect(second).not.toBe(first);
       await vi.waitFor(() =>
-        expect(isIsolatedProcess(second, isolatedPaths(repo, env))).toBe(true),
+        expect(isIsolatedIndexerProcess(second, isolatedPaths(repo, env))).toBe(
+          true,
+        ),
       );
       expect(() => process.kill(second, 0)).not.toThrow();
 
@@ -261,7 +323,14 @@ setInterval(() => {}, 1000);
       env.CARGO_TARGET_DIR = path.join(repo, "missing");
       const result = run("launch");
       expect(result.status).toBe(1);
-      expect(result.stderr).toMatch(/No built binary/);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
+    });
+
+    it("refuses to launch when the ts binary is missing", async () => {
+      await rm(path.join(repo, "target/release/ts"));
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
     });
   },
 );

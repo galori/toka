@@ -72,6 +72,7 @@ export function isolatedPaths(worktree, env = process.env) {
     cache: path.join(home, "cache"),
     shimDir: path.join(home, "bin"),
     shim: path.join(home, "bin", "systemctl"),
+    loginctlShim: path.join(home, "bin", "loginctl"),
     shimLog: path.join(home, "run", "systemctl-shim.log"),
     indexerPidFile: path.join(home, "run", "indexer.pid"),
     indexerLog: path.join(home, "run", "indexer.log"),
@@ -82,18 +83,23 @@ export function isolatedPaths(worktree, env = process.env) {
     supervisorLog: path.join(home, "run", "supervisor.log"),
     indexFolders: path.join(home, "config", "toka", "index-folders.json"),
     binary: path.join(targetDir, "release", "toka"),
+    tsBinary: path.join(targetDir, "release", "ts"),
     schemaFile: "src-tauri/gen/schemas/linux-schema.json",
   };
 }
 
 /**
  * The environment an isolated Toka and its indexer run with. The XDG variables
- * give them their own settings, index and logs. The PATH shim keeps either
- * process from reaching the user's `toka-indexer.service` through systemctl.
+ * give them their own settings, index and logs. HOME points at the isolated
+ * home too: `ts install` resolves the legacy service file from it, so the
+ * real home stays untouched. The PATH shims keep either
+ * process from reaching the user's `toka-search.service` through systemctl
+ * or changing host login state through loginctl.
  */
 export function isolatedEnv(paths, base = process.env) {
   return {
     ...base,
+    HOME: paths.home,
     XDG_CONFIG_HOME: paths.config,
     XDG_DATA_HOME: paths.data,
     XDG_CACHE_HOME: paths.cache,
@@ -108,25 +114,26 @@ function quote(text) {
 }
 
 /**
- * A stand-in `systemctl`. The app runs `systemctl --user start|stop
- * toka-indexer.service` on launch and on "reset index"; unshimmed, an isolated
- * instance would stop the user's real indexer. The shim logs each call and acts
- * only on the isolated indexer: `stop` ends it and `start` respawns it if it is
- * not running, as systemd would. Every other call is a no-op that succeeds.
+ * A stand-in `systemctl`. The app runs `ts install` at startup and `toka
+ * restart` stops and starts the service; unshimmed, an isolated instance
+ * would stop the user's real indexer. The shim logs each call and acts
+ * only on the isolated indexer: `stop` ends it and `start` respawns it if
+ * it is not running, as systemd would. Every other call is a no-op that
+ * succeeds.
  */
 export function shimScript(paths) {
   return `#!/bin/sh
 # Installed by scripts/isolated: isolated Toka must never control the real
-# toka-indexer.service. It controls the isolated indexer instead.
+# toka-search.service. It controls the isolated indexer instead.
 PIDFILE=${quote(paths.indexerPidFile)}
 printf '%s systemctl %s\\n' "$(date -Is)" "$*" >> ${quote(paths.shimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
-# A stale pid file may name a recycled PID: only trust it if it is our binary.
-if [ -n "$pid" ] && { ! tr '\\0' '\\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 | grep -qxF ${quote(paths.binary)} || ! tr '\\0' '\\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF ${quote(`XDG_CONFIG_HOME=${paths.config}`)}; }; then
+# A stale pid file may name a recycled PID: only trust it if it is our indexer.
+if [ -n "$pid" ] && { ! tr '\\0' '\\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1 | grep -qxF ${quote(paths.tsBinary)} || ! tr '\\0' '\\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF ${quote(`XDG_CONFIG_HOME=${paths.config}`)}; }; then
   pid=
 fi
 case "$*" in
-  *"stop toka-indexer.service"*)
+  *"stop toka-search.service"*)
     if [ -n "$pid" ]; then
       kill -s TERM -- "-$pid" 2>/dev/null
       # Like the real "systemctl stop", return only once the indexer is gone.
@@ -138,11 +145,32 @@ case "$*" in
       kill -s KILL -- "-$pid" 2>/dev/null
     fi
     ;;
-  *"start toka-indexer.service"*)
+  *"start toka-search.service"*)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      setsid ${quote(paths.binary)} --indexer >> ${quote(paths.indexerLog)} 2>&1 </dev/null &
+      setsid ${quote(paths.tsBinary)} daemon run >> ${quote(paths.indexerLog)} 2>&1 </dev/null &
       echo $! > "$PIDFILE"
     fi
+    ;;
+esac
+exit 0
+`;
+}
+
+/**
+ * A stand-in `loginctl`. `ts install` probes lingering with
+ * `show-user $USER -p Linger --value` and enables it otherwise; unshimmed,
+ * an isolated instance would change the user's real login state. The probe
+ * passes `--value`, so it answers the bare `yes` the real tool prints (and
+ * the probe compares against), reporting lingering as already enabled.
+ * Every other call is a no-op that succeeds.
+ */
+export function loginctlShimScript() {
+  return `#!/bin/sh
+# Installed by scripts/isolated: isolated Toka must never change host login
+# state. Report lingering as already enabled; do nothing otherwise.
+case "$*" in
+  *"show-user"*)
+    echo yes
     ;;
 esac
 exit 0
@@ -161,7 +189,23 @@ export function seedConfig(folderPaths, newId) {
 }
 
 export function indexerArguments() {
-  return ["--indexer"];
+  return ["daemon", "run"];
+}
+
+/**
+ * How the isolated build compiles the `ts` search helper. It runs from
+ * `src-tauri` because the tauri CLI builds from there too (it sets its
+ * working directory to the project dir before invoking cargo), so a
+ * relative `CARGO_TARGET_DIR` resolves under `src-tauri` for both
+ * binaries — matching `isolatedPaths`, and landing `ts` where `launch`
+ * looks. An absolute target dir is unaffected by the cwd either way.
+ */
+export function tsBuildInvocation(paths) {
+  return {
+    command: "cargo",
+    args: ["build", "--release", "-p", "ts"],
+    cwd: path.join(paths.worktree, "src-tauri"),
+  };
 }
 
 /**
@@ -188,7 +232,19 @@ export function isProcessOf(pid, binary, procRoot = "/proc") {
  * app when they share a cargo target directory.
  */
 export function isIsolatedProcess(pid, paths, procRoot = "/proc") {
-  if (!isProcessOf(pid, paths.binary, procRoot)) return false;
+  return isIsolatedBinary(pid, paths, paths.binary, procRoot);
+}
+
+/**
+ * True when `pid` is the worktree's isolated `ts` indexer. The indexer is
+ * a different binary than the app now, so it gets its own check.
+ */
+export function isIsolatedIndexerProcess(pid, paths, procRoot = "/proc") {
+  return isIsolatedBinary(pid, paths, paths.tsBinary, procRoot);
+}
+
+function isIsolatedBinary(pid, paths, binary, procRoot) {
+  if (!isProcessOf(pid, binary, procRoot)) return false;
   try {
     const environment = readFileSync(
       path.join(procRoot, String(pid), "environ"),
@@ -243,7 +299,7 @@ export function readState(paths) {
 export function describeRun(paths, state = readState(paths)) {
   const indexerPid = state ? currentIndexerPid(paths, state) : null;
   const app = state ? isIsolatedProcess(state.appPid, paths) : false;
-  const indexer = state ? isIsolatedProcess(indexerPid, paths) : false;
+  const indexer = state ? isIsolatedIndexerProcess(indexerPid, paths) : false;
   return {
     worktree: paths.worktree,
     name: paths.name,

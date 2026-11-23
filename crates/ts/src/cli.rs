@@ -9,6 +9,7 @@ use toka_search::{
     daemon_state::{self, DaemonActivity, DaemonStatus},
     index_stats::{self, IndexStats},
     owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
+    reset::{ResetReport, ResetTarget},
     search::{MediaType, SearchEngine, SearchFields, SearchRequest, VideoResult, PAGE_SIZE},
     service::{Outcome, ServiceOp},
 };
@@ -19,9 +20,11 @@ use toka_search::{
 /// so readers gate on the exit status.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  candidates <query> Print the raw candidate paths behind a search query\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  reset [--yes]    Remove Toka's search state\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
+const CANDIDATES_USAGE: &str = "Usage: ts candidates <query> [--json]";
+const CANDIDATES_HELP: &str = "Usage: ts candidates <query> [--json]\n\nPrint the raw candidate paths behind a search query: the OR-widened set the search engine filters by fields, media type, and visibility, with recorded renames applied. The Toka app searches through this and filters it with the viewer's own fields; `ts search` runs the same engine's filters itself. Prints one full path per result line, or one JSON document (schema 1) with --json. A missing index reads empty, never created. Changes nothing in the index.\n\nUse -- to ask for text starting with a dash.";
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing in the index.";
 const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
@@ -29,14 +32,14 @@ const STATUS_HELP: &str = "Usage: ts status [--json] [--watch]\n\nShow whether t
 const DAEMON_HELP: &str =
     "Usage: ts daemon <command>\n\nCommands:\n  run   Run the indexer daemon in the foreground";
 const DAEMON_RUN_USAGE: &str = "Usage: ts daemon run";
-const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command. One supervisor owns each index: whichever starts first wins, so a second `ts daemon run` on the same index exits 1 instead of starting. The Toka app takes the same lock, so running a daemon alongside it is safe: the app yields its own watchers with a warning and keeps reading the index.";
-const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]      Add a folder to the index\n  remove <path> [--json]   Remove a folder from the index\n  list [--json]            List the folders the index watches";
+const DAEMON_RUN_HELP: &str = "Usage: ts daemon run\n\nRun the indexer daemon in the foreground until stopped: watching every search folder, generating thumbnails, and publishing a heartbeat for `ts status`. This is the service manager's entry point, not an interactive command. One supervisor owns each index: only `ts daemon run` holds the supervisor lock, so a second one on the same index exits 1 instead of starting. The Toka app supervises nothing — it reaches the index only through `ts` — so running a daemon alongside it is safe.";
+const FOLDERS_HELP: &str = "Usage: ts folders <command>\n\nCommands:\n  add <path> [--json]       Add a folder to the index\n  remove <path|id> [--json] Remove a folder from the index\n  list [--json]             List the folders the index watches";
 const FOLDERS_LIST_USAGE: &str = "Usage: ts folders list [--json]";
 const FOLDERS_LIST_HELP: &str = "Usage: ts folders list [--json]\n\nList the folders the index watches, one per line with its indexing state. Changes nothing in the index.";
 const FOLDERS_ADD_USAGE: &str = "Usage: ts folders add <path> [--json]";
 const FOLDERS_ADD_HELP: &str = "Usage: ts folders add <path> [--json]\n\nAdd a folder to the index, exactly as adding it in the app does. The running indexer picks it up and starts scanning on its own; on macOS with the app quit, the folder waits for the next launch. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to add a path starting with a dash.";
-const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path> [--json]";
-const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
+const FOLDERS_REMOVE_USAGE: &str = "Usage: ts folders remove <path|id> [--json]";
+const FOLDERS_REMOVE_HELP: &str = "Usage: ts folders remove <path|id> [--json]\n\nRemove a folder from the index, exactly as removing it in the app does: its files leave the index and the running indexer stops watching it. Names the folder by path or by the id `ts folders list --json` reports; the id removes folders whose paths are not valid UTF-8, which no shell spelling can name. Prints a confirmation, or one JSON document (schema 1) of the resulting folder state with --json.\n\nUse -- to remove a path starting with a dash.";
 const SYNC_PATH_USAGE: &str = "Usage: ts sync-path <path>";
 const SYNC_PATH_HELP: &str = "Usage: ts sync-path <path>\n\nRefresh one path in the index after it changed on disk, as the app does after a rename, move, or delete. The path must sit under a watched folder; anything else is an error. Prints nothing. A missing index is left alone, exactly as in the app.\n\nUse -- to sync a path starting with a dash.";
 const SYNC_RENAME_USAGE: &str = "Usage: ts sync-rename <from> <to>";
@@ -53,6 +56,8 @@ const RESTART_USAGE: &str = "Usage: ts restart [--json]";
 const RESTART_HELP: &str = "Usage: ts restart [--json]\n\nRestart the indexer service: a stop plus a start, so a stopped service ends up running and `ts status` uptime resets. The service must be installed first. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key. The document covers operation failures after argument validation: usage errors exit 2 with usage text on stderr and no document.";
 const START_USAGE: &str = "Usage: ts start [--json]";
 const START_HELP: &str = "Usage: ts start [--json]\n\nStart the indexer service. Starting what already runs succeeds and says so. The service must be installed first. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key. The document covers operation failures after argument validation: usage errors exit 2 with usage text on stderr and no document.";
+const RESET_USAGE: &str = "Usage: ts reset [--yes] [--json]";
+const RESET_HELP: &str = "Usage: ts reset [--yes] [--json]\n\nPut Toka's search state back to a first-run state. Removes the search index, the thumbnail cache, and Toka's log files; media files are not touched. Without --yes, lists what would be removed and changes nothing. With --yes, stops the indexer service first — when the stop fails, nothing is removed. With --json, prints one JSON document (schema 1): the preview lists `targets`, and --yes reports `removed`, `failures`, and whether the pre-removal stop passed (`indexerStopped`).";
 const STOP_USAGE: &str = "Usage: ts stop [--json]";
 const STOP_HELP: &str = "Usage: ts stop [--json]\n\nStop the indexer service. Stopping what already stopped — or was never installed — succeeds and says so. With --json, a failure prints the partial actions plus an `error` key as one JSON document (schema 1); success documents omit the key. The document covers operation failures after argument validation: usage errors exit 2 with usage text on stderr and no document.";
 
@@ -102,6 +107,7 @@ pub fn run_command(
     read_status: impl FnMut() -> Result<DaemonStatus, String>,
     run_daemon: impl FnOnce() -> Result<(), String>,
     service: impl FnOnce(ServiceOp) -> Result<Outcome, (String, Outcome)>,
+    reset: impl FnOnce(bool) -> Result<ResetEffect, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -130,6 +136,10 @@ pub fn run_command(
             stdout,
             stderr,
         );
+    }
+
+    if command == OsStr::new("candidates") {
+        return run_candidates_command(&arguments[2..], create_engine, stdout, stderr);
     }
 
     if command == OsStr::new("stats") {
@@ -217,8 +227,154 @@ pub fn run_command(
         );
     }
 
+    if command == OsStr::new("reset") {
+        return run_reset_command(&arguments[2..], reset, stdout, stderr);
+    }
+
     let _ = writeln!(stderr, "{GENERAL_HELP}");
     2
+}
+
+/// What one `ts reset` run decided: the targets a preview lists, or the
+/// report an applied reset returns. One injected closure answers both,
+/// told apart by the confirmation flag.
+#[derive(Debug)]
+pub enum ResetEffect {
+    Preview(Vec<ResetTarget>),
+    Applied(ResetReport),
+}
+
+fn run_reset_command(
+    arguments: &[OsString],
+    reset: impl FnOnce(bool) -> Result<ResetEffect, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(RESET_HELP, stdout, stderr);
+    }
+    let Some((confirmed, json)) = parse_reset_arguments(arguments) else {
+        let _ = writeln!(stderr, "{RESET_USAGE}");
+        return 2;
+    };
+    let effect = match reset(confirmed) {
+        Ok(effect) => effect,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts reset: {error}");
+            return 1;
+        }
+    };
+    match effect {
+        ResetEffect::Preview(targets) => print_reset_preview(&targets, json, stdout, stderr),
+        ResetEffect::Applied(report) => print_reset_report(&report, json, stdout, stderr),
+    }
+}
+
+/// Nothing, `--yes`, `--json`, or both: the whole argument language of
+/// `reset`. `None` is a usage error for the caller to report.
+fn parse_reset_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
+    let mut confirmed = false;
+    let mut json = false;
+    for argument in arguments {
+        if argument == OsStr::new("--yes") {
+            confirmed = true;
+        } else if argument == OsStr::new("--json") {
+            json = true;
+        } else {
+            return None;
+        }
+    }
+    Some((confirmed, json))
+}
+
+/// The preview `toka reset` shows: what would go, then the nudge to
+/// confirm. A successful preview exits 0 — it did its job — where the
+/// older `toka reset` preview exits 2; the shape is what mirrors.
+fn print_reset_preview(
+    targets: &[ResetTarget],
+    json: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if json {
+        // Lossy paths, as in thumbnail: non-UTF-8 bytes must not break
+        // encoding of this document.
+        let targets: Vec<String> = targets
+            .iter()
+            .map(|target| target.path.to_string_lossy().into_owned())
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "targets": targets,
+        });
+        return print_json(&document, "ts reset", stdout, stderr);
+    }
+    let wrote = writeln!(stdout, "Reset would remove these, if present:").and_then(|()| {
+        targets
+            .iter()
+            .try_for_each(|target| writeln!(stdout, "  {}", target.path.display()))
+    });
+    if let Err(error) = wrote.and_then(|()| stdout.flush()) {
+        let _ = writeln!(stderr, "ts reset: could not write: {error}");
+        return 1;
+    }
+    let _ = writeln!(
+        stderr,
+        "Nothing was changed. Run `ts reset --yes` to reset."
+    );
+    0
+}
+
+fn print_reset_report(
+    report: &ResetReport,
+    json: bool,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if json {
+        let removed: Vec<String> = report
+            .removed
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "indexerStopped": report.indexer_stopped,
+            "removed": removed,
+            "failures": report.failures,
+        });
+        let status = print_json(&document, "ts reset", stdout, stderr);
+        if status != 0 {
+            return status;
+        }
+        // Failures reach stderr in JSON mode too, as in the service
+        // commands: the document is for parsing, the lines for humans.
+        for failure in &report.failures {
+            let _ = writeln!(stderr, "ts reset: {failure}");
+        }
+        return i32::from(!report.failures.is_empty());
+    }
+    for path in &report.removed {
+        if let Err(error) = writeln!(stdout, "removed {}", path.display()) {
+            let _ = writeln!(stderr, "ts reset: could not write: {error}");
+            return 1;
+        }
+    }
+    for failure in &report.failures {
+        let _ = writeln!(stderr, "ts reset: {failure}");
+    }
+    if !report.failures.is_empty() {
+        return 1;
+    }
+    match writeln!(stdout, "Toka search state was reset.").and_then(|()| stdout.flush()) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts reset: could not write: {error}");
+            1
+        }
+    }
 }
 
 fn run_folders_command(
@@ -409,14 +565,14 @@ fn run_folders_remove_command(
     if paths.is_empty() {
         let _ = writeln!(
             stderr,
-            "Folders remove needs a folder path.\n{FOLDERS_REMOVE_USAGE}"
+            "Folders remove needs a folder path or id.\n{FOLDERS_REMOVE_USAGE}"
         );
         return 2;
     }
     if paths.len() > 1 {
         let _ = writeln!(
             stderr,
-            "Folders remove takes one folder path.\n{FOLDERS_REMOVE_USAGE}"
+            "Folders remove takes one folder path or id.\n{FOLDERS_REMOVE_USAGE}"
         );
         return 2;
     }
@@ -428,7 +584,7 @@ fn run_folders_remove_command(
             return 1;
         }
     };
-    // The app removes by id; the shell names a path, so resolve it to the
+    // The shell names a path or a folder id, so resolve it to the
     // configured folder first. Unlike the app's remove flow — which opens
     // (and thereby creates) the database — a missing index errors here
     // instead: `read_folders` reports no folders when the database file is
@@ -460,12 +616,14 @@ fn run_folders_remove_command(
     }
 }
 
-/// The configured folder `requested` names. The normalized spelling
-/// matches first: recorded entries are canonical absolute paths, and the
-/// normalization also resolves a typed spelling against the current
-/// directory, so a folder deleted from disk — often the very reason to
-/// remove it — still matches what the same shell spelling added. The
-/// spelling as typed only matches when nothing normalized does, so one
+/// The configured folder `requested` names. A folder id matches first:
+/// ids are minted UUIDs no shell spelling collides with, and the id is the
+/// only spelling that can name a folder whose path is not valid UTF-8. The
+/// normalized path matches next: recorded entries are canonical absolute
+/// paths, and the normalization also resolves a typed spelling against the
+/// current directory, so a folder deleted from disk — often the very
+/// reason to remove it — still matches what the same shell spelling added.
+/// The spelling as typed only matches when nothing else does, so one
 /// request can never ambiguously name two rows.
 fn resolve_folder<'a>(
     folders: &'a [OwnedIndexFolder],
@@ -474,7 +632,8 @@ fn resolve_folder<'a>(
     let spelling = toka_search::owned_index::canonical_spelling(requested);
     folders
         .iter()
-        .find(|folder| folder.path == spelling)
+        .find(|folder| OsStr::new(folder.id.as_str()) == requested.as_os_str())
+        .or_else(|| folders.iter().find(|folder| folder.path == spelling))
         .or_else(|| folders.iter().find(|folder| folder.path == requested))
 }
 
@@ -1508,6 +1667,105 @@ fn take_search_number(
         .ok_or_else(|| format!("{flag} needs a positive number, got '{value}'."))
 }
 
+struct CandidatesOptions {
+    query: String,
+    json: bool,
+}
+
+fn run_candidates_command(
+    arguments: &[OsString],
+    create_engine: impl FnOnce() -> Result<SearchEngine, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(CANDIDATES_HELP, stdout, stderr);
+    }
+
+    let options = match parse_candidates_arguments(arguments) {
+        Ok(options) => options,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{CANDIDATES_USAGE}");
+            return 2;
+        }
+    };
+
+    let engine = match create_engine() {
+        Ok(engine) => engine,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts candidates: {error}");
+            return 1;
+        }
+    };
+    let (candidates, revision) = match engine.raw_candidates(&options.query) {
+        Ok(found) => found,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts candidates: {error}");
+            return 1;
+        }
+    };
+    if options.json {
+        // Lossy strings, never `PathBuf`s: real paths can hold
+        // non-UTF-8 bytes on Unix, and those must not break this
+        // document — the same lossy encoding the human output uses.
+        let candidates: Vec<String> = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "query": options.query,
+            "indexRevision": revision,
+            "candidates": candidates,
+        });
+        return print_json(&document, "ts candidates", stdout, stderr);
+    }
+    for path in candidates {
+        if let Err(error) = writeln!(stdout, "{}", path.display()) {
+            let _ = writeln!(stderr, "ts candidates: could not write a result: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "ts candidates: could not write results: {error}");
+        return 1;
+    }
+    0
+}
+
+fn parse_candidates_arguments(arguments: &[OsString]) -> Result<CandidatesOptions, String> {
+    let mut options = CandidatesOptions {
+        query: String::new(),
+        json: false,
+    };
+    let mut words: Vec<&str> = Vec::new();
+    let mut only_words = false;
+    for argument in arguments {
+        let Some(text) = argument.to_str() else {
+            return Err("Candidate terms must be valid text.".to_owned());
+        };
+        if only_words {
+            words.push(text);
+        } else if text == "--" {
+            only_words = true;
+        } else if text == "--json" {
+            options.json = true;
+        } else if text.starts_with('-') {
+            return Err(format!("Unknown option '{text}'."));
+        } else {
+            words.push(text);
+        }
+    }
+    let query = words.join(" ");
+    if query.trim().is_empty() {
+        return Err("Candidates needs a query.".to_owned());
+    }
+    options.query = query;
+    Ok(options)
+}
+
 fn print_text(text: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
     if let Err(error) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
         let _ = writeln!(stderr, "ts: could not write output: {error}");
@@ -1589,6 +1847,10 @@ mod tests {
         panic!("this command must not manage the service")
     }
 
+    fn no_reset(_confirmed: bool) -> Result<super::ResetEffect, String> {
+        panic!("this command must not reset the search state")
+    }
+
     #[test]
     fn version_prefers_the_build_version_over_the_manifest_version() {
         assert_eq!(
@@ -1637,6 +1899,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1646,6 +1909,7 @@ mod tests {
             assert!(output.contains("Usage: ts <command>"), "{output}");
             for command in [
                 "search",
+                "candidates",
                 "stats",
                 "status",
                 "install",
@@ -1653,6 +1917,7 @@ mod tests {
                 "restart",
                 "start",
                 "stop",
+                "reset",
                 "folders",
                 "sync-path",
                 "sync-rename",
@@ -1729,6 +1994,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -1762,6 +2028,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -1796,6 +2063,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1829,6 +2097,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -1878,6 +2147,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -1927,6 +2197,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -1978,6 +2249,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2039,6 +2311,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2089,6 +2362,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2119,6 +2393,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2176,6 +2451,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2222,6 +2498,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2256,6 +2533,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2301,6 +2579,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2363,6 +2642,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2422,6 +2702,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2469,6 +2750,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2511,6 +2793,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2556,6 +2839,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2597,6 +2881,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2646,6 +2931,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2685,6 +2971,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2729,6 +3016,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2765,6 +3053,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2800,6 +3089,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2834,6 +3124,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2875,6 +3166,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -2913,6 +3205,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2952,6 +3245,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -2962,6 +3256,369 @@ mod tests {
             format!("{}\n", video.display())
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_command_prints_the_unfiltered_candidate_paths() {
+        let directory = tempdir().unwrap();
+        let matching = directory.path().join("clip.mp4");
+        let unfiltered = directory.path().join("unrelated.mp4");
+        fs::write(&matching, b"video").unwrap();
+        fs::write(&unfiltered, b"video").unwrap();
+        // A negation the engine would narrow: candidates keep both.
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![
+            matching.clone(),
+            unfiltered.clone(),
+        ])));
+        let args = ["ts", "candidates", "clip", "NOT", "unrelated"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("{}\n{}\n", matching.display(), unfiltered.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_without_a_query_prints_usage() {
+        let args = ["ts", "candidates"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("Candidates needs a query.\n{}\n", super::CANDIDATES_USAGE)
+        );
+    }
+
+    #[test]
+    fn candidates_help_does_not_create_the_search_engine() {
+        for flag in ["--help", "-h"] {
+            let args = ["ts", "candidates", flag].map(OsString::from).to_vec();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            let status = run_command(
+                &args,
+                || panic!("help must not create the search engine"),
+                no_verbose_engine,
+                no_stats,
+                no_folders,
+                no_add_folder,
+                no_remove_folder,
+                no_sync_path,
+                no_sync_rename,
+                no_thumbnail,
+                no_preview,
+                no_status,
+                no_daemon_run,
+                no_service,
+                no_reset,
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(status, 0, "{flag}");
+            assert!(String::from_utf8(stdout)
+                .unwrap()
+                .contains(super::CANDIDATES_USAGE));
+            assert!(stderr.is_empty());
+        }
+    }
+
+    #[test]
+    fn candidates_engine_setup_error_returns_a_failure_status() {
+        let args = ["ts", "candidates", "family"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Err("search index could not be opened".into()),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts candidates: search index could not be opened\n"
+        );
+    }
+
+    #[test]
+    fn candidates_provider_error_returns_a_failure_status() {
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let args = ["ts", "candidates", "family"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 1);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "ts candidates: backend unavailable\n"
+        );
+    }
+
+    #[test]
+    fn candidates_json_prints_a_versioned_document() {
+        let directory = tempdir().unwrap();
+        let videos = (0..2)
+            .map(|number| {
+                let video = directory
+                    .path()
+                    .join(format!("family-trip-{number:02}.mp4"));
+                fs::write(&video, b"video").unwrap();
+                video
+            })
+            .collect::<Vec<_>>();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(videos.clone())));
+        let args = ["ts", "candidates", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["query"], "family");
+        // The fixture provider carries no revision; the real provider's
+        // revision flows through the same field.
+        assert_eq!(document["indexRevision"], 0);
+        assert_eq!(
+            document["candidates"],
+            serde_json::json!([videos[0].to_string_lossy(), videos[1].to_string_lossy(),])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    // Non-UTF-8 names only exist on Unix filesystems, and Linux alone in
+    // practice: macOS (APFS) rejects them at creation, so this scenario
+    // cannot occur there. The lossy conversion itself is platform-neutral.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidates_json_with_non_utf8_names_prints_lossy_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempdir().unwrap();
+        let name = OsString::from_vec(b"family-\xff-trip.mp4".to_vec());
+        let video = directory.path().join(&name);
+        fs::write(&video, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![video.clone()])));
+        let args = ["ts", "candidates", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["candidates"],
+            serde_json::json!([video.to_string_lossy().into_owned()])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_after_a_dash_separator_takes_flags_literally() {
+        let directory = tempdir().unwrap();
+        let video = directory.path().join("--json-fan.mp4");
+        fs::write(&video, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FixtureProvider(vec![video.clone()])));
+        let args = ["ts", "candidates", "--", "--json-fan"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("{}\n", video.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_with_an_unknown_option_is_a_usage_error() {
+        let args = ["ts", "candidates", "family", "--page", "2"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert!(stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!("Unknown option '--page'.\n{}\n", super::CANDIDATES_USAGE)
+        );
     }
 
     fn sample_stats() -> IndexStats {
@@ -3002,6 +3659,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3036,6 +3694,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3082,6 +3741,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3116,6 +3776,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3148,6 +3809,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3172,6 +3834,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3227,6 +3890,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3260,6 +3924,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3306,6 +3971,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3370,6 +4036,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3424,6 +4091,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3463,6 +4131,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3494,6 +4163,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3543,6 +4213,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3581,6 +4252,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3613,6 +4285,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3654,6 +4327,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -3692,6 +4366,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3730,6 +4405,46 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "Removed /media/movies\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn folders_remove_accepts_a_folder_id() {
+        let args = ["ts", "folders", "remove", "abc"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            || Ok(sample_folders()),
+            no_add_folder,
+            |id| {
+                assert_eq!(id, "abc");
+                Ok(sample_state())
+            },
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3783,6 +4498,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3823,6 +4539,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3883,6 +4600,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3918,6 +4636,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3953,6 +4672,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -3992,6 +4712,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4030,6 +4751,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4065,6 +4787,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4101,6 +4824,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4138,6 +4862,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4179,6 +4904,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4215,6 +4941,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4253,6 +4980,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4287,6 +5015,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4329,6 +5058,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4371,6 +5101,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4411,6 +5142,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4449,6 +5181,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4483,6 +5216,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4524,6 +5258,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4559,6 +5294,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4599,6 +5335,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4641,6 +5378,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4679,6 +5417,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4713,6 +5452,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4757,6 +5497,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4797,6 +5538,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4842,6 +5584,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4878,6 +5621,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4912,6 +5656,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -4946,6 +5691,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -4985,6 +5731,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5019,6 +5766,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5116,6 +5864,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5148,6 +5897,7 @@ mod tests {
             || Ok(running_daemon()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5180,6 +5930,7 @@ mod tests {
             || Ok(stopped_daemon()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5217,6 +5968,7 @@ mod tests {
                 || Ok(snapshot.clone()),
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5254,6 +6006,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5287,6 +6040,7 @@ mod tests {
             || Err::<DaemonStatus, _>("the index is locked".to_owned()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5320,6 +6074,7 @@ mod tests {
             || Ok(idle_daemon()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5351,6 +6106,7 @@ mod tests {
             || Ok(stopped_daemon()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5703,6 +6459,7 @@ mod tests {
             || Ok(unknown.clone()),
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5738,6 +6495,7 @@ mod tests {
                 no_status,
                 no_daemon_run,
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5769,6 +6527,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5802,6 +6561,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5836,6 +6596,7 @@ mod tests {
             no_status,
             no_daemon_run,
             no_service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -5873,6 +6634,7 @@ mod tests {
                 no_status,
                 || result.clone(),
                 no_service,
+                no_reset,
                 &mut stdout,
                 &mut stderr,
             );
@@ -5914,6 +6676,7 @@ mod tests {
             no_status,
             no_daemon_run,
             service,
+            no_reset,
             &mut stdout,
             &mut stderr,
         );
@@ -6250,6 +7013,219 @@ mod tests {
                 format!("ts {command}: not installed\n"),
                 "{command}"
             );
+        }
+    }
+
+    fn run_with_reset(
+        arguments: &[&str],
+        reset: impl FnOnce(bool) -> Result<super::ResetEffect, String>,
+    ) -> (i32, String, String) {
+        let args = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            reset,
+            &mut stdout,
+            &mut stderr,
+        );
+        (
+            status,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    fn preview_targets() -> Vec<toka_search::reset::ResetTarget> {
+        use toka_search::reset::ResetTarget;
+        vec![
+            ResetTarget::file(PathBuf::from("/home/test/state/index.sqlite3")),
+            ResetTarget::dir(PathBuf::from("/tmp/toka-thumbnails-1000")),
+        ]
+    }
+
+    fn applied_report() -> toka_search::reset::ResetReport {
+        toka_search::reset::ResetReport {
+            removed: vec![PathBuf::from("/home/test/state/index.sqlite3")],
+            failures: Vec::new(),
+            indexer_stopped: true,
+        }
+    }
+
+    #[test]
+    fn reset_preview_lists_targets_and_changes_nothing() {
+        let (status, stdout, stderr) = run_with_reset(&["ts", "reset"], |confirmed| {
+            assert!(!confirmed);
+            Ok(super::ResetEffect::Preview(preview_targets()))
+        });
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            stdout,
+            "Reset would remove these, if present:\n  /home/test/state/index.sqlite3\n  /tmp/toka-thumbnails-1000\n"
+        );
+        assert_eq!(
+            stderr,
+            "Nothing was changed. Run `ts reset --yes` to reset.\n"
+        );
+    }
+
+    #[test]
+    fn reset_preview_json_prints_a_versioned_document() {
+        let (status, stdout, stderr) = run_with_reset(&["ts", "reset", "--json"], |confirmed| {
+            assert!(!confirmed);
+            Ok(super::ResetEffect::Preview(preview_targets()))
+        });
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["targets"],
+            serde_json::json!([
+                "/home/test/state/index.sqlite3",
+                "/tmp/toka-thumbnails-1000",
+            ])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn reset_with_yes_removes_and_reports() {
+        let (status, stdout, stderr) = run_with_reset(&["ts", "reset", "--yes"], |confirmed| {
+            assert!(confirmed);
+            Ok(super::ResetEffect::Applied(applied_report()))
+        });
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            stdout,
+            "removed /home/test/state/index.sqlite3\nToka search state was reset.\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn reset_with_yes_json_reports_the_stop_and_the_removals() {
+        let (status, stdout, stderr) =
+            run_with_reset(&["ts", "reset", "--yes", "--json"], |confirmed| {
+                assert!(confirmed);
+                Ok(super::ResetEffect::Applied(applied_report()))
+            });
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["indexerStopped"], true);
+        assert_eq!(
+            document["removed"],
+            serde_json::json!(["/home/test/state/index.sqlite3"])
+        );
+        assert_eq!(document["failures"], serde_json::json!([]));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn reset_with_yes_json_reports_a_failed_stop_as_not_stopped() {
+        let (status, stdout, stderr) =
+            run_with_reset(&["ts", "reset", "--json", "--yes"], |confirmed| {
+                assert!(confirmed);
+                Ok(super::ResetEffect::Applied(
+                    toka_search::reset::ResetReport {
+                        removed: Vec::new(),
+                        failures: vec![
+                            "refusing to reset while the indexer may be running.".to_owned()
+                        ],
+                        indexer_stopped: false,
+                    },
+                ))
+            });
+
+        assert_eq!(status, 1);
+        let document: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(document["indexerStopped"], false);
+        assert_eq!(document["removed"], serde_json::json!([]));
+        assert_eq!(document["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            stderr,
+            "ts reset: refusing to reset while the indexer may be running.\n"
+        );
+    }
+
+    #[test]
+    fn reset_with_yes_human_reports_failures_without_a_success_line() {
+        let (status, stdout, stderr) = run_with_reset(&["ts", "reset", "--yes"], |confirmed| {
+            assert!(confirmed);
+            Ok(super::ResetEffect::Applied(
+                toka_search::reset::ResetReport {
+                    removed: vec![PathBuf::from("/home/test/state/index.sqlite3")],
+                    failures: vec!["could not remove /home/test/logs: busy".to_owned()],
+                    indexer_stopped: true,
+                },
+            ))
+        });
+
+        assert_eq!(status, 1);
+        assert_eq!(stdout, "removed /home/test/state/index.sqlite3\n");
+        assert_eq!(stderr, "ts reset: could not remove /home/test/logs: busy\n");
+    }
+
+    #[test]
+    fn reset_plan_error_exits_1_without_a_preview() {
+        for arguments in [vec!["ts", "reset"], vec!["ts", "reset", "--yes"]] {
+            let (status, stdout, stderr) = run_with_reset(&arguments, |_| {
+                Err("Toka could not find a place for its search index.".to_owned())
+            });
+            assert_eq!(status, 1, "{arguments:?}");
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert_eq!(
+                stderr, "ts reset: Toka could not find a place for its search index.\n",
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_rejects_anything_but_yes_and_json() {
+        for arguments in [
+            vec!["ts", "reset", "--link"],
+            vec!["ts", "reset", "extra"],
+            vec!["ts", "reset", "--yes", "--yes", "extra"],
+        ] {
+            let (status, stdout, stderr) = run_with_reset(&arguments, no_reset);
+            assert_eq!(status, 2, "{arguments:?}");
+            assert!(stdout.is_empty(), "{arguments:?}");
+            assert!(
+                stderr.contains("Usage: ts reset [--yes] [--json]"),
+                "{arguments:?}: {stderr}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_help_does_not_plan_the_reset() {
+        for flag in ["-h", "--help"] {
+            let (status, stdout, stderr) = run_with_reset(&["ts", "reset", flag], no_reset);
+            assert_eq!(status, 0, "{flag}");
+            assert!(
+                stdout.contains("Usage: ts reset [--yes] [--json]"),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty(), "{flag}");
         }
     }
 }

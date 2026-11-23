@@ -8,7 +8,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
@@ -684,7 +684,7 @@ impl IndexUpdates for OwnedIndexUpdates {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OwnedFolderStatus {
     Pending,
@@ -696,7 +696,7 @@ pub enum OwnedFolderStatus {
 
 /// One directory the indexer has visited, with what it found directly in it.
 /// `scanning` is true for the directory being read right now.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScannedDirectory {
     #[serde(serialize_with = "crate::lossy_path::serialize")]
@@ -707,7 +707,7 @@ pub struct ScannedDirectory {
     pub subfolders: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedIndexFolder {
     pub id: String,
@@ -728,7 +728,7 @@ pub struct OwnedIndexFolder {
     pub recent_directories: Vec<ScannedDirectory>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedIndexState {
     pub supported: bool,
@@ -6422,6 +6422,24 @@ mod tests {
             Some(&serde_json::Value::Array(Vec::new())),
             "recentDirectories should serialize as an empty list, saw {folder}"
         );
+    }
+
+    #[test]
+    fn index_state_round_trips_through_the_json_contract() {
+        // The app parses `ts folders` documents back into this shape, so
+        // serialization must be reversible — not just well-formed.
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let manager =
+            OwnedIndexManager::under(directory.path().join("state").join("index.sqlite3"));
+        manager.add_folder(&root).unwrap();
+
+        let state = manager.state().unwrap();
+        let json = serde_json::to_value(&state).unwrap();
+        let back: OwnedIndexState = serde_json::from_value(json).unwrap();
+
+        assert_eq!(back, state);
     }
 
     #[test]

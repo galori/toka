@@ -35,9 +35,10 @@ npm run build:linux:install
 This installs Toka into `~/.local/opt/toka` and registers a desktop entry, so it
 appears in the Applications menu and can be launched from there. No `sudo` is
 needed, and nothing outside your home directory is touched. It also links the
-`toka` command into `~/.local/bin` and enables `toka-indexer.service` for the
-current user. The service runs while you are logged in; it does not enable
-systemd lingering.
+`toka` and `ts` commands into `~/.local/bin` and runs `ts install`, which
+enables the `toka-search.service` user service for the current user. The
+service runs while you are logged in; `ts install` also attempts to enable
+systemd lingering so indexing can continue while logged out.
 
 Add `-- --appimage` to build and install a self-contained AppImage instead. That
 is what you want when copying Toka to another machine; it takes about 90 seconds
