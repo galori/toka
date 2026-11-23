@@ -4,11 +4,36 @@ use std::path::PathBuf;
 
 pub struct OwnedIndexSearchProvider {
     database: PathBuf,
+    read_only: bool,
 }
 
 impl OwnedIndexSearchProvider {
     pub fn new(database: PathBuf) -> Self {
-        Self { database }
+        Self {
+            database,
+            read_only: false,
+        }
+    }
+
+    /// A provider for `ts` searches that must leave the index unchanged:
+    /// every open is read-only, so a version 1 database is never
+    /// migrated and stays usable by a version 1 app. The app keeps the
+    /// migrating [`OwnedIndexSearchProvider::new`]. (SQLite may still
+    /// touch `-wal`/`-shm` sidecars beside the database while reading.)
+    pub fn new_read_only(database: PathBuf) -> Self {
+        Self {
+            database,
+            read_only: true,
+        }
+    }
+
+    fn open_index(&self) -> Result<crate::owned_index::OwnedIndex, SearchError> {
+        let index = if self.read_only {
+            crate::owned_index::OwnedIndex::open_read_only(&self.database)
+        } else {
+            crate::owned_index::OwnedIndex::open(&self.database)
+        };
+        index.map_err(|error| SearchError::Provider(error.to_string()))
     }
 }
 
@@ -20,13 +45,16 @@ impl SearchProvider for OwnedIndexSearchProvider {
         _context: &SearchLogContext,
     ) -> Result<Vec<PathBuf>, SearchError> {
         let terms = query_terms(query)?;
-        crate::owned_index::OwnedIndex::open(&self.database)
-            .and_then(|index| index.search_candidates(&terms))
+        self.open_index()?
+            .search_candidates(&terms)
             .map_err(|error| SearchError::Provider(error.to_string()))
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
-        let roots = crate::owned_index::root_paths(&self.database)
+        let roots = self
+            .open_index()?
+            .roots()
+            .map(|roots| roots.into_iter().map(|(_, path)| path).collect::<Vec<_>>())
             .map_err(|error| SearchError::Provider(error.to_string()))?;
         paths.retain(|path| {
             roots.iter().any(|root| {
@@ -39,7 +67,13 @@ impl SearchProvider for OwnedIndexSearchProvider {
     }
 
     fn revision(&self) -> u64 {
-        crate::owned_index::index_revision(&self.database).unwrap_or(0)
+        self.open_index()
+            .and_then(|index| {
+                index
+                    .revision()
+                    .map_err(|error| SearchError::Provider(error.to_string()))
+            })
+            .unwrap_or(0)
     }
 }
 

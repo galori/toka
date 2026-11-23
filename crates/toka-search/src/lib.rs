@@ -6,6 +6,7 @@
 //! `ts` shell utility will do the same.
 
 pub mod config;
+pub mod daemon_state;
 pub mod index_stats;
 pub mod indexer_daemon;
 pub mod lossy_path;

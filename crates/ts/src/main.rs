@@ -7,6 +7,7 @@ use std::{
 #[cfg(not(feature = "fixtures"))]
 use toka_search::providers::OwnedIndexSearchProvider;
 use toka_search::{
+    daemon_state::DaemonStatus,
     index_stats::IndexStats,
     owned_index::{
         self, IndexUpdates, OwnedIndexFolder, OwnedIndexManager, OwnedIndexState,
@@ -63,7 +64,7 @@ fn search_provider() -> Result<Arc<dyn SearchProvider>, String> {
     }
     #[cfg(not(feature = "fixtures"))]
     {
-        Ok(Arc::new(OwnedIndexSearchProvider::new(
+        Ok(Arc::new(OwnedIndexSearchProvider::new_read_only(
             owned_index::database_path()?,
         )))
     }
@@ -73,13 +74,20 @@ fn create_engine_with_logger(logger: SearchLogger) -> Result<SearchEngine, Strin
     // A missing index searches empty instead of being created: opening it
     // would write a database and locking the rename overlay would write a
     // lock file, and a read-only command must leave no state behind. No
-    // overlay path either, so nothing is ever locked or persisted.
+    // overlay path either, so nothing is ever locked or persisted. Only a
+    // truly missing index reads empty, though: any other metadata failure
+    // (permissions, I/O) is an error, and a non-file at the index path is
+    // a broken setup — `is_file` answers false for all three, which used
+    // to report every metadata failure as a healthy-empty search.
     #[cfg(not(feature = "fixtures"))]
-    if !owned_index::database_path()?.is_file() {
-        return Ok(SearchEngine::new_with_logger(
-            Arc::new(EmptyProvider),
-            Arc::new(logger),
-        ));
+    {
+        let database = owned_index::database_path()?;
+        if !owned_index::index_file_for_inspection(&database)? {
+            return Ok(SearchEngine::new_with_logger(
+                Arc::new(EmptyProvider),
+                Arc::new(logger),
+            ));
+        }
     }
     let provider = search_provider()?;
     let rename_overlay_path = Some(owned_index::search_rename_overlay_path()?);
@@ -100,11 +108,21 @@ fn create_verbose_engine() -> Result<SearchEngine, String> {
 }
 
 fn read_index_stats() -> Result<IndexStats, String> {
-    OwnedIndexManager::for_inspection()?.stats()
+    OwnedIndexManager::for_read_only_inspection()?.stats()
+}
+
+fn read_status() -> Result<DaemonStatus, String> {
+    toka_search::daemon_state::read_status(&owned_index::database_path()?)
+}
+
+/// Runs the indexer daemon in the foreground: the same supervisor loop
+/// `toka --indexer` runs, so either entry point keeps the index fresh.
+fn run_daemon() -> Result<(), String> {
+    toka_search::indexer_daemon::run_daemon()
 }
 
 fn read_folders() -> Result<Vec<OwnedIndexFolder>, String> {
-    OwnedIndexManager::for_inspection()?.folders()
+    OwnedIndexManager::for_read_only_inspection()?.folders()
 }
 
 /// Adds a folder exactly as the app does: the manager inserts the `roots`
@@ -196,6 +214,8 @@ fn main() {
         sync_rename,
         make_thumbnail,
         make_preview,
+        read_status,
+        run_daemon,
         &mut stdout,
         &mut stderr,
     );

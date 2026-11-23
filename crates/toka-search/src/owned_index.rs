@@ -2,24 +2,32 @@ use crate::{
     index_visibility,
     search::{is_supported_image, is_supported_video},
     tags,
+    timestamp::{now_ns, time_ns},
 };
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const REPAIR_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Media files committed per scan transaction.
+const SCAN_BATCH_SIZE: usize = 128;
 
 const SCHEMA: &str = r#"
 CREATE TABLE schema_meta (
@@ -28,7 +36,7 @@ CREATE TABLE schema_meta (
 ) WITHOUT ROWID;
 
 INSERT INTO schema_meta (key, value) VALUES
-    ('schema_version', 1),
+    ('schema_version', 2),
     ('index_revision', 0);
 
 CREATE TABLE roots (
@@ -122,6 +130,7 @@ CREATE TABLE scan_runs (
     folders_discovered INTEGER NOT NULL DEFAULT 0,
     folders_scanned INTEGER NOT NULL DEFAULT 0,
     files_discovered INTEGER NOT NULL DEFAULT 0,
+    files_indexable INTEGER NOT NULL DEFAULT 0,
     files_indexed INTEGER NOT NULL DEFAULT 0,
     videos_indexed INTEGER NOT NULL DEFAULT 0,
     images_indexed INTEGER NOT NULL DEFAULT 0,
@@ -143,6 +152,44 @@ CREATE TABLE repair_queue (
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT
 ) WITHOUT ROWID;
+
+CREATE TABLE daemon_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pid INTEGER NOT NULL,
+    started_at_ns INTEGER NOT NULL,
+    heartbeat_at_ns INTEGER NOT NULL,
+    activity TEXT NOT NULL CHECK (activity IN ('idle', 'scanning', 'repairing', 'thumbnails', 'offline-waiting')),
+    current_root BLOB,
+    current_path BLOB,
+    pending_roots INTEGER NOT NULL DEFAULT 0,
+    files_remaining INTEGER NOT NULL DEFAULT 0,
+    pending_repairs INTEGER NOT NULL DEFAULT 0,
+    pending_thumbnails INTEGER NOT NULL DEFAULT 0
+);
+"#;
+
+/// Version 1 databases predate the daemon liveness row and the indexable
+/// file counter; the migration only adds the table and the column, so
+/// existing roots, files, and scan progress survive untouched and no
+/// re-index is required.
+const MIGRATION_1_TO_2: &str = r#"
+ALTER TABLE scan_runs ADD COLUMN files_indexable INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE daemon_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    pid INTEGER NOT NULL,
+    started_at_ns INTEGER NOT NULL,
+    heartbeat_at_ns INTEGER NOT NULL,
+    activity TEXT NOT NULL CHECK (activity IN ('idle', 'scanning', 'repairing', 'thumbnails', 'offline-waiting')),
+    current_root BLOB,
+    current_path BLOB,
+    pending_roots INTEGER NOT NULL DEFAULT 0,
+    files_remaining INTEGER NOT NULL DEFAULT 0,
+    pending_repairs INTEGER NOT NULL DEFAULT 0,
+    pending_thumbnails INTEGER NOT NULL DEFAULT 0
+);
+
+UPDATE schema_meta SET value = 2 WHERE key = 'schema_version';
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -173,6 +220,8 @@ pub enum OwnedIndexError {
     WorkerStopped,
     #[error("Toka could not fully scan {path}: {failures} path read failed.")]
     IncompleteScan { path: String, failures: u64 },
+    #[error("Toka stopped indexing {path} early.")]
+    Cancelled { path: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -210,6 +259,7 @@ pub struct ScanProgress {
     pub folders_discovered: u64,
     pub folders_scanned: u64,
     pub files_discovered: u64,
+    pub files_indexable: u64,
     pub files_indexed: u64,
     pub videos_indexed: u64,
     pub images_indexed: u64,
@@ -240,6 +290,7 @@ impl ScanProgress {
             folders_discovered: 1,
             folders_scanned: 0,
             files_discovered: 0,
+            files_indexable: 0,
             files_indexed: 0,
             videos_indexed: 0,
             images_indexed: 0,
@@ -321,6 +372,12 @@ impl IndexedFile {
 pub struct OwnedIndex {
     connection: Connection,
     path: PathBuf,
+    /// The `user_version` this handle opened at. A migrating open always
+    /// normalizes to [`SCHEMA_VERSION`]; a read-only open keeps whatever it
+    /// found, so readers can tolerate older schemas (no `daemon_state`
+    /// table or `files_indexable` column on version 1, no tables at all on
+    /// a version 0 empty file) instead of erroring on them.
+    opened_version: i64,
 }
 
 /// A root's recorded mount columns. `None` fields mean nothing was recorded
@@ -557,7 +614,8 @@ impl OwnedIndexUpdates {
                 if *healed != *recorded {
                     index.migrate_root_spelling(root_id, recorded, healed)?;
                 }
-                index.synchronize_path(root_id, healed, &path)?;
+                // A one-shot CLI sync has no stop request to honor.
+                index.synchronize_path(root_id, healed, &path, &AtomicBool::new(false))?;
                 matched = true;
             }
         }
@@ -607,7 +665,8 @@ impl OwnedIndexUpdates {
                 if *healed != *recorded {
                     index.migrate_root_spelling(root_id, recorded, healed)?;
                 }
-                index.synchronize_rename(root_id, healed, &from, &to)?;
+                // A one-shot CLI sync has no stop request to honor.
+                index.synchronize_rename(root_id, healed, &from, &to, &AtomicBool::new(false))?;
                 Ok(SyncOutcome::Matched)
             }
             None => Ok(SyncOutcome::Unmatched),
@@ -683,7 +742,12 @@ pub struct OwnedIndexState {
 pub struct OwnedIndexManager {
     database: PathBuf,
     watch: bool,
+    read_only: bool,
     watchers: Mutex<HashMap<String, ManagedRootWatcher>>,
+    // Behind a mutex: a manager that yielded to a running daemon retries
+    // the acquisition on every reconcile, so supervision resumes here
+    // once the daemon stops.
+    daemon_guard: Mutex<Option<crate::indexer_daemon::DaemonLock>>,
 }
 
 struct ManagedRootWatcher {
@@ -691,10 +755,70 @@ struct ManagedRootWatcher {
     watcher: OwnedIndexWatcher,
 }
 
+/// Whether an inspectable index file exists: only a truly missing index
+/// reads empty. Any other metadata failure (permissions, I/O) is an
+/// error, and a non-file at the index path is a broken setup, not an
+/// empty index — `is_file` answers false for all three, which used to
+/// report every metadata failure as a healthy-empty index with exit 0.
+/// The single taxonomy for every read command (`ts` and status alike),
+/// so the exit codes cannot drift apart again.
+pub fn index_file_for_inspection(database: &Path) -> Result<bool, String> {
+    match fs::metadata(database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Toka could not read its search index: {error}")),
+        Ok(metadata) if !metadata.is_file() => Err(format!(
+            "Toka's search index path is not a file: {}",
+            database.display()
+        )),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// Creates (and secures) the index parent, so acquiring the daemon lock
+/// never fails on a missing folder after a reset wipes it. Both the
+/// startup acquisition and a yielded manager's re-acquisition go through
+/// here: the lock file lives beside the index, and either path can run
+/// with the whole folder gone.
+pub(crate) fn ensure_index_parent(database: &Path) -> Result<(), String> {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            OwnedIndexError::Permissions {
+                path: parent.display().to_string(),
+                source,
+            }
+            .to_string()
+        })?;
+        secure_directory(parent).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 impl OwnedIndexManager {
     #[cfg(any(target_os = "macos", test))]
     pub fn system() -> Result<Self, String> {
-        let manager = Self::new(database_path()?, true);
+        Self::system_under(database_path()?)
+    }
+
+    /// A watching manager on an explicit database: what `system` starts,
+    /// and what tests supervise without touching the real index.
+    #[cfg(any(target_os = "macos", test))]
+    fn system_under(database: PathBuf) -> Result<Self, String> {
+        // Create (and secure) the lock's parent first, so a first launch
+        // — or a post-reset one, where the whole folder is gone — never
+        // fails opening the lock. Acquisition itself still happens before
+        // any watcher starts.
+        ensure_index_parent(&database)?;
+        // One supervisor per index: when a `ts` daemon already runs here,
+        // the app leaves supervision to it instead of interleaving scan
+        // generations with its own watchers.
+        let daemon_guard = crate::indexer_daemon::try_acquire_daemon_lock(&database)?;
+        if daemon_guard.is_none() {
+            eprintln!(
+                "Toka's indexer daemon is already running: leaving search folder supervision to it."
+            );
+        }
+        let mut manager = Self::new(database, true);
+        manager.daemon_guard = Mutex::new(daemon_guard);
         manager.restore_watchers();
         Ok(manager)
     }
@@ -702,6 +826,27 @@ impl OwnedIndexManager {
     /// A manager for reading the index without starting watchers.
     pub fn for_inspection() -> Result<Self, String> {
         Ok(Self::new(database_path()?, false))
+    }
+
+    /// A manager for `ts` reads that must leave the index unchanged:
+    /// every open is read-only, so a version 1 database is never
+    /// migrated and stays usable by a version 1 app. Anything that
+    /// writes through this manager fails loudly on the query-only
+    /// connection instead of slipping through; `ts` wires only its read
+    /// commands to it. (SQLite may still touch `-wal`/`-shm` sidecars
+    /// beside the database while reading.)
+    pub fn for_read_only_inspection() -> Result<Self, String> {
+        let mut manager = Self::new(database_path()?, false);
+        manager.read_only = true;
+        Ok(manager)
+    }
+
+    /// A read-only manager on an explicit database, for tests. Mirrors
+    /// [`under`]: no watchers, and every open read-only.
+    pub fn under_read_only(database: PathBuf) -> Self {
+        let mut manager = Self::new(database, false);
+        manager.read_only = true;
+        manager
     }
 
     // Unconditional (not just `cfg(test)`): the app's tests build managers
@@ -716,8 +861,24 @@ impl OwnedIndexManager {
         Self {
             database,
             watch,
+            read_only: false,
             watchers: Mutex::new(HashMap::new()),
+            daemon_guard: Mutex::new(None),
         }
+    }
+
+    /// Whether this manager runs its own watchers: a system manager yields
+    /// to a running `ts` daemon, which holds the same lock. Reads keep
+    /// working either way; only supervision is skipped.
+    fn supervises_watchers(&self) -> Result<bool, String> {
+        if !self.watch {
+            return Ok(false);
+        }
+        let guard = self
+            .daemon_guard
+            .lock()
+            .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
+        Ok(guard.is_some())
     }
 
     #[cfg(any(target_os = "macos", test))]
@@ -799,7 +960,7 @@ impl OwnedIndexManager {
     /// The search folders and their indexing state. Inspecting must not
     /// create an index that does not exist yet.
     pub fn folders(&self) -> Result<Vec<OwnedIndexFolder>, String> {
-        if !self.database.is_file() {
+        if !index_file_for_inspection(&self.database)? {
             return Ok(Vec::new());
         }
         Ok(self.state()?.folders)
@@ -809,7 +970,7 @@ impl OwnedIndexManager {
     pub fn stats(&self) -> Result<crate::index_stats::IndexStats, String> {
         use crate::index_stats::{FolderState, FolderStats, IndexStats};
         // Inspecting must not create an index that does not exist yet.
-        if !self.database.is_file() {
+        if !index_file_for_inspection(&self.database)? {
             return Ok(IndexStats {
                 revision: 0,
                 videos: 0,
@@ -900,7 +1061,7 @@ impl OwnedIndexManager {
             id
         };
 
-        if self.watch {
+        if self.supervises_watchers()? {
             match OwnedIndexWatcher::start(&self.database, id.clone(), root.clone()) {
                 Ok(watcher) => {
                     watchers.insert(
@@ -945,11 +1106,32 @@ impl OwnedIndexManager {
     }
 
     fn open(&self) -> Result<OwnedIndex, OwnedIndexError> {
-        OwnedIndex::open(&self.database)
+        if self.read_only {
+            OwnedIndex::open_read_only(&self.database)
+        } else {
+            OwnedIndex::open(&self.database)
+        }
     }
 
     fn ensure_watchers(&self) -> Result<(), String> {
-        if !self.watch {
+        // A manager that yielded to a running daemon retries the lock on
+        // every pass: once the daemon stops, this manager takes over
+        // supervision instead of leaving the folders unwatched for life.
+        // Watchers only (re)start below, after the lock is held. The
+        // parent is ensured first, exactly as at startup: a reset while
+        // yielded wipes the lock's folder, and without this the
+        // re-acquisition errors ENOENT on every poll until restart.
+        if self.watch {
+            let mut guard = self
+                .daemon_guard
+                .lock()
+                .map_err(|_| "Toka's search folder manager is unavailable.".to_owned())?;
+            if guard.is_none() {
+                ensure_index_parent(&self.database)?;
+                *guard = crate::indexer_daemon::try_acquire_daemon_lock(&self.database)?;
+            }
+        }
+        if !self.supervises_watchers()? {
             return Ok(());
         }
         let mut watchers = self
@@ -1025,19 +1207,267 @@ pub fn search_rename_overlay_path() -> Result<PathBuf, String> {
     Ok(database_path()?.with_file_name("search-renames.json"))
 }
 
-pub(crate) fn root_paths(database: &Path) -> Result<Vec<PathBuf>, OwnedIndexError> {
-    OwnedIndex::open(database)?
-        .roots()
-        .map(|roots| roots.into_iter().map(|(_, path)| path).collect())
+/// Opens a write transaction, taking the write lock up front. Deferred
+/// transactions read first and upgrade on their first write — and when
+/// that upgrade collides with another writer's commit (the daemon
+/// heartbeat, a concurrent scan), the upgrade dies of BUSY_SNAPSHOT
+/// instead of waiting out the busy timeout. Writers queue behind each
+/// other here instead, which is what the timeout is for.
+fn write_transaction(connection: &mut Connection) -> Result<Transaction<'_>, OwnedIndexError> {
+    connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(OwnedIndexError::from)
 }
 
-pub(crate) fn index_revision(database: &Path) -> Result<u64, OwnedIndexError> {
-    OwnedIndex::open(database)?.revision()
+/// Whether a SQLite error is a lock conflict worth retrying.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == rusqlite::ErrorCode::DatabaseBusy
+    )
+}
+
+/// Switches the database to WAL mode, retrying while a racing opener
+/// holds the write lock. Unlike ordinary statements, `PRAGMA journal_mode`
+/// does not honor the connection's busy timeout: it needs an EXCLUSIVE
+/// lock and reports SQLITE_BUSY at once when a concurrent first-opener is
+/// mid-migration, so the retry lives at this layer instead. Bounded like
+/// the busy timeout, so a wedged lock still surfaces as an error.
+fn set_wal_mode(connection: &Connection) -> Result<(), rusqlite::Error> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(error) if is_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Where a sync-step probe fired: after one file's write transaction
+/// committed during a sync, or while planning / rewriting an in-root
+/// rename. Only constructed in tests; production builds never fire one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum SyncProbeSite {
+    /// One file committed during `try_synchronize_path`, including files
+    /// a directory walk reaches one by one.
+    FileCommitted,
+    /// One indexed row planned during `try_synchronize_rename`.
+    RenamePlanned,
+    /// One planned move rewritten during `try_synchronize_rename`.
+    RenameRewritten,
+    /// One media batch committed during a scan (`scan_root_in_batches`).
+    /// Unlike [`SyncProbeSite::FileCommitted`], which fires in the
+    /// single-path syncs, this is the hook scans offer: scans batch
+    /// their writes and never pass through `try_synchronize_path`.
+    ScanBatchCommitted,
+}
+
+/// Test-only probe fired at sync boundaries (see [`SyncProbeSite`]), so
+/// cancellation tests can handshake with the worker at a commit or
+/// planning boundary instead of polling the database. Thread-local, so
+/// tests running in parallel never observe each other's probes;
+/// production builds keep only the no-op [`fire_sync_probe`] shell.
+#[cfg(test)]
+type SyncStepProbeSlot = std::cell::RefCell<Option<Box<dyn Fn(SyncProbeSite)>>>;
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_STEP_PROBE: SyncStepProbeSlot = const { SyncStepProbeSlot::new(None) };
+}
+
+/// Installs `probe` on this thread while `run` executes, removing it
+/// afterwards even when `run` panics. Only the calling thread observes
+/// the probe: a worker thread installs its own.
+#[cfg(test)]
+pub(crate) fn with_sync_step_probe<R>(
+    probe: impl Fn(SyncProbeSite) + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SYNC_STEP_PROBE.with(|slot| slot.borrow_mut().take());
+        }
+    }
+    SYNC_STEP_PROBE.with(|slot| *slot.borrow_mut() = Some(Box::new(probe)));
+    let _guard = Guard;
+    run()
+}
+
+/// Process-wide probe fired alongside the thread-local one, but only
+/// for a single root id: watcher-driven scans run on worker threads
+/// tests cannot reach, so timing-window tests handshake here instead
+/// of racing wall clocks. Parallel tests use distinct root ids and
+/// never observe each other's probes. Test-only; production builds
+/// keep just the no-op shell below.
+#[cfg(test)]
+static GLOBAL_SYNC_PROBE: std::sync::Mutex<Option<GlobalSyncProbe>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Clone)]
+struct GlobalSyncProbe {
+    root_id: String,
+    // Shared so the slot lock is never held while a probe runs: a
+    // gated probe blocks, and blocking under the lock would stall
+    // every other test's worker at its own probe fires.
+    probe: std::sync::Arc<dyn Fn(SyncProbeSite) + Send + Sync>,
+}
+
+/// Installs a process-wide probe for one root id; see
+/// [`GLOBAL_SYNC_PROBE`]. Replaces any previous installation.
+#[cfg(test)]
+pub(crate) fn set_global_sync_probe(
+    root_id: &str,
+    probe: impl Fn(SyncProbeSite) + Send + Sync + 'static,
+) {
+    *GLOBAL_SYNC_PROBE.lock().unwrap() = Some(GlobalSyncProbe {
+        root_id: root_id.to_owned(),
+        probe: std::sync::Arc::new(probe),
+    });
+}
+
+/// Removes the process-wide probe. Tests that install one must call
+/// this before returning, so a later test never trips on a stale gate.
+#[cfg(test)]
+pub(crate) fn clear_global_sync_probe() {
+    GLOBAL_SYNC_PROBE.lock().unwrap().take();
+}
+
+/// Runs `run` with a process-wide probe installed for one root id,
+/// removing it afterwards even when `run` panics — the scoped form
+/// tests should prefer over manual set/clear.
+#[cfg(test)]
+pub(crate) fn with_global_sync_probe<R>(
+    root_id: &str,
+    probe: impl Fn(SyncProbeSite) + Send + Sync + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            clear_global_sync_probe();
+        }
+    }
+    set_global_sync_probe(root_id, probe);
+    let _guard = Guard;
+    run()
+}
+
+#[cfg(test)]
+fn fire_sync_probe(root_id: &str, site: SyncProbeSite) {
+    SYNC_STEP_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow().as_ref() {
+            probe(site);
+        }
+    });
+    let gated = GLOBAL_SYNC_PROBE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|installed| installed.clone()));
+    if let Some(installed) = gated {
+        if installed.root_id == root_id {
+            (installed.probe)(site);
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn fire_sync_probe(_root_id: &str, _site: SyncProbeSite) {}
+
+/// What a watcher's worker thread is doing between filesystem events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerStage {
+    Scanning,
+    Repairing,
+    Watching,
+}
+
+/// A watcher's live state for the daemon heartbeat: its current stage plus
+/// the latest scan progress it reported.
+#[derive(Clone, Debug)]
+pub(crate) struct WatcherLive {
+    pub stage: WorkerStage,
+    pub last_progress: Option<ScanProgress>,
+}
+
+impl Default for WatcherLive {
+    fn default() -> Self {
+        Self {
+            stage: WorkerStage::Watching,
+            last_progress: None,
+        }
+    }
+}
+
+/// What a watcher shares with its worker thread: the flag `stop` sets so
+/// a scan or repair in progress aborts promptly, and the live snapshot
+/// the daemon heartbeat reads.
+#[derive(Clone)]
+pub(crate) struct WorkerShared {
+    cancel: Arc<AtomicBool>,
+    live: Arc<Mutex<WatcherLive>>,
+}
+
+impl WorkerShared {
+    fn new() -> Self {
+        Self {
+            cancel: Arc::new(AtomicBool::new(false)),
+            live: Arc::new(Mutex::new(WatcherLive::default())),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// The flag to hand to cancellable scan and repair calls.
+    fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    fn set_stage(&self, stage: WorkerStage) {
+        set_stage(&self.live, stage);
+    }
+
+    fn record_progress(&self, progress: &ScanProgress) {
+        if let Ok(mut live) = self.live.lock() {
+            live.last_progress = Some(progress.clone());
+        }
+    }
+
+    fn snapshot(&self) -> WatcherLive {
+        self.live
+            .lock()
+            .map(|live| live.clone())
+            .unwrap_or_default()
+    }
 }
 
 pub(crate) struct OwnedIndexWatcher {
     stop: mpsc::Sender<()>,
     worker: Option<JoinHandle<Result<(), OwnedIndexError>>>,
+    shared: WorkerShared,
+}
+
+/// Records a worker stage transition. Advisory only: a poisoned lock keeps
+/// the last-known stage rather than crashing the worker. Entering the
+/// repair stage drops the last scan's progress, so the heartbeat never
+/// reports a stale file as the repair's current path; progress a repair
+/// itself reports repopulates it.
+fn set_stage(live: &Mutex<WatcherLive>, stage: WorkerStage) {
+    if let Ok(mut live) = live.lock() {
+        live.stage = stage;
+        if stage == WorkerStage::Repairing {
+            live.last_progress = None;
+        }
+    }
 }
 
 impl OwnedIndexWatcher {
@@ -1100,12 +1530,47 @@ impl OwnedIndexWatcher {
         K: Send + 'static,
     {
         let (stop, stop_receiver) = mpsc::channel();
+        let shared = WorkerShared::new();
+        let worker_shared = shared.clone();
+        // Every progress report updates the live snapshot first, so the
+        // daemon heartbeat always shows what the scan last saw.
+        let progress_shared = shared.clone();
+        let mut on_progress = move |progress: &ScanProgress| {
+            progress_shared.record_progress(progress);
+            on_progress(progress);
+        };
         let worker = thread::Builder::new()
             .name(format!("toka-index-{root_id}"))
             .spawn(move || {
                 let _keepalive = keepalive;
-                index.scan_root(&root_id, &root, |progress| on_progress(progress))?;
-                index.repair_pending(&root_id, &root, |progress| on_progress(progress))?;
+                worker_shared.set_stage(WorkerStage::Scanning);
+                match index.scan_root_in_batches(
+                    &root_id,
+                    &root,
+                    SCAN_BATCH_SIZE,
+                    worker_shared.cancel_flag(),
+                    |progress| on_progress(progress),
+                ) {
+                    // A cancelled scan is a stop request honored, not a
+                    // failure: exit quietly and let `stop` join promptly.
+                    Err(OwnedIndexError::Cancelled { .. }) => return Ok(()),
+                    result => {
+                        result?;
+                    }
+                }
+                worker_shared.set_stage(WorkerStage::Repairing);
+                match index.repair_pending(
+                    &root_id,
+                    &root,
+                    worker_shared.cancel_flag(),
+                    |progress| on_progress(progress),
+                ) {
+                    Err(OwnedIndexError::Cancelled { .. }) => return Ok(()),
+                    result => {
+                        result?;
+                    }
+                }
+                worker_shared.set_stage(WorkerStage::Watching);
                 let mut event_state = NotifyEventState::default();
                 let mut last_repair_scan = Instant::now();
                 loop {
@@ -1118,22 +1583,38 @@ impl OwnedIndexWatcher {
                                 &mut index,
                                 &root_id,
                                 &root,
+                                &worker_shared,
                                 &mut event_state,
                                 event,
                                 &mut on_progress,
                             ) {
+                                if matches!(error, OwnedIndexError::Cancelled { .. }) {
+                                    return Ok(());
+                                }
                                 eprintln!("Toka could not apply a search index event: {error}");
                             }
                         }
                         Ok(Err(error)) => {
                             eprintln!("Toka's folder watcher missed an event: {error}");
-                            repair_root(&mut index, &root_id, &root, &mut on_progress);
+                            repair_root(
+                                &mut index,
+                                &root_id,
+                                &root,
+                                &worker_shared,
+                                &mut on_progress,
+                            );
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout)
                             if last_repair_scan.elapsed() >= REPAIR_SCAN_INTERVAL =>
                         {
-                            repair_root(&mut index, &root_id, &root, &mut on_progress);
+                            repair_root(
+                                &mut index,
+                                &root_id,
+                                &root,
+                                &worker_shared,
+                                &mut on_progress,
+                            );
                             last_repair_scan = Instant::now();
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1147,10 +1628,14 @@ impl OwnedIndexWatcher {
         Ok(Self {
             stop,
             worker: Some(worker),
+            shared,
         })
     }
 
     pub(crate) fn stop(mut self) -> Result<(), OwnedIndexError> {
+        // The flag first: a worker mid-scan aborts on it, and one already
+        // in its event loop exits on the message below.
+        self.shared.cancel();
         let _ = self.stop.send(());
         match self.worker.take().expect("watcher worker missing").join() {
             Ok(result) => result,
@@ -1165,10 +1650,16 @@ impl OwnedIndexWatcher {
             .as_ref()
             .is_some_and(|worker| worker.is_finished())
     }
+
+    /// The worker's latest reported state, for the daemon heartbeat.
+    pub(crate) fn live(&self) -> WatcherLive {
+        self.shared.snapshot()
+    }
 }
 
 impl Drop for OwnedIndexWatcher {
     fn drop(&mut self) {
+        self.shared.cancel();
         let _ = self.stop.send(());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1185,34 +1676,65 @@ fn repair_root(
     index: &mut OwnedIndex,
     root_id: &str,
     root: &Path,
+    shared: &WorkerShared,
     on_progress: &mut impl FnMut(&ScanProgress),
 ) {
-    if let Err(error) = index.scan_root(root_id, root, |progress| on_progress(progress)) {
-        eprintln!("Toka could not repair its search index: {error}");
+    // A cancelled repair is a stop request being honored, not a failure:
+    // stay silent and let the worker loop observe the stop message.
+    shared.set_stage(WorkerStage::Scanning);
+    if let Err(error) = index.scan_root_in_batches(
+        root_id,
+        root,
+        SCAN_BATCH_SIZE,
+        shared.cancel_flag(),
+        |progress| on_progress(progress),
+    ) {
+        shared.set_stage(WorkerStage::Watching);
+        if !matches!(error, OwnedIndexError::Cancelled { .. }) {
+            eprintln!("Toka could not repair its search index: {error}");
+        }
         return;
     }
-    if let Err(error) = index.repair_pending(root_id, root, |progress| on_progress(progress)) {
-        eprintln!("Toka could not replay its search index repairs: {error}");
+    shared.set_stage(WorkerStage::Repairing);
+    if let Err(error) = index.repair_pending(root_id, root, shared.cancel_flag(), |progress| {
+        on_progress(progress)
+    }) {
+        shared.set_stage(WorkerStage::Watching);
+        if !matches!(error, OwnedIndexError::Cancelled { .. }) {
+            eprintln!("Toka could not replay its search index repairs: {error}");
+        }
+        return;
     }
+    shared.set_stage(WorkerStage::Watching);
 }
 
 fn apply_notify_event(
     index: &mut OwnedIndex,
     root_id: &str,
     root: &Path,
+    shared: &WorkerShared,
     state: &mut NotifyEventState,
     event: Event,
     on_progress: &mut impl FnMut(&ScanProgress),
 ) -> Result<(), OwnedIndexError> {
     if event.need_rescan() {
         state.renames.clear();
-        index.scan_root(root_id, root, |progress| on_progress(progress))?;
+        shared.set_stage(WorkerStage::Scanning);
+        let result = index.scan_root_in_batches(
+            root_id,
+            root,
+            SCAN_BATCH_SIZE,
+            shared.cancel_flag(),
+            |progress| on_progress(progress),
+        );
+        shared.set_stage(WorkerStage::Watching);
+        result?;
         return Ok(());
     }
     match &event.kind {
         EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::Both)) => {
             if let (Some(from), Some(to)) = (event.paths.first(), event.paths.last()) {
-                return index.synchronize_rename(root_id, root, from, to);
+                return index.synchronize_rename(root_id, root, from, to, shared.cancel_flag());
             }
         }
         EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::From)) => {
@@ -1224,7 +1746,13 @@ fn apply_notify_event(
         EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To)) => {
             if let (Some(tracker), Some(to)) = (event.tracker(), event.paths.first()) {
                 if let Some(from) = state.renames.remove(&tracker) {
-                    return index.synchronize_rename(root_id, root, &from, to);
+                    return index.synchronize_rename(
+                        root_id,
+                        root,
+                        &from,
+                        to,
+                        shared.cancel_flag(),
+                    );
                 }
             }
         }
@@ -1232,49 +1760,156 @@ fn apply_notify_event(
         _ => {}
     }
     for path in event.paths {
-        index.synchronize_path(root_id, root, &path)?;
+        index.synchronize_path(root_id, root, &path, shared.cancel_flag())?;
     }
     Ok(())
 }
 
+/// Reads SQLite's `user_version` from raw header bytes (offset 60) without
+/// opening the database, so refusing an unknown schema cannot mutate
+/// anything — not even WAL sidecars or a hot-journal rollback, both of
+/// which a `Connection::open` performs. Returns `None` when the file is
+/// missing or too short to hold a header, or when the magic is wrong;
+/// all three fall through to the normal open path below, which handles
+/// creation and corrupt files exactly as before.
+fn pre_open_user_version(path: &Path) -> Option<i64> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header).ok()?;
+    if header[0..16] != *b"SQLite format 3\0" {
+        return None;
+    }
+    Some(i64::from(u32::from_be_bytes([
+        header[60], header[61], header[62], header[63],
+    ])))
+}
+
 impl OwnedIndex {
     pub fn open(path: &Path) -> Result<Self, OwnedIndexError> {
+        // Refuse unknown schemas before opening at all: even opening can
+        // create -shm sidecars or roll back a hot journal.
+        if let Some(version) = pre_open_user_version(path) {
+            if version != 0 && version != 1 && version != SCHEMA_VERSION {
+                return Err(OwnedIndexError::UnsupportedSchema(version));
+            }
+        }
+        // The parent must exist before SQLite can open inside it; creating
+        // it is the only filesystem effect before the version check below.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OwnedIndexError::Permissions {
                 path: parent.display().to_string(),
                 source,
             })?;
-            secure_directory(parent)?;
         }
 
         let mut connection = Connection::open(path)?;
-        secure_file(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
+
+        // The version gates every side effect: refusing an unknown schema
+        // must leave the database byte-identical — no chmod, no WAL flip,
+        // not even securing the parent — so a newer app's index still
+        // opens once upgraded again.
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != 0 && version != 1 && version != SCHEMA_VERSION {
+            return Err(OwnedIndexError::UnsupportedSchema(version));
+        }
+
+        if let Some(parent) = path.parent() {
+            secure_directory(parent)?;
+        }
+        secure_file(path)?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;\n\
-             PRAGMA journal_mode = WAL;\n\
              PRAGMA synchronous = NORMAL;",
         )?;
+        // Retried, not batched: the WAL flip bypasses the busy timeout.
+        set_wal_mode(&connection)?;
 
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == SCHEMA_VERSION {
+            return Ok(Self {
+                connection,
+                path: path.to_path_buf(),
+                opened_version: SCHEMA_VERSION,
+            });
+        }
+        // Creating or migrating under an immediate transaction: the first
+        // opener wins the write lock, and a concurrent first-opener waits
+        // out the busy timeout, then re-reads the version inside its own
+        // transaction and finds nothing left to do. A deferred transaction
+        // would let both select the migration before either locked, and the
+        // loser would die creating a table the winner already committed.
+        let transaction = write_transaction(&mut connection)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
             0 => {
-                let transaction = connection.transaction()?;
                 transaction.execute_batch(SCHEMA)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
             }
+            1 => {
+                transaction.execute_batch(MIGRATION_1_TO_2)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            // A concurrent first-opener migrated while this one waited for
+            // the write lock: nothing left to do.
             SCHEMA_VERSION => {}
             other => return Err(OwnedIndexError::UnsupportedSchema(other)),
         }
+        transaction.commit()?;
 
         Ok(Self {
             connection,
             path: path.to_path_buf(),
+            opened_version: SCHEMA_VERSION,
         })
     }
 
-    fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
+    /// Opens an existing index for reading without changing the index
+    /// itself: no directories are created, no permissions or journal
+    /// settings are touched, and older schemas are never migrated — a
+    /// version 1 database stays readable by a version 1 app. SQLite may
+    /// still create `-wal`/`-shm` sidecar files beside the database while
+    /// reading; the promise is about the index content, not the directory
+    /// listing. `PRAGMA query_only` makes any accidental write fail loudly
+    /// instead of slipping through. Readers must tolerate whatever the
+    /// accepted schemas lack (today: no `daemon_state` table on version 1,
+    /// and an empty file on version 0). The 5s busy timeout matches
+    /// writable opens: on a read-only handle it only waits out a writer's
+    /// lock, never writes.
+    pub fn open_read_only(path: &Path) -> Result<Self, OwnedIndexError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA query_only = ON;")?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        match version {
+            0 | 1 | SCHEMA_VERSION => {}
+            other => return Err(OwnedIndexError::UnsupportedSchema(other)),
+        }
+        Ok(Self {
+            connection,
+            path: path.to_path_buf(),
+            opened_version: version,
+        })
+    }
+
+    /// Whether this handle opened an empty (version 0) database: no tables
+    /// exist, so every read below answers empty instead of failing.
+    fn is_empty_database(&self) -> bool {
+        self.opened_version == 0
+    }
+
+    /// Whether `scan_runs` has the version 2 indexable counter. A
+    /// migrating open always lands on version 2; only a read-only open of
+    /// a version 1 database answers false.
+    fn has_indexable_column(&self) -> bool {
+        self.opened_version >= SCHEMA_VERSION
+    }
+
+    pub(crate) fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare("SELECT id, path FROM roots ORDER BY id")?;
@@ -1287,6 +1922,9 @@ impl OwnedIndex {
     pub(crate) fn roots_with_state(
         &self,
     ) -> Result<Vec<(String, PathBuf, String)>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare("SELECT id, path, state FROM roots ORDER BY id")?;
@@ -1349,6 +1987,9 @@ impl OwnedIndex {
         &self,
         terms: &[String],
     ) -> Result<Vec<PathBuf>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Vec::new());
+        }
         if terms.is_empty()
             || terms
                 .iter()
@@ -1396,7 +2037,7 @@ impl OwnedIndex {
     }
 
     fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "INSERT INTO roots (
                 id, path, display_path, state, created_at_ns, updated_at_ns
@@ -1427,14 +2068,12 @@ impl OwnedIndex {
         recorded: &Path,
         canonical: &Path,
     ) -> Result<(), OwnedIndexError> {
-        // IMMEDIATE first, then SELECT inside: the file list and generation
-        // must be read under the write lock, or a concurrent scan can slip
-        // rows in between. One-time per legacy root, so no chunking; a very
-        // large legacy root holds the lock until the migration commits,
-        // bounded by the connection's busy_timeout.
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // The file list and generation must be read under the write
+        // lock, or a concurrent scan can slip rows in between. One-time
+        // per legacy root, so no chunking; a very large legacy root holds
+        // the lock until the migration commits, bounded by the
+        // connection's busy_timeout.
+        let transaction = write_transaction(&mut self.connection)?;
         if another_root_holds(&transaction, root_id, canonical)? {
             return Ok(());
         }
@@ -1546,7 +2185,7 @@ impl OwnedIndex {
     }
 
     fn remove_root(&mut self, id: &str) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let removed = transaction.execute("DELETE FROM roots WHERE id = ?1", [id])?;
         if removed == 0 {
             return Err(OwnedIndexError::FolderNotConfigured);
@@ -1565,7 +2204,10 @@ impl OwnedIndex {
         Ok(())
     }
 
-    fn revision(&self) -> Result<u64, OwnedIndexError> {
+    pub(crate) fn revision(&self) -> Result<u64, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(0);
+        }
         let revision: i64 = self.connection.query_row(
             "SELECT value FROM schema_meta WHERE key = 'index_revision'",
             [],
@@ -1575,6 +2217,9 @@ impl OwnedIndex {
     }
 
     fn media_counts(&self) -> Result<(u64, u64), OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok((0, 0));
+        }
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
                 COALESCE(SUM(media_type = 'video'), 0),
@@ -1587,6 +2232,9 @@ impl OwnedIndex {
     }
 
     fn root_media_counts(&self, root_id: &str) -> Result<(u64, u64), OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok((0, 0));
+        }
         let (videos, images): (i64, i64) = self.connection.query_row(
             "SELECT
                 COALESCE(SUM(files.media_type = 'video'), 0),
@@ -1599,6 +2247,8 @@ impl OwnedIndex {
         Ok((videos as u64, images as u64))
     }
 
+    /// Scans one root to completion. Watchers run the cancellable batch
+    /// form below instead, so `stop` aborts a scan in progress.
     pub fn scan_root<F>(
         &mut self,
         root_id: &str,
@@ -1608,7 +2258,13 @@ impl OwnedIndex {
     where
         F: FnMut(&ScanProgress),
     {
-        self.scan_root_in_batches(root_id, root, 128, on_progress)
+        self.scan_root_in_batches(
+            root_id,
+            root,
+            SCAN_BATCH_SIZE,
+            &AtomicBool::new(false),
+            on_progress,
+        )
     }
 
     #[cfg(test)]
@@ -1622,7 +2278,13 @@ impl OwnedIndex {
     where
         F: FnMut(&ScanProgress),
     {
-        self.scan_root_in_batches(root_id, root, batch_size.max(1), on_progress)
+        self.scan_root_in_batches(
+            root_id,
+            root,
+            batch_size.max(1),
+            &AtomicBool::new(false),
+            on_progress,
+        )
     }
 
     fn scan_root_in_batches<F>(
@@ -1630,6 +2292,7 @@ impl OwnedIndex {
         root_id: &str,
         root: &Path,
         batch_size: usize,
+        cancel: &AtomicBool,
         mut on_progress: F,
     ) -> Result<ScanProgress, OwnedIndexError>
     where
@@ -1655,6 +2318,9 @@ impl OwnedIndex {
         let mut batch = Vec::with_capacity(batch_size);
 
         while let Some(directory) = pending.pop_front() {
+            if cancel.load(Ordering::Relaxed) {
+                return self.finish_cancelled_scan(&mut progress, root);
+            }
             match index_visibility::is_hidden(&directory) {
                 Ok(true) => {
                     progress.skipped_paths = progress.skipped_paths.saturating_add(1);
@@ -1697,6 +2363,12 @@ impl OwnedIndex {
                         continue;
                     }
                 };
+                // A directory can hold thousands of files, so each one is a
+                // cancellation point too: stopping a root never waits out a
+                // whole directory listing.
+                if cancel.load(Ordering::Relaxed) {
+                    return self.finish_cancelled_scan(&mut progress, root);
+                }
                 let path = entry.path();
                 match index_visibility::is_hidden(&path) {
                     Ok(true) => {
@@ -1762,6 +2434,11 @@ impl OwnedIndex {
                     on_progress(&progress);
                     continue;
                 };
+                // Indexable only: unsupported, empty, and unreadable files
+                // never reach the batch, so the queued-work count built
+                // from this counter does not mistake them for remaining
+                // work.
+                progress.files_indexable = progress.files_indexable.saturating_add(1);
                 batch.push(file);
                 if batch.len() >= batch_size {
                     self.commit_batch(root_id, generation, &mut batch, &mut progress)?;
@@ -1797,7 +2474,7 @@ impl OwnedIndex {
     ) -> Result<(i64, ScanProgress), OwnedIndexError> {
         let progress = ScanProgress::new(root_id);
         let root_bytes = path_bytes(root);
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         // Update-only: a scan must never resurrect a root that was removed
         // after the caller read the roots table.
         let changed = transaction.execute(
@@ -1839,7 +2516,7 @@ impl OwnedIndex {
         batch: &mut Vec<IndexedFile>,
         progress: &mut ScanProgress,
     ) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let mut videos = 0u64;
         let mut images = 0u64;
         for file in batch.drain(..) {
@@ -1904,14 +2581,31 @@ impl OwnedIndex {
             [],
         )?;
         transaction.commit()?;
+        fire_sync_probe(root_id, SyncProbeSite::ScanBatchCommitted);
         Ok(())
     }
 
     fn save_progress(&mut self, progress: &ScanProgress) -> Result<(), OwnedIndexError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         persist_progress(&transaction, progress)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Aborts a scan without recording it as finished: the roots row and
+    /// the scan run stay `scanning` with partial counts, committed batches
+    /// keep their generation, and the next scan supersedes all of it — an
+    /// incomplete scan is never trusted as successful.
+    fn finish_cancelled_scan(
+        &mut self,
+        progress: &mut ScanProgress,
+        root: &Path,
+    ) -> Result<ScanProgress, OwnedIndexError> {
+        progress.touch();
+        self.save_progress(progress)?;
+        Err(OwnedIndexError::Cancelled {
+            path: root.display().to_string(),
+        })
     }
 
     fn finish_failed_scan(
@@ -1924,7 +2618,7 @@ impl OwnedIndex {
         progress.current_file = None;
         progress.error = Some(message.to_owned());
         progress.touch();
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         persist_progress(&transaction, progress)?;
         transaction.execute(
             "UPDATE roots SET state = 'error', updated_at_ns = ?2 WHERE id = ?1",
@@ -1944,7 +2638,7 @@ impl OwnedIndex {
         progress.current_file = None;
         progress.error = None;
         progress.touch();
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "DELETE FROM root_files
              WHERE root_id = ?1 AND scan_generation != ?2",
@@ -1974,43 +2668,150 @@ impl OwnedIndex {
         &self,
         root_id: &str,
     ) -> Result<Option<ScanProgress>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(None);
+        }
+        // Version 1 has no `files_indexable` column; the committed count
+        // stands in for it there, so remaining work reads as none rather
+        // than inventing a backlog. Selecting it in the same position
+        // keeps every column index below identical on both schemas.
+        let indexable = if self.has_indexable_column() {
+            "files_indexable"
+        } else {
+            "files_indexed"
+        };
+        let query = format!(
+            "SELECT root_id, state,
+                folders_discovered, folders_scanned,
+                files_discovered, {indexable}, files_indexed,
+                videos_indexed, images_indexed,
+                skipped_paths, read_failures,
+                current_folder, current_file,
+                started_at_ns, updated_at_ns, error
+             FROM scan_runs
+             WHERE root_id = ?1
+             ORDER BY generation DESC
+             LIMIT 1"
+        );
+        self.connection
+            .query_row(&query, [root_id], |row| {
+                let phase = ScanPhase::from_database(&row.get::<_, String>(1)?)?;
+                let started_at_ns: i64 = row.get(13)?;
+                let updated_at_ns: i64 = row.get(14)?;
+                let files_indexed = row.get::<_, i64>(6)? as u64;
+                let elapsed_ns = updated_at_ns.saturating_sub(started_at_ns).max(1);
+                Ok(ScanProgress {
+                    root_id: row.get(0)?,
+                    phase,
+                    folders_discovered: row.get::<_, i64>(2)? as u64,
+                    folders_scanned: row.get::<_, i64>(3)? as u64,
+                    files_discovered: row.get::<_, i64>(4)? as u64,
+                    files_indexable: row.get::<_, i64>(5)? as u64,
+                    files_indexed,
+                    videos_indexed: row.get::<_, i64>(7)? as u64,
+                    images_indexed: row.get::<_, i64>(8)? as u64,
+                    skipped_paths: row.get::<_, i64>(9)? as u64,
+                    read_failures: row.get::<_, i64>(10)? as u64,
+                    current_folder: row.get::<_, Option<Vec<u8>>>(11)?.map(path_from_bytes),
+                    current_file: row.get::<_, Option<Vec<u8>>>(12)?.map(path_from_bytes),
+                    started_at_ns,
+                    updated_at_ns,
+                    scan_rate: files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64,
+                    error: row.get(15)?,
+                })
+            })
+            .optional()
+            .map_err(OwnedIndexError::from)
+    }
+
+    /// Replaces the single daemon liveness row with this heartbeat. The
+    /// daemon is the only writer; `ts status` only reads.
+    pub(crate) fn publish_daemon_state(
+        &self,
+        pid: u32,
+        started_at_ns: i64,
+        beat: &crate::daemon_state::DaemonBeat,
+    ) -> Result<(), OwnedIndexError> {
+        self.connection.execute(
+            "INSERT INTO daemon_state (
+                id, pid, started_at_ns, heartbeat_at_ns, activity,
+                current_root, current_path,
+                pending_roots, files_remaining, pending_repairs, pending_thumbnails
+             ) VALUES (
+                1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             )
+             ON CONFLICT(id) DO UPDATE SET
+                pid = excluded.pid,
+                started_at_ns = excluded.started_at_ns,
+                heartbeat_at_ns = excluded.heartbeat_at_ns,
+                activity = excluded.activity,
+                current_root = excluded.current_root,
+                current_path = excluded.current_path,
+                pending_roots = excluded.pending_roots,
+                files_remaining = excluded.files_remaining,
+                pending_repairs = excluded.pending_repairs,
+                pending_thumbnails = excluded.pending_thumbnails",
+            params![
+                i64::from(pid),
+                started_at_ns,
+                beat.heartbeat_at_ns,
+                beat.activity.as_database(),
+                beat.current_root.as_deref().map(path_bytes),
+                beat.current_path.as_deref().map(path_bytes),
+                database_count(beat.queue.pending_roots),
+                database_count(beat.queue.files_remaining),
+                database_count(beat.queue.pending_repairs),
+                database_count(beat.queue.pending_thumbnails),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn read_daemon_state(
+        &self,
+    ) -> Result<Option<crate::daemon_state::DaemonStateRow>, OwnedIndexError> {
+        // Version 1 predates the liveness row; a missing table reads as no
+        // heartbeat rather than an error, so read-only status works there.
+        let has_table: bool = self.connection.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master
+             WHERE type = 'table' AND name = 'daemon_state'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_table {
+            return Ok(None);
+        }
         self.connection
             .query_row(
-                "SELECT root_id, state,
-                    folders_discovered, folders_scanned,
-                    files_discovered, files_indexed,
-                    videos_indexed, images_indexed,
-                    skipped_paths, read_failures,
-                    current_folder, current_file,
-                    started_at_ns, updated_at_ns, error
-                 FROM scan_runs
-                 WHERE root_id = ?1
-                 ORDER BY generation DESC
-                 LIMIT 1",
-                [root_id],
+                "SELECT pid, started_at_ns, heartbeat_at_ns, activity,
+                    current_root, current_path,
+                    pending_roots, files_remaining, pending_repairs, pending_thumbnails
+                 FROM daemon_state
+                 WHERE id = 1",
+                [],
                 |row| {
-                    let phase = ScanPhase::from_database(&row.get::<_, String>(1)?)?;
-                    let started_at_ns: i64 = row.get(12)?;
-                    let updated_at_ns: i64 = row.get(13)?;
-                    let files_indexed = row.get::<_, i64>(5)? as u64;
-                    let elapsed_ns = updated_at_ns.saturating_sub(started_at_ns).max(1);
-                    Ok(ScanProgress {
-                        root_id: row.get(0)?,
-                        phase,
-                        folders_discovered: row.get::<_, i64>(2)? as u64,
-                        folders_scanned: row.get::<_, i64>(3)? as u64,
-                        files_discovered: row.get::<_, i64>(4)? as u64,
-                        files_indexed,
-                        videos_indexed: row.get::<_, i64>(6)? as u64,
-                        images_indexed: row.get::<_, i64>(7)? as u64,
-                        skipped_paths: row.get::<_, i64>(8)? as u64,
-                        read_failures: row.get::<_, i64>(9)? as u64,
-                        current_folder: row.get::<_, Option<Vec<u8>>>(10)?.map(path_from_bytes),
-                        current_file: row.get::<_, Option<Vec<u8>>>(11)?.map(path_from_bytes),
-                        started_at_ns,
-                        updated_at_ns,
-                        scan_rate: files_indexed as f64 * 1_000_000_000.0 / elapsed_ns as f64,
-                        error: row.get(14)?,
+                    let pid: i64 = row.get(0)?;
+                    Ok(crate::daemon_state::DaemonStateRow {
+                        // A pid that does not fit (or zero, which signals a
+                        // process group rather than a process) can never be
+                        // alive, so it reads as unknown.
+                        pid: u32::try_from(pid).ok().filter(|pid| *pid != 0),
+                        started_at_ns: row.get(1)?,
+                        heartbeat_at_ns: row.get(2)?,
+                        activity: crate::daemon_state::DaemonActivity::from_database(
+                            &row.get::<_, String>(3)?,
+                        ),
+                        current_root: row.get::<_, Option<Vec<u8>>>(4)?.map(path_from_bytes),
+                        current_path: row.get::<_, Option<Vec<u8>>>(5)?.map(path_from_bytes),
+                        queue: crate::daemon_state::DaemonQueue {
+                            // Stored counts are trusted but tamperable; a
+                            // negative reads as zero rather than wrapping
+                            // to billions of phantom files.
+                            pending_roots: row.get::<_, i64>(6)?.max(0) as u64,
+                            files_remaining: row.get::<_, i64>(7)?.max(0) as u64,
+                            pending_repairs: row.get::<_, i64>(8)?.max(0) as u64,
+                            pending_thumbnails: row.get::<_, i64>(9)?.max(0) as u64,
+                        },
                     })
                 },
             )
@@ -2018,13 +2819,81 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
+    /// Roots whose storage is missing, as last recorded. Read live by
+    /// `ts status` (like the service state) rather than published with the
+    /// heartbeat, so no schema change carries it. A missing `roots` table
+    /// — an empty database — reads as none.
+    pub(crate) fn offline_root_count(&self) -> Result<u64, OwnedIndexError> {
+        let has_table: bool = self.connection.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master
+             WHERE type = 'table' AND name = 'roots'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_table {
+            return Ok(0);
+        }
+        let offline: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM roots WHERE state = 'offline'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(offline.max(0) as u64)
+    }
+
+    /// The queued work the daemon publishes with its heartbeat: roots not
+    /// fully indexed, indexable files seen but uncommitted by scans in
+    /// progress, and queued repairs, plus the thumbnail backlog the caller
+    /// counts live.
+    pub(crate) fn daemon_queue_counts(
+        &self,
+        pending_thumbnails: u64,
+    ) -> Result<crate::daemon_state::DaemonQueue, OwnedIndexError> {
+        // Pending, scanning, and errored roots: work the daemon can act
+        // on. Offline roots count separately — `ts status` lists them on
+        // their own line, and they never hold `ts status --watch`.
+        let pending_roots: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM roots WHERE state != 'ready' AND state != 'offline'",
+            [],
+            |row| row.get(0),
+        )?;
+        // Only each root's latest run counts: an older 'scanning' row is
+        // history from a generation a later scan superseded. Indexable,
+        // not discovered: unsupported, empty, and unreadable files never
+        // reach the batch, so counting them would report already-decided
+        // files as remaining work. Each run clamps at zero before
+        // summing: a migrated version 1 row (indexable 0, indexed N)
+        // would otherwise contribute -N and hide another root's real
+        // remainder behind the single clamp below.
+        let files_remaining: Option<i64> = self.connection.query_row(
+            "SELECT SUM(MAX(files_indexable - files_indexed, 0))
+             FROM scan_runs
+             WHERE state = 'scanning'
+               AND generation = (
+                    SELECT scan_generation FROM roots WHERE id = scan_runs.root_id
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_repairs: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM repair_queue", [], |row| row.get(0))?;
+        Ok(crate::daemon_state::DaemonQueue {
+            pending_roots: pending_roots as u64,
+            files_remaining: files_remaining.unwrap_or(0).max(0) as u64,
+            pending_repairs: pending_repairs as u64,
+            pending_thumbnails,
+        })
+    }
+
     pub(crate) fn synchronize_path(
         &mut self,
         root_id: &str,
         root: &Path,
         path: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), OwnedIndexError> {
-        match self.try_synchronize_path(root_id, root, path) {
+        match self.try_synchronize_path(root_id, root, path, cancel) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = error.to_string();
@@ -2039,7 +2908,13 @@ impl OwnedIndex {
         root_id: &str,
         root: &Path,
         path: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), OwnedIndexError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(OwnedIndexError::Cancelled {
+                path: path.display().to_string(),
+            });
+        }
         if !path.starts_with(root) {
             return Ok(());
         }
@@ -2066,7 +2941,7 @@ impl OwnedIndex {
             }
         };
         if metadata.as_ref().is_some_and(fs::Metadata::is_dir) {
-            return self.synchronize_tree(root_id, root, path);
+            return self.synchronize_tree(root_id, root, path, cancel);
         }
         let Some(file) = metadata
             .filter(fs::Metadata::is_file)
@@ -2074,7 +2949,7 @@ impl OwnedIndex {
         else {
             return self.remove_indexed_path(root_id, path);
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         let generation: i64 = transaction.query_row(
             "SELECT scan_generation FROM roots WHERE id = ?1",
             [root_id],
@@ -2128,6 +3003,7 @@ impl OwnedIndex {
             [],
         )?;
         transaction.commit()?;
+        fire_sync_probe(root_id, SyncProbeSite::FileCommitted);
         Ok(())
     }
 
@@ -2136,14 +3012,28 @@ impl OwnedIndex {
         root_id: &str,
         root: &Path,
         tree: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), OwnedIndexError> {
         let mut pending = VecDeque::from([tree.to_path_buf()]);
         while let Some(directory) = pending.pop_front() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(OwnedIndexError::Cancelled {
+                    path: directory.display().to_string(),
+                });
+            }
             let entries = fs::read_dir(&directory).map_err(|source| OwnedIndexError::PathRead {
                 path: directory.display().to_string(),
                 source,
             })?;
             for entry in entries {
+                // Each file commits its own transaction, so each one is a
+                // cancellation point too: stopping a root never waits out
+                // a whole queued directory, and the repair stays queued.
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(OwnedIndexError::Cancelled {
+                        path: directory.display().to_string(),
+                    });
+                }
                 let entry = entry.map_err(|source| OwnedIndexError::PathRead {
                     path: directory.display().to_string(),
                     source,
@@ -2167,7 +3057,7 @@ impl OwnedIndex {
                 if file_type.is_dir() {
                     pending.push_back(path);
                 } else if file_type.is_file() {
-                    self.try_synchronize_path(root_id, root, &path)?;
+                    self.try_synchronize_path(root_id, root, &path, cancel)?;
                 }
             }
         }
@@ -2194,7 +3084,7 @@ impl OwnedIndex {
             }
             file_ids
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = write_transaction(&mut self.connection)?;
         for file_id in file_ids {
             transaction.execute(
                 "DELETE FROM root_files WHERE root_id = ?1 AND file_id = ?2",
@@ -2258,6 +3148,7 @@ impl OwnedIndex {
         &mut self,
         root_id: &str,
         root: &Path,
+        cancel: &AtomicBool,
         mut on_progress: F,
     ) -> Result<usize, OwnedIndexError>
     where
@@ -2269,11 +3160,18 @@ impl OwnedIndex {
             .into_iter()
             .filter(|repair| repair.path.starts_with(root))
         {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(OwnedIndexError::Cancelled {
+                    path: root.display().to_string(),
+                });
+            }
             let result = if repair.reason == "direct rename" {
-                self.scan_root(root_id, root, |progress| on_progress(progress))
-                    .map(|_| ())
+                self.scan_root_in_batches(root_id, root, SCAN_BATCH_SIZE, cancel, |progress| {
+                    on_progress(progress)
+                })
+                .map(|_| ())
             } else {
-                self.try_synchronize_path(root_id, root, &repair.path)
+                self.try_synchronize_path(root_id, root, &repair.path, cancel)
             };
             match result {
                 Ok(()) => {
@@ -2282,6 +3180,11 @@ impl OwnedIndex {
                         [path_bytes(&repair.path)],
                     )?;
                     repaired += 1;
+                }
+                // A cancelled repair stays queued for the next run; only a
+                // genuine failure is re-queued with its error.
+                Err(error) if matches!(error, OwnedIndexError::Cancelled { .. }) => {
+                    return Err(error);
                 }
                 Err(error) => {
                     self.queue_repair(&repair.path, &repair.reason, &error.to_string())?;
@@ -2297,8 +3200,9 @@ impl OwnedIndex {
         root: &Path,
         from: &Path,
         to: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), OwnedIndexError> {
-        match self.try_synchronize_rename(root_id, root, from, to) {
+        match self.try_synchronize_rename(root_id, root, from, to, cancel) {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = error.to_string();
@@ -2314,13 +3218,19 @@ impl OwnedIndex {
         root: &Path,
         from: &Path,
         to: &Path,
+        cancel: &AtomicBool,
     ) -> Result<(), OwnedIndexError> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(OwnedIndexError::Cancelled {
+                path: to.display().to_string(),
+            });
+        }
         let root_moved = from == root;
         if !root_moved {
             match (from.starts_with(root), to.starts_with(root)) {
                 (false, false) => return Ok(()),
                 (true, false) => return self.remove_indexed_path(root_id, from),
-                (false, true) => return self.try_synchronize_path(root_id, root, to),
+                (false, true) => return self.try_synchronize_path(root_id, root, to, cancel),
                 (true, true) => {}
             }
         }
@@ -2339,6 +3249,15 @@ impl OwnedIndex {
             })?;
             let mut moved_files = Vec::new();
             for row in rows {
+                // Stopping mid-rename must not wait out the scan of every
+                // row, its metadata reads, and the rewrite commit: each
+                // planned row is a cancellation point.
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(OwnedIndexError::Cancelled {
+                        path: to.display().to_string(),
+                    });
+                }
+                fire_sync_probe(root_id, SyncProbeSite::RenamePlanned);
                 let (file_id, old_path) = row?;
                 let Ok(relative) = old_path.strip_prefix(from) else {
                     continue;
@@ -2369,7 +3288,14 @@ impl OwnedIndex {
             }
             moved_files
         };
-        let transaction = self.connection.transaction()?;
+        // Planning finished after the stop arrived: do not open the
+        // rewrite transaction at all.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(OwnedIndexError::Cancelled {
+                path: to.display().to_string(),
+            });
+        }
+        let transaction = write_transaction(&mut self.connection)?;
         transaction.query_row(
             "SELECT scan_generation FROM roots WHERE id = ?1",
             [root_id],
@@ -2384,6 +3310,17 @@ impl OwnedIndex {
             )?;
         }
         for (file_id, file) in moved_files {
+            // Each rewritten row is a cancellation point too: dropping
+            // the uncommitted transaction rolls everything back, so a
+            // cancelled rename commits nothing — not even the roots row
+            // already staged above.
+            if cancel.load(Ordering::Relaxed) {
+                drop(transaction);
+                return Err(OwnedIndexError::Cancelled {
+                    path: to.display().to_string(),
+                });
+            }
+            fire_sync_probe(root_id, SyncProbeSite::RenameRewritten);
             let Some(file) = file else {
                 transaction.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
                 continue;
@@ -2434,12 +3371,22 @@ impl OwnedIndex {
                 }
             }
         }
+        // Recheck after the last row: a stop landing between the final
+        // per-row check and the commit below must still roll everything
+        // back — otherwise the rename commits while the destination sync
+        // reports it cancelled.
+        if cancel.load(Ordering::Relaxed) {
+            drop(transaction);
+            return Err(OwnedIndexError::Cancelled {
+                path: to.display().to_string(),
+            });
+        }
         transaction.execute(
             "UPDATE schema_meta SET value = value + 1 WHERE key = 'index_revision'",
             [],
         )?;
         transaction.commit()?;
-        self.try_synchronize_path(root_id, if root_moved { to } else { root }, to)
+        self.try_synchronize_path(root_id, if root_moved { to } else { root }, to, cancel)
     }
 
     fn is_own_index_path(&self, path: &Path) -> bool {
@@ -2470,16 +3417,17 @@ fn persist_progress(
             folders_discovered = ?3,
             folders_scanned = ?4,
             files_discovered = ?5,
-            files_indexed = ?6,
-            videos_indexed = ?7,
-            images_indexed = ?8,
-            skipped_paths = ?9,
-            read_failures = ?10,
-            current_folder = ?11,
-            current_file = ?12,
-            updated_at_ns = ?13,
-            finished_at_ns = ?14,
-            error = ?15
+            files_indexable = ?6,
+            files_indexed = ?7,
+            videos_indexed = ?8,
+            images_indexed = ?9,
+            skipped_paths = ?10,
+            read_failures = ?11,
+            current_folder = ?12,
+            current_file = ?13,
+            updated_at_ns = ?14,
+            finished_at_ns = ?15,
+            error = ?16
          WHERE root_id = ?1
            AND generation = (
                 SELECT scan_generation FROM roots WHERE id = ?1
@@ -2490,6 +3438,7 @@ fn persist_progress(
             database_count(progress.folders_discovered),
             database_count(progress.folders_scanned),
             database_count(progress.files_discovered),
+            database_count(progress.files_indexable),
             database_count(progress.files_indexed),
             database_count(progress.videos_indexed),
             database_count(progress.images_indexed),
@@ -2517,19 +3466,6 @@ fn folders_search_text(path: &Path) -> String {
         .unwrap_or_else(|| Path::new(""))
         .to_string_lossy()
         .to_lowercase()
-}
-
-fn now_ns() -> i64 {
-    time_ns(SystemTime::now()).unwrap_or_default()
-}
-
-fn time_ns(time: SystemTime) -> Option<i64> {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
-        Err(error) => i64::try_from(error.duration().as_nanos())
-            .ok()
-            .and_then(i64::checked_neg),
-    }
 }
 
 #[cfg(unix)]
@@ -2649,7 +3585,7 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         for table in [
             "schema_meta",
             "roots",
@@ -2658,6 +3594,7 @@ mod tests {
             "search_docs",
             "scan_runs",
             "repair_queue",
+            "daemon_state",
         ] {
             assert!(tables.contains(table), "missing table {table}");
         }
@@ -2896,7 +3833,9 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        index.synchronize_path("root", &root, &hidden).unwrap();
+        index
+            .synchronize_path("root", &root, &hidden, &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(manager.state().unwrap().indexed_videos, 1);
         assert!(std::process::Command::new("/usr/bin/chflags")
             .arg("hidden")
@@ -2905,7 +3844,12 @@ mod tests {
             .unwrap()
             .success());
         index
-            .synchronize_path("root", &root, &hidden.join("nested/clip.mp4"))
+            .synchronize_path(
+                "root",
+                &root,
+                &hidden.join("nested/clip.mp4"),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(manager.state().unwrap().indexed_videos, 0);
     }
@@ -2925,13 +3869,23 @@ mod tests {
         fs::write(root.join("new/photo.jpg"), b"photo").unwrap();
 
         index
-            .synchronize_path("root", &root, &root.join("new"))
+            .synchronize_path("root", &root, &root.join("new"), &AtomicBool::new(false))
             .unwrap();
         index
-            .synchronize_path("root", &root, &root.join("new/.worktrees/nested/clip.mp4"))
+            .synchronize_path(
+                "root",
+                &root,
+                &root.join("new/.worktrees/nested/clip.mp4"),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         index
-            .synchronize_path("root", &root, &root.join("new/.hidden.mp4"))
+            .synchronize_path(
+                "root",
+                &root,
+                &root.join("new/.hidden.mp4"),
+                &AtomicBool::new(false),
+            )
             .unwrap();
 
         let state = OwnedIndexManager::under(database).state().unwrap();
@@ -2966,13 +3920,13 @@ mod tests {
 
             fs::rename(&visible, &hidden).unwrap();
             index
-                .synchronize_rename("root", &root, &visible, &hidden)
+                .synchronize_rename("root", &root, &visible, &hidden, &AtomicBool::new(false))
                 .unwrap();
             assert_eq!(manager.state().unwrap().indexed_videos, 0, "{hidden_name}");
 
             fs::rename(&hidden, &visible).unwrap();
             index
-                .synchronize_rename("root", &root, &hidden, &visible)
+                .synchronize_rename("root", &root, &hidden, &visible, &AtomicBool::new(false))
                 .unwrap();
             assert_eq!(manager.state().unwrap().indexed_videos, 1, "{visible_name}");
         }
@@ -3058,6 +4012,7 @@ mod tests {
         assert_eq!(finished.folders_discovered, 2);
         assert_eq!(finished.folders_scanned, 2);
         assert_eq!(finished.files_discovered, 4);
+        assert_eq!(finished.files_indexable, 2);
         assert_eq!(finished.files_indexed, 2);
         assert_eq!(finished.videos_indexed, 1);
         assert_eq!(finished.images_indexed, 1);
@@ -3077,6 +4032,7 @@ mod tests {
 
         let stored = index.scan_progress("root").unwrap().unwrap();
         assert_eq!(stored.phase, ScanPhase::Ready);
+        assert_eq!(stored.files_indexable, 2);
         assert_eq!(stored.files_indexed, 2);
         assert_eq!(
             indexed_display_paths(&index),
@@ -4330,7 +5286,17 @@ mod tests {
         let event = Event::new(EventKind::Any).set_flag(notify::event::Flag::Rescan);
         let mut state = NotifyEventState::default();
 
-        apply_notify_event(&mut index, "root", &root, &mut state, event, &mut |_| {}).unwrap();
+        let shared = WorkerShared::new();
+        apply_notify_event(
+            &mut index,
+            "root",
+            &root,
+            &shared,
+            &mut state,
+            event,
+            &mut |_| {},
+        )
+        .unwrap();
 
         assert!(indexed_display_paths(&index).contains(missed.to_string_lossy().as_ref()));
     }
@@ -4372,16 +5338,239 @@ mod tests {
             .unwrap()
             .insert_root("root", &root)
             .unwrap();
-        let restored_manager = OwnedIndexManager::new(database, true);
-        restored_manager.restore_watchers();
+        let restored_manager = OwnedIndexManager::system_under(database).unwrap();
 
-        wait_for(|| {
-            restored_manager
-                .state()
-                .is_ok_and(|state| state.folders[0].status == OwnedFolderStatus::Ready)
-        });
+        // A completion wait, not a race: a one-file scan finishes in
+        // milliseconds unloaded, so this bound only guards a genuinely
+        // stuck restore — and reports the last state if it trips.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = restored_manager.state().unwrap();
+            if state.folders[0].status == OwnedFolderStatus::Ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore never completed; last saw: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(restored_manager.state().unwrap().indexed_videos, 1);
         restored_manager.remove_folder("root").unwrap();
+    }
+
+    // The supervision tests never drop a guard and re-acquire it: other
+    // test threads fork short-lived children (every `systemctl` probe) that
+    // inherit open lock files across the fork, so a just-released lock can
+    // read as held for microseconds. Each test below holds its side
+    // continuously instead, which asserts the same mutual exclusion
+    // deterministically.
+    #[test]
+    #[cfg(unix)]
+    fn a_system_manager_yields_supervision_to_a_running_daemon() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+
+        // A held lock reads as a running daemon: the manager starts no
+        // watchers, but reads keep working.
+        let _daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(!manager.supervises_watchers().unwrap());
+        assert!(manager.watchers.lock().unwrap().is_empty());
+        assert_eq!(manager.state().unwrap().folders.len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_system_manager_creates_a_missing_index_directory_before_locking() {
+        let directory = tempdir().unwrap();
+        let parent = directory.path().join("missing-index-folder");
+        let database = parent.join("index.sqlite3");
+
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+
+        assert!(parent.is_dir(), "the index parent must be created first");
+        assert!(manager.supervises_watchers().unwrap());
+        assert!(
+            crate::indexer_daemon::try_acquire_daemon_lock(&database)
+                .unwrap()
+                .is_none(),
+            "the manager must hold the daemon lock"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_yielded_manager_resumes_supervision_once_the_daemon_stops() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+
+        // The daemon holds the lock: the manager starts yielded, with no
+        // watchers of its own.
+        let daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(!manager.supervises_watchers().unwrap());
+        assert!(manager.watchers.lock().unwrap().is_empty());
+        drop(daemon);
+
+        // A just-released lock can read as held for microseconds (forked
+        // children inherit the lock file), so the re-acquisition retries
+        // until a reconcile takes over supervision and restores watchers.
+        wait_for(|| {
+            manager.ensure_watchers().unwrap();
+            manager.supervises_watchers().unwrap()
+        });
+        assert_eq!(manager.watchers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_yielded_manager_recreates_a_reset_index_directory_while_reacquiring() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        // The index lives in its own folder so the reset below wipes only
+        // it, never the watched media.
+        let parent = directory.path().join("index-folder");
+        let database = parent.join("index.sqlite3");
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("root", &root)
+            .unwrap();
+
+        // The daemon holds the lock: the manager starts yielded, with no
+        // watchers of its own.
+        let daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(!manager.supervises_watchers().unwrap());
+
+        // A reset while yielded wipes the lock's whole folder; the daemon
+        // stops with it.
+        std::fs::remove_dir_all(&parent).unwrap();
+        drop(daemon);
+
+        // The next poll recreates the parent and re-acquires instead of
+        // erroring ENOENT on every poll until restart. A just-released
+        // lock can read as held for microseconds (forked children
+        // inherit the lock file), so the re-acquisition retries until a
+        // reconcile takes over supervision.
+        wait_for(|| {
+            manager.ensure_watchers().unwrap();
+            manager.supervises_watchers().unwrap()
+        });
+        assert!(parent.is_dir());
+        assert!(
+            crate::indexer_daemon::try_acquire_daemon_lock(&database)
+                .unwrap()
+                .is_none(),
+            "the manager must hold the daemon lock"
+        );
+        // Supervision actually resumes: a folder added now gets a watcher.
+        manager.add_folder(&root).unwrap();
+        assert_eq!(manager.watchers.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_supervising_system_manager_refuses_a_second_supervisor() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        let manager = OwnedIndexManager::system_under(database.clone()).unwrap();
+
+        assert!(manager.supervises_watchers().unwrap());
+        assert!(
+            crate::indexer_daemon::try_acquire_daemon_lock(&database)
+                .unwrap()
+                .is_none(),
+            "the daemon side must yield to the app's watchers"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_system_managers_yield_to_whichever_started_first() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+
+        // Two coeval managers, not a manager against a bare lock: the
+        // second yields supervision while its reads keep working.
+        let first = OwnedIndexManager::system_under(database.clone()).unwrap();
+        assert!(first.supervises_watchers().unwrap());
+        let second = OwnedIndexManager::system_under(database.clone()).unwrap();
+
+        assert!(!second.supervises_watchers().unwrap());
+        assert!(second.watchers.lock().unwrap().is_empty());
+        assert!(second.state().unwrap().folders.is_empty());
+        assert!(first.supervises_watchers().unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn system_under_reports_an_index_directory_it_cannot_secure() {
+        // Root can chmod anything, so this refusal only exists for the
+        // rest of us.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        // The filesystem root always exists (so ensuring it gets past
+        // creation) and is never securable by an unprivileged user.
+        let database = PathBuf::from("/").join("toka-test-index.sqlite3");
+
+        let error = OwnedIndexManager::system_under(database)
+            .err()
+            .expect("system_under must refuse an unsecurable index directory");
+
+        assert!(
+            error.contains("could not secure"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adding_a_folder_without_supervision_starts_no_watcher() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let _daemon = crate::indexer_daemon::try_acquire_daemon_lock(&database)
+            .unwrap()
+            .expect("test holds the daemon lock");
+        let manager = OwnedIndexManager::system_under(database).unwrap();
+
+        let state = manager.add_folder(&root).unwrap();
+
+        // The folder is recorded for the daemon to pick up; only the
+        // in-process watcher is skipped.
+        assert_eq!(state.folders.len(), 1);
+        assert!(manager.watchers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -4475,7 +5664,9 @@ mod tests {
         std::fs::write(added.join("one.mp4"), b"one").unwrap();
         std::fs::write(added.join("nested/two.jpg"), b"two").unwrap();
 
-        index.synchronize_path("root", &root, &added).unwrap();
+        index
+            .synchronize_path("root", &root, &added, &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([
@@ -4485,7 +5676,9 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&added).unwrap();
-        index.synchronize_path("root", &root, &added).unwrap();
+        index
+            .synchronize_path("root", &root, &added, &AtomicBool::new(false))
+            .unwrap();
         assert!(indexed_display_paths(&index).is_empty());
     }
 
@@ -4546,7 +5739,7 @@ mod tests {
         index.scan_root("root", &root, |_| {}).unwrap();
 
         assert!(index
-            .synchronize_path("missing-root", &root, &clip)
+            .synchronize_path("missing-root", &root, &clip, &AtomicBool::new(false))
             .is_err());
         drop(index);
 
@@ -4557,7 +5750,13 @@ mod tests {
         assert_eq!(repairs[0].reason, "direct update");
         assert!(repairs[0].last_error.is_some());
 
-        assert_eq!(reopened.repair_pending("root", &root, |_| {}).unwrap(), 1);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            reopened
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
         assert!(reopened.pending_repairs().unwrap().is_empty());
     }
 
@@ -4582,10 +5781,12 @@ mod tests {
         )))
         .add_path(from.clone())
         .set_tracker(7);
+        let shared = WorkerShared::new();
         apply_notify_event(
             &mut index,
             "root",
             &root,
+            &shared,
             &mut state,
             from_event,
             &mut |_| {},
@@ -4599,7 +5800,16 @@ mod tests {
         )))
         .add_path(to.clone())
         .set_tracker(7);
-        apply_notify_event(&mut index, "root", &root, &mut state, to_event, &mut |_| {}).unwrap();
+        apply_notify_event(
+            &mut index,
+            "root",
+            &root,
+            &shared,
+            &mut state,
+            to_event,
+            &mut |_| {},
+        )
+        .unwrap();
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.join("clip.mp4").to_string_lossy().into_owned()])
@@ -4621,7 +5831,7 @@ mod tests {
         std::fs::rename(&from, &to).unwrap();
 
         assert!(index
-            .synchronize_rename("missing-root", &root, &from, &to)
+            .synchronize_rename("missing-root", &root, &from, &to, &AtomicBool::new(false))
             .is_err());
 
         let repairs = index.pending_repairs().unwrap();
@@ -4629,7 +5839,13 @@ mod tests {
         assert_eq!(repairs[0].path, to);
         assert_eq!(repairs[0].reason, "direct rename");
 
-        assert_eq!(index.repair_pending("root", &root, |_| {}).unwrap(), 1);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            index
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([to.to_string_lossy().into_owned()])
@@ -4651,7 +5867,7 @@ mod tests {
         std::fs::rename(&root, &renamed).unwrap();
 
         index
-            .synchronize_rename("root", &root, &root, &renamed)
+            .synchronize_rename("root", &root, &root, &renamed, &AtomicBool::new(false))
             .unwrap();
 
         assert_eq!(
@@ -4682,13 +5898,13 @@ mod tests {
 
         std::fs::rename(&inside, &moved_out).unwrap();
         index
-            .synchronize_rename("root", &root, &inside, &moved_out)
+            .synchronize_rename("root", &root, &inside, &moved_out, &AtomicBool::new(false))
             .unwrap();
         assert!(indexed_display_paths(&index).is_empty());
 
         std::fs::rename(&moved_out, &inside).unwrap();
         index
-            .synchronize_rename("root", &root, &moved_out, &inside)
+            .synchronize_rename("root", &root, &moved_out, &inside, &AtomicBool::new(false))
             .unwrap();
         assert_eq!(
             indexed_display_paths(&index),
@@ -4715,7 +5931,7 @@ mod tests {
         std::fs::rename(&from, &to).unwrap();
 
         index
-            .synchronize_rename("parent", &parent, &from, &to)
+            .synchronize_rename("parent", &parent, &from, &to, &AtomicBool::new(false))
             .unwrap();
 
         let parent_memberships: i64 = index
@@ -4759,7 +5975,13 @@ mod tests {
 
         std::fs::rename(&old_folder, &new_folder).unwrap();
         index
-            .synchronize_rename("root", &root, &old_folder, &new_folder)
+            .synchronize_rename(
+                "root",
+                &root,
+                &old_folder,
+                &new_folder,
+                &AtomicBool::new(false),
+            )
             .unwrap();
 
         assert_eq!(
@@ -4788,14 +6010,18 @@ mod tests {
         let clip = root.join("clip.mp4");
 
         std::fs::write(&clip, b"one").unwrap();
-        index.synchronize_path("root", &root, &clip).unwrap();
+        index
+            .synchronize_path("root", &root, &clip, &AtomicBool::new(false))
+            .unwrap();
         assert_eq!(
             indexed_display_paths(&index),
             BTreeSet::from([clip.to_string_lossy().into_owned()])
         );
 
         std::fs::write(&clip, b"a larger video").unwrap();
-        index.synchronize_path("root", &root, &clip).unwrap();
+        index
+            .synchronize_path("root", &root, &clip, &AtomicBool::new(false))
+            .unwrap();
         let size: i64 = index
             .connection
             .query_row("SELECT size_bytes FROM files", [], |row| row.get(0))
@@ -4803,7 +6029,9 @@ mod tests {
         assert_eq!(size, 14);
 
         std::fs::remove_file(&clip).unwrap();
-        index.synchronize_path("root", &root, &clip).unwrap();
+        index
+            .synchronize_path("root", &root, &clip, &AtomicBool::new(false))
+            .unwrap();
         assert!(indexed_display_paths(&index).is_empty());
     }
 
@@ -5111,6 +6339,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn stats_and_folders_on_a_metadata_failure_error_instead_of_reporting_empty() {
+        let directory = tempdir().unwrap();
+        // A component past NAME_MAX fails metadata with ENAMETOOLONG on
+        // Unix for every user — unlike chmod tricks, which root sails
+        // through.
+        let database = directory.path().join("a".repeat(300)).join("index.sqlite3");
+        let manager = OwnedIndexManager::under_read_only(database);
+
+        let folders = manager.folders().unwrap_err();
+        let stats = manager.stats().unwrap_err();
+
+        assert!(
+            folders.contains("could not read its search index"),
+            "unexpected error: {folders}"
+        );
+        assert!(
+            stats.contains("could not read its search index"),
+            "unexpected error: {stats}"
+        );
+    }
+
+    #[test]
+    fn stats_and_folders_on_a_directory_at_the_index_path_error_instead_of_reporting_empty() {
+        let directory = tempdir().unwrap();
+        let manager = OwnedIndexManager::under_read_only(directory.path().to_path_buf());
+
+        let folders = manager.folders().unwrap_err();
+        let stats = manager.stats().unwrap_err();
+
+        assert!(
+            folders.contains("is not a file"),
+            "unexpected error: {folders}"
+        );
+        assert!(stats.contains("is not a file"), "unexpected error: {stats}");
+    }
+
+    #[test]
     fn removing_a_managed_root_removes_its_files() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
@@ -5200,5 +6466,1549 @@ mod tests {
             let mode = entry.metadata().unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{} was not private", entry.path().display());
         }
+    }
+
+    #[test]
+    fn opening_a_version_1_database_migrates_it_without_touching_roots() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 1: drop the liveness table and the
+            // indexable counter, plus both version markers.
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open(&database).unwrap();
+
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let meta: i64 = index
+            .connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta, 2);
+        // Roots, files, and progress survive; nothing needs rescanning.
+        let roots = index.roots_with_state().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].2, "ready");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+        assert!(index.read_daemon_state().unwrap().is_none());
+        let columns: Vec<String> = index
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('scan_runs')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            columns.contains(&"files_indexable".to_owned()),
+            "{columns:?}"
+        );
+    }
+
+    #[test]
+    fn read_only_open_creates_nothing_when_the_index_is_missing() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("missing").join("index.sqlite3");
+
+        let result = OwnedIndex::open_read_only(&database);
+
+        assert!(result.is_err());
+        assert!(!database.is_file());
+        assert!(!database.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn read_only_open_leaves_a_version_1_database_untouched() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 1: no liveness table, no indexable
+            // counter, version markers back to 1.
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+
+        // Still version 1, byte for byte: a read must never migrate.
+        // (SQLite may still create ephemeral -shm/-wal sidecars beside
+        // the database; those are its runtime state, not index state,
+        // and every reader — including a version 1 app — creates them.)
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        drop(index);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        // A missing liveness table reads as no heartbeat, not an error.
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        assert!(index.read_daemon_state().unwrap().is_none());
+        // And any write through the handle fails instead of slipping in.
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 1,
+            activity: crate::daemon_state::DaemonActivity::Idle,
+            current_root: None,
+            current_path: None,
+            queue: crate::daemon_state::DaemonQueue::default(),
+        };
+        assert!(
+            index.publish_daemon_state(1, 1, &beat).is_err(),
+            "query_only must refuse writes"
+        );
+    }
+
+    #[test]
+    fn read_only_open_rejects_an_unknown_schema() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+
+        let result = OwnedIndex::open_read_only(&database);
+
+        assert!(matches!(
+            result,
+            Err(OwnedIndexError::UnsupportedSchema(99))
+        ));
+    }
+
+    #[test]
+    fn read_only_open_carries_the_same_busy_timeout_as_writable_opens() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+
+        let busy_timeout: i64 = index
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        // Without it contended reads fail instantly with BUSY; old reads
+        // went through open() with 5s.
+        assert_eq!(busy_timeout, 5_000);
+    }
+
+    #[test]
+    fn a_read_only_open_waits_out_a_contended_lock_instead_of_failing_busy() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // An EXCLUSIVE lock blocks even readers: the open below (and its
+        // version probe) must wait for the release instead of failing.
+        let blocker = Connection::open(&database).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        let roots = index.roots().unwrap();
+
+        releaser.join().unwrap();
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn read_only_inspection_reads_a_version_1_database_without_migrating() {
+        use crate::providers::OwnedIndexSearchProvider;
+        use crate::search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE};
+        use crate::search_log::SearchLogContext;
+
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("family-trip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 1: no liveness table, no indexable
+            // counter, version markers back to 1.
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+
+        // Everything `ts` reads: folders, stats, and search.
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        let folders = manager.folders().unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].status, OwnedFolderStatus::Ready);
+        let stats = manager.stats().unwrap();
+        assert_eq!(stats.videos, 1);
+        assert_eq!(stats.folders.len(), 1);
+        let provider = OwnedIndexSearchProvider::new_read_only(database.clone());
+        let request = SearchRequest {
+            query: "family".into(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Videos,
+        };
+        let context = SearchLogContext::from(&request);
+        let candidates = provider.candidates("family", false, &context).unwrap();
+        assert_eq!(candidates, vec![root.join("family-trip.mp4")]);
+        assert!(provider.revision() > 0);
+        let mut paths = vec![
+            root.join("family-trip.mp4"),
+            PathBuf::from("/elsewhere/nope.mp4"),
+        ];
+        provider.retain_visible_paths(&mut paths).unwrap();
+        assert_eq!(paths, vec![root.join("family-trip.mp4")]);
+
+        // Still version 1, byte for byte: no read migrated anything.
+        let version: i64 = Connection::open(&database)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn scan_progress_on_version_1_reports_committed_files_as_indexable() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("family-trip.mp4"), b"video").unwrap();
+        std::fs::write(root.join("notes.txt"), b"unsupported").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        let progress = index.scan_progress("root").unwrap().expect("scan run");
+
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(progress.files_discovered, 2);
+        assert_eq!(progress.files_indexed, 1);
+        // No indexable counter on version 1: the committed count stands
+        // in, so remaining work reads as none.
+        assert_eq!(progress.files_indexable, 1);
+    }
+
+    #[test]
+    fn read_only_inspection_of_an_empty_database_is_empty() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        // Version 0: an empty file with no tables at all.
+        std::fs::write(&database, []).unwrap();
+
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        assert!(manager.folders().unwrap().is_empty());
+        let stats = manager.stats().unwrap();
+        assert_eq!(stats.revision, 0);
+        assert_eq!(stats.videos, 0);
+        assert_eq!(stats.images, 0);
+        assert!(stats.folders.is_empty());
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+        assert!(index
+            .search_candidates(&["family".to_owned()])
+            .unwrap()
+            .is_empty());
+        assert_eq!(index.revision().unwrap(), 0);
+        assert!(index.roots().unwrap().is_empty());
+        assert!(index.scan_progress("root").unwrap().is_none());
+
+        // And nothing was created: still an empty file.
+        assert_eq!(std::fs::read(&database).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn writes_through_a_read_only_manager_fail_loudly() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        OwnedIndexManager::under(database.clone())
+            .add_folder(&root)
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+
+        let manager = OwnedIndexManager::under_read_only(database.clone());
+        let other = directory.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(manager.add_folder(&other).is_err());
+        assert!(manager.remove_folder("root").is_err());
+
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn concurrent_first_opens_migrate_exactly_once() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 1)
+                .unwrap();
+        }
+
+        // Eight first-openers race the same version 1 database: one
+        // migrates, the rest wait out the busy timeout and find nothing
+        // left to do. Every opener succeeds.
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    OwnedIndex::open(&database)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let index = OwnedIndex::open(&database).unwrap();
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(index.roots().unwrap().len(), 1);
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+
+        // The same race for fresh creation: one wins, the rest open what
+        // the winner created.
+        let fresh = directory.path().join("fresh.sqlite3");
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let fresh = fresh.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    OwnedIndex::open(&fresh)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let version: i64 = Connection::open(&fresh)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+
+    #[test]
+    fn write_transactions_hold_the_write_lock_up_front() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut first = OwnedIndex::open(&database).unwrap();
+
+        let transaction = write_transaction(&mut first.connection).unwrap();
+
+        // A second writer cannot even begin while the first holds its
+        // transaction open with no statements run: the lock was taken up
+        // front, not deferred to the first write — which is what keeps a
+        // concurrent commit from failing the upgrade with BUSY_SNAPSHOT.
+        let second = Connection::open(&database).unwrap();
+        second.busy_timeout(Duration::ZERO).unwrap();
+        let blocked = second.execute_batch("BEGIN IMMEDIATE");
+        assert!(
+            matches!(
+                blocked,
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "expected BUSY, got {blocked:?}"
+        );
+        drop(transaction);
+        second.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn migrating_preserves_scan_error_and_offline_roots_with_wal_present() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        for name in ["scanning", "errored", "offline"] {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        let offline_dir = directory.path().join("offline").canonicalize().unwrap();
+        std::fs::write(offline_dir.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index
+            .insert_root("scanning", &directory.path().join("scanning"))
+            .unwrap();
+        index
+            .insert_root("errored", &directory.path().join("errored"))
+            .unwrap();
+        index.insert_root("offline", &offline_dir).unwrap();
+        index.scan_root("offline", &offline_dir, |_| {}).unwrap();
+        // A mid-scan run and an errored run, as an interrupted daemon
+        // would leave them, plus the scanned root going offline — then
+        // the whole thing rewound to version 1.
+        index
+            .connection
+            .execute_batch(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'scanning';
+                 INSERT INTO scan_runs (
+                    root_id, generation, state,
+                    folders_discovered, folders_scanned,
+                    files_discovered, files_indexable, files_indexed,
+                    videos_indexed, images_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('scanning', 1, 'scanning', 4, 2, 10, 8, 5, 5, 0, 1, 2);
+                 UPDATE roots SET state = 'error', scan_generation = 1 WHERE id = 'errored';
+                 INSERT INTO scan_runs (
+                    root_id, generation, state,
+                    folders_discovered, folders_scanned,
+                    files_discovered, files_indexable, files_indexed,
+                    videos_indexed, images_indexed,
+                    started_at_ns, updated_at_ns, error
+                 ) VALUES ('errored', 1, 'error', 2, 2, 6, 6, 6, 5, 1, 1, 2, 'boom');
+                 UPDATE roots SET state = 'offline' WHERE id = 'offline';
+                 DROP TABLE daemon_state;
+                 ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                 UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+            )
+            .unwrap();
+        index
+            .connection
+            .pragma_update(None, "user_version", 1)
+            .unwrap();
+        // Uncheckpointed version 1 content still sits in the WAL, and the
+        // old handle stays open while the migration runs — as a version 1
+        // app holding the database would — so the migration must read
+        // through the WAL instead of a clean file.
+        let wal = database.with_extension("sqlite3-wal");
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "expected WAL content beside the version 1 database"
+        );
+        let migrated = OwnedIndex::open(&database).unwrap();
+        drop(index);
+        let index = migrated;
+
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let states = index.roots_with_state().unwrap();
+        assert_eq!(
+            states
+                .iter()
+                .map(|(id, _, state)| (id.as_str(), state.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("errored", "error"),
+                ("offline", "offline"),
+                ("scanning", "scanning")
+            ]
+        );
+        let mid = index
+            .scan_progress("scanning")
+            .unwrap()
+            .expect("mid-scan run");
+        assert_eq!(mid.phase, ScanPhase::Scanning);
+        assert_eq!(mid.files_discovered, 10);
+        assert_eq!(mid.files_indexed, 5);
+        // The re-added counter defaults to zero for pre-migration rows.
+        assert_eq!(mid.files_indexable, 0);
+        let failed = index
+            .scan_progress("errored")
+            .unwrap()
+            .expect("errored run");
+        assert_eq!(failed.phase, ScanPhase::Error);
+        assert_eq!(failed.error.as_deref(), Some("boom"));
+        // The offline root's files survive the migration.
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+        assert!(index.read_daemon_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn opening_a_newer_schema_fails_cleanly_without_migrating() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 999)
+            .unwrap();
+        // Roll back to delete-mode with loose permissions, so any chmod
+        // or WAL flip during the refusal below shows up.
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = DELETE;")
+            .unwrap();
+        let sidecars = ["-wal", "-shm", "-journal"]
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", database.display())));
+        for sidecar in &sidecars {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+        #[cfg(unix)]
+        let mode_before = {
+            use std::os::unix::fs::PermissionsExt;
+            (
+                std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(directory.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+            )
+        };
+
+        let result = OwnedIndex::open(&database);
+
+        // A downgrade is a clean error, not a migration attempt: the
+        // version check runs before any side effect, so the database —
+        // bytes, mode, and sidecars — is untouched and still opens once
+        // upgraded again.
+        assert!(matches!(
+            result,
+            Err(OwnedIndexError::UnsupportedSchema(999))
+        ));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                (
+                    std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+                    std::fs::metadata(directory.path())
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                ),
+                mode_before
+            );
+        }
+        for sidecar in &sidecars {
+            assert!(
+                !sidecar.exists(),
+                "refusal must not create {}",
+                sidecar.display()
+            );
+        }
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        OwnedIndex::open(&database).unwrap();
+    }
+
+    fn dir_listing(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn refusing_a_newer_wal_database_touches_neither_bytes_nor_sidecars() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // A newer app's index: version 999, WAL mode with live sidecars.
+        // Refusal happens from raw header bytes before any open, so it
+        // cannot create -shm, roll back a hot journal, or touch modes —
+        // by construction, not just by ordering inside open().
+        Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 999)
+            .unwrap();
+        let held = Connection::open(&database).unwrap();
+        held.execute_batch("CREATE TABLE probe(x); INSERT INTO probe VALUES (1);")
+            .unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let wal_before =
+            std::fs::read(PathBuf::from(format!("{}-wal", database.display()))).unwrap();
+        let listing_before = dir_listing(directory.path());
+
+        let result = OwnedIndex::open(&database);
+
+        assert!(matches!(
+            result,
+            Err(OwnedIndexError::UnsupportedSchema(999))
+        ));
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert_eq!(
+            std::fs::read(PathBuf::from(format!("{}-wal", database.display()))).unwrap(),
+            wal_before
+        );
+        assert_eq!(dir_listing(directory.path()), listing_before);
+        drop(held);
+    }
+
+    #[test]
+    fn open_retries_the_wal_flip_past_a_reserved_lock() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        // RESERVED lets the version probe read but blocks the WAL flip's
+        // EXCLUSIVE lock — and PRAGMA bypasses busy_timeout, so without
+        // the application-level retry this open fails instantly with BUSY.
+        let blocker = Connection::open(&database).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            blocker.execute_batch("COMMIT").unwrap();
+        });
+
+        OwnedIndex::open(&database).unwrap();
+
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn entering_repair_clears_the_last_reported_progress() {
+        let shared = WorkerShared::new();
+        let mut progress = ScanProgress::new("root");
+        progress.current_file = Some(PathBuf::from("/media/a.mp4"));
+        shared.record_progress(&progress);
+        shared.set_stage(WorkerStage::Scanning);
+        assert!(shared.snapshot().last_progress.is_some());
+
+        // Entering repair drops the scan's stale path...
+        shared.set_stage(WorkerStage::Repairing);
+        let live = shared.snapshot();
+        assert_eq!(live.stage, WorkerStage::Repairing);
+        assert!(live.last_progress.is_none());
+
+        // ...until the repair itself reports progress.
+        shared.record_progress(&progress);
+        assert!(shared.snapshot().last_progress.is_some());
+
+        // Other transitions keep what was reported.
+        shared.set_stage(WorkerStage::Watching);
+        assert!(shared.snapshot().last_progress.is_some());
+    }
+
+    #[test]
+    fn negative_stored_counts_read_as_zero() {
+        let (_directory, index) = open_index();
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 2_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Idle,
+            current_root: None,
+            current_path: None,
+            queue: crate::daemon_state::DaemonQueue::default(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "UPDATE daemon_state
+                 SET pending_roots = -5, files_remaining = -3,
+                     pending_repairs = -1, pending_thumbnails = -7
+                 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+
+        assert_eq!(row.queue, crate::daemon_state::DaemonQueue::default());
+    }
+
+    #[test]
+    fn daemon_heartbeat_round_trips_through_the_liveness_row() {
+        let (_directory, index) = open_index();
+        assert!(index.read_daemon_state().unwrap().is_none());
+
+        let queue = crate::daemon_state::DaemonQueue {
+            pending_roots: 2,
+            files_remaining: 40,
+            pending_repairs: 1,
+            pending_thumbnails: 3,
+        };
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 2_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Scanning,
+            current_root: Some(PathBuf::from("/media")),
+            current_path: Some(PathBuf::from("/media/a.mp4")),
+            queue: queue.clone(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+        assert_eq!(row.pid, Some(1234));
+        assert_eq!(row.started_at_ns, 1_000_000_000);
+        assert_eq!(row.heartbeat_at_ns, 2_000_000_000);
+        assert_eq!(row.activity, crate::daemon_state::DaemonActivity::Scanning);
+        assert_eq!(row.current_root, Some(PathBuf::from("/media")));
+        assert_eq!(row.current_path, Some(PathBuf::from("/media/a.mp4")));
+        assert_eq!(row.queue, queue);
+
+        // A second heartbeat replaces the row instead of adding one.
+        let beat = crate::daemon_state::DaemonBeat {
+            heartbeat_at_ns: 3_000_000_000,
+            activity: crate::daemon_state::DaemonActivity::Idle,
+            current_root: None,
+            current_path: None,
+            queue: crate::daemon_state::DaemonQueue::default(),
+        };
+        index
+            .publish_daemon_state(1234, 1_000_000_000, &beat)
+            .unwrap();
+        let row = index.read_daemon_state().unwrap().expect("heartbeat row");
+        assert_eq!(row.heartbeat_at_ns, 3_000_000_000);
+        assert_eq!(row.activity, crate::daemon_state::DaemonActivity::Idle);
+        assert_eq!(row.current_root, None);
+        let count: i64 = index
+            .connection
+            .query_row("SELECT COUNT(*) FROM daemon_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn daemon_queue_counts_pending_roots_files_and_repairs() {
+        let directory = tempdir().unwrap();
+        let ready_root = directory.path().join("ready");
+        let busy_root = directory.path().join("busy");
+        std::fs::create_dir(&ready_root).unwrap();
+        std::fs::create_dir(&busy_root).unwrap();
+        let ready_root = ready_root.canonicalize().unwrap();
+        let busy_root = busy_root.canonicalize().unwrap();
+        std::fs::write(ready_root.join("clip.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("ready", &ready_root).unwrap();
+        index.scan_root("ready", &ready_root, |_| {}).unwrap();
+        index.insert_root("busy", &busy_root).unwrap();
+        // A scan generation in progress: fifty files seen, forty of them
+        // indexable, thirty indexed. The ten excluded files (unsupported,
+        // empty, unreadable) are decided, not remaining.
+        index
+            .connection
+            .execute(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'busy'",
+                [],
+            )
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexable, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('busy', 1, 'scanning', 3, 50, 40, 30, 0, 0)",
+                [],
+            )
+            .unwrap();
+        index
+            .queue_repair(&busy_root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+
+        let queue = index.daemon_queue_counts(7).unwrap();
+
+        assert_eq!(queue.pending_roots, 1);
+        assert_eq!(queue.files_remaining, 10);
+        assert_eq!(queue.pending_repairs, 1);
+        assert_eq!(queue.pending_thumbnails, 7);
+
+        // A superseded generation's stale 'scanning' row does not count.
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexable, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('busy', 0, 'scanning', 1, 1000, 900, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(index.daemon_queue_counts(0).unwrap().files_remaining, 10);
+    }
+
+    #[test]
+    fn files_remaining_clamps_over_committed_runs_before_summing() {
+        let directory = tempdir().unwrap();
+        let migrated_root = directory.path().join("migrated");
+        let busy_root = directory.path().join("busy");
+        std::fs::create_dir(&migrated_root).unwrap();
+        std::fs::create_dir(&busy_root).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("migrated", &migrated_root).unwrap();
+        index.insert_root("busy", &busy_root).unwrap();
+        // A version 1 scan interrupted mid-run migrates to indexable 0 /
+        // indexed N: the new counter defaults to zero for pre-migration
+        // rows while the committed count survives.
+        index
+            .connection
+            .execute(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'migrated'",
+                [],
+            )
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexable, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('migrated', 1, 'scanning', 1, 12, 0, 12, 0, 0)",
+                [],
+            )
+            .unwrap();
+        // Beside a root with ten files seen but uncommitted: clamping
+        // after the sum would report max(0, -12 + 10) = 0 and hide the
+        // real remainder.
+        index
+            .connection
+            .execute(
+                "UPDATE roots SET state = 'scanning', scan_generation = 1 WHERE id = 'busy'",
+                [],
+            )
+            .unwrap();
+        index
+            .connection
+            .execute(
+                "INSERT INTO scan_runs (
+                    root_id, generation, state, folders_discovered,
+                    files_discovered, files_indexable, files_indexed,
+                    started_at_ns, updated_at_ns
+                 ) VALUES ('busy', 1, 'scanning', 1, 10, 10, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(index.daemon_queue_counts(0).unwrap().files_remaining, 10);
+    }
+
+    #[test]
+    fn files_remaining_counts_only_uncommitted_indexable_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("first.mp4"), b"one").unwrap();
+        std::fs::write(root.join("second.mp4"), b"two").unwrap();
+        std::fs::write(root.join("notes.txt"), b"text").unwrap();
+        std::fs::File::create(root.join("empty.mov")).unwrap();
+        // An unread directory behind the files guarantees a cancellation
+        // check still waits after every file is classified, whatever
+        // order the filesystem lists them in: without it the scan could
+        // commit its batch and finish before noticing the flag.
+        std::fs::create_dir(root.join("later")).unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut scanner = OwnedIndex::open(&database).unwrap();
+        scanner.insert_root("root", &root).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+
+        // Abort once every file is classified but no batch committed: the
+        // notes and the empty clip are excluded, never remaining.
+        let cancel = AtomicBool::new(false);
+        let result =
+            scanner.scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |progress| {
+                if progress.files_discovered == 4 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+
+        let stored = observer.scan_progress("root").unwrap().unwrap();
+        assert_eq!(stored.phase, ScanPhase::Scanning);
+        assert_eq!(stored.files_discovered, 4);
+        assert_eq!(stored.files_indexable, 2);
+        assert_eq!(stored.files_indexed, 0);
+        assert_eq!(observer.daemon_queue_counts(0).unwrap().files_remaining, 2);
+    }
+
+    #[test]
+    fn a_cancelled_scan_is_not_recorded_as_successful() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let error = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap_err();
+        assert!(
+            matches!(error, OwnedIndexError::Cancelled { .. }),
+            "expected Cancelled, got {error}"
+        );
+
+        // The roots row and the run stay 'scanning': nothing claims the
+        // aborted scan finished.
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+        let progress = index.scan_progress("root").unwrap().expect("partial run");
+        assert_eq!(progress.phase, ScanPhase::Scanning);
+
+        // A fresh scan completes honestly afterwards.
+        let cancel = AtomicBool::new(false);
+        let progress = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "ready");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+    }
+
+    #[test]
+    fn cancelling_mid_scan_keeps_finished_writes_and_rescans_cleanly() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip-a.mp4"), b"video").unwrap();
+        std::fs::write(root.join("clip-b.mp4"), b"video").unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+
+        // Abort right after the first batch commits: the write must stand
+        // while the scan itself must not count as finished.
+        let cancel = AtomicBool::new(false);
+        let mut indexed = 0u64;
+        let result = index.scan_root_in_batches("root", &root, 1, &cancel, |progress| {
+            if progress.files_indexed > indexed {
+                indexed = progress.files_indexed;
+                cancel.store(true, Ordering::Relaxed);
+            }
+        });
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+
+        assert_eq!(indexed, 1);
+        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+
+        let cancel = AtomicBool::new(false);
+        let progress = index
+            .scan_root_in_batches("root", &root, SCAN_BATCH_SIZE, &cancel, |_| {})
+            .unwrap();
+        assert_eq!(progress.phase, ScanPhase::Ready);
+        assert_eq!(indexed_display_paths(&index).len(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_directory_sync_indexes_nothing_and_queues_its_repair() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = root.canonicalize().unwrap();
+        let nested = root.join("nested");
+        std::fs::write(nested.join("clip.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let result = index.synchronize_path("root", &root, &nested, &cancel);
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert!(indexed_display_paths(&index).is_empty());
+        // The unfinished update is queued for the next repair run.
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, nested);
+    }
+
+    #[test]
+    fn a_cancelled_rename_sync_applies_nothing() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let from = root.join("clip.mp4");
+        let to = root.join("renamed.mp4");
+        std::fs::write(&from, b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let result = index.synchronize_rename("root", &root, &from, &to, &cancel);
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(
+            indexed_display_paths(&index),
+            BTreeSet::from([from.to_string_lossy().into_owned()])
+        );
+    }
+
+    /// A root with `files` clips indexed under `old/`, then renamed on
+    /// disk to `new/`: the rename sync below must move the rows. Every
+    /// indexed file sits under the renamed directory, so every planning
+    /// row matches.
+    fn indexed_renamed_directory(
+        files: usize,
+    ) -> (tempfile::TempDir, OwnedIndex, PathBuf, PathBuf, PathBuf) {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let from = root.join("old");
+        std::fs::create_dir_all(&from).unwrap();
+        for number in 0..files {
+            std::fs::write(from.join(format!("clip-{number:02}.mp4")), b"video").unwrap();
+        }
+        let root = root.canonicalize().unwrap();
+        let from = root.join("old");
+        let to = root.join("new");
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        (directory, index, root, from, to)
+    }
+
+    fn index_revision(index: &OwnedIndex) -> i64 {
+        index
+            .connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'index_revision'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rename_cancelled_mid_planning_commits_nothing_and_stays_queued() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(3);
+        let before = indexed_display_paths(&index);
+        assert_eq!(before.len(), 3);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let planned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&planned);
+
+        // The stop arrives while planning is still reading rows: the
+        // first planned row raises it, the next row's check honors it —
+        // long before the rewrite transaction opens. The count proves
+        // the per-row check fired, not just the post-planning one.
+        let result = with_sync_step_probe(
+            move |site| {
+                if site == SyncProbeSite::RenamePlanned {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            || index.synchronize_rename("root", &root, &from, &to, &cancel),
+        );
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(planned.load(Ordering::Relaxed), 1);
+        assert_eq!(indexed_display_paths(&index), before);
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+        assert_eq!(repairs[0].reason.as_str(), "direct rename");
+    }
+
+    #[test]
+    fn a_rename_cancelled_after_planning_never_opens_its_rewrite() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(3);
+        let before = indexed_display_paths(&index);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let planned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&planned);
+        let rewritten = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rewritten_counted = Arc::clone(&rewritten);
+
+        // The stop lands on the last planning row: planning runs to
+        // completion, but the rewrite transaction never opens.
+        let result = with_sync_step_probe(
+            move |site| match site {
+                SyncProbeSite::RenamePlanned => {
+                    if counted.fetch_add(1, Ordering::Relaxed) + 1 == 3 {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+                SyncProbeSite::RenameRewritten => {
+                    rewritten_counted.fetch_add(1, Ordering::Relaxed);
+                }
+                SyncProbeSite::FileCommitted | SyncProbeSite::ScanBatchCommitted => {}
+            },
+            || index.synchronize_rename("root", &root, &from, &to, &cancel),
+        );
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(planned.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            rewritten.load(Ordering::Relaxed),
+            0,
+            "the rewrite transaction must never open"
+        );
+        assert_eq!(indexed_display_paths(&index), before);
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+    }
+
+    #[test]
+    fn a_rename_cancelled_on_its_only_row_rolls_back_before_commit() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(1);
+        let before = indexed_display_paths(&index);
+        let revision = index_revision(&index);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+
+        // A single moved file: the stop lands on its only rewrite, past
+        // every per-row check, so only the pre-commit recheck can still
+        // roll the transaction back.
+        let result = with_sync_step_probe(
+            move |site| {
+                if site == SyncProbeSite::RenameRewritten {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            || index.synchronize_rename("root", &root, &from, &to, &cancel),
+        );
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(indexed_display_paths(&index), before);
+        assert_eq!(
+            index_revision(&index),
+            revision,
+            "the revision bump must roll back with the rewrite"
+        );
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+    }
+
+    #[test]
+    fn a_rename_cancelled_mid_rewrite_rolls_everything_back() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(3);
+        let before = indexed_display_paths(&index);
+        let revision = index_revision(&index);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let rewritten = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&rewritten);
+
+        // The stop arrives with the first rewrite: the second row's check
+        // fires, and dropping the uncommitted transaction rolls back even
+        // the first row's rewrite.
+        let result = with_sync_step_probe(
+            move |site| {
+                if site == SyncProbeSite::RenameRewritten {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    stop.store(true, Ordering::Relaxed);
+                }
+            },
+            || index.synchronize_rename("root", &root, &from, &to, &cancel),
+        );
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(rewritten.load(Ordering::Relaxed), 1);
+        assert_eq!(indexed_display_paths(&index), before);
+        assert_eq!(
+            index_revision(&index),
+            revision,
+            "the revision bump must roll back with the rewrite"
+        );
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+    }
+
+    #[test]
+    fn a_directory_sync_aborts_mid_walk_when_cancelled() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = root.canonicalize().unwrap();
+        let nested = root.join("nested");
+        const CLIPS: usize = 1200;
+        for number in 0..CLIPS {
+            std::fs::write(nested.join(format!("clip-{number:04}.mp4")), b"video").unwrap();
+        }
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        let observer = OwnedIndex::open(&database).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // A bounded handshake at the first file commit: each file commits
+        // its own transaction, so the worker signals and waits there while
+        // the test sets the stop and releases it. No polling, so a
+        // descheduled observer cannot miss the window — and a worker that
+        // fails first reports its own failure instead of hanging the wait.
+        let (committed_sender, committed_receiver) = mpsc::channel::<()>();
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+        let signalled = Arc::new(AtomicBool::new(false));
+        let worker_signalled = Arc::clone(&signalled);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = thread::spawn(move || {
+            with_sync_step_probe(
+                move |site| {
+                    if site == SyncProbeSite::FileCommitted
+                        && !worker_signalled.swap(true, Ordering::Relaxed)
+                    {
+                        committed_sender.send(()).unwrap();
+                        release_receiver
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("the test releases the worker after setting the stop");
+                    }
+                },
+                || index.synchronize_path("root", &root, &nested, &worker_cancel),
+            )
+        });
+        if committed_receiver
+            .recv_timeout(Duration::from_secs(30))
+            .is_err()
+        {
+            if worker.is_finished() {
+                match worker.join() {
+                    Ok(result) => {
+                        panic!("the sync worker finished before committing anything: {result:?}")
+                    }
+                    Err(_) => panic!("the sync worker panicked before committing anything"),
+                }
+            }
+            panic!("timed out waiting for the first committed file");
+        }
+        cancel.store(true, Ordering::Relaxed);
+        release_sender.send(()).unwrap();
+        let result = worker.join().expect("sync thread panicked");
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        // The stop landed before the second file: exactly the first
+        // commit survived.
+        assert_eq!(indexed_display_paths(&observer).len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_directory_repair_replays_on_the_next_run() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = root.canonicalize().unwrap();
+        let nested = root.join("nested");
+        std::fs::write(nested.join("clip.mp4"), b"video").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index
+            .queue_repair(&nested, "direct update", "boom")
+            .unwrap();
+        let cancel = AtomicBool::new(true);
+
+        let result = index.repair_pending("root", &root, &cancel, |_| {});
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, nested);
+
+        // The next run replays it once the stop request is gone.
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            index
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
+        assert!(index.pending_repairs().unwrap().is_empty());
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+    }
+
+    #[test]
+    fn a_cancelled_rename_repair_replays_to_completion_on_the_next_run() {
+        let (_directory, mut index, root, from, to) = indexed_renamed_directory(3);
+        let before: BTreeSet<String> = (0..3)
+            .map(|number| {
+                from.join(format!("clip-{number:02}.mp4"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(indexed_display_paths(&index), before);
+        let cancel = AtomicBool::new(true);
+
+        let result = index.synchronize_rename("root", &root, &from, &to, &cancel);
+
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(indexed_display_paths(&index), before);
+        let repairs = index.pending_repairs().unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].path, to);
+        assert_eq!(repairs[0].reason, "direct rename");
+
+        // The next run replays the rename repair to completion: the rows
+        // move to their new names and the queue drains.
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            index
+                .repair_pending("root", &root, &cancel, |_| {})
+                .unwrap(),
+            1
+        );
+        assert!(index.pending_repairs().unwrap().is_empty());
+        let expected: BTreeSet<String> = (0..3)
+            .map(|number| {
+                to.join(format!("clip-{number:02}.mp4"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(indexed_display_paths(&index), expected);
+    }
+
+    #[test]
+    fn a_cancelled_repair_stays_queued_for_the_next_run() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mut index = OwnedIndex::open(&directory.path().join("index.sqlite3")).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index
+            .queue_repair(&root.join("late.mp4"), "direct update", "boom")
+            .unwrap();
+
+        let cancel = AtomicBool::new(true);
+        let result = index.repair_pending("root", &root, &cancel, |_| {});
+        assert!(
+            matches!(result, Err(OwnedIndexError::Cancelled { .. })),
+            "expected Cancelled, got {result:?}"
+        );
+        assert_eq!(index.pending_repairs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stopping_a_watcher_mid_scan_cancels_promptly() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        for number in 0..2000 {
+            let name = format!("clip-{number:05}-with-a-long-name-to-index-properly.mp4");
+            std::fs::write(root.join(name), b"video").unwrap();
+        }
+        let database = directory.path().join("index.sqlite3");
+        // A root id unique to this test: the gate below only ever trips
+        // for it, so parallel tests never observe each other's probes.
+        OwnedIndex::open(&database)
+            .unwrap()
+            .insert_root("cancel-probe-root", &root)
+            .unwrap();
+
+        // Gate the worker after its first batch commit instead of racing
+        // a poll against the scan: stop lands mid-scan deterministically
+        // on any machine speed.
+        let (gated_tx, gated_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let batches = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_batches = std::sync::Arc::clone(&batches);
+        with_global_sync_probe(
+            "cancel-probe-root",
+            move |site| {
+                if site == SyncProbeSite::ScanBatchCommitted
+                    && worker_batches.fetch_add(1, Ordering::Relaxed) + 1 == 1
+                {
+                    gated_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the test releases the gate once stop is underway");
+                }
+            },
+            || {
+                let watcher = OwnedIndexWatcher::start_with_progress(
+                    &database,
+                    "cancel-probe-root".into(),
+                    root,
+                    |_| {},
+                )
+                .unwrap();
+                gated_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the scan must commit a first batch");
+
+                // Stop from another thread: stop() joins the worker, and
+                // the worker sits in the gate until released below.
+                let (stopped_tx, stopped_rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = stopped_tx.send(watcher.stop());
+                });
+                release_tx.send(()).unwrap();
+                stopped_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("stop must join promptly, not wait out the scan")
+                    .unwrap();
+
+                // Aborted mid-scan, never recorded successful: one batch
+                // committed, the bulk of the walk unvisited.
+                let index = OwnedIndex::open(&database).unwrap();
+                assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+                let videos = OwnedIndexManager::under(database.clone())
+                    .state()
+                    .unwrap()
+                    .indexed_videos;
+                assert!(
+                    (128..2000).contains(&videos),
+                    "expected a partial scan, found {videos} videos"
+                );
+                let progress = index
+                    .scan_progress("cancel-probe-root")
+                    .unwrap()
+                    .expect("partial run");
+                assert_eq!(progress.phase, ScanPhase::Scanning);
+            },
+        );
     }
 }

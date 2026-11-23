@@ -2,6 +2,22 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The current time as nanoseconds since the Unix epoch, for the integer
+/// timestamp columns. Clocks before the epoch read as zero or negative,
+/// never panic.
+pub(crate) fn now_ns() -> i64 {
+    time_ns(SystemTime::now()).unwrap_or_default()
+}
+
+pub(crate) fn time_ns(time: SystemTime) -> Option<i64> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_nanos()).ok(),
+        Err(error) => i64::try_from(error.duration().as_nanos())
+            .ok()
+            .and_then(i64::checked_neg),
+    }
+}
+
 /// The current time as an RFC 3339 UTC string with millisecond precision.
 pub(crate) fn now_rfc3339() -> String {
     let millis = SystemTime::now()

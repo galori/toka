@@ -24,13 +24,13 @@ fn run_ts_with_fixture_env(arguments: &[&str], fixture_videos: Option<OsString>)
     run_ts_with_home(arguments, home.path(), &data_home, fixture_videos, None)
 }
 
-fn run_ts_with_home(
+fn ts_command(
     arguments: &[&str],
     home: &Path,
     data_home: &Path,
     fixture_videos: Option<OsString>,
     cwd: Option<&Path>,
-) -> Output {
+) -> Command {
     // A scratch temp space too, so even cache reads cannot escape the
     // test's directories.
     let scratch = home.join("tmp");
@@ -53,8 +53,17 @@ fn run_ts_with_home(
             command.env_remove("TS_FIXTURE_VIDEOS");
         }
     }
+    command
+}
 
-    let child = command
+fn run_ts_with_home(
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    fixture_videos: Option<OsString>,
+    cwd: Option<&Path>,
+) -> Output {
+    let child = ts_command(arguments, home, data_home, fixture_videos, cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -63,13 +72,71 @@ fn run_ts_with_home(
     wait_for_exit(child)
 }
 
-fn wait_for_exit(mut child: Child) -> Output {
+/// Starts `ts daemon run` against a scratch home and returns the live
+/// child. The caller must kill it: tests wrap their body so a failure
+/// cannot orphan a watcher on the test directories.
+fn spawn_daemon(home: &ScratchHome) -> Child {
+    ts_command(
+        &["daemon", "run"],
+        home.home.path(),
+        &home.data_home,
+        None,
+        None,
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap()
+}
+
+/// Runs a daemon test body against a live daemon, killing the daemon
+/// afterwards even when the body panics, then re-raising the failure.
+fn with_daemon(home: &ScratchHome, body: impl FnOnce() + std::panic::UnwindSafe) {
+    let mut daemon = spawn_daemon(home);
+    let result = std::panic::catch_unwind(body);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Polls `ts status --json` until `ready` accepts it or the timeout
+/// lapses. A stopped daemon still prints a document (with exit 3), so
+/// every poll either parses or fails the wait, never the test.
+fn wait_for_status(
+    home: &ScratchHome,
+    timeout: Duration,
+    mut ready: impl FnMut(&serde_json::Value) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = run_at(home, &["status", "--json"]);
+        if let Ok(document) =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&output.stdout))
+        {
+            if ready(&document) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn wait_for_exit(child: Child) -> Output {
+    wait_for_exit_timeout(child, Duration::from_secs(10))
+}
+
+fn wait_for_exit_timeout(mut child: Child, timeout: Duration) -> Output {
     let started = Instant::now();
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
         }
-        if started.elapsed() > Duration::from_secs(10) {
+        if started.elapsed() > timeout {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
             panic!(
@@ -261,6 +328,283 @@ fn folders_list_json_with_no_index_is_an_empty_document() {
     assert_eq!(document["schema"], 1);
     assert_eq!(document["folders"].as_array().unwrap().len(), 0);
     assert!(output.stderr.is_empty());
+}
+
+/// Where the child resolves the index: dirs honors XDG_DATA_HOME on
+/// Linux but derives it from HOME on macOS.
+fn index_database_path(home: &Path, data_home: &Path) -> PathBuf {
+    // Each platform resolves from one root and ignores the other.
+    #[cfg(target_os = "macos")]
+    let _ = data_home;
+    #[cfg(not(target_os = "macos"))]
+    let _ = home;
+    #[cfg(target_os = "macos")]
+    let database = home
+        .join("Library/Application Support")
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    #[cfg(not(target_os = "macos"))]
+    let database = data_home
+        .join(toka_search::config::APP_DATA_DIR_NAME)
+        .join(toka_search::config::INDEX_FILE_NAME);
+    database
+}
+
+/// Runs `ts` with explicit HOME / data-home / TMPDIR, creating none of
+/// them: the caller sets up exactly the layout the probe needs —
+/// including layouts that cannot exist, like an overlong path.
+fn run_ts_with_raw_envs(
+    arguments: &[&str],
+    home: &Path,
+    data_home: &Path,
+    tmpdir: &Path,
+) -> Output {
+    let child = Command::new(env!("CARGO_BIN_EXE_ts"))
+        .args(arguments)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", data_home)
+        .env("TMPDIR", tmpdir)
+        .env_remove("TS_FIXTURE_VIDEOS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    wait_for_exit(child)
+}
+
+/// A scratch layout whose index path fails metadata with ENAMETOOLONG on
+/// Unix for every user: a component past NAME_MAX under both HOME (what
+/// macOS resolves) and XDG_DATA_HOME (what Linux resolves), with a
+/// normal TMPDIR beside them. Nothing under the overlong components is
+/// ever created — metadata fails whether or not the path exists.
+fn overlong_env() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let base = tempdir().unwrap();
+    let overlong = "a".repeat(300);
+    let home = base.path().join(&overlong).join("home");
+    let data_home = base.path().join(&overlong).join("data");
+    let tmpdir = base.path().join("tmp");
+    fs::create_dir_all(&tmpdir).unwrap();
+    (base, home, data_home, tmpdir)
+}
+
+#[test]
+fn stats_with_an_unreadable_index_errors_instead_of_reporting_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_with_an_unreadable_index_errors_instead_of_reporting_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_with_an_unreadable_index_errors_instead_of_searching_empty() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn stats_with_a_directory_at_the_index_path_errors_instead_of_reporting_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+#[test]
+fn folders_list_with_a_directory_at_the_index_path_errors_instead_of_reporting_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_with_a_directory_at_the_index_path_errors_instead_of_searching_empty() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+/// Writes a version-999 database at the child's index path: an index
+/// from a newer Toka that this one must refuse, not migrate.
+fn write_newer_schema_database(database: &Path) {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    toka_search::owned_index::OwnedIndex::open(database).unwrap();
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .pragma_update(None, "user_version", 999)
+        .unwrap();
+}
+
+fn write_corrupt_database(database: &Path) {
+    if let Some(parent) = database.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(database, b"this is not a SQLite database at all").unwrap();
+}
+
+#[test]
+fn stats_on_a_newer_schema_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_on_a_newer_schema_errors_instead_of_listing() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_on_a_newer_schema_errors_instead_of_searching() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn folders_list_on_a_corrupt_index_errors_instead_of_listing() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["folders", "list"], vec!["folders", "list", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn stats_on_a_corrupt_index_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["stats"], vec!["stats", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn search_on_a_corrupt_index_errors_instead_of_searching() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["search", "family"], vec!["search", "family", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
 }
 
 #[cfg(feature = "fixtures")]
@@ -1450,4 +1794,613 @@ fn folders_add_through_a_symlink_echoes_the_stored_spelling() {
     let folders = document["folders"].as_array().unwrap();
     assert_eq!(folders.len(), 1);
     assert_eq!(folders[0]["path"], canonical.to_string_lossy().into_owned());
+}
+
+#[test]
+fn status_with_no_index_reports_a_stopped_daemon_with_exit_3() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status"]);
+
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Daemon:   not running\n"), "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn status_json_with_no_index_is_a_stopped_document() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status", "--json"]);
+
+    assert_eq!(output.status.code(), Some(3));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["running"], false);
+    assert!(document["activity"].is_null());
+    assert_eq!(document["queue"]["pendingRoots"], 0);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn status_creates_no_state_without_an_index() {
+    let home = scratch_home();
+
+    for arguments in [
+        &["status"][..],
+        &["status", "--json"][..],
+        &["status", "--watch"][..],
+    ] {
+        let output = run_ts_with_home(arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(3), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+    assert!(files_under(home.home.path()).is_empty());
+}
+
+#[test]
+fn status_on_a_newer_schema_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_newer_schema_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("schema version 999"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_on_a_corrupt_index_errors_instead_of_reporting() {
+    let home = scratch_home();
+    write_corrupt_database(&index_database_path(home.home.path(), &home.data_home));
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not use its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_with_an_unreadable_index_errors_instead_of_reporting_stopped() {
+    let (_base, home, data_home, tmpdir) = overlong_env();
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_raw_envs(&arguments, &home, &data_home, &tmpdir);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("could not read its search index"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn status_with_a_directory_at_the_index_path_errors_instead_of_reporting_stopped() {
+    let home = scratch_home();
+    let database = index_database_path(home.home.path(), &home.data_home);
+    fs::create_dir_all(&database).unwrap();
+
+    for arguments in [vec!["status"], vec!["status", "--json"]] {
+        let output = run_ts_with_home(&arguments, home.home.path(), &home.data_home, None, None);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("is not a file"), "{arguments:?}: {stderr}");
+    }
+}
+
+#[test]
+fn status_with_an_unknown_option_prints_usage() {
+    let home = scratch_home();
+
+    let output = run_at(&home, &["status", "--verbose"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Usage: ts status [--json] [--watch]\n"
+    );
+}
+
+#[test]
+fn daemon_help_prints_without_starting_anything() {
+    for arguments in [&["daemon", "--help"][..], &["daemon", "run", "--help"][..]] {
+        let output = run_ts(arguments, &[]);
+        assert_eq!(output.status.code(), Some(0), "{arguments:?}");
+        assert!(!output.stdout.is_empty(), "{arguments:?}");
+        assert!(output.stderr.is_empty(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn daemon_without_a_subcommand_prints_usage() {
+    let output = run_ts(&["daemon"], &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("Usage: ts daemon"));
+}
+
+#[test]
+fn daemon_run_indexes_added_folders_until_stopped() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    create_video(&media, 0);
+    create_video(&media, 1);
+
+    // Managed inline (rather than `with_daemon`) so a timeout can report
+    // whether the daemon is still alive and what it logged before the
+    // kill discards the evidence.
+    let mut daemon = spawn_daemon(&home);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The daemon publishes its first heartbeat within seconds.
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+
+        let media_argument = media.to_string_lossy().into_owned();
+        let output = run_at(&home, &["folders", "add", &media_argument]);
+        assert_eq!(output.status.code(), Some(0));
+
+        // The daemon picks the folder up and drains its queue to idle.
+        // The wait pairs status with stats: an idle report alone could
+        // predate the add, but idle plus two indexed videos proves the
+        // daemon saw the folder and scanned it.
+        let idle_and_empty = |document: &serde_json::Value| {
+            document["running"] == true
+                && document["activity"] == "idle"
+                && document["queue"]["pendingRoots"] == 0
+                && document["queue"]["filesRemaining"] == 0
+                && document["queue"]["pendingRepairs"] == 0
+                && document["queue"]["pendingThumbnails"] == 0
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (finished, last_status, last_videos) = loop {
+            let output = run_at(&home, &["status", "--json"]);
+            let status_text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let idle = serde_json::from_str::<serde_json::Value>(&status_text)
+                .map(|document| idle_and_empty(&document))
+                .unwrap_or(false);
+            let videos_text = if idle {
+                let output = run_at(&home, &["stats", "--json"]);
+                Some(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                None
+            };
+            let videos = videos_text
+                .as_ref()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                .and_then(|document| document["videos"].as_u64());
+            if videos == Some(2) {
+                // Both halves agree — but the idle heartbeat may predate
+                // the stats read (a stale pre-add beat plus committed
+                // stats would accept while the daemon is still busy).
+                // Heartbeats land every two seconds, so settling past two
+                // intervals means the next heartbeat must postdate the
+                // stats read; only a fresh idle report then proves the
+                // daemon drained its queue after indexing.
+                thread::sleep(Duration::from_secs(5));
+                let output = run_at(&home, &["status", "--json"]);
+                let verify_text = String::from_utf8_lossy(&output.stdout).into_owned();
+                let fresh_idle = serde_json::from_str::<serde_json::Value>(&verify_text)
+                    .map(|document| {
+                        idle_and_empty(&document)
+                            && document["heartbeatAgeSecs"]
+                                .as_u64()
+                                .is_some_and(|age| age <= 2)
+                    })
+                    .unwrap_or(false);
+                if fresh_idle {
+                    break (true, verify_text, videos_text);
+                }
+            }
+            if Instant::now() >= deadline {
+                break (false, status_text, videos_text);
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert!(
+            finished,
+            "the daemon never finished indexing; last status: {last_status} last stats: {}",
+            last_videos.as_deref().unwrap_or("<stats never read>"),
+        );
+
+        // The heartbeat stays fresh while the daemon runs.
+        let output = run_at(&home, &["status", "--json"]);
+        assert_eq!(output.status.code(), Some(0));
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert!(document["heartbeatAgeSecs"].as_u64().unwrap() < 10);
+        assert!(document["uptimeSecs"].as_u64().is_some());
+
+        // The accepted pair proved quiescence; the final report must use
+        // an observation consistent with it, not a single racy read.
+        let activity_deadline = Instant::now() + Duration::from_secs(30);
+        let stdout = loop {
+            let output = run_at(&home, &["status"]);
+            assert_eq!(output.status.code(), Some(0));
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            if stdout.contains("Activity: idle") {
+                break stdout;
+            }
+            assert!(
+                Instant::now() < activity_deadline,
+                "the daemon never settled back to idle; last status: {stdout}"
+            );
+            thread::sleep(Duration::from_millis(200));
+        };
+        assert!(stdout.contains("Daemon:   running"), "{stdout}");
+    }));
+    // Whether the body passed or failed: is the daemon still alive, what
+    // did it say on stderr, and what did it log?
+    let daemon_state = match daemon.try_wait() {
+        Ok(None) => "alive".to_owned(),
+        status => format!("exited: {status:?}"),
+    };
+    let _ = daemon.kill();
+    let daemon_output = daemon.wait_with_output();
+    let daemon_stderr = daemon_output
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+        .unwrap_or_else(|error| format!("<could not reap the daemon: {error}>"));
+    let indexer_log = indexer_log_path(&home);
+    let indexer_log_tail = fs::read_to_string(&indexer_log)
+        .map(|log| {
+            let mut lines: Vec<&str> = log.lines().collect();
+            if lines.len() > 20 {
+                lines = lines[lines.len() - 20..].to_vec();
+            }
+            lines.join("\n")
+        })
+        .unwrap_or_else(|_| "<no indexer log>".to_owned());
+    if let Err(payload) = result {
+        eprintln!("daemon state at failure: {daemon_state}");
+        eprintln!("daemon stderr at failure: {daemon_stderr}");
+        eprintln!("indexer log at failure:\n{indexer_log_tail}");
+        std::panic::resume_unwind(payload);
+    }
+
+    // A dead daemon reads as stopped: the pid is gone even though its
+    // last heartbeat is seconds old.
+    let output = run_at(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Daemon:   not running"), "{stdout}");
+}
+
+/// Where a scratch home's daemon writes its log: dirs honors
+/// XDG_DATA_HOME on Linux but derives it from HOME on macOS.
+fn indexer_log_path(home: &ScratchHome) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = home.home.path().join("Library/Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = home.data_home.clone();
+    base.join(toka_search::config::APP_LOG_DIR_NAME)
+        .join("logs/indexer.log")
+}
+
+/// Rewinds a version 2 index to version 1: no liveness table, no
+/// indexable counter, version markers back to 1.
+#[cfg(not(feature = "fixtures"))]
+fn rewind_to_v1(database: &Path) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE daemon_state;
+             ALTER TABLE scan_runs DROP COLUMN files_indexable;
+             UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+        )
+        .unwrap();
+    connection.pragma_update(None, "user_version", 1).unwrap();
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn schema_user_version(database: &Path) -> i64 {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap()
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn schema_meta_version(database: &Path) -> i64 {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// A logical dump of the index: every table's row count, in name order.
+/// Compared alongside the raw bytes, so a read that rewrote content
+/// without changing the file size still fails.
+#[cfg(not(feature = "fixtures"))]
+fn index_dump(database: &Path) -> Vec<(String, i64)> {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let tables: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (table, count)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "fixtures"))]
+fn assert_v1_untouched(database: &Path, bytes: &[u8], dump: &[(String, i64)]) {
+    assert_eq!(schema_user_version(database), 1);
+    assert_eq!(schema_meta_version(database), 1);
+    assert_eq!(index_dump(database), dump);
+    assert_eq!(fs::read(database).unwrap(), bytes);
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn read_commands_leave_a_version_1_database_untouched() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let media = media.canonicalize().unwrap();
+    create_video(&media, 0);
+    create_video(&media, 1);
+
+    // A scanned version 2 index, rewound to version 1.
+    let media_argument = media.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = scratch_database(&home);
+    let manager = OwnedIndexManager::under(database.clone());
+    let folders = manager.folders().unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &folders[0].path, |_| {})
+        .unwrap();
+    rewind_to_v1(&database);
+    let before = fs::read(&database).unwrap();
+    let dump = index_dump(&database);
+
+    // Every read command proves it can read version 1, then proves it
+    // changed nothing: version markers, logical dump, and raw bytes.
+    let output = run_at(&home, &["status"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Daemon:   not running\n"));
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["status", "--json"]);
+    assert_eq!(output.status.code(), Some(3));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["running"], false);
+    assert_v1_untouched(&database, &before, &dump);
+
+    // A stopped daemon exits the watch immediately, without waiting.
+    let output = run_at(&home, &["status", "--watch"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["stats"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Videos:   2"), "{stdout}");
+    assert!(stdout.contains("Folders:  1"), "{stdout}");
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["stats", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["videos"], 2);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["folders", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{} [ready]\n", media.display())
+    );
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 1);
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["search", "family"]);
+    assert_eq!(output.status.code(), Some(0));
+    let mut expected = [
+        media.join("family-trip-00.mp4").display().to_string(),
+        media.join("family-trip-01.mp4").display().to_string(),
+    ];
+    expected.sort();
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        expected.join("\n") + "\n"
+    );
+    assert_v1_untouched(&database, &before, &dump);
+
+    let output = run_at(&home, &["search", "family", "--json"]);
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["totalResults"], 2);
+    assert_v1_untouched(&database, &before, &dump);
+
+    // A write migrates: adding a folder moves the database to version 2,
+    // and the version 1 content survives the move.
+    let more = home.home.path().join("more");
+    fs::create_dir_all(&more).unwrap();
+    let more_argument = more.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &more_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(schema_user_version(&database), 2);
+    let output = run_at(&home, &["stats", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["videos"], 2);
+    assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+
+    // So does starting the daemon: rewind, let the heartbeat migrate,
+    // and the folders are still all there.
+    rewind_to_v1(&database);
+    assert_eq!(schema_user_version(&database), 1);
+    with_daemon(&home, || {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+    });
+    assert_eq!(schema_user_version(&database), 2);
+    let output = run_at(&home, &["folders", "list", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["folders"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn status_watch_against_a_live_daemon_exits_when_the_queue_drains() {
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    // Enough files that the scan cannot finish before the watch's first
+    // read, so the watch provably holds instead of exiting at once.
+    for number in 0..200 {
+        create_video(&media, number);
+    }
+
+    let mut daemon = spawn_daemon(&home);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the daemon never published a heartbeat"
+        );
+
+        let media_argument = media.to_string_lossy().into_owned();
+        let output = run_at(&home, &["folders", "add", &media_argument]);
+        assert_eq!(output.status.code(), Some(0));
+
+        // Wait until the daemon publishes outstanding work: the watch
+        // must start while the queue is non-empty, or a stale idle
+        // heartbeat would end it before the scan even starts. The first
+        // non-empty publish lands seconds before the drain, so the
+        // watch's first read still sees work outstanding.
+        let queue_empty = |document: &serde_json::Value| {
+            document["queue"]["pendingRoots"] == 0
+                && document["queue"]["filesRemaining"] == 0
+                && document["queue"]["pendingRepairs"] == 0
+                && document["queue"]["pendingThumbnails"] == 0
+        };
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+                    && (document["activity"] != "idle" || !queue_empty(document))
+            }),
+            "the daemon never published outstanding work"
+        );
+
+        // The watch holds while the daemon scans, then exits 0 on the
+        // drained queue. Piped, so no screen clears may appear. The bound
+        // is generous on purpose: 200 fixture videos each run real
+        // ffprobe/ffmpeg rejection, which is seconds even unloaded and
+        // far slower on loaded CI — the bound only guards a real hang.
+        let child = ts_command(
+            &["status", "--watch"],
+            home.home.path(),
+            &home.data_home,
+            None,
+            None,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let output = wait_for_exit_timeout(child, Duration::from_secs(120));
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains('\x1b'), "{stdout:?}");
+        assert!(stdout.contains("Activity: idle"), "{stdout}");
+        assert!(
+            stdout.matches("Daemon:").count() >= 2,
+            "expected the watch to hold for several renders, got:\n{stdout}"
+        );
+        assert!(output.stderr.is_empty());
+    }));
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn a_second_daemon_on_the_same_index_exits_with_an_error() {
+    let home = scratch_home();
+
+    with_daemon(&home, || {
+        assert!(
+            wait_for_status(&home, Duration::from_secs(30), |document| {
+                document["running"] == true
+            }),
+            "the first daemon never started"
+        );
+
+        let output = run_at(&home, &["daemon", "run"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "ts daemon run: Another Toka indexer daemon is already running.\n"
+        );
+    });
 }
