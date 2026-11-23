@@ -198,6 +198,87 @@ describe("buildTsSidecar", () => {
   });
 });
 
+// Compile and bundle stay split on purpose: the bundle overlay (which
+// carries the sidecar) reaches only `tauri bundle`, never a compile whose
+// build script would mis-copy the sidecar under cargo's nested per-package
+// build layout. These checkers assert that split shape — a reunited
+// single-phase `tauri build --bundles … --config …bundle.conf.json` must
+// fail them even though it contains every magic string.
+function splitViolationsBuildScript(buildScript: string): string[] {
+  const code = buildScript.replace(/\/\/.*$/gm, "");
+  const violations: string[] = [];
+  const argvLists = [...code.matchAll(/\[([\s\S]*?)\]/g)]
+    .map((match) => match[1])
+    .filter((body) => body.includes('"tauri"'));
+  if (
+    !argvLists.some(
+      (body) => body.includes('"build"') && body.includes('"--no-bundle"'),
+    )
+  ) {
+    violations.push("no `tauri build` argv with --no-bundle");
+  }
+  for (const body of argvLists.filter((item) => item.includes('"build"'))) {
+    for (const flag of [
+      '"--bundles"',
+      '"--config"',
+      "tauri.bundle.conf.json",
+    ]) {
+      if (body.includes(flag)) {
+        violations.push(`a \`tauri build\` argv carries ${flag}`);
+      }
+    }
+  }
+  if (
+    !argvLists.some(
+      (body) =>
+        body.includes('"bundle"') && body.includes("tauri.bundle.conf.json"),
+    )
+  ) {
+    violations.push("no `tauri bundle` argv merges the overlay");
+  }
+  const outsideArgv = code.replace(/\[[^\]]*\]/gs, "");
+  if (outsideArgv.includes("tauri.bundle.conf.json")) {
+    violations.push("the overlay path appears outside a spawn argv");
+  }
+  return violations;
+}
+
+function splitViolationsWorkflow(workflow: string): string[] {
+  const lines = workflow.replace(/^\s*#.*$/gm, "").split("\n");
+  const violations: string[] = [];
+  const buildLines = lines.filter((line) => line.includes("tauri build"));
+  const bundleLines = lines.filter((line) => line.includes("tauri bundle"));
+  if (!buildLines.some((line) => line.includes("--no-bundle"))) {
+    violations.push("no `tauri build` line with --no-bundle");
+  }
+  for (const line of buildLines) {
+    for (const flag of ["--bundles", "--config", "tauri.bundle.conf.json"]) {
+      if (line.includes(flag)) {
+        violations.push(`a \`tauri build\` line carries ${flag}`);
+      }
+    }
+  }
+  if (
+    !bundleLines.some(
+      (line) =>
+        line.includes("--bundles") &&
+        line.includes("--config") &&
+        line.includes("tauri.bundle.conf.json"),
+    )
+  ) {
+    violations.push("no `tauri bundle` line merges the overlay");
+  }
+  for (const line of lines) {
+    if (
+      line.includes("tauri.bundle.conf.json") &&
+      !line.includes("tauri bundle")
+    ) {
+      violations.push("the overlay path appears off a `tauri bundle` line");
+    }
+  }
+  return violations;
+}
+
 describe("tauri sidecar bundling", () => {
   it("ships ts in every bundle, where the app resolves it as its sibling", async () => {
     const overlay = JSON.parse(
@@ -223,14 +304,25 @@ describe("tauri sidecar bundling", () => {
     );
 
     for (const flow of [buildScript, ci, release]) {
-      expect(flow).toContain("tauri.bundle.conf.json");
       expect(flow).toContain("build-ts-sidecar.mjs");
     }
     // Compile and bundle stay split: the overlay reaches only
     // `tauri bundle`, never a compile whose build script would
     // mis-copy the sidecar under cargo's nested build layout.
-    expect(buildScript).toContain('"bundle"');
-    expect(ci).toContain("tauri bundle");
-    expect(release).toContain("tauri bundle");
+    expect(buildScript).toContain('"--no-bundle"');
+    expect(splitViolationsBuildScript(buildScript)).toEqual([]);
+    expect(splitViolationsWorkflow(ci)).toEqual([]);
+    expect(splitViolationsWorkflow(release)).toEqual([]);
+  });
+
+  it("rejects a reunited single-phase flow that bundles during compile", () => {
+    // The split-shape test above must fail if compile+bundle ever reunite:
+    // these fixtures carry every magic string yet violate the split.
+    const reunitedArgv =
+      'spawnSync("npm", ["run", "tauri", "build", "--", "--bundles", "app", "--config", "src-tauri/tauri.bundle.conf.json"])';
+    expect(splitViolationsBuildScript(reunitedArgv).length).toBeGreaterThan(0);
+    const reunitedShell =
+      "npm run tauri build -- --bundles app --config src-tauri/tauri.bundle.conf.json";
+    expect(splitViolationsWorkflow(reunitedShell).length).toBeGreaterThan(0);
   });
 });

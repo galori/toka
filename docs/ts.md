@@ -24,8 +24,9 @@ worktree app at a worktree `ts`.
 
 ## Command reference
 
-`ts <command> [arguments]`. Every command prints human-readable output by
-default and one JSON document with `--json`. Paths starting with a dash need
+`ts <command> [arguments]`. Most commands print human-readable output by
+default and one JSON document with `--json`; `sync-path`, `sync-rename`
+and `daemon run` print no JSON. Paths starting with a dash need
 `--` first. `-h`/`--help` after any command shows its help; `-v`/`--version`
 prints e.g. `ts 0.1.1+482.a1b2c3d (Git SHA a1b2c3d)`.
 
@@ -125,8 +126,10 @@ fails, nothing is removed.
 ### Exit codes
 
 - `0` — ok (also `--help` and `--version`).
-- `1` — the operation failed: `ts <command>: <reason>` on stderr, nothing
-  on stdout except the partial `--json` documents below.
+- `1` — the operation failed: `ts <command>: <reason>` on stderr. With
+  `--json`, stdout holds only the partial documents below; in human mode
+  it first prints the completed actions (service operations) or the
+  `removed …` lines (`reset --yes`).
 - `2` — usage error: usage text on stderr, no document even with `--json`.
 - `3` — `ts status` only: the daemon is not running. The report or document
   still prints; the code lets scripts branch.
@@ -152,7 +155,8 @@ Per-command documents:
   `totalResults`, `totalPages`, `indexRevision`, and `results` — each hit
   with `path`, `id`, `fileName`, `extension`, `thumbnailPath` (null until
   generated), `tags`, and `folderTags`. Without `--page`, `page` is 1 and
-  the document holds every hit (truncated by `--limit`).
+  the document holds every hit (truncated by `--limit`); `--count --json`
+  prints only `schema`, `query`, and `totalResults`.
 - `candidates`: `query`, `indexRevision`, and `candidates` (paths).
 - `stats`: `revision`, `videos`, `images`, `serviceRunning`, and `folders`
   (each with `path`, `state`, `scannedFiles`, `videos`, `images`, `message`).
@@ -235,12 +239,14 @@ is already there. `ts uninstall` removes the link it owns.
 | Index           | `~/.local/share/toka/index.sqlite3`                | `~/Library/Application Support/toka/index.sqlite3`                |
 | Search log      | `~/.local/share/app.toka.desktop/logs/search.log`  | `~/Library/Logs/app.toka.desktop/search.log`                      |
 | Indexer log     | `~/.local/share/app.toka.desktop/logs/indexer.log` | `~/Library/Application Support/app.toka.desktop/logs/indexer.log` |
-| Thumbnail cache | `$TMPDIR/toka-thumbnails`                          | `$TMPDIR/toka-thumbnails`                                         |
+| Thumbnail cache | `$TMPDIR/toka-thumbnails-<uid>`                    | `$TMPDIR/toka-thumbnails-<uid>`                                   |
 | Service         | `~/.config/systemd/user/toka-search.service`       | `~/Library/LaunchAgents/app.toka.ts.plist`                        |
 | Shell link      | `~/.local/bin/ts`                                  | `~/.local/bin/ts`                                                 |
 
 The Linux data/config paths follow `$XDG_DATA_HOME`/`$XDG_CONFIG_HOME` when
 set. Only `ts` opens the index; the app reaches it solely by spawning `ts`.
+The plain `$TMPDIR/toka-thumbnails` directory is the orphaned pre-uid-scoping
+root: nothing writes there anymore, and reset only removes it.
 The daemon rewrites its heartbeat row every 2 seconds; `ts status` counts
 the daemon running when its pid is alive and the heartbeat is under
 10 seconds old.

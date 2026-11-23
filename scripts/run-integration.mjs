@@ -1,6 +1,7 @@
 import { randomInt } from "node:crypto";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { prepareBuild } from "../bin/prepare-build.mjs";
 
 const task = process.argv[2];
 const supportedTasks = new Set(["all", "standard", "owned", "native"]);
@@ -24,6 +25,13 @@ const cargoTargetDirectory = resolve(
   "target",
   `e2e-${fixturePort}`,
 );
+// `ts` has no build script, so its version line reads only these two
+// variables: without them a dev `ts --version` shows the bare Cargo
+// version with `(Git SHA development)` while the app shows the real SHA.
+const buildInfo = prepareBuild();
+const devGitSha = /^[0-9a-f]+$/i.test(buildInfo.gitSha ?? "")
+  ? buildInfo.gitSha
+  : undefined;
 const environment = {
   ...process.env,
   CARGO_TARGET_DIR: cargoTargetDirectory,
@@ -31,6 +39,8 @@ const environment = {
   TOKA_E2E_BINARY: resolve(cargoTargetDirectory, "debug", "toka"),
   TOKA_E2E_FIXTURE_RUN_ID: fixturePort,
   VITE_E2E_FIXTURE_SERVER_PORT: fixturePort,
+  TS_BUILD_VERSION: buildInfo.buildVersion,
+  ...(devGitSha === undefined ? {} : { TOKA_GIT_SHA: devGitSha }),
 };
 const wdio = resolve("node_modules/.bin/wdio");
 

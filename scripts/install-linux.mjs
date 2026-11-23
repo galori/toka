@@ -13,8 +13,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runTsInstall } from "./run-ts-install.mjs";
 
-export { runTsInstall };
-
 const appName = "Toka";
 const desktopFileName = "toka.desktop";
 

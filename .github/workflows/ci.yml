@@ -17,7 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # The app shells out to `ts`, so its suites run separately and first:
       # a search-helper regression fails here in about a minute instead of
-      # after the slow app legs.
+      # after the slow app legs. The app legs re-run these suites via
+      # `npm run rust:test` on purpose: fast fail here, macOS coverage there.
       - name: toka-search tests
         run: cargo test --manifest-path src-tauri/Cargo.toml -p toka-search
       - name: ts tests
@@ -113,13 +114,8 @@ jobs:
           # whose build script would mis-copy the sidecar under cargo's
           # nested per-package build layout. See bin/build.mjs.
           node bin/build-ts-sidecar.mjs --target ${{ matrix.rust-target }}
-          if [ "$RUNNER_OS" = Linux ]; then
-            npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
-            npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
-          else
-            npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
-            npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
-          fi
+          npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
+          npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
       - uses: actions/upload-artifact@v4
         with:
           name: toka-${{ matrix.rust-target }}
