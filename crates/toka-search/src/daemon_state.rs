@@ -65,8 +65,9 @@ impl DaemonActivity {
 pub struct DaemonQueue {
     /// Roots not fully indexed yet.
     pub pending_roots: u64,
-    /// Files seen but not yet committed by scans in progress: a lower bound,
-    /// since a scan cannot know how many files it has not reached yet.
+    /// Indexable files seen but not yet committed by scans in progress:
+    /// a lower bound, since a scan cannot know how many files it has not
+    /// reached yet. Unsupported, empty, and unreadable files never count.
     pub files_remaining: u64,
     pub pending_repairs: u64,
     /// Folders still awaiting thumbnail generation, counted per folder:
@@ -132,9 +133,10 @@ pub(crate) struct DaemonStateRow {
     pub queue: DaemonQueue,
 }
 
-/// Reads the daemon's status without changing anything: a missing index
-/// reports a stopped daemon instead of being created, exactly as `stats`
-/// and `folders list` already refuse to create one.
+/// Reads the daemon's status without changing anything: the index opens
+/// read-only, so a version 1 database is never migrated and stays usable
+/// by a version 1 app, and a missing index reports a stopped daemon
+/// instead of being created.
 pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
     // systemd only exists on Linux; elsewhere there is no service to ask.
     #[cfg(any(target_os = "linux", test))]
@@ -155,8 +157,8 @@ pub fn read_status(database: &Path) -> Result<DaemonStatus, String> {
     if !database.is_file() {
         return Ok(stopped());
     }
-    let index =
-        crate::owned_index::OwnedIndex::open(database).map_err(|error| error.to_string())?;
+    let index = crate::owned_index::OwnedIndex::open_read_only(database)
+        .map_err(|error| error.to_string())?;
     let Some(row) = index
         .read_daemon_state()
         .map_err(|error| error.to_string())?
@@ -419,6 +421,40 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.pid, None);
         assert_eq!(status.activity, None);
+    }
+
+    #[test]
+    fn status_on_a_version_1_database_reports_stopped_without_migrating() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        OwnedIndex::open(&database).unwrap();
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            // Rewind to version 1: no liveness table, no indexable
+            // counter, version markers back to 1.
+            connection
+                .execute_batch(
+                    "DROP TABLE daemon_state;
+                     ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let before = std::fs::read(&database).unwrap();
+
+        let status = read_status(&database).unwrap();
+
+        assert!(!status.running);
+        assert_eq!(status.pid, None);
+        assert_eq!(status.activity, None);
+        // Still version 1, byte for byte: status must never migrate.
+        let version: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
     }
 
     #[test]

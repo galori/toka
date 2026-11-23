@@ -211,9 +211,10 @@ pub fn run_daemon() -> Result<(), String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Toka could not create its index folder: {error}"))?;
     }
-    // One daemon per index: a second supervisor would interleave scan
+    // One supervisor per index: a second one would interleave scan
     // generations with the first and mark partial scans ready.
-    let _daemon_lock = acquire_daemon_lock(&database)?;
+    let _daemon_lock = try_acquire_daemon_lock(&database)?
+        .ok_or_else(|| "Another Toka indexer daemon is already running.".to_owned())?;
     let logger = Arc::new(IndexLogger::new(indexer_log_path()?));
     logger.record("indexer started");
     let (sender, receiver) = mpsc::channel();
@@ -248,21 +249,24 @@ pub fn run_daemon() -> Result<(), String> {
     }
 }
 
-/// The lock file guarding against a second daemon on the same index. Held
-/// open (and locked) for the daemon's whole run; dropping it releases the
-/// lock, and the operating system releases it on a crash, so the lock can
-/// never go stale.
+/// The lock file guarding one supervisor per index. Held open (and
+/// locked) for the supervisor's whole run; dropping it releases the lock,
+/// and the operating system releases it on a crash, so the lock can never
+/// go stale. The `ts` daemon and the app's in-process watchers take the
+/// same lock, so whichever starts second yields to the first.
 #[cfg(unix)]
-struct DaemonLock {
+pub(crate) struct DaemonLock {
     _file: fs::File,
 }
 
 #[cfg(not(unix))]
-struct DaemonLock;
+pub(crate) struct DaemonLock;
 
-/// Refuses to start when another daemon already runs on this index.
+/// Tries the daemon lock without blocking: `Ok(None)` when another
+/// supervisor already runs on this index, so the caller yields instead of
+/// queueing behind it forever.
 #[cfg(unix)]
-fn acquire_daemon_lock(database: &Path) -> Result<DaemonLock, String> {
+pub(crate) fn try_acquire_daemon_lock(database: &Path) -> Result<Option<DaemonLock>, String> {
     let path = database.with_file_name("daemon.lock");
     let file = fs::OpenOptions::new()
         .create(true)
@@ -271,21 +275,19 @@ fn acquire_daemon_lock(database: &Path) -> Result<DaemonLock, String> {
         .open(&path)
         .map_err(|error| format!("Toka could not lock its indexer daemon: {error}"))?;
     use std::os::fd::AsRawFd;
-    // Non-blocking: a second daemon exits with an error instead of
-    // queueing behind the first one forever.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            return Err("Another Toka indexer daemon is already running.".into());
+            return Ok(None);
         }
         return Err(format!("Toka could not lock its indexer daemon: {error}"));
     }
-    Ok(DaemonLock { _file: file })
+    Ok(Some(DaemonLock { _file: file }))
 }
 
 #[cfg(not(unix))]
-fn acquire_daemon_lock(_database: &Path) -> Result<DaemonLock, String> {
-    Ok(DaemonLock)
+pub(crate) fn try_acquire_daemon_lock(_database: &Path) -> Result<Option<DaemonLock>, String> {
+    Ok(Some(DaemonLock))
 }
 
 #[derive(Deserialize)]

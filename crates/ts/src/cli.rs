@@ -654,7 +654,7 @@ fn run_status_command(
             return 1;
         }
     };
-    print_status(&status, json, stdout, stderr)
+    print_status(&status, json, false, stdout, stderr)
 }
 
 /// Nothing, `--json`, `--watch`, or both: the whole argument language of
@@ -675,10 +675,13 @@ fn parse_status_arguments(arguments: &[OsString]) -> Option<(bool, bool)> {
 }
 
 /// Prints one status snapshot. Exit 3 when the daemon is not running, so
-/// scripts can branch on it; the report itself still prints.
+/// scripts can branch on it; the report itself still prints. A watch
+/// stream prints compact JSON, one document per line, so each snapshot
+/// parses independently; a one-shot `--json` prints the pretty document.
 fn print_status(
     status: &DaemonStatus,
     json: bool,
+    compact_json: bool,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -695,7 +698,12 @@ fn print_status(
             }
         };
         document["schema"] = serde_json::json!(JSON_SCHEMA_VERSION);
-        return match print_json(&document, "ts status", stdout, stderr) {
+        let code = if compact_json {
+            print_json_compact(&document, "ts status", stdout, stderr)
+        } else {
+            print_json(&document, "ts status", stdout, stderr)
+        };
+        return match code {
             0 => stopped,
             code => code,
         };
@@ -737,7 +745,9 @@ fn run_status_watch(
             }
         }
         first = false;
-        let code = print_status(&status, json, stdout, stderr);
+        // Compact exactly when streaming JSON: human watch output is
+        // unaffected.
+        let code = print_status(&status, json, json, stdout, stderr);
         if code != 0 {
             // A write or encode error (1), or a stopped daemon (3).
             return code;
@@ -1028,18 +1038,42 @@ fn print_json(
     stderr: &mut impl Write,
 ) -> i32 {
     match serde_json::to_string_pretty(document) {
-        Ok(text) => {
-            if let Err(error) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
-                let _ = writeln!(stderr, "{command}: could not write results: {error}");
-                return 1;
-            }
-            0
-        }
+        Ok(text) => write_json_line(&text, command, stdout, stderr),
         Err(error) => {
             let _ = writeln!(stderr, "{command}: could not encode results: {error}");
             1
         }
     }
+}
+
+/// One compact document per line, for `--watch` streams: line-oriented
+/// consumers parse each snapshot independently.
+fn print_json_compact(
+    document: &serde_json::Value,
+    command: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    match serde_json::to_string(document) {
+        Ok(text) => write_json_line(&text, command, stdout, stderr),
+        Err(error) => {
+            let _ = writeln!(stderr, "{command}: could not encode results: {error}");
+            1
+        }
+    }
+}
+
+fn write_json_line(
+    text: &str,
+    command: &str,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if let Err(error) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
+        let _ = writeln!(stderr, "{command}: could not write results: {error}");
+        return 1;
+    }
+    0
 }
 
 fn run_search(
@@ -5004,7 +5038,14 @@ mod tests {
         assert_eq!(code, 0);
         let output = String::from_utf8(stdout).unwrap();
         assert!(!output.contains('\x1b'), "{output:?}");
-        assert_eq!(output.matches("\"schema\": 1").count(), 2, "{output}");
+        // One compact document per line: each line parses on its own.
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "{output}");
+        for line in lines {
+            let document: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(document["schema"], 1, "{line}");
+            assert_eq!(document["running"], true, "{line}");
+        }
         assert!(stderr.is_empty());
     }
 
