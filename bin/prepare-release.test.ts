@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   assertStampAllowed,
   deriveRelease,
@@ -143,5 +145,20 @@ describe("release environment", () => {
     expect(() =>
       assertStampAllowed({ isCI: false, force: true }),
     ).not.toThrow();
+  });
+});
+
+describe("release CLI", () => {
+  test("prints matching version and tag lines for the current checkout", () => {
+    const script = fileURLToPath(
+      new URL("./prepare-release.mjs", import.meta.url),
+    );
+    const output = execFileSync(process.execPath, [script], {
+      encoding: "utf8",
+    });
+
+    expect(output).toMatch(
+      /^RELEASE_VERSION=(\d+\.\d+\.\d+)\nRELEASE_TAG=v\1\n$/,
+    );
   });
 });
