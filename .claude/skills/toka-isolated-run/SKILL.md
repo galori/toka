@@ -8,7 +8,7 @@ description: Build a Toka worktree without installing it and run it beside the i
 Builds and runs a worktree's Toka **without touching the installed app**. The
 isolated instance never touches the installed app (`~/.local/opt/toka`,
 `~/.local/bin/toka`, `toka.desktop`), the user's real index
-(`~/.config/toka`, `~/.local/share/toka`) or the real `toka-indexer.service`.
+(`~/.config/toka`, `~/.local/share/toka`) or the real `toka-search.service`.
 
 Never use `npm run build:linux` for pre-merge testing: it ends by overwriting the
 installed app.
@@ -33,7 +33,7 @@ them and pass `--worktree`.
    `pgrep -a -x 'rustc|cargo'`. Terminate only processes that are demonstrably
    orphans of an interrupted build of this worktree (check `ps -o ppid,cwd`);
    another project's concurrent build is not yours to kill.
-3. `launch --detach`: starts the app and its own `--indexer`, returns once the
+3. `launch --detach`: starts the app and its own `ts daemon run`, returns once the
    app is up. Without `--detach` it runs in the foreground and Ctrl-C stops both.
 4. Tell the user what is running and where: the `status` output (app and indexer
    PIDs, the isolated home `<worktree>/.scratch/isolated-home`, the binary) and
@@ -48,13 +48,13 @@ them and pass `--worktree`.
   search folders, index databases, status file and logs. One home per worktree,
   so several branches can run at once.
 - **The indexer is started by hand** with the same env. The app's own
-  `systemctl --user start toka-indexer.service` would otherwise be a no-op against
+  `systemctl --user start toka-search.service` would otherwise be a no-op against
   the user's system indexer, which reads the real config, so isolated folders
   would never be indexed. The launcher tracks both PIDs in
   `run/state.json`, verifies the command line before signalling, and kills both
   process groups on exit, Ctrl-C or `stop`.
 - **`systemctl` is shimmed.** `<home>/bin` comes first on PATH with a `systemctl`
-  that logs to `run/systemctl-shim.log`. For `toka-indexer.service` it stops or
+  that logs to `run/systemctl-shim.log`. For `toka-search.service` it stops or
   (re)starts the **isolated** indexer (pid in `run/indexer.pid`), as systemd would
   for the app's launch and "reset index" calls; every other call is a no-op that
   succeeds. The real service is never reachable. Never launch the isolated binary

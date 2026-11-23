@@ -1,10 +1,10 @@
 //! `toka --index-stats`: a plain-text report of what the indexer knows.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{fmt::Write as _, path::PathBuf};
 
 /// Where one search folder stands in the indexer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FolderState {
     Pending,
@@ -26,7 +26,7 @@ impl FolderState {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderStats {
     // Lossy on purpose: real paths can hold non-UTF-8 bytes on Unix, and
@@ -43,7 +43,7 @@ pub struct FolderStats {
     pub images: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexStats {
     pub revision: u64,
@@ -165,6 +165,31 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(state).unwrap(), label);
         }
+    }
+
+    #[test]
+    fn stats_round_trip_through_the_json_contract() {
+        let mut movies = folder("/media/movies", FolderState::Ready);
+        movies.videos = Some(3);
+        movies.images = Some(2);
+        let stats = IndexStats {
+            revision: 7,
+            videos: 3,
+            images: 2,
+            service_running: Some(true),
+            folders: vec![movies],
+        };
+
+        let json = serde_json::to_value(&stats).unwrap();
+        let back: IndexStats = serde_json::from_value(json).unwrap();
+
+        assert_eq!(back.revision, 7);
+        assert_eq!(back.videos, 3);
+        assert_eq!(back.images, 2);
+        assert_eq!(back.service_running, Some(true));
+        assert_eq!(back.folders.len(), 1);
+        assert_eq!(back.folders[0].path, PathBuf::from("/media/movies"));
+        assert_eq!(back.folders[0].state, FolderState::Ready);
     }
 
     #[test]

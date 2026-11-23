@@ -1,88 +1,66 @@
-//! `toka restart`: restart this Toka build's app and indexer, and nothing else.
+//! `toka restart`: restart this Toka build's app and its indexer.
 //!
-//! A worktree build and the installed build can run side by side. Instances
-//! are told apart by the executable they were started from, so the command
-//! only ever touches processes (and the systemd indexer service) that belong
-//! to the executable that was called.
+//! A worktree build and the installed build can run side by side. App
+//! instances are told apart by the executable they were started from, so
+//! the command only ever touches app processes that belong to the
+//! executable that was called — but the indexer is the one `ts` service
+//! for the user, restarted with `ts restart` however this Toka was built.
 
+#[cfg(any(target_os = "linux", test))]
+use crate::ts_client;
+use crate::ts_client::TsOutput;
+#[cfg(any(target_os = "linux", test))]
+use std::path::PathBuf;
+use std::{ffi::OsString, io::Write};
 #[cfg(target_os = "linux")]
-use std::path::Path;
-use std::{io::Write, path::PathBuf};
-#[cfg(target_os = "linux")]
-use toka_search::service::parse_service_executable;
 use toka_search::service::same_executable;
 
 #[cfg(target_os = "linux")]
-use std::{fs, process::Command, thread, time::Duration};
-
-/// One running process of the executable being restarted.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Instance {
-    pub pid: u32,
-    /// The background `--indexer` process, as opposed to the app window.
-    pub is_indexer: bool,
-}
+use std::{fs, path::Path, process::Command, thread, time::Duration};
 
 /// Everything `restart` needs from the machine, so the decisions can be tested.
+#[cfg(any(target_os = "linux", test))]
 pub trait Host {
-    /// Running processes started from this executable, excluding this command.
-    fn instances(&mut self) -> Vec<Instance>;
-    /// The executable the `toka-indexer.service` user unit runs, if it has one.
-    fn service_executable(&mut self) -> Option<PathBuf>;
+    /// Running app processes started from this executable, excluding this
+    /// command. A stale pre-`ts` indexer counts as one: it holds the index
+    /// lock the restarted service needs.
+    fn instances(&mut self) -> Vec<u32>;
     /// This executable.
     fn executable(&self) -> PathBuf;
     fn terminate(&mut self, pid: u32) -> Result<(), String>;
-    fn restart_service(&mut self) -> Result<(), String>;
-    /// Starts this executable detached, with `--indexer` or no argument.
-    fn spawn(&mut self, indexer: bool) -> Result<(), String>;
+    /// Restarts the shared indexer service through `ts restart`.
+    fn restart_indexer(&mut self) -> Result<ts_client::ServiceReport, String>;
+    /// Starts this executable's app detached.
+    fn spawn_app(&mut self) -> Result<(), String>;
 }
 
-/// Restarts the app and the indexer of `host`'s executable. Returns what it did.
+/// Restarts the app and the indexer of `host`'s executable. Returns what
+/// it did; a failure anywhere still runs the rest, and all failures join
+/// the error.
+#[cfg(any(target_os = "linux", test))]
 pub fn restart(host: &mut impl Host) -> Result<Vec<String>, String> {
-    let executable = host.executable();
-    let service_is_ours = host
-        .service_executable()
-        .is_some_and(|service| same_executable(&service, &executable));
     let instances = host.instances();
     let mut actions = Vec::new();
     let mut failures = Vec::new();
-    let mut indexer_was_running = false;
 
-    for instance in &instances {
-        if instance.is_indexer {
-            indexer_was_running = true;
-            // The service restart below replaces a service-managed indexer.
-            if service_is_ours {
-                continue;
+    for pid in instances {
+        match host.terminate(pid) {
+            Ok(()) => actions.push(format!("stopped Toka (pid {pid})")),
+            Err(error) => failures.push(error),
+        }
+    }
+
+    match host.restart_indexer() {
+        Ok(report) => {
+            actions.extend(report.actions.into_iter().map(|action| action.message));
+            if let Some(error) = report.error {
+                failures.push(error);
             }
         }
-        match host.terminate(instance.pid) {
-            Ok(()) => actions.push(format!(
-                "stopped {} (pid {})",
-                if instance.is_indexer {
-                    "indexer"
-                } else {
-                    "Toka"
-                },
-                instance.pid
-            )),
-            Err(error) => failures.push(error),
-        }
+        Err(error) => failures.push(error),
     }
 
-    if service_is_ours {
-        match host.restart_service() {
-            Ok(()) => actions.push("restarted toka-indexer.service".to_owned()),
-            Err(error) => failures.push(error),
-        }
-    } else if indexer_was_running {
-        match host.spawn(true) {
-            Ok(()) => actions.push("started indexer".to_owned()),
-            Err(error) => failures.push(error),
-        }
-    }
-
-    match host.spawn(false) {
+    match host.spawn_app() {
         Ok(()) => actions.push("started Toka".to_owned()),
         Err(error) => failures.push(error),
     }
@@ -96,7 +74,8 @@ pub fn restart(host: &mut impl Host) -> Result<Vec<String>, String> {
 
 /// The `restart` subcommand entry point.
 pub fn run(
-    arguments: &[std::ffi::OsString],
+    arguments: &[OsString],
+    run_ts: impl FnMut(&[OsString]) -> Result<TsOutput, String>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -110,7 +89,7 @@ pub fn run(
     }
     #[cfg(target_os = "linux")]
     {
-        let mut host = match SystemHost::new() {
+        let mut host = match SystemHost::new(run_ts) {
             Ok(host) => host,
             Err(error) => {
                 let _ = writeln!(stderr, "toka restart: {error}");
@@ -132,6 +111,7 @@ pub fn run(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = run_ts;
         let _ = stdout;
         let _ = writeln!(stderr, "toka restart: only supported on Linux");
         1
@@ -139,20 +119,21 @@ pub fn run(
 }
 
 pub const USAGE: &str = "Usage: toka restart";
-pub const HELP: &str = "Usage: toka restart\n\nRestart this Toka's app and its indexer. Only the Toka that was called is restarted: a worktree build leaves the installed Toka alone, and the installed Toka leaves worktree builds alone.";
+pub const HELP: &str = "Usage: toka restart\n\nRestart this Toka's app and its indexer. Only the app that was called is restarted: a worktree build leaves the installed app alone, and the installed app leaves worktree builds alone. The indexer is the shared `ts` service, restarted with `ts restart`.";
 
 #[cfg(target_os = "linux")]
-struct SystemHost {
+struct SystemHost<F> {
     executable: PathBuf,
+    run_ts: F,
 }
 
 #[cfg(target_os = "linux")]
-impl SystemHost {
-    fn new() -> Result<Self, String> {
+impl<F> SystemHost<F> {
+    fn new(run_ts: F) -> Result<Self, String> {
         let executable = std::env::current_exe()
             .and_then(|path| path.canonicalize())
             .map_err(|error| format!("could not find the toka executable: {error}"))?;
-        Ok(Self { executable })
+        Ok(Self { executable, run_ts })
     }
 }
 
@@ -167,10 +148,12 @@ fn process_executable(proc_root: &Path, pid: u32) -> Option<PathBuf> {
     ))
 }
 
-/// Finds processes of `executable` under `proc_root`, other than `own_pid` and
-/// other CLI commands (such as a running `toka search`).
+/// The pids of `executable` under `proc_root`, other than `own_pid` and
+/// other CLI commands (such as a running `toka search`). A stale
+/// pre-`ts` indexer is just another process of this executable — and one
+/// that has to go, since it holds the index lock.
 #[cfg(target_os = "linux")]
-pub fn find_instances(proc_root: &Path, executable: &Path, own_pid: u32) -> Vec<Instance> {
+pub fn find_instances(proc_root: &Path, executable: &Path, own_pid: u32) -> Vec<u32> {
     let Ok(entries) = fs::read_dir(proc_root) else {
         return Vec::new();
     };
@@ -202,30 +185,22 @@ pub fn find_instances(proc_root: &Path, executable: &Path, own_pid: u32) -> Vec<
                 std::ffi::OsString::from_vec(part.to_vec())
             })
             .collect();
-        let is_indexer = arguments
-            .get(1)
-            .is_some_and(|argument| argument == "--indexer");
-        if !is_indexer && crate::cli::is_command(&arguments) {
+        if crate::cli::is_command(&arguments) {
             continue;
         }
-        found.push(Instance { pid, is_indexer });
+        found.push(pid);
     }
-    found.sort_by_key(|instance| instance.pid);
+    found.sort();
     found
 }
 
 #[cfg(target_os = "linux")]
-impl Host for SystemHost {
-    fn instances(&mut self) -> Vec<Instance> {
+impl<F> Host for SystemHost<F>
+where
+    F: FnMut(&[OsString]) -> Result<TsOutput, String>,
+{
+    fn instances(&mut self) -> Vec<u32> {
         find_instances(Path::new("/proc"), &self.executable, std::process::id())
-    }
-
-    fn service_executable(&mut self) -> Option<PathBuf> {
-        let output = Command::new("systemctl")
-            .args(["--user", "show", "-p", "ExecStart", "toka-indexer.service"])
-            .output()
-            .ok()?;
-        parse_service_executable(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn executable(&self) -> PathBuf {
@@ -252,26 +227,15 @@ impl Host for SystemHost {
         }
     }
 
-    fn restart_service(&mut self) -> Result<(), String> {
-        let status = Command::new("systemctl")
-            .args(["--user", "restart", "toka-indexer.service"])
-            .status()
-            .map_err(|error| format!("could not restart the indexer service: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "the indexer service could not be restarted (systemctl exited with {status})"
-            ))
-        }
+    fn restart_indexer(&mut self) -> Result<ts_client::ServiceReport, String> {
+        let args = [OsString::from("restart"), OsString::from("--json")];
+        let output = (self.run_ts)(&args)?;
+        ts_client::service_report_from_output("restart", &output)
     }
 
-    fn spawn(&mut self, indexer: bool) -> Result<(), String> {
+    fn spawn_app(&mut self) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(&self.executable);
-        if indexer {
-            command.arg("--indexer");
-        }
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -297,28 +261,31 @@ mod tests {
 
     struct Fake {
         executable: PathBuf,
-        service: Option<PathBuf>,
-        instances: Vec<Instance>,
+        instances: Vec<u32>,
+        indexer: Result<ts_client::ServiceReport, String>,
         calls: Vec<String>,
     }
 
     impl Fake {
-        fn new(service: Option<&str>, instances: Vec<Instance>) -> Self {
+        fn new(instances: Vec<u32>) -> Self {
             Self {
                 executable: "/installed/toka".into(),
-                service: service.map(PathBuf::from),
                 instances,
+                indexer: Ok(ts_client::ServiceReport {
+                    actions: vec![ts_client::ServiceAction {
+                        message: "restarted the indexer".to_owned(),
+                        changed: true,
+                    }],
+                    error: None,
+                }),
                 calls: Vec::new(),
             }
         }
     }
 
     impl Host for Fake {
-        fn instances(&mut self) -> Vec<Instance> {
+        fn instances(&mut self) -> Vec<u32> {
             self.instances.clone()
-        }
-        fn service_executable(&mut self) -> Option<PathBuf> {
-            self.service.clone()
         }
         fn executable(&self) -> PathBuf {
             self.executable.clone()
@@ -327,86 +294,75 @@ mod tests {
             self.calls.push(format!("terminate {pid}"));
             Ok(())
         }
-        fn restart_service(&mut self) -> Result<(), String> {
-            self.calls.push("restart-service".into());
-            Ok(())
+        fn restart_indexer(&mut self) -> Result<ts_client::ServiceReport, String> {
+            self.calls.push("restart-indexer".into());
+            self.indexer.clone()
         }
-        fn spawn(&mut self, indexer: bool) -> Result<(), String> {
-            self.calls.push(
-                if indexer {
-                    "spawn-indexer"
-                } else {
-                    "spawn-app"
-                }
-                .into(),
-            );
+        fn spawn_app(&mut self) -> Result<(), String> {
+            self.calls.push("spawn-app".into());
             Ok(())
         }
     }
 
-    fn app(pid: u32) -> Instance {
-        Instance {
-            pid,
-            is_indexer: false,
-        }
-    }
-    fn indexer(pid: u32) -> Instance {
-        Instance {
-            pid,
-            is_indexer: true,
-        }
-    }
-
     #[test]
-    fn the_installed_toka_restarts_its_app_and_its_service() {
-        let mut host = Fake::new(Some("/installed/toka"), vec![app(10), indexer(11)]);
+    fn restart_stops_the_app_restarts_the_indexer_and_starts_again() {
+        let mut host = Fake::new(vec![10, 11]);
 
-        restart(&mut host).unwrap();
+        let actions = restart(&mut host).unwrap();
 
-        // The service-managed indexer is replaced by the service restart, not killed.
-        assert_eq!(host.calls, ["terminate 10", "restart-service", "spawn-app"]);
-    }
-
-    #[test]
-    fn a_worktree_toka_never_touches_the_installed_service() {
-        let mut host = Fake::new(Some("/other/toka"), vec![app(20), indexer(21)]);
-
-        restart(&mut host).unwrap();
-
-        assert!(!host.calls.contains(&"restart-service".to_owned()));
         assert_eq!(
             host.calls,
-            ["terminate 20", "terminate 21", "spawn-indexer", "spawn-app"]
+            [
+                "terminate 10",
+                "terminate 11",
+                "restart-indexer",
+                "spawn-app"
+            ]
+        );
+        assert_eq!(
+            actions,
+            [
+                "stopped Toka (pid 10)",
+                "stopped Toka (pid 11)",
+                "restarted the indexer",
+                "started Toka",
+            ]
         );
     }
 
     #[test]
-    fn a_worktree_without_a_running_indexer_does_not_start_one() {
-        let mut host = Fake::new(None, vec![app(30)]);
+    fn it_restarts_the_indexer_even_when_nothing_was_running() {
+        let mut host = Fake::new(vec![]);
 
         restart(&mut host).unwrap();
 
-        assert_eq!(host.calls, ["terminate 30", "spawn-app"]);
+        assert_eq!(host.calls, ["restart-indexer", "spawn-app"]);
     }
 
     #[test]
-    fn it_starts_toka_even_when_nothing_was_running() {
-        let mut host = Fake::new(Some("/installed/toka"), vec![]);
+    fn a_failed_indexer_restart_is_reported_but_the_app_still_restarts() {
+        let mut host = Fake::new(vec![40]);
+        host.indexer = Ok(ts_client::ServiceReport {
+            actions: vec![ts_client::ServiceAction {
+                message: "stopped the indexer".to_owned(),
+                changed: true,
+            }],
+            error: Some("could not start it again".to_owned()),
+        });
 
-        restart(&mut host).unwrap();
+        let error = restart(&mut host).unwrap_err();
 
-        assert_eq!(host.calls, ["restart-service", "spawn-app"]);
+        // The partial actions ran; only the error joins the failure.
+        assert_eq!(error, "could not start it again");
+        assert_eq!(host.calls, ["terminate 40", "restart-indexer", "spawn-app"]);
     }
 
     #[test]
     fn a_failed_stop_is_reported_but_the_rest_still_runs() {
         struct Stubborn(Fake);
         impl Host for Stubborn {
-            fn instances(&mut self) -> Vec<Instance> {
+            fn instances(&mut self) -> Vec<u32> {
                 self.0.instances()
-            }
-            fn service_executable(&mut self) -> Option<PathBuf> {
-                self.0.service_executable()
             }
             fn executable(&self) -> PathBuf {
                 self.0.executable()
@@ -414,24 +370,35 @@ mod tests {
             fn terminate(&mut self, pid: u32) -> Result<(), String> {
                 Err(format!("could not stop process {pid}"))
             }
-            fn restart_service(&mut self) -> Result<(), String> {
-                self.0.restart_service()
+            fn restart_indexer(&mut self) -> Result<ts_client::ServiceReport, String> {
+                self.0.restart_indexer()
             }
-            fn spawn(&mut self, indexer: bool) -> Result<(), String> {
-                self.0.spawn(indexer)
+            fn spawn_app(&mut self) -> Result<(), String> {
+                self.0.spawn_app()
             }
         }
-        let mut host = Stubborn(Fake::new(Some("/installed/toka"), vec![app(40)]));
+        let mut host = Stubborn(Fake::new(vec![40]));
 
         let error = restart(&mut host).unwrap_err();
 
         assert_eq!(error, "could not stop process 40");
-        assert_eq!(host.0.calls, ["restart-service", "spawn-app"]);
+        assert_eq!(host.0.calls, ["restart-indexer", "spawn-app"]);
+    }
+
+    #[test]
+    fn restart_reports_ts_spawn_failures() {
+        let mut host = Fake::new(vec![]);
+        host.indexer = Err("Toka could not find the `ts` search helper.".to_owned());
+
+        let error = restart(&mut host).unwrap_err();
+
+        assert_eq!(error, "Toka could not find the `ts` search helper.");
+        assert_eq!(host.calls, ["restart-indexer", "spawn-app"]);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn finds_only_processes_of_the_given_executable() {
+    fn finds_processes_of_the_given_executable_including_stale_indexers() {
         use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let mine = root.path().join("mine");
@@ -445,6 +412,8 @@ mod tests {
             fs::write(dir.join("cmdline"), cmdline).unwrap();
         };
         add(1, &mine, b"toka\0");
+        // A stale pre-`ts` indexer: same executable, not a CLI command,
+        // so it is found and stopped like any app process.
         add(2, &mine, b"toka\0--indexer\0");
         add(3, &other, b"toka\0");
         add(4, &mine, b"toka\0search\0cats\0");
@@ -452,6 +421,6 @@ mod tests {
 
         let found = find_instances(root.path(), &mine, 5);
 
-        assert_eq!(found, vec![app(1), indexer(2)]);
+        assert_eq!(found, vec![1, 2]);
     }
 }

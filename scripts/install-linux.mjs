@@ -21,6 +21,18 @@ function desktopExecPath(filePath) {
 }
 
 /**
+ * Atomically replaces `linkPath` with a link to `target`, staging through
+ * a `.new` name first.
+ */
+async function replaceLink(linkPath, target) {
+  await unlink(`${linkPath}.new`).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+  });
+  await symlink(target, `${linkPath}.new`);
+  await rename(`${linkPath}.new`, linkPath);
+}
+
+/**
  * Copies `sourcePath` to `~/.local/opt/toka/<installedName>` and registers a
  * desktop entry for it. The copy lands on a temporary name first, because
  * writing over the executable of a running instance fails with ETXTBSY.
@@ -30,7 +42,8 @@ async function installExecutable({
   installedName,
   homeDir,
   iconPath,
-  runServiceCommand,
+  tsSourcePath,
+  runTsInstall,
 }) {
   const installDir = path.join(homeDir, ".local", "opt", "toka");
   const applicationsDir = path.join(homeDir, ".local", "share", "applications");
@@ -54,39 +67,35 @@ async function installExecutable({
 
   const binDir = path.join(homeDir, ".local", "bin");
   await mkdir(binDir, { recursive: true });
-  const commandLink = path.join(binDir, "toka");
-  await unlink(`${commandLink}.new`).catch((error) => {
-    if (error.code !== "ENOENT") throw error;
-  });
-  await symlink(installedPath, `${commandLink}.new`);
-  await rename(`${commandLink}.new`, commandLink);
+  await replaceLink(path.join(binDir, "toka"), installedPath);
 
-  const userServiceDir = path.join(homeDir, ".config", "systemd", "user");
-  await mkdir(userServiceDir, { recursive: true });
-  const service = `[Unit]
-Description=Toka private media indexer
+  // The search helper beside the app, linked for the shell too. The app
+  // resolves it as its sibling; the link is for interactive use.
+  const installedTsPath = path.join(installDir, "ts");
+  let tsInstalled = false;
+  if (tsSourcePath === undefined) {
+    console.warn("No ts binary provided; skipping the search helper install.");
+  } else {
+    try {
+      const tsTemporaryPath = `${installedTsPath}.new`;
+      await copyFile(tsSourcePath, tsTemporaryPath);
+      await chmod(tsTemporaryPath, 0o755);
+      await rename(tsTemporaryPath, installedTsPath);
+      await replaceLink(path.join(binDir, "ts"), installedTsPath);
+      tsInstalled = true;
+    } catch (error) {
+      console.warn(`Could not install the ts search helper: ${error.message}`);
+    }
+  }
 
-[Service]
-ExecStart=\"${installedPath.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}\" --indexer
-Restart=on-failure
-RestartSec=2
-Nice=10
-IOSchedulingClass=idle
-
-[Install]
-WantedBy=default.target
-`;
-  await writeFile(
-    path.join(userServiceDir, "toka-indexer.service"),
-    service,
-    "utf8",
-  );
-  runServiceCommand?.("daemon-reload");
-  runServiceCommand?.("enable", "toka-indexer.service");
-  // `enable --now` leaves an already-running service on the old executable
-  // inode after an atomic app update. Restart starts first installs too, and
-  // guarantees updates immediately run the newly installed indexer.
-  runServiceCommand?.("restart", "toka-indexer.service");
+  // The service belongs to `ts` now: `ts install` writes the unit,
+  // migrates the old toka-indexer.service away, and starts the daemon —
+  // idempotently, so updates and first installs share this path. A failed
+  // service setup warns but never fails the install: the app runs
+  // degraded and retries at startup.
+  if (tsInstalled) {
+    runTsInstall?.(installedTsPath);
+  }
 
   let iconName = "application-x-executable";
   try {
@@ -150,14 +159,19 @@ export function releaseDir(env = process.env) {
   );
 }
 
-const runServiceCommand = (...arguments_) => {
-  const result = spawnSync("systemctl", ["--user", ...arguments_], {
+const runTsInstall = (installedTsPath) => {
+  const result = spawnSync(installedTsPath, ["install"], {
     stdio: "inherit",
   });
-  if (result.error)
+  if (result.error) {
     console.warn(
-      `Could not run systemctl --user ${arguments_.join(" ")}: ${result.error.message}`,
+      `Could not run ts install: ${result.error.message}. The app will retry at startup.`,
     );
+  } else if (result.status !== 0) {
+    console.warn(
+      `ts install exited with ${result.status}. The app will retry at startup.`,
+    );
+  }
 };
 
 if (
@@ -166,20 +180,24 @@ if (
 ) {
   const homeDir = process.env.HOME ?? os.homedir();
   const iconPath = path.resolve("src-tauri/icons/128x128.png");
+  // Built alongside the app by bin/build.mjs.
+  const tsSourcePath = path.join(releaseDir(), "ts");
 
   if (process.argv.includes("--appimage")) {
     await installAppImage({
       bundleDir: path.join(releaseDir(), "bundle", "appimage"),
       homeDir,
       iconPath,
-      runServiceCommand,
+      tsSourcePath,
+      runTsInstall,
     });
   } else {
     await installBinary({
       binaryPath: path.join(releaseDir(), "toka"),
       homeDir,
       iconPath,
-      runServiceCommand,
+      tsSourcePath,
+      runTsInstall,
     });
   }
 

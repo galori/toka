@@ -37,6 +37,22 @@ impl OwnedIndexSearchProvider {
     }
 }
 
+/// Keeps the paths a search may show: under a watched root, with no
+/// hidden ancestor (a dotfile, or a macOS-hidden folder, anywhere from
+/// the root down). The visibility half of [`SearchProvider`], factored
+/// out so the app's `ts`-backed provider — which learns its roots from
+/// `ts folders list` instead of the database — filters exactly as the
+/// owned-index provider does.
+pub fn retain_visible_under_roots(roots: &[PathBuf], paths: &mut Vec<PathBuf>) {
+    paths.retain(|path| {
+        roots.iter().any(|root| {
+            path.starts_with(root)
+                && crate::index_visibility::hidden_ancestor(root, path)
+                    .is_ok_and(|hidden| hidden.is_none())
+        })
+    });
+}
+
 impl SearchProvider for OwnedIndexSearchProvider {
     fn candidates(
         &self,
@@ -56,13 +72,7 @@ impl SearchProvider for OwnedIndexSearchProvider {
             .roots()
             .map(|roots| roots.into_iter().map(|(_, path)| path).collect::<Vec<_>>())
             .map_err(|error| SearchError::Provider(error.to_string()))?;
-        paths.retain(|path| {
-            roots.iter().any(|root| {
-                path.starts_with(root)
-                    && crate::index_visibility::hidden_ancestor(root, path)
-                        .is_ok_and(|hidden| hidden.is_none())
-            })
-        });
+        retain_visible_under_roots(&roots, paths);
         Ok(())
     }
 
@@ -200,6 +210,22 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn visible_helper_keeps_only_paths_under_visible_roots() {
+        let root = PathBuf::from("/media");
+        let visible = root.join("clip.mp4");
+        let mut paths = vec![
+            visible.clone(),
+            root.join(".clip.mp4"),
+            root.join(".worktrees/clip.mp4"),
+            PathBuf::from("/elsewhere/clip.mp4"),
+        ];
+
+        retain_visible_under_roots(&[root], &mut paths);
+
+        assert_eq!(paths, vec![visible]);
     }
 
     #[test]

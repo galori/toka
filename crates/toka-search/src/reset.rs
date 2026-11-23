@@ -73,15 +73,21 @@ impl ResetPlan {
     }
 }
 
+#[derive(Debug)]
 pub struct ResetReport {
     pub removed: Vec<PathBuf>,
     pub failures: Vec<String>,
+    /// Whether the pre-removal indexer stop passed: false only when a
+    /// configured stop failed and nothing was removed. True when the plan
+    /// configures no stop — nothing was there to block the reset.
+    pub indexer_stopped: bool,
 }
 
 pub fn apply(plan: &ResetPlan) -> ResetReport {
     let mut report = ResetReport {
         removed: Vec::new(),
         failures: Vec::new(),
+        indexer_stopped: true,
     };
     // Fail closed: a supervisor that survives the stop would rewrite what
     // is being deleted — and, worse, deleting the lock file out from under
@@ -90,6 +96,7 @@ pub fn apply(plan: &ResetPlan) -> ResetReport {
     if let Some(stop) = plan.stop_indexer {
         if let Err(message) = stop() {
             report.failures.push(message);
+            report.indexer_stopped = false;
             return report;
         }
     }
@@ -244,6 +251,7 @@ mod tests {
 
         assert_eq!(report.failures, vec!["systemctl failed".to_owned()]);
         assert!(report.removed.is_empty());
+        assert!(!report.indexer_stopped);
         assert!(file.exists(), "a failed stop must remove nothing");
     }
 
@@ -259,7 +267,22 @@ mod tests {
 
         assert!(report.failures.is_empty());
         assert_eq!(report.removed, vec![file.clone()]);
+        assert!(report.indexer_stopped);
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_plan_without_a_stop_reports_the_indexer_as_stopped() {
+        let root = tempdir().unwrap();
+        let file = root.path().join("index.sqlite3");
+        fs::write(&file, b"db").unwrap();
+        let plan = ResetPlan::new(vec![ResetTarget::file(file.clone())]);
+
+        let report = apply(&plan);
+
+        assert!(report.failures.is_empty());
+        assert!(report.indexer_stopped);
+        assert_eq!(report.removed, vec![file.clone()]);
     }
 
     #[test]

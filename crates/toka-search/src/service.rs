@@ -230,7 +230,7 @@ impl Host for SystemHost {
     }
 
     fn purge_paths(&mut self) -> Result<Vec<crate::reset::ResetTarget>, String> {
-        purge_data_paths()
+        reset_data_paths()
     }
 
     fn service_env(&self) -> Vec<(String, String)> {
@@ -244,17 +244,18 @@ impl Host for SystemHost {
     }
 }
 
-/// The index data `uninstall --purge-data` removes: the index's known
-/// files (the database, its sidecars, the rename overlay, the legacy
-/// daemon lock), every log file, and the thumbnail cache — both the
-/// current uid-scoped root and the pre-upgrade unscoped one uid-scoping
-/// orphaned, so upgrade+purge leaves no stale cache behind. Never media,
-/// tags, or add-ons — the same set the app's reset removes, minus the
-/// app's own caches. The index directory itself is never removed, so
+/// The search state a reset removes: the index's known files (the
+/// database, its sidecars, the rename overlay, the legacy daemon lock),
+/// every log file, and the thumbnail cache — both the current uid-scoped
+/// root and the pre-upgrade unscoped one uid-scoping orphaned, so
+/// upgrade+reset leaves no stale cache behind. Never media, tags, or
+/// add-ons — the same set the app's reset removes, minus the app's own
+/// caches. Shared by `uninstall --purge-data` and `ts reset`, so the two
+/// can never drift apart. The index directory itself is never removed, so
 /// foreign content stored there always survives; the index artifacts are
 /// file-only targets, so a directory at one of their paths refuses
 /// instead of deleting.
-fn purge_data_paths() -> Result<Vec<crate::reset::ResetTarget>, String> {
+pub fn reset_data_paths() -> Result<Vec<crate::reset::ResetTarget>, String> {
     use crate::reset::ResetTarget;
     let database = crate::owned_index::database_path()?;
     let mut paths: Vec<ResetTarget> = crate::owned_index::index_data_files(&database)
@@ -5371,12 +5372,12 @@ mod tests {
     }
 
     #[test]
-    fn purge_data_paths_covers_both_thumbnail_cache_roots() {
-        // The purge removes the current uid-scoped cache plus the unscoped
-        // root uid-scoping orphaned, so upgrade+purge leaves no stale
-        // cache behind — and the fresh root is still purged exactly as
+    fn reset_data_paths_covers_both_thumbnail_cache_roots() {
+        // The reset removes the current uid-scoped cache plus the unscoped
+        // root uid-scoping orphaned, so upgrade+reset leaves no stale
+        // cache behind — and the fresh root is still removed exactly as
         // before. Read-only: building the list touches nothing.
-        let paths = purge_data_paths().unwrap();
+        let paths = reset_data_paths().unwrap();
 
         for root in [
             crate::thumbnails::cache_output_root(),

@@ -119,10 +119,10 @@ nothing. Close Toka before resetting.
 ### Restart Toka
 
 `toka restart` (Linux) restarts the Toka app and its indexer. It only affects
-the Toka you called: the installed `toka` restarts the installed app and the
-`toka-indexer.service` user service, while a `toka` built in a worktree
-restarts only its own app and indexer processes and leaves the installed ones
-alone (and the other way round).
+the Toka you called: the installed `toka` restarts the installed app, while a
+`toka` built in a worktree restarts only its own app and leaves the installed
+one alone (and the other way round). Either way the indexer is the shared
+`ts` service, restarted with `ts restart`.
 
 ## Add-ons
 

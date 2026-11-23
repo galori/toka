@@ -7,10 +7,11 @@ mod player_linux;
 mod playlist;
 mod restart;
 mod subtitles;
+mod ts_client;
 
-// The search and indexing modules live in the `toka-search` crate. They are
-// imported by module name so the rest of this file — and `crate::search`
-// paths elsewhere — keep working unchanged.
+// The search and indexing modules live in the `toka-search` crate. The app
+// reaches them only through `ts_client` (which spawns `ts`) and pure
+// helpers with no index IO — see the ownership rule on `ts_client`.
 use serde::Serialize;
 #[cfg(all(target_os = "linux", not(feature = "e2e"), not(debug_assertions)))]
 use std::io::IsTerminal as _;
@@ -18,18 +19,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Manager, State};
 use tauri_plugin_opener::OpenerExt;
-#[cfg(target_os = "linux")]
-use toka_search::indexer_daemon;
-#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
-use toka_search::service;
 use toka_search::{
-    index_stats,
-    owned_index::{self, IndexUpdates, OwnedIndexUpdates},
-    providers::OwnedIndexSearchProvider,
-    reset,
+    owned_index::OwnedIndexState,
     search::{self, SearchEngine, SearchError, SearchPage, SearchProvider, SearchRequest},
-    search_log::{self, SearchLogSettings, SearchLogger},
-    tags, thumbnails,
+    search_log::{SearchLogSettings, SearchLogger},
+    tags,
 };
 
 #[derive(Serialize)]
@@ -60,18 +54,6 @@ struct CommandError {
 struct DeletedVideo {
     trash_name: String,
     original_path: PathBuf,
-}
-
-fn synchronize_index_path(updates: &dyn IndexUpdates, path: &Path) {
-    if let Err(error) = updates.synchronize_path(path) {
-        eprintln!("Toka could not update its owned index: {error}");
-    }
-}
-
-fn synchronize_index_rename(updates: &dyn IndexUpdates, from: &Path, to: &Path) {
-    if let Err(error) = updates.synchronize_rename(from, to) {
-        eprintln!("Toka could not update its owned index: {error}");
-    }
 }
 
 /// What Toka was asked to open, kept until the frontend is ready for it.
@@ -140,20 +122,18 @@ fn index_error(message: String) -> CommandError {
 
 #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
 #[tauri::command]
-fn index_state(
-    manager: State<'_, owned_index::OwnedIndexManager>,
-) -> Result<owned_index::OwnedIndexState, CommandError> {
-    manager.state().map_err(index_error)
+fn index_state() -> Result<OwnedIndexState, CommandError> {
+    ts_client::index_state().map_err(index_error)
 }
 
-// Integration builds use a fixture search provider rather than a persistent
-// index. Reporting that index management is unsupported keeps the fixture's
-// search screen deterministic and prevents tests from writing the developer's
-// real folder configuration.
+// Integration builds search through a fixture `ts` rather than a
+// persistent index. Reporting that index management is unsupported keeps
+// the fixture's search screen deterministic and prevents tests from
+// writing the developer's real folder configuration.
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "e2e"))]
 #[tauri::command]
-fn index_state() -> owned_index::OwnedIndexState {
-    owned_index::OwnedIndexState {
+fn index_state() -> OwnedIndexState {
+    OwnedIndexState {
         supported: false,
         revision: 0,
         indexed_videos: 0,
@@ -192,11 +172,8 @@ fn index_state() -> UnsupportedIndexState {
     any(not(feature = "e2e"), feature = "native-e2e")
 ))]
 #[tauri::command]
-fn add_index_folder(
-    path: String,
-    manager: State<'_, owned_index::OwnedIndexManager>,
-) -> Result<owned_index::OwnedIndexState, CommandError> {
-    manager.add_folder(Path::new(&path)).map_err(index_error)
+fn add_index_folder(path: String) -> Result<OwnedIndexState, CommandError> {
+    ts_client::folders_add(Path::new(&path)).map_err(index_error)
 }
 
 #[cfg(all(
@@ -204,11 +181,8 @@ fn add_index_folder(
     any(not(feature = "e2e"), feature = "native-e2e")
 ))]
 #[tauri::command]
-fn remove_index_folder(
-    id: String,
-    manager: State<'_, owned_index::OwnedIndexManager>,
-) -> Result<owned_index::OwnedIndexState, CommandError> {
-    manager.remove_folder(&id).map_err(index_error)
+fn remove_index_folder(id: String) -> Result<OwnedIndexState, CommandError> {
+    ts_client::folders_remove_by_id(&id).map_err(index_error)
 }
 
 impl From<SearchError> for CommandError {
@@ -379,16 +353,39 @@ async fn search_match_count(
     })?
 }
 
+/// The thumbnail for the result behind `result_id`: images are their
+/// own thumbnail (the engine's fast path, kept byte-identical), anything
+/// else is generated through `ts`. A failure reads exactly as a
+/// generation failure always did.
+fn thumbnail_path(engine: &SearchEngine, result_id: &str) -> Result<PathBuf, SearchError> {
+    let path = engine.video_path(result_id)?;
+    if search::is_supported_image(&path) {
+        return Ok(path);
+    }
+    ts_client::thumbnail(&path).map_err(|_| SearchError::VideoUnavailable)
+}
+
+/// The preview frames for the result behind `result_id`: images are
+/// their own single frame, anything else is generated through `ts`.
+fn preview_paths(engine: &SearchEngine, result_id: &str) -> Result<Vec<PathBuf>, SearchError> {
+    let path = engine.video_path(result_id)?;
+    if search::is_supported_image(&path) {
+        return Ok(vec![path]);
+    }
+    ts_client::preview(&path).map_err(|_| SearchError::VideoUnavailable)
+}
+
 #[tauri::command]
 async fn video_thumbnail(
     result_id: String,
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<String, CommandError> {
-    // Thumbnail generation invokes ffmpeg. Keep it off the command thread so
-    // a rapid scroll cannot freeze the WebView while a tile is being filled.
+    // Thumbnail generation invokes ffmpeg (through `ts`). Keep it off the
+    // command thread so a rapid scroll cannot freeze the WebView while a
+    // tile is being filled.
     let engine = Arc::clone(engine.inner());
-    let path = tauri::async_runtime::spawn_blocking(move || engine.thumbnail_path(&result_id))
+    let path = tauri::async_runtime::spawn_blocking(move || thumbnail_path(&engine, &result_id))
         .await
         .map_err(|error| CommandError {
             kind: "Thumbnail",
@@ -413,11 +410,11 @@ async fn video_preview(
     app: tauri::AppHandle,
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<Vec<String>, CommandError> {
-    // On a worker, not the main thread: this runs ffmpeg once per frame, and
-    // on the main thread a first hover would freeze the window for as long as
-    // that took.
+    // On a worker, not the main thread: this runs ffmpeg once per frame
+    // (through `ts`), and on the main thread a first hover would freeze
+    // the window for as long as that took.
     let engine = Arc::clone(engine.inner());
-    let paths = tauri::async_runtime::spawn_blocking(move || engine.preview_paths(&result_id))
+    let paths = tauri::async_runtime::spawn_blocking(move || preview_paths(&engine, &result_id))
         .await
         .map_err(|error| CommandError {
             kind: "Thumbnail",
@@ -854,11 +851,10 @@ fn delete_video(
     result_id: String,
     engine: State<'_, Arc<SearchEngine>>,
     deleted: State<'_, Mutex<Option<DeletedVideo>>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<(), CommandError> {
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
     let trash_name = move_to_trash(&path)?;
-    synchronize_index_path(updates.inner(), &path);
+    ts_client::sync_path_best_effort(&path);
     *deleted.lock().unwrap() = trash_name.map(|trash_name| DeletedVideo {
         trash_name,
         original_path: path,
@@ -897,10 +893,7 @@ fn restore_from_trash(item: &DeletedVideo) -> std::io::Result<bool> {
 }
 
 #[tauri::command]
-fn undo_delete(
-    deleted: State<'_, Mutex<Option<DeletedVideo>>>,
-    updates: State<'_, OwnedIndexUpdates>,
-) -> Result<(), CommandError> {
+fn undo_delete(deleted: State<'_, Mutex<Option<DeletedVideo>>>) -> Result<(), CommandError> {
     let item = deleted.lock().unwrap().take().ok_or_else(|| CommandError {
         kind: "Delete",
         message: "There is no video deletion to undo.".into(),
@@ -921,7 +914,7 @@ fn undo_delete(
         message: format!("The deleted video could not be restored: {error}"),
     })?;
     if output {
-        synchronize_index_path(updates.inner(), &item.original_path);
+        ts_client::sync_path_best_effort(&item.original_path);
         Ok(())
     } else {
         Err(CommandError {
@@ -936,9 +929,14 @@ fn set_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::set, updates.inner())
+    update_video_tags(
+        &result_id,
+        &tags,
+        &engine,
+        tags::set,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 #[tauri::command]
@@ -946,9 +944,14 @@ fn add_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::add, updates.inner())
+    update_video_tags(
+        &result_id,
+        &tags,
+        &engine,
+        tags::add,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 #[tauri::command]
@@ -956,9 +959,14 @@ fn remove_video_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<VideoTagUpdate, TagsError> {
-    update_video_tags(&result_id, &tags, &engine, tags::remove, updates.inner())
+    update_video_tags(
+        &result_id,
+        &tags,
+        &engine,
+        tags::remove,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 /// Puts the same tags on every video in `result_ids`, in one call rather than
@@ -969,16 +977,20 @@ fn add_tags_to_videos(
     result_ids: Vec<String>,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> BulkTagUpdate {
-    tag_videos(&result_ids, &tags, &engine, updates.inner())
+    tag_videos(
+        &result_ids,
+        &tags,
+        &engine,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 fn tag_videos(
     result_ids: &[String],
     tags: &[String],
     engine: &SearchEngine,
-    updates: &dyn IndexUpdates,
+    on_rename: impl Fn(&Path, &Path),
 ) -> BulkTagUpdate {
     let mut tagged = Vec::new();
     let mut failed = 0;
@@ -987,7 +999,7 @@ fn tag_videos(
         // One video that has moved or been deleted since the search is a
         // reason to say so afterwards, not a reason to abandon the rest of
         // the page half tagged.
-        match update_video_tags(result_id, tags, engine, tags::add, updates) {
+        match update_video_tags(result_id, tags, engine, tags::add, &on_rename) {
             Ok(update) => tagged.push(TaggedVideo {
                 result_id: result_id.clone(),
                 file_name: update.file_name,
@@ -1008,14 +1020,14 @@ fn tag_videos(
     }
 }
 
-/// Retags the video behind `result_id` and keeps both indexes pointing at the
-/// renamed file before the command returns.
+/// Retags the video behind `result_id` and keeps the index pointing at
+/// the renamed file before the command returns.
 fn update_video_tags(
     result_id: &str,
     tags: &[String],
     engine: &SearchEngine,
     operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
-    updates: &dyn IndexUpdates,
+    on_rename: impl Fn(&Path, &Path),
 ) -> Result<VideoTagUpdate, TagsError> {
     let path = engine.video_path(result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
@@ -1031,7 +1043,7 @@ fn update_video_tags(
             kind: "VideoUnavailable",
             message: error.to_string(),
         })?;
-    synchronize_index_rename(updates, &path, &update.path);
+    on_rename(&path, &update.path);
     Ok(VideoTagUpdate {
         file_name: update
             .path
@@ -1048,9 +1060,14 @@ fn add_folder_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<FolderTagUpdate, TagsError> {
-    update_folder_tags(&result_id, &tags, &engine, tags::add, updates.inner())
+    update_folder_tags(
+        &result_id,
+        &tags,
+        &engine,
+        tags::add,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 #[tauri::command]
@@ -1058,19 +1075,24 @@ fn remove_folder_tags(
     result_id: String,
     tags: Vec<String>,
     engine: State<'_, Arc<SearchEngine>>,
-    updates: State<'_, OwnedIndexUpdates>,
 ) -> Result<FolderTagUpdate, TagsError> {
-    update_folder_tags(&result_id, &tags, &engine, tags::remove, updates.inner())
+    update_folder_tags(
+        &result_id,
+        &tags,
+        &engine,
+        tags::remove,
+        ts_client::sync_rename_best_effort,
+    )
 }
 
 /// Retags the folder the video behind `result_id` sits in. That renames the
-/// folder, so both indexes follow every result inside it.
+/// folder, so the index follows every result inside it.
 fn update_folder_tags(
     result_id: &str,
     tags: &[String],
     engine: &SearchEngine,
     operation: fn(&Path, &[String]) -> Result<tags::TagUpdate, String>,
-    updates: &dyn IndexUpdates,
+    on_rename: impl Fn(&Path, &Path),
 ) -> Result<FolderTagUpdate, TagsError> {
     let path = engine.video_path(result_id).map_err(|error| TagsError {
         kind: "VideoUnavailable",
@@ -1089,7 +1111,7 @@ fn update_folder_tags(
         message,
     })?;
     let mut result_ids = engine.rename_folder(folder, update.path.clone());
-    synchronize_index_rename(updates, folder, &update.path);
+    on_rename(folder, &update.path);
     result_ids.sort();
     Ok(FolderTagUpdate {
         folder_tags: update.tags,
@@ -1282,40 +1304,17 @@ fn set_native_video_bounds(x: i32, y: i32, width: i32, height: i32, visible: boo
     player_linux::set_bounds(x, y, width, height, visible);
 }
 
-fn owned_index_platform_provider(database: PathBuf) -> Arc<dyn SearchProvider> {
-    Arc::new(OwnedIndexSearchProvider::new(database))
-}
-
 fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvider>, String> {
-    // Integration-test builds always serve the configured fixtures. The
-    // legacy TOKA_SEARCH_PROVIDER override used to select real providers that
-    // no longer exist; it must not fall through to the persistent index here.
-    #[cfg(feature = "e2e")]
+    // Every macOS and Linux build searches through `ts` — integration
+    // builds too, with their fixture videos forwarded to the `ts`
+    // children. The legacy TOKA_SEARCH_PROVIDER override selected real
+    // providers that no longer exist; it must not fall through to a
+    // persistent index here.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        struct FixtureSearchProvider;
-        impl SearchProvider for FixtureSearchProvider {
-            fn candidates(
-                &self,
-                _query: &str,
-                _whole_path: bool,
-                _context: &search_log::SearchLogContext,
-            ) -> Result<Vec<std::path::PathBuf>, SearchError> {
-                let paths = std::env::var_os("TOKA_E2E_VIDEOS").ok_or_else(|| {
-                    SearchError::Provider("The integration-test videos were not configured.".into())
-                })?;
-                Ok(std::env::split_paths(&paths).collect())
-            }
-        }
-        Ok(Arc::new(FixtureSearchProvider))
+        Ok(Arc::new(ts_client::TsSearchProvider::new()))
     }
-    #[cfg(all(any(target_os = "macos", target_os = "linux"), not(feature = "e2e")))]
-    {
-        Ok(owned_index_platform_provider(owned_index::database_path()?))
-    }
-    #[cfg(all(
-        not(any(target_os = "macos", target_os = "linux")),
-        not(feature = "e2e")
-    ))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         struct UnsupportedProvider;
         impl SearchProvider for UnsupportedProvider {
@@ -1346,88 +1345,48 @@ fn addon_directory(
     }
 }
 
-/// Everything Toka stores: its search folders and index (and their caches),
-/// thumbnail and web caches, and log files. Never the user's media, tags, or
-/// add-ons.
-#[cfg(not(mobile))]
-fn reset_plan() -> Result<reset::ResetPlan, String> {
-    // The index's known files — never the directory itself, so foreign
-    // content stored there always survives. File-only targets, so a
-    // directory at one of their paths refuses instead of deleting.
-    let mut paths: Vec<reset::ResetTarget> =
-        owned_index::index_data_files(&owned_index::database_path()?)
-            .into_iter()
-            .map(reset::ResetTarget::file)
-            .collect();
-    paths.push(reset::ResetTarget::dir(thumbnails::cache_output_root()));
-    if let Some(cache) = dirs::cache_dir() {
-        paths.push(reset::ResetTarget::dir(cache.join("app.toka.desktop")));
-    }
-    paths.extend(search_log::reset_paths());
-    #[allow(unused_mut)]
-    let mut plan = reset::ResetPlan::new(paths);
-    // The indexer stops before anything is deleted, on both platforms that
-    // run it as a service — and the reset fails closed when the stop does,
-    // so a surviving supervisor never watches its state vanish.
-    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
-    {
-        plan.stop_indexer = Some(service::stop_indexer_services);
-    }
-    Ok(plan)
-}
-
-fn read_index_stats() -> Result<index_stats::IndexStats, String> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        // Read-only like `ts stats`: `--index-stats` promises changes nothing,
-        // so it must neither migrate nor create the index.
-        owned_index::OwnedIndexManager::for_read_only_inspection()?.stats()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Err("The indexer is not supported on this platform.".to_owned())
+/// Installs the indexer service idempotently at startup, so the first
+/// launch after upgrade works with no user action. Best effort: when
+/// `ts` is missing or the service manager refuses, the app logs a
+/// warning and runs degraded — reads work, only freshness needs the
+/// daemon. Skipped in e2e builds, which must never touch real services.
+#[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+fn ensure_search_service() {
+    match ts_client::ensure_installed() {
+        Ok(report) => {
+            // Changed steps are worth one line each — the first launch
+            // after upgrade says what it set up — while the steady
+            // state's already-done steps stay silent.
+            for action in report.actions {
+                if action.changed {
+                    eprintln!("Toka indexer: {}", action.message);
+                }
+            }
+            if let Some(error) = report.error {
+                eprintln!("Toka could not install its indexer service: {error}");
+            }
+        }
+        Err(error) => eprintln!("Toka could not install its indexer service: {error}"),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let arguments = std::env::args_os().collect::<Vec<_>>();
-    #[cfg(target_os = "linux")]
-    if arguments
-        .get(1)
-        .is_some_and(|argument| argument == std::ffi::OsStr::new("--indexer"))
-    {
-        if let Err(message) = indexer_daemon::run_daemon() {
-            eprintln!("{message}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
+    // `--indexer` is gone (the indexer is `ts daemon run` now): route it
+    // to the CLI for a clear error, never to a GUI launch. It stays out
+    // of `is_command` so restarts still stop a stale pre-`ts` indexer
+    // instead of skipping it as another CLI command.
     #[cfg(not(mobile))]
-    if cli::is_command(&arguments) {
+    if cli::is_command(&arguments)
+        || arguments
+            .get(1)
+            .is_some_and(|argument| argument == std::ffi::OsStr::new("--indexer"))
+    {
         let status = {
             let mut stdout = std::io::stdout();
             let mut stderr = std::io::stderr();
-            cli::run_command(
-                &arguments,
-                || {
-                    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
-                    indexer_daemon::ensure_indexer();
-                    let logger = Arc::new(SearchLogger::system());
-                    let provider = platform_provider(logger.clone())?;
-                    let rename_overlay_path = Some(owned_index::search_rename_overlay_path()?);
-                    Ok(SearchEngine::new_with_logger_and_rename_store(
-                        provider,
-                        logger,
-                        rename_overlay_path,
-                    ))
-                },
-                reset_plan,
-                read_index_stats,
-                &mut stdout,
-                &mut stderr,
-            )
+            cli::run_command(&arguments, ts_client::run_cli, &mut stdout, &mut stderr)
         };
         if status != 0 {
             std::process::exit(status);
@@ -1438,8 +1397,8 @@ pub fn run() {
     // A release GUI launch from an interactive shell hands off to a detached
     // child with no standard streams and exits, so the shell gets its prompt
     // back immediately and never sees the GUI toolkit's output. CLI commands,
-    // the indexer, debug builds such as `tauri dev`, and piped launches stay
-    // in this process.
+    // debug builds such as `tauri dev`, and piped launches stay in this
+    // process.
     #[cfg(all(target_os = "linux", not(feature = "e2e"), not(debug_assertions)))]
     if crate::launch::should_detach_gui(
         &arguments,
@@ -1450,8 +1409,8 @@ pub fn run() {
         crate::launch::detach_gui(&arguments);
     }
 
-    #[cfg(all(target_os = "linux", not(feature = "e2e")))]
-    indexer_daemon::ensure_indexer();
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
+    ensure_search_service();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init());
@@ -1472,33 +1431,19 @@ pub fn run() {
     );
     let registry = Arc::new(addons::AddonRegistry::system(user_addons.as_deref()));
     let logger = Arc::new(SearchLogger::system());
-    let rename_overlay_path = Some(
-        owned_index::search_rename_overlay_path()
-            .expect("Toka could not find a place for its search rename state."),
-    );
-    let engine = Arc::new(SearchEngine::new_with_logger_and_rename_store(
+    // No rename overlay of the app's own: the overlay lives with the
+    // index, so only `ts` reads and writes it. The engine keeps renames
+    // in memory for this session; the index learns them through syncs.
+    let engine = Arc::new(SearchEngine::new_with_logger(
         platform_provider(logger.clone()).expect("Toka could not initialize its search provider"),
         logger.clone(),
-        rename_overlay_path,
     ));
     let builder = builder
         .manage(logger.clone())
         .manage(engine)
-        .manage(OwnedIndexUpdates::system())
         .manage(registry)
         .manage(Mutex::new(None::<DeletedVideo>))
         .manage(launched);
-    // The daemon owns the watchers on Linux, so the GUI opens the index
-    // without starting its own.
-    #[cfg(target_os = "linux")]
-    let builder = builder.manage(
-        owned_index::OwnedIndexManager::for_inspection()
-            .expect("Toka could not find its search index"),
-    );
-    #[cfg(all(target_os = "macos", not(feature = "e2e")))]
-    let builder = builder.manage(
-        owned_index::OwnedIndexManager::system().expect("Toka could not find its search index"),
-    );
     #[cfg(all(target_os = "linux", feature = "e2e", not(feature = "native-e2e")))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         search_videos,
@@ -1673,6 +1618,7 @@ pub fn run() {
 mod tests {
     use super::*;
     use std::path::Path;
+    use toka_search::search_log::SearchLogContext;
 
     #[test]
     fn addon_launch_page_keeps_only_the_exact_creator() {
@@ -1866,27 +1812,55 @@ mod tests {
         assert!(error.message.contains("clip.mp4"), "{}", error.message);
     }
 
+    /// The app's startup provider searches through `ts`: one search
+    /// round-trips candidates, visibility roots, and the revision.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
-    fn macos_startup_provider_searches_the_owned_index_without_mdfind() {
+    fn startup_provider_searches_through_ts() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("fixtures");
         std::fs::create_dir(&root).unwrap();
         let sample = root.join("sample.mp4");
         std::fs::write(&sample, b"sample video").unwrap();
-        let database = directory.path().join("state").join("index.sqlite3");
-        let manager = owned_index::OwnedIndexManager::under(database.clone());
-        let state = manager.add_folder(&root).unwrap();
-        let folder_id = &state.folders[0].id;
-        owned_index::OwnedIndex::open(&database)
-            .unwrap()
-            .scan_root(folder_id, &root, |_| {})
-            .unwrap();
+        let search = serde_json::json!({
+            "schema": 1,
+            "query": "sample",
+            "page": 1,
+            "pageSize": 1,
+            "totalResults": 1,
+            "totalPages": 1,
+            "indexRevision": 42,
+            "results": [{"path": sample.to_string_lossy()}],
+        });
+        let folders = serde_json::json!({
+            "schema": 1,
+            "folders": [{
+                "id": "aaa",
+                "path": root.to_string_lossy(),
+                "status": "ready",
+                "message": null,
+                "scannedFiles": 1,
+                "currentPath": null,
+                "recentDirectories": [],
+            }],
+        });
+        let shim = directory.path().join("ts");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = search ]; then cat <<'TS_EOF'\n{search}\nTS_EOF\nelif [ \"$1\" = folders ]; then cat <<'TS_EOF'\n{folders}\nTS_EOF\nelse echo \"unexpected argv: $*\" >&2; exit 9; fi\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = ts_client::test_env::EnvGuard::lock();
+        env.set("TS_BIN", shim.as_os_str());
+        env.remove("TOKA_E2E_VIDEOS");
 
-        let log_path = directory.path().join("search.jsonl");
-        let logger = Arc::new(SearchLogger::new(log_path.clone()));
-        let provider = owned_index_platform_provider(database);
+        let logger = Arc::new(SearchLogger::disabled());
+        let provider = platform_provider(logger.clone()).unwrap();
         let engine = SearchEngine::new_with_logger(provider, logger);
-
         let page = engine
             .search(SearchRequest {
                 query: "sample".into(),
@@ -1900,12 +1874,7 @@ mod tests {
 
         assert_eq!(page.total_results, 1);
         assert_eq!(page.results[0].file_name, "sample.mp4");
-        let search_log = match std::fs::read_to_string(log_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => panic!("could not read search log: {error}"),
-        };
-        assert!(!search_log.contains("/usr/bin/mdfind"));
+        assert_eq!(page.index_revision, 42);
     }
 
     struct FakeProvider(Vec<PathBuf>);
@@ -1915,7 +1884,7 @@ mod tests {
             &self,
             _query: &str,
             _whole_path: bool,
-            _context: &search_log::SearchLogContext,
+            _context: &SearchLogContext,
         ) -> Result<Vec<PathBuf>, SearchError> {
             Ok(self.0.clone())
         }
@@ -1951,13 +1920,25 @@ mod tests {
             })
             .collect();
         let (engine, ids) = engine_over(paths);
-        let updates = OwnedIndexUpdates::new(directory.path().join("missing-index.sqlite3"));
+        let renamed = Arc::new(Mutex::new(Vec::new()));
+        let record = {
+            let renamed = Arc::clone(&renamed);
+            move |from: &Path, to: &Path| {
+                renamed
+                    .lock()
+                    .unwrap()
+                    .push((from.to_path_buf(), to.to_path_buf()));
+            }
+        };
 
-        let update = tag_videos(&ids, &["beach".to_owned()], &engine, &updates);
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine, record);
 
         assert_eq!(update.failed, 0);
         assert_eq!(update.problem, None);
         assert_eq!(update.tagged.len(), 2);
+        // Every tag syncs its rename to the index: production passes the
+        // `ts` sync, tests record it.
+        assert_eq!(renamed.lock().unwrap().len(), 2);
         for tagged in &update.tagged {
             assert_eq!(tagged.tags, ["beach"]);
             assert!(tagged.file_name.contains("[beach]"), "{}", tagged.file_name);
@@ -1977,27 +1958,12 @@ mod tests {
         std::fs::write(&present, b"test").unwrap();
         std::fs::write(&missing, b"test").unwrap();
         let (engine, ids) = engine_over(vec![present, missing.clone()]);
-        let updates = OwnedIndexUpdates::new(directory.path().join("missing-index.sqlite3"));
         std::fs::remove_file(&missing).unwrap();
 
-        let update = tag_videos(&ids, &["beach".to_owned()], &engine, &updates);
+        let update = tag_videos(&ids, &["beach".to_owned()], &engine, |_, _| {});
 
         assert_eq!(update.tagged.len(), 1);
         assert_eq!(update.failed, 1);
         assert!(update.problem.is_some());
-    }
-
-    /// The reset stops the indexer service before deleting anything, on
-    /// both platforms that run it — so a surviving supervisor fails the
-    /// reset instead of watching its state vanish.
-    #[cfg(not(mobile))]
-    #[test]
-    fn reset_stops_the_indexer_before_deleting() {
-        let plan = reset_plan().unwrap();
-
-        #[cfg(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e")))]
-        assert!(plan.stop_indexer.is_some());
-        #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(feature = "e2e"))))]
-        assert!(plan.stop_indexer.is_none());
     }
 }

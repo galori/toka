@@ -10,8 +10,6 @@ use crate::owned_index::{
 };
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-#[cfg(not(feature = "e2e"))]
-use std::io;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -24,9 +22,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
-#[cfg(not(feature = "e2e"))]
-use std::process::ExitStatus;
 
 pub(crate) struct IndexLogger {
     path: PathBuf,
@@ -69,56 +64,8 @@ impl IndexLogger {
     }
 }
 
-#[cfg(not(feature = "e2e"))]
+#[cfg(all(not(feature = "e2e"), any(target_os = "linux", test)))]
 use crate::config::INDEXER_SERVICE_NAME as INDEXER_SERVICE;
-
-#[cfg(not(feature = "e2e"))]
-pub(crate) fn ensure_indexer_with_runner<F>(
-    home: Option<&Path>,
-    config_dir: Option<&Path>,
-    mut run: F,
-) -> Result<(), String>
-where
-    F: FnMut(&[&str]) -> io::Result<ExitStatus>,
-{
-    // The `ts` service owns the daemon now; the legacy one only still
-    // exists where `ts install` has not migrated it away yet. The new
-    // unit lives under the config directory (`XDG_CONFIG_HOME` when
-    // set); the legacy one stays where the old installer wrote it, under
-    // `~/.config`. A home with neither installed (or no home at all)
-    // still attempts the new service, so a missing install fails loudly
-    // instead of silently starting nothing.
-    let ts_present = config_dir.is_some_and(|dir| crate::service::unit_path(dir).is_file());
-    let legacy_present = home.is_some_and(|home| crate::service::legacy_unit_path(home).is_file());
-    let service = if ts_present || !legacy_present {
-        crate::config::TS_SERVICE_NAME
-    } else {
-        INDEXER_SERVICE
-    };
-    let arguments = ["--user", "start", service];
-    let status = run(&arguments)
-        .map_err(|error| format!("Toka could not start its indexer service: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Toka's indexer service could not be started (systemctl exited with {status})"
-        ))
-    }
-}
-
-#[cfg(not(feature = "e2e"))]
-pub fn ensure_indexer() {
-    let home = dirs::home_dir();
-    let config = dirs::config_dir();
-    if let Err(message) =
-        ensure_indexer_with_runner(home.as_deref(), config.as_deref(), |arguments| {
-            Command::new("systemctl").args(arguments).status()
-        })
-    {
-        eprintln!("{message}");
-    }
-}
 
 /// Whether the indexer service is running right now, if systemd can say.
 #[cfg(all(not(feature = "e2e"), any(target_os = "linux", test)))]
@@ -1238,106 +1185,6 @@ mod tests {
         sender.send(2).unwrap();
         drain_events(&receiver);
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[cfg(not(feature = "e2e"))]
-    #[test]
-    fn starts_the_ts_service_once_it_is_installed() {
-        // The new unit lives under the config directory, which may diverge
-        // from `~/.config` when `XDG_CONFIG_HOME` is set.
-        for config in [".config", "xdg-config"] {
-            let home = tempdir().unwrap();
-            let config = home.path().join(config);
-            let unit = crate::service::unit_path(&config);
-            fs::create_dir_all(unit.parent().unwrap()).unwrap();
-            fs::write(&unit, b"[Unit]").unwrap();
-            let mut commands: Vec<Vec<String>> = Vec::new();
-
-            ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
-                commands.push(
-                    arguments
-                        .iter()
-                        .map(|argument| (*argument).to_owned())
-                        .collect(),
-                );
-                std::process::Command::new("true").status()
-            })
-            .unwrap();
-
-            assert_eq!(
-                commands,
-                vec![vec![
-                    "--user".to_owned(),
-                    "start".to_owned(),
-                    "toka-search.service".to_owned(),
-                ]],
-                "{config:?}"
-            );
-        }
-    }
-
-    #[cfg(not(feature = "e2e"))]
-    #[test]
-    fn falls_back_to_the_legacy_service_until_ts_migrates_it() {
-        let home = tempdir().unwrap();
-        let config = home.path().join(".config");
-        let legacy = crate::service::legacy_unit_path(home.path());
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::write(&legacy, b"[Unit]").unwrap();
-        let mut commands: Vec<Vec<String>> = Vec::new();
-
-        ensure_indexer_with_runner(Some(home.path()), Some(&config), |arguments| {
-            commands.push(
-                arguments
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect(),
-            );
-            std::process::Command::new("true").status()
-        })
-        .unwrap();
-
-        assert_eq!(
-            commands,
-            vec![vec![
-                "--user".to_owned(),
-                "start".to_owned(),
-                "toka-indexer.service".to_owned(),
-            ]]
-        );
-    }
-
-    #[cfg(not(feature = "e2e"))]
-    #[test]
-    fn attempts_the_ts_service_when_nothing_is_installed() {
-        let home = tempdir().unwrap();
-        let config = home.path().join(".config");
-        for missing in [(Some(home.path()), Some(config.as_path())), (None, None)] {
-            let mut commands: Vec<Vec<String>> = Vec::new();
-
-            ensure_indexer_with_runner(missing.0, missing.1, |arguments| {
-                commands.push(
-                    arguments
-                        .iter()
-                        .map(|argument| (*argument).to_owned())
-                        .collect(),
-                );
-                std::process::Command::new("true").status()
-            })
-            .unwrap();
-
-            // A missing install fails loudly on the new service instead of
-            // silently starting nothing.
-            assert_eq!(
-                commands,
-                vec![vec![
-                    "--user".to_owned(),
-                    "start".to_owned(),
-                    "toka-search.service".to_owned(),
-                ]],
-                "{missing:?}"
-            );
-        }
     }
 
     #[test]

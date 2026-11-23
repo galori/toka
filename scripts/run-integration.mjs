@@ -45,13 +45,16 @@ function run(command, args, environmentOverride) {
 
 function buildE2e() {
   run("npm", ["run", "build:integration"]);
+  // The e2e app searches through `ts`: a fixtures build beside the e2e
+  // `toka`, resolved as its sibling with the fixture videos forwarded.
+  run("cargo", ["build", "-p", "ts", "--features", "fixtures"]);
 }
 
 function runWdio(config, environmentOverride) {
   run(wdio, ["run", config], environmentOverride);
 }
 
-// The owned-index spec drives the real app and its real indexer daemon, so
+// The owned-index spec drives the real app and its real `ts` daemon, so
 // it needs a non-e2e build in its own target directory.
 function buildOwned() {
   const targetDirectory = resolve("src-tauri", "target", `owned-${fixturePort}`);
@@ -81,6 +84,9 @@ function buildOwned() {
     ],
     ownedEnvironment,
   );
+  // The owned app is the real app: it needs the real `ts` beside it —
+  // for its own calls and for the daemon the wdio config spawns.
+  run("cargo", ["build", "-p", "ts"], ownedEnvironment);
   return ownedEnvironment;
 }
 
@@ -92,6 +98,7 @@ if (task === "standard") {
   runWdio("wdio.owned.conf.ts", ownedEnvironment);
 } else if (task === "native") {
   run("npm", ["run", "build:integration:native"]);
+  run("cargo", ["build", "-p", "ts", "--features", "fixtures"]);
   runWdio("wdio.native.conf.ts");
 } else {
   buildE2e();
@@ -102,6 +109,7 @@ if (task === "standard") {
   }
   if (process.platform === "linux") {
     run("npm", ["run", "build:integration:native"]);
+    run("cargo", ["build", "-p", "ts", "--features", "fixtures"]);
     runWdio("wdio.native.conf.ts");
   }
 }

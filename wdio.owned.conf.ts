@@ -6,11 +6,11 @@ import {
   mkdirSync,
 } from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
-import { delimiter, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Options } from "@wdio/types";
 
-// A fake home directory, so the app and its indexer daemon only ever touch
+// A fake home directory, so the app and its `ts` daemon only ever touch
 // this test's files. XDG variables are set explicitly because the test runner
 // may already export them. WebdriverIO re-evaluates this file in each worker,
 // so the launcher publishes the home for workers to reuse; otherwise each
@@ -24,12 +24,12 @@ process.env.XDG_CONFIG_HOME = join(homeDirectory, ".config");
 process.env.XDG_DATA_HOME = join(homeDirectory, ".local", "share");
 process.env.XDG_CACHE_HOME = join(homeDirectory, ".cache");
 
-// The owned build is the real app, so it runs `systemctl --user start
-// toka-indexer.service` on launch. On a machine with Toka installed that would
-// start the real user service against the real index, while this run spawns
-// its own daemon below. Shadow systemctl on PATH so the app under test cannot
-// reach the installed service; every call succeeds without doing anything,
-// which also truthfully reports the test daemon as running.
+// The owned build is the real app, so it runs `ts install` at startup,
+// which shells out to systemctl. On a machine with Toka installed that
+// would touch the real user service, while this run spawns its own daemon
+// below. Shadow systemctl on PATH so the app under test cannot reach the
+// installed service; every call succeeds without doing anything, which
+// also truthfully reports the test daemon as running.
 const shimDirectory = join(homeDirectory, "bin");
 mkdirSync(shimDirectory, { recursive: true });
 const shimPath = join(shimDirectory, "systemctl");
@@ -53,9 +53,14 @@ writeFileSync(
   ),
 );
 
-const binaryPath = process.env.TOKA_E2E_BINARY ?? resolve(
-  `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
-);
+const binaryPath =
+  process.env.TOKA_E2E_BINARY ??
+  resolve(
+    `src-tauri/target/debug/toka${process.platform === "win32" ? ".exe" : ""}`,
+  );
+// The real `ts` the owned app resolves as its sibling (built beside it
+// by run-integration), which also runs the test daemon below.
+const tsBinaryPath = join(dirname(binaryPath), "ts");
 
 let daemon: ChildProcess | undefined;
 
@@ -79,9 +84,9 @@ export const config: Options.Testrunner = {
   connectionRetryTimeout: 30_000,
   mochaOpts: { timeout: 180_000 },
   onPrepare: () => {
-    // The app adds the fixture folder through its own UI; the indexer daemon
+    // The app adds the fixture folder through its own UI; the `ts` daemon
     // below is what scans it, exactly like on a real machine.
-    daemon = spawn(binaryPath, ["--indexer"], {
+    daemon = spawn(tsBinaryPath, ["daemon", "run"], {
       env: { ...process.env },
       stdio: "ignore",
       detached: true,

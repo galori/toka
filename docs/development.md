@@ -32,7 +32,7 @@ node scripts/isolated/toka-isolated.mjs stop --clean
 The branch runs beside your installed Toka with its own settings, index and
 indexer, under `<worktree>/.scratch/isolated-home`. It indexes a throwaway copy of
 `test/fixtures`, and a `systemctl` shim keeps it from controlling your real
-`toka-indexer.service`.
+`toka-search.service`.
 
 ## Search diagnostics
 
@@ -120,7 +120,7 @@ network.
 
 - `src/` contains the React interface and Tauri command client.
 - `src-tauri/` contains the Rust application, search providers, and file-access boundary.
-- Both platforms search Toka's owned SQLite index in `src-tauri/src/owned_index.rs`. On Linux a `toka-indexer.service` user service runs `toka --indexer`, which hosts the index watchers so folders stay current with the window closed.
+- Both platforms search Toka's owned SQLite index through the `ts` helper (`crates/ts`, backed by `crates/toka-search`). A `toka-search.service` user service on Linux (a `ts` launchd agent on macOS) runs `ts daemon run`, which hosts the index watchers so folders stay current with the window closed.
 - Linux playback renders libmpv into a GTK OpenGL surface layered over the React player region; other platforms retain the web media engine.
 - Searches are case-insensitive filename keyword searches. All entered words must appear in the filename, zero-byte media is ignored, and results are sorted, deduplicated, and paginated in groups of 24.
 - The frontend receives opaque result IDs rather than filesystem paths. Rust validates the selected file before granting the player temporary asset access.
@@ -139,7 +139,7 @@ to see its version, build age, Git SHA, and number of commits behind
 ## Linux troubleshooting
 
 - No results: press `Ctrl+,` and check that the folder is configured and reports Ready. A disconnected drive reports Drive disconnected and keeps its existing database.
-- Background updates: check `systemctl --user status toka-indexer.service`. Re-running `npm run build:linux:install` refreshes and restarts the user service.
+- Background updates: check `systemctl --user status toka-search.service` (or `ts status`). Re-running `npm run build:linux:install` refreshes the binaries and re-runs `ts install`.
 - Slow indexing: the status pane reports folders in progress and files scanned; if those numbers stop changing, inspect the indexer log at `~/.local/share/app.toka.desktop/logs/indexer.log`.
 - Build dependency errors: compare installed packages with the current [Tauri Linux prerequisites](https://v2.tauri.app/start/prerequisites/).
 - `libmpv could not be loaded`: install `libmpv2`; on Tails, persist it with Additional Software.
