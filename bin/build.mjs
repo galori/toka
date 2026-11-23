@@ -19,36 +19,55 @@ const env = {
   VITE_GIT_SHA: info.gitSha,
 };
 
-function bundleArguments() {
-  if (target === "mac") return ["--bundles", "app,dmg"];
-  return wantsAppImage ? ["--bundles", "appimage"] : ["--no-bundle"];
+function bundlesToPackage() {
+  if (target === "mac") return ["app", "dmg"];
+  return wantsAppImage ? ["appimage"] : [];
 }
 
-const build = spawnSync(
-  "npm",
-  ["run", "tauri", "build", "--", ...bundleArguments()],
-  {
-    cwd: root,
-    env,
-    stdio: "inherit",
-  },
-);
-if (build.status !== 0) process.exit(build.status ?? 1);
-
-// The search helper the app shells out to, built alongside the app so
-// installers and e2e runs find it next to the `toka` binary. Version
-// provenance mirrors build.rs: only a hex SHA reaches the binary.
-const gitSha = /^[0-9a-f]+$/i.test(info.gitSha ?? "") ? info.gitSha : undefined;
-const tsBuild = spawnSync("cargo", ["build", "--release", "-p", "ts"], {
+// The search helper the app shells out to, built before the app so the
+// bundler picks it up as the `binaries/ts` sidecar — and so the Linux
+// installer finds the release binary beside the app build. One build
+// serves both: the sidecar stage step builds release `ts` itself.
+const sidecar = spawnSync("node", ["bin/build-ts-sidecar.mjs"], {
   cwd: root,
-  env: {
-    ...env,
-    TS_BUILD_VERSION: info.buildVersion,
-    ...(gitSha === undefined ? {} : { TOKA_GIT_SHA: gitSha }),
-  },
   stdio: "inherit",
 });
-if (tsBuild.status !== 0) process.exit(tsBuild.status ?? 1);
+if (sidecar.status !== 0) process.exit(sidecar.status ?? 1);
+
+// Compile first with the base config, then bundle with the sidecar overlay
+// merged in — never `tauri build --bundles` with the overlay. The overlay
+// reaches the compile's build script through TAURI_CONFIG, and tauri-build
+// copies sidecars itself there: it derives the destination as three
+// directories above OUT_DIR, which was the profile directory under cargo's
+// flat build layout but is `build/` under the nested per-package layout —
+// so the copy lands on cargo's own `build/ts` directory and fails. The
+// bundler reads the staged sidecar straight from `src-tauri/binaries`,
+// which is layout-independent, so only it gets the overlay.
+const build = spawnSync("npm", ["run", "tauri", "build", "--", "--no-bundle"], {
+  cwd: root,
+  env,
+  stdio: "inherit",
+});
+if (build.status !== 0) process.exit(build.status ?? 1);
+
+const bundles = bundlesToPackage();
+if (bundles.length > 0) {
+  const bundle = spawnSync(
+    "npm",
+    [
+      "run",
+      "tauri",
+      "bundle",
+      "--",
+      "--bundles",
+      bundles.join(","),
+      "--config",
+      "src-tauri/tauri.bundle.conf.json",
+    ],
+    { cwd: root, stdio: "inherit" },
+  );
+  if (bundle.status !== 0) process.exit(bundle.status ?? 1);
+}
 
 console.log(
   `Built: ${builtArtifactPath({ target, appimage: wantsAppImage }, root)}`,

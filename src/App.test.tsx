@@ -183,6 +183,9 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Ctrl+Shift+T");
   expect(help).toHaveTextContent("Ctrl+Shift+A");
   expect(help).toHaveTextContent("Open actions from add-ons");
+  expect(help).toHaveTextContent(
+    "the ts background service keeps them indexed",
+  );
   expect(
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
   ).toHaveAttribute("aria-keyshortcuts", "Escape");
@@ -283,6 +286,19 @@ test("opens folder setup on first launch when search folders are supported", asy
   expect(addFolder).toHaveAttribute("aria-keyshortcuts", "Ctrl+O");
   expect(addFolder.querySelector(".key-hint")).toHaveTextContent("Ctrl+O");
   expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+  expect(screen.getByText(/ts uninstall removes the service/)).toBeVisible();
+});
+
+test("says on screen when the index state cannot be read at startup", async () => {
+  indexStateMock.mockRejectedValue(
+    new Error("Toka could not find the `ts` search helper."),
+  );
+
+  render(<App />);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Toka could not find the `ts` search helper.",
+  );
 });
 
 test("adds a search folder and makes the setup completable", async () => {
@@ -5935,17 +5951,23 @@ test("opens the playing video's parent folder in a new Toka from the control and
   invokeMock.mockClear();
   await user.click(control);
   await waitFor(() =>
-    expect(invokeMock).toHaveBeenCalledWith("open_parent_folder_in_new_window", {
-      resultId: "video-1",
-    }),
+    expect(invokeMock).toHaveBeenCalledWith(
+      "open_parent_folder_in_new_window",
+      {
+        resultId: "video-1",
+      },
+    ),
   );
 
   invokeMock.mockClear();
   fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true });
   await waitFor(() =>
-    expect(invokeMock).toHaveBeenCalledWith("open_parent_folder_in_new_window", {
-      resultId: "video-1",
-    }),
+    expect(invokeMock).toHaveBeenCalledWith(
+      "open_parent_folder_in_new_window",
+      {
+        resultId: "video-1",
+      },
+    ),
   );
   expect(invokeMock).not.toHaveBeenCalledWith("open_new_window");
   expect(invokeMock).not.toHaveBeenCalledWith("open_folder_in_new_window", {
@@ -5978,7 +6000,9 @@ test("says why the playing video's parent folder could not be opened", async () 
     await screen.findByRole("button", { name: "Play clip.mp4" }),
   );
   await user.click(
-    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+    await screen.findByRole("button", {
+      name: "Open parent folder in new window",
+    }),
   );
 
   expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -6016,7 +6040,9 @@ test("clears the parent-folder error when playback advances", async () => {
     await screen.findByRole("button", { name: "Play clip-1.mp4" }),
   );
   await user.click(
-    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+    await screen.findByRole("button", {
+      name: "Open parent folder in new window",
+    }),
   );
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Another Toka could not be started.",
@@ -6060,7 +6086,9 @@ test("drops a parent-folder failure that lands after advancing", async () => {
     await screen.findByRole("button", { name: "Play clip-1.mp4" }),
   );
   await user.click(
-    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+    await screen.findByRole("button", {
+      name: "Open parent folder in new window",
+    }),
   );
   await user.click(screen.getByRole("button", { name: "Next video" }));
   expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
@@ -6152,14 +6180,10 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
   });
   fireEvent.keyDown(tabAction, { key: "Tab" });
   await waitFor(() => expect(profileTabAction).toHaveFocus());
-  expect(
-    screen.queryByRole("menu", { name: "Add-ons" }),
-  ).toBeInTheDocument();
+  expect(screen.queryByRole("menu", { name: "Add-ons" })).toBeInTheDocument();
   fireEvent.keyDown(profileTabAction, { key: "Tab", shiftKey: true });
   await waitFor(() => expect(tabAction).toHaveFocus());
-  expect(
-    screen.queryByRole("menu", { name: "Add-ons" }),
-  ).toBeInTheDocument();
+  expect(screen.queryByRole("menu", { name: "Add-ons" })).toBeInTheDocument();
 
   fireEvent.keyDown(tabAction, { key: "Escape" });
   expect(
@@ -6186,9 +6210,7 @@ test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async (
     name: /Tiktok profile/,
   });
   await waitFor(() =>
-    expect(
-      screen.getByRole("menuitem", { name: /Toka search/ }),
-    ).toHaveFocus(),
+    expect(screen.getByRole("menuitem", { name: /Toka search/ })).toHaveFocus(),
   );
   await user.keyboard("{ArrowDown}");
   await waitFor(() => expect(profileAction).toHaveFocus());
@@ -6284,9 +6306,7 @@ test("Tab cycles the add-on menu forward and Shift+Tab cycles it back", async ()
   await waitFor(() => expect(middle).toHaveFocus());
   fireEvent.keyDown(middle, { key: "Tab", shiftKey: true });
   await waitFor(() => expect(first).toHaveFocus());
-  expect(
-    screen.queryByRole("menu", { name: "Add-ons" }),
-  ).toBeInTheDocument();
+  expect(screen.queryByRole("menu", { name: "Add-ons" })).toBeInTheDocument();
 });
 
 test("keeps unmatched add-ons disabled and shows load failures in their menu", async () => {

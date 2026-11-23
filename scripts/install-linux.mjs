@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
   chmod,
   copyFile,
@@ -12,6 +11,9 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runTsInstall } from "./run-ts-install.mjs";
+
+export { runTsInstall };
 
 const appName = "Toka";
 const desktopFileName = "toka.desktop";
@@ -69,8 +71,11 @@ async function installExecutable({
   await mkdir(binDir, { recursive: true });
   await replaceLink(path.join(binDir, "toka"), installedPath);
 
-  // The search helper beside the app, linked for the shell too. The app
-  // resolves it as its sibling; the link is for interactive use.
+  // The search helper beside the app, which is how the app resolves
+  // it. The shell link and the service belong to `ts install --link`
+  // below: it links ~/.local/bin/ts itself (refusing to clobber a real
+  // file there), writes the unit, migrates the old
+  // toka-indexer.service away, and starts the daemon.
   const installedTsPath = path.join(installDir, "ts");
   let tsInstalled = false;
   if (tsSourcePath === undefined) {
@@ -81,18 +86,12 @@ async function installExecutable({
       await copyFile(tsSourcePath, tsTemporaryPath);
       await chmod(tsTemporaryPath, 0o755);
       await rename(tsTemporaryPath, installedTsPath);
-      await replaceLink(path.join(binDir, "ts"), installedTsPath);
       tsInstalled = true;
     } catch (error) {
       console.warn(`Could not install the ts search helper: ${error.message}`);
     }
   }
 
-  // The service belongs to `ts` now: `ts install` writes the unit,
-  // migrates the old toka-indexer.service away, and starts the daemon —
-  // idempotently, so updates and first installs share this path. A failed
-  // service setup warns but never fails the install: the app runs
-  // degraded and retries at startup.
   if (tsInstalled) {
     runTsInstall?.(installedTsPath);
   }
@@ -158,40 +157,6 @@ export function releaseDir(env = process.env) {
     "release",
   );
 }
-
-export const runTsInstall = (installedTsPath) => {
-  const installed = spawnSync(installedTsPath, ["install"], {
-    stdio: "inherit",
-  });
-  if (installed.error) {
-    console.warn(
-      `Could not run ts install: ${installed.error.message}. The app will retry at startup.`,
-    );
-    return;
-  }
-  if (installed.status !== 0) {
-    console.warn(
-      `ts install exited with ${installed.status}. The app will retry at startup.`,
-    );
-    return;
-  }
-  // An update replaced the binary under a running daemon: `ts install`
-  // alone reports "already running" and leaves the old daemon on it, so
-  // restart onto the new binary. Warn-and-continue like the install: a
-  // failed restart never fails the install.
-  const restarted = spawnSync(installedTsPath, ["restart"], {
-    stdio: "inherit",
-  });
-  if (restarted.error) {
-    console.warn(
-      `Could not run ts restart: ${restarted.error.message}. The running indexer keeps the previous binary until the next restart.`,
-    );
-  } else if (restarted.status !== 0) {
-    console.warn(
-      `ts restart exited with ${restarted.status}. The running indexer keeps the previous binary until the next restart.`,
-    );
-  }
-};
 
 if (
   process.argv[1] &&

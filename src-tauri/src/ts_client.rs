@@ -13,9 +13,9 @@
 //! Every spawn resolves `ts` through [`resolve_ts`], carries a timeout
 //! (no hangs: past the deadline the child is killed and the call
 //! errors), and maps exits per the `ts` contract: 0 answers, 1 reports
-//! the operation's own failure on stderr, 2 is a caller bug the app's
-//! own validation makes unreachable, and 3 means the daemon is not
-//! running. `--json` documents must carry `"schema": 1`.
+//! the operation's own failure on stderr, 2 is a usage error that means
+//! the app and `ts` disagree, and 3 means the daemon is not running.
+//! `--json` documents must carry `"schema": 1`.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -290,23 +290,29 @@ pub(crate) fn timeout_for(command: &str) -> Duration {
 }
 
 /// Maps a nonzero `ts` exit to its error, if it is one: exit 1 carries
-/// stderr, exit 2 is an internal misuse the app's own validation keeps
-/// unreachable, and exit 3 means the daemon is not running. Exit 0 (and
-/// only it) is `None`.
+/// stderr, exit 2 is a usage error — reachable only when the app and `ts`
+/// disagree, such as an older `ts` that never learned the call — and exit
+/// 3 means the daemon is not running. Exit 0 (and only it) is `None`.
 fn nonzero_error(command: &str, output: &TsOutput) -> Option<String> {
     match output.status {
         0 => None,
         1 => Some(command_error(command, output)),
-        2 => {
-            debug_assert!(
-                false,
-                "toka misused `ts {command}`: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            Some(format!("Toka misused its search helper (`ts {command}`)."))
-        }
+        2 => Some(disagreement_error(command, output)),
         3 => Some("The indexer is unavailable.".to_owned()),
         _ => Some(command_error(command, output)),
+    }
+}
+
+/// The disagreement an exit-2 `ts <command>` reports: what `ts` said,
+/// kept whole — with an older helper that never learned the call, its
+/// usage text is the diagnosis.
+fn disagreement_error(command: &str, output: &TsOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("Toka and its search helper disagree about `ts {command}`: the helper reported a usage error.")
+    } else {
+        format!("Toka and its search helper disagree about `ts {command}`: {stderr}")
     }
 }
 
@@ -1227,6 +1233,29 @@ mod tests {
 
         let error = parse_json_output("search", &output(7, "", "ts search: gone\n")).unwrap_err();
         assert_eq!(error, "gone");
+    }
+
+    #[test]
+    fn exit_2_reports_an_app_and_ts_disagreement_in_ts_own_words() {
+        // An older `ts` that never learned the subcommand answers usage,
+        // not JSON: the error names the disagreement and keeps what `ts`
+        // said, instead of blaming the app for misusing its helper.
+        let error = parse_json_output(
+            "candidates",
+            &output(
+                2,
+                "",
+                "ts: unknown command `candidates`\nUsage: ts <command>\n",
+            ),
+        )
+        .unwrap_err();
+        assert!(error.contains("disagree"), "{error}");
+        assert!(error.contains("unknown command"), "{error}");
+        assert!(!error.contains("misused"), "{error}");
+
+        let error = parse_json_output("stats", &output(2, "", "")).unwrap_err();
+        assert!(error.contains("disagree"), "{error}");
+        assert!(error.contains("ts stats"), "{error}");
     }
 
     #[test]

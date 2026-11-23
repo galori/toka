@@ -945,7 +945,7 @@ const HELP_SECTIONS: HelpSection[] = [
       {
         shortcut: "Ctrl+,",
         description:
-          "Manage search folders; hidden files and folders are skipped",
+          "Manage search folders; the ts background service keeps them indexed, and hidden files and folders are skipped",
       },
       {
         shortcut: "Ctrl+Shift+L",
@@ -4218,6 +4218,11 @@ export default function App() {
       const launchedPage = launched?.page;
       if (launchResult.status === "rejected")
         setError(errorMessage(launchResult.reason));
+      // A missing or broken `ts` helper rejects here: say so on screen
+      // instead of leaving an empty window. The 1 s poll below stays
+      // silent — a transient failure mid-session must not flash.
+      if (indexResult.status === "rejected")
+        setError(errorMessage(indexResult.reason));
       if (indexResult.status === "fulfilled") {
         setManagedIndex(indexResult.value);
         if (
@@ -4594,6 +4599,11 @@ export default function App() {
           <p>
             Add the folders that contain your videos and images. Toka keeps
             their search indexes up to date in the background.
+          </p>
+          <p>
+            Indexing runs as a ts background service, so it continues while Toka
+            is closed. Run ts status to see what it is doing; ts uninstall
+            removes the service.
           </p>
           <p>
             Files and folders whose names start with a dot are skipped. On

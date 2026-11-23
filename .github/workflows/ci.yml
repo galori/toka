@@ -7,8 +7,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  ts:
+    name: ts (search helper)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # The app shells out to `ts`, so its suites run separately and first:
+      # a search-helper regression fails here in about a minute instead of
+      # after the slow app legs.
+      - name: toka-search tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p toka-search
+      - name: ts tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p ts
+      - name: ts fixture CLI tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml -p ts --features fixtures --test cli
   test:
     name: test (${{ matrix.status-os }}, ${{ matrix.rust-target }}, ${{ matrix.bundles }})
+    needs: ts
     strategy:
       fail-fast: false
       matrix:
@@ -88,10 +106,19 @@ jobs:
             echo "VITE_BUILD_TIME=$VITE_BUILD_TIME"
             echo "VITE_GIT_SHA=$VITE_GIT_SHA"
           } >> "$GITHUB_ENV"
+          # The `binaries/ts` sidecar the bundles ship: built and staged
+          # before the bundler reads it. Compile and bundle stay split on
+          # purpose — the bundle overlay (which carries the sidecar) is
+          # only ever merged into `tauri bundle`, never into a compile,
+          # whose build script would mis-copy the sidecar under cargo's
+          # nested per-package build layout. See bin/build.mjs.
+          node bin/build-ts-sidecar.mjs --target ${{ matrix.rust-target }}
           if [ "$RUNNER_OS" = Linux ]; then
-            npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+            npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
+            npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
           else
-            npm run tauri build -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
+            npm run tauri build -- --target ${{ matrix.rust-target }} --no-bundle
+            npm run tauri bundle -- --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --config src-tauri/tauri.bundle.conf.json
           fi
       - uses: actions/upload-artifact@v4
         with:
