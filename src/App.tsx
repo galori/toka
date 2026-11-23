@@ -1542,6 +1542,11 @@ function Player({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   });
+  // The error names the video that was showing when it failed; a new video
+  // starts with a clean slate rather than inheriting it.
+  useEffect(() => {
+    setParentFolderError(undefined);
+  }, [video.id]);
   const copyPath = async () => {
     // Without the prepared path only the bare name is known, which is not
     // what "Copy file path" promises; the button is disabled for the same case.

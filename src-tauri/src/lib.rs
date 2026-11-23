@@ -761,20 +761,47 @@ fn open_parent_folder_in_new_window(
     engine: State<'_, Arc<SearchEngine>>,
 ) -> Result<(), CommandError> {
     let path = engine.video_path(&result_id).map_err(CommandError::from)?;
-    start_toka(Some(parent_folder_of(&path)?))
+    start_toka(Some(&parent_folder_of(&path)?))
 }
 
 /// The folder above the folder the video sits in, for when the folders around
 /// it are what the viewer wants to browse next.
-fn parent_folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
-    let folder = folder_of(path)?;
+fn parent_folder_of(path: &std::path::Path) -> Result<std::path::PathBuf, CommandError> {
+    // Launches keep the path as given, so a relative launch stays relative:
+    // resolve it first, or the parent of a relative folder is wrongly empty.
+    let absolute = absolute_lexical(path);
+    let folder = folder_of(&absolute)?;
     folder
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
         .ok_or_else(|| CommandError {
             kind: "NewWindow",
             message: format!("{} has no parent folder Toka can open.", path.display()),
         })
+}
+
+/// An absolute path with `.` and `..` resolved lexically, without touching
+/// the disk (which may have moved on since the video was indexed).
+fn absolute_lexical(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn folder_of(path: &std::path::Path) -> Result<&std::path::Path, CommandError> {
@@ -1742,10 +1769,29 @@ mod tests {
     }
 
     #[test]
-    fn a_path_with_no_folder_has_no_parent_folder_either() {
-        let error = parent_folder_of(Path::new("video.mp4")).unwrap_err();
+    fn a_relative_video_resolves_against_the_current_directory() {
+        assert_eq!(
+            parent_folder_of(Path::new("clips/video.mp4")).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+    }
 
-        assert_eq!(error.kind, "NewWindow");
+    #[test]
+    fn a_bare_filename_sits_in_the_current_directory() {
+        let current = std::env::current_dir().unwrap();
+
+        assert_eq!(
+            parent_folder_of(Path::new("video.mp4")).unwrap(),
+            current.parent().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_dot_dot_segment_does_not_become_the_parent() {
+        assert_eq!(
+            parent_folder_of(Path::new("/Playlists/Summer/../party.mkv")).unwrap(),
+            Path::new("/")
+        );
     }
 
     #[test]

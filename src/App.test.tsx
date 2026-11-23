@@ -5893,6 +5893,47 @@ test("says why the playing video's parent folder could not be opened", async () 
   );
 });
 
+// The error names the video that failed; moving on clears it rather than
+// pinning the old complaint beside the next video.
+test("clears the parent-folder error when playback advances", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [
+          { id: "video-1", fileName: "clip-1.mp4", extension: "mp4" },
+          { id: "video-2", fileName: "clip-2.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    if (command === "open_parent_folder_in_new_window")
+      return Promise.reject(new Error("Another Toka could not be started."));
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-1.mp4" }),
+  );
+  await user.click(
+    await screen.findByRole("button", { name: "Open parent folder in new window" }),
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Another Toka could not be started.",
+  );
+
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  expect(await screen.findByLabelText("Playing clip-2.mp4")).toBeVisible();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
 test("opens the current video's add-ons and runs one from Ctrl+Shift+A", async () => {
   invokeMock.mockImplementation((command: string) => {
     if (command === "search_videos") {
