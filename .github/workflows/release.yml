@@ -13,10 +13,11 @@ permissions:
   contents: read
 
 # Serialize releases in trigger order so an older commit cannot publish over a
-# newer one; queued runs wait, they are never cancelled or dropped.
+# newer one. Pending runs queue in order (up to 100 deep) instead of canceling.
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
