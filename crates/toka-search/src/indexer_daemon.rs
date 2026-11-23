@@ -1346,42 +1346,74 @@ mod tests {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
         fs::create_dir(&media).unwrap();
+        // Enough files that the scan observably lasts: the test must catch
+        // it mid-flight, and a loaded CI worker needs a wide window.
         for number in 0..2000 {
             write_media(&media, &format!("clip-{number:05}.mp4"));
         }
         let database = directory.path().join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
-        manager.add_folder(&media).unwrap();
+        let root_id = manager.add_folder(&media).unwrap().folders[0].id.clone();
 
-        let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
-        supervisor.reconcile();
-        assert_eq!(supervisor.active_count(), 1);
-        // Catch the scan early in its single directory: past the first
-        // file (so a current path is latched) but far from done.
-        assert!(
-            poll_until(Duration::from_secs(30), || {
-                supervisor.watchers.values().next().is_some_and(|entry| {
-                    let live = entry.watcher.live();
-                    live.stage == WorkerStage::Scanning
-                        && live.last_progress.as_ref().is_some_and(|progress| {
-                            progress.current_file.is_some() && progress.files_discovered < 500
-                        })
-                })
-            }),
-            "the scan never got underway"
-        );
+        // Gate the worker after two batch commits instead of racing a
+        // poll against the scan: deterministic on any machine speed. The
+        // gate only ever trips for this root id.
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc,
+        };
+        let (gated_tx, gated_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let committed = Arc::new(AtomicUsize::new(0));
+        let worker_committed = Arc::clone(&committed);
+        crate::owned_index::with_global_sync_probe(
+            &root_id,
+            move |site| {
+                if site == crate::owned_index::SyncProbeSite::ScanBatchCommitted
+                    && worker_committed.fetch_add(1, Ordering::Relaxed) + 1 == 2
+                {
+                    gated_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the test releases the gate after asserting the heartbeat");
+                }
+            },
+            || {
+                let mut supervisor = test_supervisor(database.clone(), quiet_thumbnails());
+                supervisor.reconcile();
+                assert_eq!(supervisor.active_count(), 1);
 
-        supervisor.publish_heartbeat();
-        let status = crate::daemon_state::read_status(&database).unwrap();
-        assert!(status.running);
-        assert_eq!(
-            status.activity,
-            Some(crate::daemon_state::DaemonActivity::Scanning)
+                gated_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the scan must commit two batches");
+                // Worker paused mid-scan: the heartbeat must show it.
+                supervisor.publish_heartbeat();
+                let status = crate::daemon_state::read_status(&database).unwrap();
+                assert!(status.running);
+                assert_eq!(
+                    status.activity,
+                    Some(crate::daemon_state::DaemonActivity::Scanning)
+                );
+                assert_eq!(status.current_root, Some(media.canonicalize().unwrap()));
+                let current = status.current_path.expect("current file");
+                assert!(current.starts_with(media.canonicalize().unwrap()));
+                assert_eq!(status.queue.pending_roots, 1);
+
+                release_tx.send(()).unwrap();
+                // The gated scan completes normally once released.
+                assert!(
+                    poll_until(Duration::from_secs(60), || {
+                        manager
+                            .state()
+                            .is_ok_and(|state| state.indexed_videos == 2000)
+                    }),
+                    "the released scan never finished"
+                );
+            },
         );
-        assert_eq!(status.current_root, Some(media.canonicalize().unwrap()));
-        let current = status.current_path.expect("current file");
-        assert!(current.starts_with(media.canonicalize().unwrap()));
-        assert_eq!(status.queue.pending_roots, 1);
     }
 
     #[test]

@@ -126,13 +126,17 @@ fn wait_for_status(
     }
 }
 
-fn wait_for_exit(mut child: Child) -> Output {
+fn wait_for_exit(child: Child) -> Output {
+    wait_for_exit_timeout(child, Duration::from_secs(10))
+}
+
+fn wait_for_exit_timeout(mut child: Child, timeout: Duration) -> Output {
     let started = Instant::now();
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
         }
-        if started.elapsed() > Duration::from_secs(10) {
+        if started.elapsed() > timeout {
             let _ = child.kill();
             let output = child.wait_with_output().unwrap();
             panic!(
@@ -2346,8 +2350,22 @@ fn status_watch_against_a_live_daemon_exits_when_the_queue_drains() {
         );
 
         // The watch holds while the daemon scans, then exits 0 on the
-        // drained queue. Piped, so no screen clears may appear.
-        let output = run_at(&home, &["status", "--watch"]);
+        // drained queue. Piped, so no screen clears may appear. The bound
+        // is generous on purpose: 200 fixture videos each run real
+        // ffprobe/ffmpeg rejection, which is seconds even unloaded and
+        // far slower on loaded CI — the bound only guards a real hang.
+        let child = ts_command(
+            &["status", "--watch"],
+            home.home.path(),
+            &home.data_home,
+            None,
+            None,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let output = wait_for_exit_timeout(child, Duration::from_secs(120));
         assert_eq!(output.status.code(), Some(0));
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(!stdout.contains('\x1b'), "{stdout:?}");

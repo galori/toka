@@ -1262,6 +1262,11 @@ pub(crate) enum SyncProbeSite {
     RenamePlanned,
     /// One planned move rewritten during `try_synchronize_rename`.
     RenameRewritten,
+    /// One media batch committed during a scan (`scan_root_in_batches`).
+    /// Unlike [`SyncProbeSite::FileCommitted`], which fires in the
+    /// single-path syncs, this is the hook scans offer: scans batch
+    /// their writes and never pass through `try_synchronize_path`.
+    ScanBatchCommitted,
 }
 
 /// Test-only probe fired at sync boundaries (see [`SyncProbeSite`]), so
@@ -1296,17 +1301,85 @@ pub(crate) fn with_sync_step_probe<R>(
     run()
 }
 
+/// Process-wide probe fired alongside the thread-local one, but only
+/// for a single root id: watcher-driven scans run on worker threads
+/// tests cannot reach, so timing-window tests handshake here instead
+/// of racing wall clocks. Parallel tests use distinct root ids and
+/// never observe each other's probes. Test-only; production builds
+/// keep just the no-op shell below.
 #[cfg(test)]
-fn fire_sync_probe(site: SyncProbeSite) {
+static GLOBAL_SYNC_PROBE: std::sync::Mutex<Option<GlobalSyncProbe>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Clone)]
+struct GlobalSyncProbe {
+    root_id: String,
+    // Shared so the slot lock is never held while a probe runs: a
+    // gated probe blocks, and blocking under the lock would stall
+    // every other test's worker at its own probe fires.
+    probe: std::sync::Arc<dyn Fn(SyncProbeSite) + Send + Sync>,
+}
+
+/// Installs a process-wide probe for one root id; see
+/// [`GLOBAL_SYNC_PROBE`]. Replaces any previous installation.
+#[cfg(test)]
+pub(crate) fn set_global_sync_probe(
+    root_id: &str,
+    probe: impl Fn(SyncProbeSite) + Send + Sync + 'static,
+) {
+    *GLOBAL_SYNC_PROBE.lock().unwrap() = Some(GlobalSyncProbe {
+        root_id: root_id.to_owned(),
+        probe: std::sync::Arc::new(probe),
+    });
+}
+
+/// Removes the process-wide probe. Tests that install one must call
+/// this before returning, so a later test never trips on a stale gate.
+#[cfg(test)]
+pub(crate) fn clear_global_sync_probe() {
+    GLOBAL_SYNC_PROBE.lock().unwrap().take();
+}
+
+/// Runs `run` with a process-wide probe installed for one root id,
+/// removing it afterwards even when `run` panics — the scoped form
+/// tests should prefer over manual set/clear.
+#[cfg(test)]
+pub(crate) fn with_global_sync_probe<R>(
+    root_id: &str,
+    probe: impl Fn(SyncProbeSite) + Send + Sync + 'static,
+    run: impl FnOnce() -> R,
+) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            clear_global_sync_probe();
+        }
+    }
+    set_global_sync_probe(root_id, probe);
+    let _guard = Guard;
+    run()
+}
+
+#[cfg(test)]
+fn fire_sync_probe(root_id: &str, site: SyncProbeSite) {
     SYNC_STEP_PROBE.with(|slot| {
         if let Some(probe) = slot.borrow().as_ref() {
             probe(site);
         }
     });
+    let gated = GLOBAL_SYNC_PROBE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|installed| installed.clone()));
+    if let Some(installed) = gated {
+        if installed.root_id == root_id {
+            (installed.probe)(site);
+        }
+    }
 }
 
 #[cfg(not(test))]
-fn fire_sync_probe(_site: SyncProbeSite) {}
+fn fire_sync_probe(_root_id: &str, _site: SyncProbeSite) {}
 
 /// What a watcher's worker thread is doing between filesystem events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2508,6 +2581,7 @@ impl OwnedIndex {
             [],
         )?;
         transaction.commit()?;
+        fire_sync_probe(root_id, SyncProbeSite::ScanBatchCommitted);
         Ok(())
     }
 
@@ -2929,7 +3003,7 @@ impl OwnedIndex {
             [],
         )?;
         transaction.commit()?;
-        fire_sync_probe(SyncProbeSite::FileCommitted);
+        fire_sync_probe(root_id, SyncProbeSite::FileCommitted);
         Ok(())
     }
 
@@ -3183,7 +3257,7 @@ impl OwnedIndex {
                         path: to.display().to_string(),
                     });
                 }
-                fire_sync_probe(SyncProbeSite::RenamePlanned);
+                fire_sync_probe(root_id, SyncProbeSite::RenamePlanned);
                 let (file_id, old_path) = row?;
                 let Ok(relative) = old_path.strip_prefix(from) else {
                     continue;
@@ -3246,7 +3320,7 @@ impl OwnedIndex {
                     path: to.display().to_string(),
                 });
             }
-            fire_sync_probe(SyncProbeSite::RenameRewritten);
+            fire_sync_probe(root_id, SyncProbeSite::RenameRewritten);
             let Some(file) = file else {
                 transaction.execute("DELETE FROM files WHERE id = ?1", [file_id])?;
                 continue;
@@ -5256,11 +5330,21 @@ mod tests {
             .unwrap();
         let restored_manager = OwnedIndexManager::system_under(database).unwrap();
 
-        wait_for(|| {
-            restored_manager
-                .state()
-                .is_ok_and(|state| state.folders[0].status == OwnedFolderStatus::Ready)
-        });
+        // A completion wait, not a race: a one-file scan finishes in
+        // milliseconds unloaded, so this bound only guards a genuinely
+        // stuck restore — and reports the last state if it trips.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let state = restored_manager.state().unwrap();
+            if state.folders[0].status == OwnedFolderStatus::Ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore never completed; last saw: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(restored_manager.state().unwrap().indexed_videos, 1);
         restored_manager.remove_folder("root").unwrap();
     }
@@ -7553,7 +7637,7 @@ mod tests {
                 SyncProbeSite::RenameRewritten => {
                     rewritten_counted.fetch_add(1, Ordering::Relaxed);
                 }
-                SyncProbeSite::FileCommitted => {}
+                SyncProbeSite::FileCommitted | SyncProbeSite::ScanBatchCommitted => {}
             },
             || index.synchronize_rename("root", &root, &from, &to, &cancel),
         );
@@ -7790,57 +7874,91 @@ mod tests {
 
     #[test]
     fn stopping_a_watcher_mid_scan_cancels_promptly() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
         let directory = tempdir().unwrap();
         let root = directory.path().join("media");
         std::fs::create_dir(&root).unwrap();
         let root = root.canonicalize().unwrap();
-        // Enough files that the scan is provably still early when the
-        // stop lands: cancelling below file 500 of 2000 leaves the bulk
-        // of the walk unvisited, so 'ready' afterwards is impossible
-        // without the cancellation working.
         for number in 0..2000 {
-            // Long names keep each file's index work well above the
-            // stop latency, so the race below always resolves to cancel.
             let name = format!("clip-{number:05}-with-a-long-name-to-index-properly.mp4");
             std::fs::write(root.join(name), b"video").unwrap();
         }
         let database = directory.path().join("index.sqlite3");
+        // A root id unique to this test: the gate below only ever trips
+        // for it, so parallel tests never observe each other's probes.
         OwnedIndex::open(&database)
             .unwrap()
-            .insert_root("root", &root)
+            .insert_root("cancel-probe-root", &root)
             .unwrap();
 
-        let watcher =
-            OwnedIndexWatcher::start_with_progress(&database, "root".into(), root, |_| {}).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let live = watcher.live();
-            let early = live.last_progress.as_ref().is_some_and(|progress| {
-                live.stage == WorkerStage::Scanning && progress.files_discovered < 500
-            });
-            if early {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the scan never got underway: {live:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Gate the worker after its first batch commit instead of racing
+        // a poll against the scan: stop lands mid-scan deterministically
+        // on any machine speed.
+        let (gated_tx, gated_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let batches = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_batches = std::sync::Arc::clone(&batches);
+        with_global_sync_probe(
+            "cancel-probe-root",
+            move |site| {
+                if site == SyncProbeSite::ScanBatchCommitted
+                    && worker_batches.fetch_add(1, Ordering::Relaxed) + 1 == 1
+                {
+                    gated_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("the test releases the gate once stop is underway");
+                }
+            },
+            || {
+                let watcher = OwnedIndexWatcher::start_with_progress(
+                    &database,
+                    "cancel-probe-root".into(),
+                    root,
+                    |_| {},
+                )
+                .unwrap();
+                gated_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the scan must commit a first batch");
 
-        let started = Instant::now();
-        watcher.stop().unwrap();
-        // An anti-hang bound, not a performance claim: aborting is instant,
-        // waiting out the scan would take the tens of seconds a full walk
-        // of 2000 files needs.
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "stop waited out the scan"
+                // Stop from another thread: stop() joins the worker, and
+                // the worker sits in the gate until released below.
+                let (stopped_tx, stopped_rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = stopped_tx.send(watcher.stop());
+                });
+                release_tx.send(()).unwrap();
+                stopped_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("stop must join promptly, not wait out the scan")
+                    .unwrap();
+
+                // Aborted mid-scan, never recorded successful: one batch
+                // committed, the bulk of the walk unvisited.
+                let index = OwnedIndex::open(&database).unwrap();
+                assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
+                let videos = OwnedIndexManager::under(database.clone())
+                    .state()
+                    .unwrap()
+                    .indexed_videos;
+                assert!(
+                    (128..2000).contains(&videos),
+                    "expected a partial scan, found {videos} videos"
+                );
+                let progress = index
+                    .scan_progress("cancel-probe-root")
+                    .unwrap()
+                    .expect("partial run");
+                assert_eq!(progress.phase, ScanPhase::Scanning);
+            },
         );
-
-        let index = OwnedIndex::open(&database).unwrap();
-        assert_eq!(index.roots_with_state().unwrap()[0].2, "scanning");
-        let progress = index.scan_progress("root").unwrap().expect("partial run");
-        assert_eq!(progress.phase, ScanPhase::Scanning);
     }
 }
