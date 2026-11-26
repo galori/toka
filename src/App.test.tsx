@@ -1620,6 +1620,21 @@ test("lists folder tagging in the help pane", async () => {
   await user.keyboard("{Escape}");
 });
 
+test("lists relative date search syntax in the help pane", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(
+    within(help).getByText(
+      'Limit terms by field or size; use quoted date windows like created:">= 1 day ago"',
+    ),
+  ).toBeVisible();
+  await user.keyboard("{Escape}");
+});
+
 test("gives the open tag field the keyboard and pauses for it", async () => {
   invokeMock
     .mockResolvedValueOnce({

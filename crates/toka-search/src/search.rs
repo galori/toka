@@ -1210,8 +1210,14 @@ enum QueryTerm {
     Date {
         field: DateField,
         comparison: Comparison,
-        date: CalendarDate,
+        date: DateThreshold,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DateThreshold {
+    Calendar(CalendarDate),
+    Timestamp(SystemTime),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1261,11 +1267,10 @@ pub(crate) fn tokenize_query(query: &str) -> Result<Vec<String>, SearchError> {
 }
 
 fn parse_query(query: &str) -> Result<QueryExpr, SearchError> {
-    let today = calendar_date(SystemTime::now()).ok_or(SearchError::InvalidQuery)?;
-    parse_query_at(query, today)
+    parse_query_at(query, SystemTime::now())
 }
 
-fn parse_query_at(query: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
+fn parse_query_at(query: &str, now: SystemTime) -> Result<QueryExpr, SearchError> {
     let tokens = tokenize_query(query)?;
     if tokens.is_empty() {
         return Err(SearchError::InvalidQuery);
@@ -1273,7 +1278,7 @@ fn parse_query_at(query: &str, today: CalendarDate) -> Result<QueryExpr, SearchE
     let mut parser = QueryParser {
         tokens,
         position: 0,
-        today,
+        now,
     };
     let expression = parser.parse_or()?;
     if parser.position != parser.tokens.len() {
@@ -1285,7 +1290,7 @@ fn parse_query_at(query: &str, today: CalendarDate) -> Result<QueryExpr, SearchE
 struct QueryParser {
     tokens: Vec<String>,
     position: usize,
-    today: CalendarDate,
+    now: SystemTime,
 }
 
 impl QueryParser {
@@ -1356,18 +1361,18 @@ impl QueryParser {
             {
                 Err(SearchError::InvalidQuery)
             }
-            Some(_) => parse_query_term(&self.consume().unwrap(), self.today),
+            Some(_) => parse_query_term(&self.consume().unwrap(), self.now),
         }
     }
 }
 
-fn parse_query_term(token: &str, today: CalendarDate) -> Result<QueryExpr, SearchError> {
+fn parse_query_term(token: &str, now: SystemTime) -> Result<QueryExpr, SearchError> {
     if let Some((raw_field, value)) = token.split_once(':') {
         let field = raw_field.to_ascii_lowercase();
         let term = match field.as_str() {
             "size" => parse_size_term(value)?,
-            "created" => parse_date_term(DateField::Created, value, today)?,
-            "modified" => parse_date_term(DateField::Modified, value, today)?,
+            "created" => parse_date_term(DateField::Created, value, now)?,
+            "modified" => parse_date_term(DateField::Modified, value, now)?,
             "type" => QueryTerm::MediaType(parse_media_type(value)?),
             "extension" | "ext" => QueryTerm::Extension(parse_extension(value)?),
             "tags" | "tag" | "filename" | "file" | "name" | "path" | "folder" => {
@@ -1495,10 +1500,12 @@ fn bare_size_range(number_text: &str, multiplier: u64) -> Option<(u64, u64)> {
 fn parse_date_term(
     field: DateField,
     value: &str,
-    today: CalendarDate,
+    now: SystemTime,
 ) -> Result<QueryTerm, SearchError> {
     let (comparison, value) = split_comparison(value);
-    let date = parse_calendar_date(value).or_else(|_| parse_relative_date(value, today))?;
+    let date = parse_calendar_date(value)
+        .map(DateThreshold::Calendar)
+        .or_else(|_| parse_relative_date(value, now).map(DateThreshold::Timestamp))?;
     Ok(QueryTerm::Date {
         field,
         comparison,
@@ -1506,47 +1513,38 @@ fn parse_date_term(
     })
 }
 
-fn parse_relative_date(value: &str, today: CalendarDate) -> Result<CalendarDate, SearchError> {
+fn parse_relative_date(value: &str, now: SystemTime) -> Result<SystemTime, SearchError> {
     let lower = value.to_ascii_lowercase();
     let parts = lower.split_whitespace().collect::<Vec<_>>();
-    if parts.len() != 3 || parts[2] != "ago" {
-        return Err(SearchError::InvalidQuery);
-    }
-    let amount = parts[0]
+    let amount_and_unit = match parts.as_slice() {
+        [amount, unit, "ago"] | ["last", amount, unit] => (*amount, *unit),
+        [amount_and_unit, "ago"] => {
+            let split = amount_and_unit
+                .find(|character: char| !character.is_ascii_digit())
+                .ok_or(SearchError::InvalidQuery)?;
+            (&amount_and_unit[..split], &amount_and_unit[split..])
+        }
+        _ => return Err(SearchError::InvalidQuery),
+    };
+    let amount = amount_and_unit
+        .0
         .parse::<u64>()
         .ok()
         .filter(|amount| *amount > 0)
         .ok_or(SearchError::InvalidQuery)?;
-    let multiplier = match parts[1] {
-        "day" | "days" => 1,
-        "week" | "weeks" => 7,
+    let unit_seconds = match amount_and_unit.1 {
+        "second" | "seconds" | "sec" | "secs" | "s" => 1,
+        "minute" | "minutes" | "min" | "mins" | "m" => 60,
+        "hour" | "hours" | "hr" | "hrs" | "h" => 60 * 60,
+        "day" | "days" | "d" => 24 * 60 * 60,
+        "week" | "weeks" | "wk" | "wks" | "w" => 7 * 24 * 60 * 60,
         _ => return Err(SearchError::InvalidQuery),
     };
-    let days = amount
-        .checked_mul(multiplier)
+    let seconds = amount
+        .checked_mul(unit_seconds)
         .ok_or(SearchError::InvalidQuery)?;
-    subtract_calendar_days(today, days)
-}
-
-fn subtract_calendar_days(
-    mut date: CalendarDate,
-    mut days: u64,
-) -> Result<CalendarDate, SearchError> {
-    while days >= u64::from(date.day) {
-        days -= u64::from(date.day);
-        if date.month == 1 {
-            date.year = date.year.checked_sub(1).ok_or(SearchError::InvalidQuery)?;
-            if date.year < 1 {
-                return Err(SearchError::InvalidQuery);
-            }
-            date.month = 12;
-        } else {
-            date.month -= 1;
-        }
-        date.day = days_in_month(date.year, date.month);
-    }
-    date.day -= days as u32;
-    CalendarDate::new(date.year, date.month, date.day).ok_or(SearchError::InvalidQuery)
+    now.checked_sub(Duration::from_secs(seconds))
+        .ok_or(SearchError::InvalidQuery)
 }
 
 fn parse_calendar_date(value: &str) -> Result<CalendarDate, SearchError> {
@@ -1702,14 +1700,16 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
             date,
         }) => fs::metadata(path)
             .ok()
-            .and_then(|metadata| {
-                let time = match field {
-                    DateField::Created => metadata.created().ok()?,
-                    DateField::Modified => metadata.modified().ok()?,
-                };
-                calendar_date(time)
+            .and_then(|metadata| match field {
+                DateField::Created => metadata.created().ok(),
+                DateField::Modified => metadata.modified().ok(),
             })
-            .is_some_and(|actual| compare(actual, *comparison, *date)),
+            .is_some_and(|actual| match date {
+                DateThreshold::Calendar(date) => {
+                    calendar_date(actual).is_some_and(|actual| compare(actual, *comparison, *date))
+                }
+                DateThreshold::Timestamp(timestamp) => compare(actual, *comparison, *timestamp),
+            }),
         QueryExpr::Not(expression) => !matches_query(path, expression, fields),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields) && matches_query(path, right, fields)
@@ -2719,32 +2719,48 @@ mod tests {
     }
 
     #[test]
-    fn relative_dates_resolve_once_from_the_search_date() {
-        let today = CalendarDate::new(2026, 3, 1).unwrap();
+    fn relative_date_thresholds_resolve_once_from_search_start() {
+        let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
 
         assert_eq!(
-            parse_query_at("modified:>\"3 days ago\"", today).unwrap(),
+            parse_query_at("modified:>\"3 days ago\"", now).unwrap(),
             QueryExpr::Term(QueryTerm::Date {
                 field: DateField::Modified,
                 comparison: Comparison::Greater,
-                date: CalendarDate::new(2026, 2, 26).unwrap(),
+                date: DateThreshold::Timestamp(now - Duration::from_secs(3 * 24 * 60 * 60)),
             })
         );
         assert_eq!(
-            parse_query_at("created:>=\"1 week ago\"", today).unwrap(),
+            parse_query_at("created:>=\"1 week ago\"", now).unwrap(),
             QueryExpr::Term(QueryTerm::Date {
                 field: DateField::Created,
                 comparison: Comparison::GreaterOrEqual,
-                date: CalendarDate::new(2026, 2, 22).unwrap(),
+                date: DateThreshold::Timestamp(now - Duration::from_secs(7 * 24 * 60 * 60)),
             })
         );
         assert_eq!(
-            subtract_calendar_days(CalendarDate::new(2024, 3, 1).unwrap(), 1).unwrap(),
-            CalendarDate::new(2024, 2, 29).unwrap()
+            parse_query_at("created:\">= 1 day ago\"", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Created,
+                comparison: Comparison::GreaterOrEqual,
+                date: DateThreshold::Timestamp(now - Duration::from_secs(24 * 60 * 60)),
+            })
         );
         assert_eq!(
-            subtract_calendar_days(CalendarDate::new(2026, 1, 1).unwrap(), 1).unwrap(),
-            CalendarDate::new(2025, 12, 31).unwrap()
+            parse_query_at("modified:\">= last 30 minutes\"", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::GreaterOrEqual,
+                date: DateThreshold::Timestamp(now - Duration::from_secs(30 * 60)),
+            })
+        );
+        assert_eq!(
+            parse_query_at("modified:\">= 30m ago\"", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::GreaterOrEqual,
+                date: DateThreshold::Timestamp(now - Duration::from_secs(30 * 60)),
+            })
         );
     }
 
@@ -2920,6 +2936,40 @@ mod tests {
             engine.search(request("modified:2026-02-30")),
             Err(SearchError::InvalidQuery)
         ));
+    }
+
+    #[test]
+    fn modified_relative_times_match_a_rolling_window() {
+        let directory = tempdir().unwrap();
+        let old = directory.path().join("old.mp4");
+        let recent = directory.path().join("recent.mp4");
+        fs::write(&old, b"test").unwrap();
+        fs::write(&recent, b"test").unwrap();
+        let now = SystemTime::now();
+        for (path, age) in [
+            (&old, Duration::from_secs(2 * 60 * 60)),
+            (&recent, Duration::from_secs(20 * 60)),
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![old, recent])));
+
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("modified:\">= 30 minutes ago\""))
+                    .unwrap()
+            ),
+            ["recent.mp4"]
+        );
+        let mut created = names(&engine.search(request("created:\">= 1 day ago\"")).unwrap());
+        created.sort();
+        assert_eq!(created, ["old.mp4", "recent.mp4"]);
     }
 
     #[test]
