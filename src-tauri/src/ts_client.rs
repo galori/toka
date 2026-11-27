@@ -403,6 +403,7 @@ fn string_list(
 /// What `ts candidates` answered: the matching paths, the index revision
 /// the search saw, and the durations that rode along keyed by path —
 /// unknown paths are absent.
+#[derive(Debug)]
 pub struct TsCandidates {
     pub paths: Vec<PathBuf>,
     pub revision: u64,

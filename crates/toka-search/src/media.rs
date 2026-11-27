@@ -47,9 +47,10 @@ fn parse_duration_seconds(text: &str) -> Result<f64, String> {
         })
 }
 
-/// Whole milliseconds for a probe's second count, for the index.
+/// Whole milliseconds for a probe's second count, for the index. At
+/// least one: a probe that found a length never records a zero.
 pub(crate) fn seconds_to_ms(seconds: f64) -> u64 {
-    (seconds * 1000.0).round() as u64
+    ((seconds * 1000.0).round() as u64).max(1)
 }
 
 /// Every non-empty supported video under `folder`, recursively. Shared by
@@ -361,7 +362,8 @@ mod tests {
     #[test]
     fn whole_milliseconds_round_from_seconds() {
         assert_eq!(seconds_to_ms(61.5), 61_500);
-        assert_eq!(seconds_to_ms(0.0004), 0);
+        // A sub-millisecond clip still reads as a length, never zero.
+        assert_eq!(seconds_to_ms(0.0004), 1);
         assert_eq!(seconds_to_ms(0.0005), 1);
     }
 }
