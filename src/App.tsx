@@ -1391,18 +1391,15 @@ function Player({
   useLayoutEffect(() => {
     currentVideoId.current = video.id;
   }, [video.id]);
-  // Numbers each tag refresh so two retags in flight cannot apply out of
-  // order: only the latest one may move the displayed path.
-  const retagRefresh = useRef(0);
-  // Where web playback was when a retag swapped the source underneath it:
-  // the engine starts the new file at the beginning, so the metadata
-  // handler puts the viewer back here. The record outlives that event for
-  // a retag that lands while a previous swap is still loading — that one
-  // carries the position forward instead of sampling the reset clock —
-  // and a new video clears it outright.
-  const resumeAfterRetag = useRef<
-    { time: number; pending: boolean } | undefined
-  >(undefined);
+  // Numbers every preparation — the effect's and each tag refresh's — so
+  // two of them in flight cannot apply out of order: only the latest one
+  // may move the displayed path.
+  const prepareSequence = useRef(0);
+  // A retag swapped the web source underneath the playing video, and the
+  // engine starts the new file at the beginning — so the metadata handler
+  // puts the viewer back at the scrubber's position, which follows every
+  // seek the viewer makes while the new source loads. A new video clears it.
+  const resumeAfterRetag = useRef(false);
   const focusAddonButton = useCallback(() => {
     const button = addonMenuWrap.current?.firstElementChild;
     if (button instanceof HTMLButtonElement) button.focus();
@@ -1624,39 +1621,33 @@ function Player({
   // brings every display up to date, and re-allows the new file for the web
   // engine. Native playback and images are untouched by the swap; the web
   // engine reloads the new source, so it resumes where the rename found it.
-  const refreshPreparedAfterRetag = async () => {
-    const id = video.id;
+  const refreshPreparedAfterRetag = async (id: string) => {
     // A tag command that answered after the viewer moved on still updates
     // its own video's tags — but the display belongs to the new video now.
     if (currentVideoId.current !== id) return;
-    retagRefresh.current += 1;
-    const refresh = retagRefresh.current;
-    // Read now, while the render's values are the video's own: by the time
-    // the re-read answers, the player may have moved on. While a previous
-    // swap is still loading, the element's clock is the new source's reset
-    // one rather than the viewer's position, so the pending resume carries
-    // forward instead of being sampled again.
-    const pending = resumeAfterRetag.current;
-    const resume =
-      !isImage && prepared?.playbackBackend !== "native"
-        ? {
-            time:
-              pending?.pending === true
-                ? pending.time
-                : (element.current?.currentTime ?? currentTime),
-          }
-        : undefined;
+    prepareSequence.current += 1;
+    const sequence = prepareSequence.current;
+    // Looked up, not closed over: a folder tag that answered late refreshes
+    // the current video rather than the one it started from. The extension
+    // never changes under a rename, so the retained list answers truly.
+    const target = playlist.find((item) => item.id === id);
+    const webVideo =
+      target !== undefined &&
+      !isImageResult(target) &&
+      prepared?.playbackBackend !== "native";
     try {
       const next = await prepareVideo(id);
-      // A newer refresh, or a newer video, owns the display now — and the
-      // resume, which is only ever stored alongside the path it belongs to.
-      if (currentVideoId.current !== id || refresh !== retagRefresh.current)
+      // A newer preparation, or a newer video, owns the display now.
+      if (
+        currentVideoId.current !== id ||
+        sequence !== prepareSequence.current
+      )
         return;
       // A tag the name already carried renames nothing: the source stays,
       // so there is no new beginning to resume from.
       if (next.filePath === preparedPath.current) return;
       preparedPath.current = next.filePath;
-      if (resume) resumeAfterRetag.current = { ...resume, pending: true };
+      if (webVideo) resumeAfterRetag.current = true;
       setPrepared(next);
     } catch {
       // The tags themselves were saved; only the displayed path stays
@@ -1670,7 +1661,7 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
-    void refreshPreparedAfterRetag();
+    void refreshPreparedAfterRetag(video.id);
   };
   // Every video in the renamed folder carries its new tags, not just this one.
   const updateFolderTags = ({ folderTags, resultIds }: FolderTagUpdate) => {
@@ -1681,7 +1672,11 @@ function Player({
       ),
     );
     for (const id of resultIds) onTagsChange(id, { folderTags });
-    if (moved.has(video.id)) void refreshPreparedAfterRetag();
+    // The display belongs to the current video: if the rename moved it too
+    // — including when the command started from another video in the same
+    // folder — its path is the one that is now stale.
+    const current = currentVideoId.current;
+    if (moved.has(current)) void refreshPreparedAfterRetag(current);
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1706,12 +1701,14 @@ function Player({
   useEffect(() => {
     let active = true;
     let nativeActive = false;
+    prepareSequence.current += 1;
+    const sequence = prepareSequence.current;
     setPrepared(undefined);
     preparedPath.current = undefined;
     setDuration(0);
     setCurrentTime(0);
     imageElapsed.current = 0;
-    resumeAfterRetag.current = undefined;
+    resumeAfterRetag.current = false;
     setError(undefined);
     setNativeStarted(false);
     setFullscreenError(undefined);
@@ -1754,8 +1751,14 @@ function Player({
           if (active) setPlayingBack(true);
         }
         if (active) {
-          setPrepared(result);
-          preparedPath.current = result.filePath;
+          // A tag refresh that started after this effect owns the path now —
+          // typically a folder tag that answered while its video was still
+          // preparing — so this older answer must not overwrite it. The
+          // slideshow setup below is the effect's own and still runs.
+          if (sequence === prepareSequence.current) {
+            setPrepared(result);
+            preparedPath.current = result.filePath;
+          }
           if (isImage) {
             imageElapsed.current = 0;
             setCurrentTime(0);
@@ -2083,8 +2086,13 @@ function Player({
       return;
     }
     // "Off" means play the video the viewer is on and stop there, so it does
-    // not move on to the next entry even in the middle of a playlist.
-    if (loop === "off") return;
+    // not move on to the next entry even in the middle of a playlist. The stop
+    // reads as a pause to anything that would otherwise resume playback — a
+    // retag landing after it must not start the video again on its own.
+    if (loop === "off") {
+      pausedByViewer.current = true;
+      return;
+    }
     const next = index < playlist.length - 1 ? index + 1 : 0;
     if (index === playlist.length - 1 && canLoadMore) {
       void loadMoreAndAdvance();
@@ -3176,20 +3184,14 @@ function Player({
               );
               media.playbackRate = speed;
               media.volume = volume / 100;
-              // A retag swaps the source under the playing video, and the
+              // A retag swapped the source under the playing video, and the
               // engine starts the new file at the beginning — so the player
-              // puts the viewer back where the rename found them. The record
-              // stays for a retag that lands while this swap is still
-              // loading, which carries it forward; a new video clears it.
+              // puts the viewer back at the scrubber's position, which
+              // follows every seek made while the new source loads.
               // Whether playback resumes follows the viewer's latest intent,
-              // not the state the retag found, which a pause or resume since
-              // has overruled.
-              const resume = resumeAfterRetag.current;
-              if (resume) {
-                resumeAfterRetag.current = { ...resume, pending: false };
-                media.currentTime = resume.time;
-                setCurrentTime(resume.time);
-              }
+              // not the state the retag found, which a pause, a resume, or
+              // the video's own ending since has overruled.
+              if (resumeAfterRetag.current) media.currentTime = currentTime;
               if (pausedByViewer.current) {
                 media.pause();
                 setPlayingBack(false);
