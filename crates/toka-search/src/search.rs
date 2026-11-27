@@ -787,11 +787,11 @@ impl SearchEngine {
         // opened straight from disk was never indexed, and a broken index
         // must not hide a folder that is right there.
         let terms = path_terms(&expression);
-        let direct = filesystem_candidates(&terms, request.media_type);
+        let (direct, walked) = filesystem_candidates(&terms, request.media_type);
         // Falling back to named files is honest only when every possible
         // match comes from them: `path:/x AND tags:y` narrows the walked
         // set, but `path:/x OR tags:y` would silently drop the index half.
-        let covered = !direct.is_empty() && query_covered_by_direct(&expression);
+        let covered = !direct.is_empty() && query_covered_by_direct(&expression, &walked);
         let mut candidates = match self.candidates(query, needs_whole_path, context) {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -1882,23 +1882,29 @@ fn split_comparison(value: &str) -> (Comparison, &str) {
 }
 
 /// Whether every possible match of the query comes from the folders and
-/// files its `path:`/`folder:` terms name: a positive location term pins its
-/// branch to the walked set, anything else can match beyond it, `AND`
-/// narrows to either side, `OR` needs both, and `NOT` flips the sense.
-fn query_covered_by_direct(expression: &QueryExpr) -> bool {
-    fn covered(expression: &QueryExpr, negated: bool) -> bool {
+/// files its `path:`/`folder:` terms name: a positive term whose value the
+/// walk actually visited anchors its branch to the walked set, anything else
+/// can match beyond it, `AND` narrows to either side, `OR` needs both, and
+/// `NOT` flips the sense. Substring matches outside the walk stay
+/// best-effort-dropped during fallback.
+fn query_covered_by_direct(expression: &QueryExpr, walked: &HashSet<String>) -> bool {
+    fn covered(expression: &QueryExpr, negated: bool, walked: &HashSet<String>) -> bool {
         match expression {
             QueryExpr::Term(QueryTerm::Text {
                 field: QueryField::Path | QueryField::Folder,
-                ..
-            }) => !negated,
+                value,
+            }) => !negated && walked.contains(value),
             QueryExpr::Term(_) => false,
-            QueryExpr::Not(inner) => covered(inner, !negated),
-            QueryExpr::And(left, right) => covered(left, negated) || covered(right, negated),
-            QueryExpr::Or(left, right) => covered(left, negated) && covered(right, negated),
+            QueryExpr::Not(inner) => covered(inner, !negated, walked),
+            QueryExpr::And(left, right) => {
+                covered(left, negated, walked) || covered(right, negated, walked)
+            }
+            QueryExpr::Or(left, right) => {
+                covered(left, negated, walked) && covered(right, negated, walked)
+            }
         }
     }
-    covered(expression, false)
+    covered(expression, false, walked)
 }
 
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
@@ -2093,7 +2099,10 @@ fn is_path_shaped(value: &str) -> bool {
 /// home (`~other/` is not expanded), everything else is taken as given,
 /// relative to wherever Toka runs.
 fn expand_location(value: &str) -> PathBuf {
-    if let Some(rest) = value.strip_prefix("~/") {
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
         if let Some(home) = dirs::home_dir() {
             // Without the trim, `~//etc` joins an absolute rest and escapes
             // the home folder entirely.
@@ -2113,8 +2122,12 @@ fn expand_location(value: &str) -> PathBuf {
 /// already knows deduplicate. One visited set across values, so overlapping
 /// folders are walked once. Values naming nothing are left to the index's
 /// substring match.
-fn filesystem_candidates(terms: &[(String, bool)], media_type: MediaType) -> Vec<PathBuf> {
+fn filesystem_candidates(
+    terms: &[(String, bool)],
+    media_type: MediaType,
+) -> (Vec<PathBuf>, HashSet<String>) {
     let mut files = Vec::new();
+    let mut walked = HashSet::new();
     let mut visited = HashSet::new();
     for (value, positive) in terms {
         if !positive || !is_path_shaped(value) {
@@ -2129,13 +2142,15 @@ fn filesystem_candidates(terms: &[(String, bool)], media_type: MediaType) -> Vec
         }
         if real.is_file() {
             if is_supported_media(&real, media_type) {
+                walked.insert(value.clone());
                 files.push(real);
             }
         } else if real.is_dir() {
+            walked.insert(value.clone());
             collect_media_recursive(&real, &mut files, &mut visited, media_type);
         }
     }
-    files
+    (files, walked)
 }
 
 /// Every supported video and image under `directory` and its subfolders.
@@ -3603,6 +3618,18 @@ mod tests {
             names(&engine.search(request(&both_query)).unwrap()),
             ["clip.mp4"]
         );
+
+        // A branch the walk never visited still needs the index, even beside
+        // a covered one: a bare fragment, or a missing location.
+        let bare_query = format!("path:\"{}\" OR path:clip", directory.path().display());
+        let error = engine.search(request(&bare_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+        let missing_query = format!(
+            "path:\"{}\" OR path:/no/such/folder/anywhere",
+            directory.path().display()
+        );
+        let error = engine.search(request(&missing_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
     }
 
     #[test]
@@ -3648,6 +3675,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_location("~/clips"), home.join("clips"));
         assert_eq!(expand_location("~//clips"), home.join("clips"));
+        assert_eq!(expand_location("~\\clips"), home.join("clips"));
         assert_eq!(expand_location("~"), home);
         assert_eq!(expand_location("/Videos"), PathBuf::from("/Videos"));
         assert_eq!(
