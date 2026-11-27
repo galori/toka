@@ -1384,6 +1384,11 @@ enum QueryTerm {
         comparison: Comparison,
         date: DateThreshold,
     },
+    DateRange {
+        field: DateField,
+        start: CalendarDate,
+        end: CalendarDate,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1687,6 +1692,16 @@ fn parse_date_term(
     now: SystemTime,
 ) -> Result<QueryTerm, SearchError> {
     let (comparison, value) = split_comparison(value);
+    if value.contains("..") {
+        return parse_date_range(field, comparison, value, now);
+    }
+    if let Some(date) = parse_named_day(value, now) {
+        return Ok(QueryTerm::Date {
+            field,
+            comparison,
+            date: DateThreshold::Calendar(date),
+        });
+    }
     let date = parse_calendar_date(value)
         .map(DateThreshold::Calendar)
         .or_else(|_| {
@@ -1706,6 +1721,49 @@ fn parse_date_term(
         comparison,
         date,
     })
+}
+
+/// `START..END` as an inclusive local-day range. Each endpoint is a
+/// calendar date or a named day; a comparison operator plus a range is an
+/// error, as is an inverted or empty range.
+fn parse_date_range(
+    field: DateField,
+    comparison: Comparison,
+    value: &str,
+    now: SystemTime,
+) -> Result<QueryTerm, SearchError> {
+    if comparison != Comparison::Equal {
+        return Err(SearchError::InvalidQuery);
+    }
+    let (start, end) = value.split_once("..").ok_or(SearchError::InvalidQuery)?;
+    let start = parse_range_endpoint(start, now)?;
+    let end = parse_range_endpoint(end, now)?;
+    if end < start {
+        return Err(SearchError::InvalidQuery);
+    }
+    Ok(QueryTerm::DateRange { field, start, end })
+}
+
+fn parse_range_endpoint(value: &str, now: SystemTime) -> Result<CalendarDate, SearchError> {
+    if value.is_empty() {
+        return Err(SearchError::InvalidQuery);
+    }
+    if let Some(named) = parse_named_day(value, now) {
+        return Ok(named);
+    }
+    parse_calendar_date(value)
+}
+
+/// `today` and `yesterday` as local calendar days, or `None` for anything
+/// else. Named days always match whole days, even with a comparison
+/// operator — the same as an explicit calendar date.
+fn parse_named_day(value: &str, now: SystemTime) -> Option<CalendarDate> {
+    let today = calendar_date(now)?;
+    match value.to_ascii_lowercase().as_str() {
+        "today" => Some(today),
+        "yesterday" => subtract_calendar_days(today, 1).ok(),
+        _ => None,
+    }
 }
 
 fn parse_relative_date(
@@ -1927,7 +1985,8 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
             QueryTerm::MediaType(_)
             | QueryTerm::Extension(_)
             | QueryTerm::Size { .. }
-            | QueryTerm::Date { .. },
+            | QueryTerm::Date { .. }
+            | QueryTerm::DateRange { .. },
         ) => false,
         QueryExpr::Not(expression) => query_needs_whole_path(expression),
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
@@ -1987,18 +2046,17 @@ fn matches_query(
             field,
             comparison,
             date,
-        }) => fs::metadata(path)
-            .ok()
-            .and_then(|metadata| match field {
-                DateField::Created => metadata.created().ok(),
-                DateField::Modified => metadata.modified().ok(),
-            })
-            .is_some_and(|actual| match date {
-                DateThreshold::Calendar(date) => {
-                    calendar_date(actual).is_some_and(|actual| compare(actual, *comparison, *date))
-                }
-                DateThreshold::Timestamp(timestamp) => compare(actual, *comparison, *timestamp),
-            }),
+        }) => field_timestamp(path, *field).is_some_and(|actual| match date {
+            DateThreshold::Calendar(date) => {
+                calendar_date(actual).is_some_and(|actual| compare(actual, *comparison, *date))
+            }
+            DateThreshold::Timestamp(timestamp) => compare(actual, *comparison, *timestamp),
+        }),
+        QueryExpr::Term(QueryTerm::DateRange { field, start, end }) => {
+            field_timestamp(path, *field)
+                .and_then(calendar_date)
+                .is_some_and(|actual| *start <= actual && actual <= *end)
+        }
         QueryExpr::Not(expression) => !matches_query(path, expression, fields, resolved),
         QueryExpr::And(left, right) => {
             matches_query(path, left, fields, resolved)
@@ -2008,6 +2066,16 @@ fn matches_query(
             matches_query(path, left, fields, resolved)
                 || matches_query(path, right, fields, resolved)
         }
+    }
+}
+
+/// The file's created or modified timestamp, or `None` when the file or
+/// the timestamp cannot be read.
+fn field_timestamp(path: &Path, field: DateField) -> Option<SystemTime> {
+    let metadata = fs::metadata(path).ok()?;
+    match field {
+        DateField::Created => metadata.created().ok(),
+        DateField::Modified => metadata.modified().ok(),
     }
 }
 
@@ -4036,6 +4104,111 @@ mod tests {
     }
 
     #[test]
+    fn named_days_parse_to_local_calendar_days() {
+        let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
+        let today = calendar_date(now).unwrap();
+        let yesterday = subtract_calendar_days(today, 1).unwrap();
+
+        assert_eq!(
+            parse_query_at("created:today", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Created,
+                comparison: Comparison::Equal,
+                date: DateThreshold::Calendar(today),
+            })
+        );
+        assert_eq!(
+            parse_query_at("modified:yesterday", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::Equal,
+                date: DateThreshold::Calendar(yesterday),
+            })
+        );
+        assert_eq!(
+            parse_query_at("modified:>yesterday", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::Greater,
+                date: DateThreshold::Calendar(yesterday),
+            })
+        );
+        assert_eq!(
+            parse_query_at("created:>=TODAY", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Created,
+                comparison: Comparison::GreaterOrEqual,
+                date: DateThreshold::Calendar(today),
+            })
+        );
+    }
+
+    #[test]
+    fn date_ranges_parse_to_inclusive_calendar_endpoints() {
+        let now = UNIX_EPOCH + Duration::from_secs(100 * 24 * 60 * 60);
+        let today = calendar_date(now).unwrap();
+        let yesterday = subtract_calendar_days(today, 1).unwrap();
+
+        assert_eq!(
+            parse_query_at("modified:2026-01-01..2026-03-31", now).unwrap(),
+            QueryExpr::Term(QueryTerm::DateRange {
+                field: DateField::Modified,
+                start: CalendarDate {
+                    year: 2026,
+                    month: 1,
+                    day: 1
+                },
+                end: CalendarDate {
+                    year: 2026,
+                    month: 3,
+                    day: 31
+                },
+            })
+        );
+        assert_eq!(
+            parse_query_at("created:yesterday..today", now).unwrap(),
+            QueryExpr::Term(QueryTerm::DateRange {
+                field: DateField::Created,
+                start: yesterday,
+                end: today,
+            })
+        );
+        assert_eq!(
+            parse_query_at("modified:01-15-1970..today", now).unwrap(),
+            QueryExpr::Term(QueryTerm::DateRange {
+                field: DateField::Modified,
+                start: CalendarDate {
+                    year: 1970,
+                    month: 1,
+                    day: 15
+                },
+                end: today,
+            })
+        );
+        // A range over one day is a range, not an error.
+        assert_eq!(
+            parse_query_at("modified:today..today", now).unwrap(),
+            QueryExpr::Term(QueryTerm::DateRange {
+                field: DateField::Modified,
+                start: today,
+                end: today,
+            })
+        );
+        for invalid in [
+            "modified:2026-03-31..2026-01-01",
+            "modified:2026-01-01..",
+            "modified:..2026-01-01",
+            "modified:>=2026-01-01..2026-03-31",
+            "modified:today..soon",
+        ] {
+            assert!(
+                parse_query_at(invalid, now).is_err(),
+                "expected {invalid} to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn path_queries_quote_values_the_tokenizer_would_split() {
         assert_eq!(
             path_query_for(Path::new("/Videos/trip")),
@@ -4278,6 +4451,118 @@ mod tests {
         let mut created = names(&engine.search(request("created:\">= 1 day ago\"")).unwrap());
         created.sort();
         assert_eq!(created, ["old.mp4", "recent.mp4"]);
+    }
+
+    #[test]
+    fn date_ranges_match_files_on_their_inclusive_boundary_days() {
+        let directory = tempdir().unwrap();
+        let old = directory.path().join("old.mp4");
+        let mid = directory.path().join("mid.mp4");
+        let new = directory.path().join("new.mp4");
+        for path in [&old, &mid, &new] {
+            fs::write(path, b"test").unwrap();
+        }
+        let now = SystemTime::now();
+        for (path, age) in [
+            (&old, Duration::from_secs(3 * 24 * 60 * 60)),
+            (&mid, Duration::from_secs(24 * 60 * 60)),
+            (&new, Duration::from_secs(20 * 60)),
+        ] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![
+            old.clone(),
+            mid.clone(),
+            new.clone(),
+        ])));
+        let day = |path: &Path| {
+            let date = calendar_date(fs::metadata(path).unwrap().modified().unwrap()).unwrap();
+            format!("{:04}-{:02}-{:02}", date.year, date.month, date.day)
+        };
+
+        let mut in_range = names(
+            &engine
+                .search(request(&format!("modified:{}..{}", day(&mid), day(&new))))
+                .unwrap(),
+        );
+        in_range.sort();
+        assert_eq!(in_range, ["mid.mp4", "new.mp4"]);
+
+        assert_eq!(
+            names(
+                &engine
+                    .search(request(&format!("modified:{}..{}", day(&old), day(&old))))
+                    .unwrap()
+            ),
+            ["old.mp4"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(request(&format!(
+                        "NOT modified:{}..{}",
+                        day(&mid),
+                        day(&new)
+                    )))
+                    .unwrap()
+            ),
+            ["old.mp4"]
+        );
+    }
+
+    #[test]
+    fn named_days_match_the_same_files_as_their_explicit_dates() {
+        let directory = tempdir().unwrap();
+        let fresh = directory.path().join("fresh.mp4");
+        let stale = directory.path().join("stale.mp4");
+        fs::write(&fresh, b"test").unwrap();
+        fs::write(&stale, b"test").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60))
+            .unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![fresh, stale])));
+        let today = calendar_date(SystemTime::now()).unwrap();
+        let yesterday = subtract_calendar_days(today, 1).unwrap();
+        let spell =
+            |date: CalendarDate| format!("{:04}-{:02}-{:02}", date.year, date.month, date.day);
+        let sorted = |page: &SearchPage| {
+            let mut found = names(page);
+            found.sort();
+            found
+        };
+
+        assert_eq!(
+            sorted(&engine.search(request("modified:today")).unwrap()),
+            sorted(
+                &engine
+                    .search(request(&format!("modified:{}", spell(today))))
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            sorted(&engine.search(request("modified:yesterday")).unwrap()),
+            sorted(
+                &engine
+                    .search(request(&format!("modified:{}", spell(yesterday))))
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            sorted(&engine.search(request("created:today")).unwrap()),
+            sorted(
+                &engine
+                    .search(request(&format!("created:{}", spell(today))))
+                    .unwrap()
+            )
+        );
     }
 
     #[test]
