@@ -4024,7 +4024,9 @@ export default function App() {
       return;
     }
     setPage((current) =>
-      current ? { ...current, results: shuffleVideos(current.results) } : current,
+      current
+        ? { ...current, results: shuffleVideos(current.results) }
+        : current,
     );
   };
 

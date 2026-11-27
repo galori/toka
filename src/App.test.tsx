@@ -894,7 +894,9 @@ test("searches start shuffled and re-run in the chosen sort order", async () => 
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
 
   expect(lastSearchSort()).toEqual({ field: "shuffle", direction: "desc" });
 
@@ -915,7 +917,9 @@ test("turns the sort order around from its direction toggle", async () => {
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
 
   // Shuffling answers to no direction, so the toggle waits for an order.
   const waiting = screen.getByRole("button", {
@@ -957,7 +961,9 @@ test("cycles what results are sorted by from its keyboard shortcut", async () =>
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
 
   const sort = screen.getByRole("combobox", { name: "Sort results" });
   expect(sort).toHaveAttribute("aria-keyshortcuts", "Ctrl+S");
@@ -986,7 +992,9 @@ test("shuffling an ordered search returns it to a shuffled search", async () => 
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
 
   await user.selectOptions(
     screen.getByRole("combobox", { name: "Sort results" }),
@@ -1013,7 +1021,9 @@ test("shuffling a shuffled search re-deals the page on screen", async () => {
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
-  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
   invokeMock.mockClear();
 
   randomMock.mockReturnValueOnce(0);
