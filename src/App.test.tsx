@@ -748,6 +748,7 @@ test("opening a folder drops the previous add-on filter", async () => {
         pageSize: 24,
         fields: { tags: true, fileName: true, path: false },
         mediaType: "videos",
+        sort: { field: "shuffle", direction: "desc" },
       },
     }),
   );
