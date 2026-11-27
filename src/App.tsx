@@ -2755,7 +2755,9 @@ function Player({
     }
     const from = seekPosition.current;
     const target = seekTo(from + amount);
-    const sign = target < from ? "−" : "+";
+    // A press clamped to a standstill still names the direction it tried.
+    const sign =
+      target < from ? "−" : target > from ? "+" : amount < 0 ? "−" : "+";
     const percentageLabel = percentage === undefined ? "" : ` (${percentage}%)`;
     showSeekOverlay(
       {
@@ -3925,9 +3927,12 @@ function Player({
               if (resumeAfterRetag.current?.pending) return;
               reportPlaybackPosition(event.currentTarget.currentTime);
             }}
-            onSeeked={(event) =>
-              reportPlaybackPosition(event.currentTarget.currentTime, true)
-            }
+            onSeeked={(event) => {
+              // Same swapped-source guard as the timeupdate above: a seeked
+              // report from the reset clock must not overwrite the resume.
+              if (resumeAfterRetag.current?.pending) return;
+              reportPlaybackPosition(event.currentTarget.currentTime, true);
+            }}
             onEnded={(event) =>
               endOfVideo(duration || event.currentTarget.duration || 0)
             }

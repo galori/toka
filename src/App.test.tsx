@@ -3473,7 +3473,13 @@ test("keeps a seek made while the retag refresh is loading", async () => {
   });
   await screen.findByDisplayValue("/Videos/tagged [review].mp4");
 
+  // A seeked report from the swapped source's reset clock is ignored like a
+  // timeupdate while the resume is pending.
   (video as HTMLVideoElement).currentTime = 0;
+  fireEvent.seeked(video);
+  expect(screen.getByRole("slider", { name: "Video timeline" })).toHaveValue(
+    "65",
+  );
   fireEvent.loadedMetadata(video);
   // The new source resumes where the seek put the viewer, not where the
   // retag found them.
@@ -5931,6 +5937,16 @@ test("clamps five-second seeks to the ends of a very short video", async () => {
   fireEvent.keyDown(window, { key: "ArrowRight" });
   expect(video).toHaveProperty("currentTime", 4);
   expect(screen.getByRole("status")).toHaveTextContent("+4s · 0:04");
+  // A press that cannot move still names the direction it tried.
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 4);
+  expect(screen.getByRole("status")).toHaveTextContent("+0s · 0:04");
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(video).toHaveProperty("currentTime", 0);
+  expect(screen.getByRole("status")).toHaveTextContent("−4s · 0:00");
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(video).toHaveProperty("currentTime", 0);
+  expect(screen.getByRole("status")).toHaveTextContent("−0s · 0:00");
 });
 
 test("seeks five percent of a four-hour video and formats the resulting time", async () => {
