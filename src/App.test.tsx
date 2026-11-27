@@ -696,6 +696,63 @@ test("an opened folder of images starts on the images toggle", async () => {
   );
 });
 
+test("opening a folder drops the previous add-on filter", async () => {
+  const addonSearch = {
+    query: "@sometiktoker",
+    fields: { tags: false, fileName: true, path: false },
+    mediaType: "videos" as const,
+    addonId: "tiktok",
+    capture: "handle",
+    value: "@sometiktoker",
+  };
+  const launched = {
+    query: "@sometiktoker",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-9", fileName: "clip [home].mp4", extension: "mp4" }],
+  };
+  const opened = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  launchIntentMock.mockResolvedValue({ page: launched, addonSearch });
+  openMock.mockResolvedValue("/Videos/shoots");
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "open_folder" || command === "search_videos")
+      return Promise.resolve(opened);
+    return Promise.resolve({ filePath: "/Videos/shoots/clip.mp4" });
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  expect(await screen.findByDisplayValue("@sometiktoker")).toBeVisible();
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  await screen.findByDisplayValue("path:/Videos/shoots");
+
+  await user.click(screen.getByRole("button", { name: "Search tags" }));
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("search_videos", {
+      request: {
+        query: "path:/Videos/shoots",
+        page: 1,
+        pageSize: 24,
+        fields: { tags: true, fileName: true, path: false },
+        mediaType: "videos",
+      },
+    }),
+  );
+});
+
 test("a launch playlist bypasses first-launch folder setup", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,

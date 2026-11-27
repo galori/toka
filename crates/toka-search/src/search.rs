@@ -786,13 +786,17 @@ impl SearchEngine {
         // Files the query names directly, whatever the index holds: a folder
         // opened straight from disk was never indexed, and a broken index
         // must not hide a folder that is right there.
-        let direct = filesystem_candidates(&path_terms(&expression));
+        let terms = path_terms(&expression);
+        let direct = filesystem_candidates(&terms);
         let mut candidates = match self.candidates(query, needs_whole_path, context) {
             Ok(candidates) => candidates,
             Err(error) => {
                 if direct.is_empty() {
                     return Err(error);
                 }
+                // The index failed but named files still answer: logged, so a
+                // half-answered `OR` never looks complete in hindsight.
+                self.logger.record_error(context, &error.to_string());
                 Vec::new()
             }
         };
@@ -800,9 +804,11 @@ impl SearchEngine {
             if direct.is_empty() {
                 return Err(error);
             }
+            self.logger.record_error(context, &error.to_string());
             candidates = Vec::new();
         }
         candidates.extend(direct);
+        let resolved = resolve_path_terms(&terms);
         for path in candidates {
             if !is_supported_media(&path, request.media_type) {
                 self.logger
@@ -813,7 +819,7 @@ impl SearchEngine {
                 self.logger.record_filtered(context, &path, "empty file");
                 continue;
             }
-            if !matches_query(&path, &expression, request.fields) {
+            if !matches_query(&path, &expression, request.fields, &resolved) {
                 self.logger
                     .record_filtered(context, &path, "query did not match");
                 continue;
@@ -1889,7 +1895,12 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     }
 }
 
-fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> bool {
+fn matches_query(
+    path: &Path,
+    expression: &QueryExpr,
+    fields: SearchFields,
+    resolved: &[ResolvedPathTerm],
+) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, value }) => match field {
             QueryField::Any => haystacks(path, fields)
@@ -1902,13 +1913,9 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
             // Either also matches by canonical location, so a relative query
             // still finds an absolute answer and the other way around.
             QueryField::Path => {
-                full_path_haystack(path).contains(&value.to_lowercase())
-                    || location_contains(value, path)
+                match_resolved_path(resolved, value, &full_path_haystack(path), path)
             }
-            QueryField::Folder => {
-                path_haystack(path).contains(&value.to_lowercase())
-                    || location_contains(value, path)
-            }
+            QueryField::Folder => match_resolved_path(resolved, value, &path_haystack(path), path),
         },
         QueryExpr::Term(QueryTerm::MediaType(media_type)) => match media_type {
             QueryMediaType::Video => is_supported_video(path),
@@ -1946,12 +1953,14 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 }
                 DateThreshold::Timestamp(timestamp) => compare(actual, *comparison, *timestamp),
             }),
-        QueryExpr::Not(expression) => !matches_query(path, expression, fields),
+        QueryExpr::Not(expression) => !matches_query(path, expression, fields, resolved),
         QueryExpr::And(left, right) => {
-            matches_query(path, left, fields) && matches_query(path, right, fields)
+            matches_query(path, left, fields, resolved)
+                && matches_query(path, right, fields, resolved)
         }
         QueryExpr::Or(left, right) => {
-            matches_query(path, left, fields) || matches_query(path, right, fields)
+            matches_query(path, left, fields, resolved)
+                || matches_query(path, right, fields, resolved)
         }
     }
 }
@@ -2023,23 +2032,22 @@ pub fn path_query_for(location: &Path) -> String {
     }
 }
 
-/// Values the query pins to a filesystem location: every `path:` and
-/// `folder:` term outside a `NOT`, quotes already stripped by the tokenizer.
-/// A negated term only ever removes candidates, so walking its folder would
-/// list files merely to throw them away.
-fn path_terms(expression: &QueryExpr) -> Vec<String> {
+/// Every `path:` and `folder:` value in the query with whether it stands
+/// outside a `NOT`, quotes already stripped by the tokenizer. A negated term
+/// only ever removes candidates, so walking its folder would list files
+/// merely to throw them away — but matching still needs its value.
+fn path_terms(expression: &QueryExpr) -> Vec<(String, bool)> {
     let mut terms = Vec::new();
     collect_path_terms(expression, false, &mut terms);
     terms
 }
 
-fn collect_path_terms(expression: &QueryExpr, negated: bool, out: &mut Vec<String>) {
+fn collect_path_terms(expression: &QueryExpr, negated: bool, out: &mut Vec<(String, bool)>) {
     match expression {
-        QueryExpr::Term(QueryTerm::Text { field, value })
-            if matches!(field, QueryField::Path | QueryField::Folder) && !negated =>
-        {
-            out.push(value.clone())
-        }
+        QueryExpr::Term(QueryTerm::Text {
+            field: QueryField::Path | QueryField::Folder,
+            value,
+        }) => out.push((value.clone(), !negated)),
         QueryExpr::Term(_) => {}
         QueryExpr::Not(inner) => collect_path_terms(inner, !negated, out),
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
@@ -2049,9 +2057,17 @@ fn collect_path_terms(expression: &QueryExpr, negated: bool, out: &mut Vec<Strin
     }
 }
 
-/// A `path:` or `folder:` value as a filesystem path: a leading `~` names the
-/// viewer's home, everything else is taken as given, relative to wherever
-/// Toka runs.
+/// Whether a `path:`/`folder:` value is shaped like a location rather than a
+/// name fragment. A bare word resolved against the working directory would
+/// silently retarget the query to whatever Toka happened to be started from,
+/// so only path-shaped values ever touch the filesystem.
+fn is_path_shaped(value: &str) -> bool {
+    value.contains(['/', '\\']) || value.starts_with('~')
+}
+
+/// A `path:` or `folder:` value as a filesystem path: `~/` names the viewer's
+/// home (`~other/` is not expanded), everything else is taken as given,
+/// relative to wherever Toka runs.
 fn expand_location(value: &str) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
@@ -2065,13 +2081,19 @@ fn expand_location(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Every playable file the query names directly: each `path:` or `folder:`
-/// value that exists on disk contributes its file, or a folder's whole
-/// contents, canonicalized so files the index already knows deduplicate.
-/// Values naming nothing are left to the index's substring match.
-fn filesystem_candidates(values: &[String]) -> Vec<PathBuf> {
+/// Every playable file the query names directly: each positive `path:` or
+/// `folder:` value that exists on disk contributes its file, or a folder's
+/// whole contents, canonicalized so files the index already knows
+/// deduplicate. One visited set across values, so overlapping folders are
+/// walked once. Values naming nothing are left to the index's substring
+/// match.
+fn filesystem_candidates(terms: &[(String, bool)]) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for value in values {
+    let mut visited = HashSet::new();
+    for (value, positive) in terms {
+        if !positive || !is_path_shaped(value) {
+            continue;
+        }
         let Ok(real) = std::fs::canonicalize(expand_location(value)) else {
             continue;
         };
@@ -2084,7 +2106,7 @@ fn filesystem_candidates(values: &[String]) -> Vec<PathBuf> {
                 files.push(real);
             }
         } else if real.is_dir() {
-            collect_media_under(&real, &mut files);
+            collect_media_recursive(&real, &mut files, &mut visited);
         }
     }
     files
@@ -2093,11 +2115,6 @@ fn filesystem_candidates(values: &[String]) -> Vec<PathBuf> {
 /// Every supported video and image under `directory` and its subfolders.
 /// Symlinked folders are followed once each, so a link back up the tree
 /// cannot loop; entries that cannot be read are skipped.
-fn collect_media_under(directory: &Path, out: &mut Vec<PathBuf>) {
-    let mut visited = HashSet::new();
-    collect_media_recursive(directory, out, &mut visited);
-}
-
 fn collect_media_recursive(
     directory: &Path,
     out: &mut Vec<PathBuf>,
@@ -2122,16 +2139,78 @@ fn collect_media_recursive(
     }
 }
 
-/// Whether `file` sits at or under the location `value` names, compared by
-/// canonical path so a relative query still matches an absolute answer and
-/// the other way around. Only consulted when the substring match above
-/// missed: resolving either side touches the filesystem.
+/// A `path:`/`folder:` value resolved once per search: the folded form for
+/// substring matching and, for values naming somewhere real, the canonical
+/// location for prefix matching — so neither is recomputed per candidate.
+struct ResolvedPathTerm {
+    value: String,
+    folded: String,
+    location: Option<PathBuf>,
+}
+
+fn resolve_path_terms(terms: &[(String, bool)]) -> Vec<ResolvedPathTerm> {
+    let mut resolved = Vec::new();
+    for (value, _) in terms {
+        if resolved
+            .iter()
+            .any(|term: &ResolvedPathTerm| term.value == *value)
+        {
+            continue;
+        }
+        let location = if is_path_shaped(value) {
+            let candidate = expand_location(value);
+            if candidate.exists() {
+                std::fs::canonicalize(candidate).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        resolved.push(ResolvedPathTerm {
+            value: value.clone(),
+            folded: value.to_lowercase(),
+            location,
+        });
+    }
+    resolved
+}
+
+/// A `path:`/`folder:` term against its haystack: the substring match first,
+/// then the canonical location, so a relative query still matches an
+/// absolute answer and the other way around.
+fn match_resolved_path(
+    resolved: &[ResolvedPathTerm],
+    value: &str,
+    haystack: &str,
+    file: &Path,
+) -> bool {
+    match resolved.iter().find(|term| term.value == value) {
+        Some(term) => {
+            haystack.contains(&term.folded) || location_under(term.location.as_deref(), file)
+        }
+        // Unreachable: `resolved` covers every value in the expression.
+        // Recompute rather than mis-match if it ever isn't.
+        None => haystack.contains(&value.to_lowercase()) || location_contains(value, file),
+    }
+}
+
+/// Whether `file` sits at or under the resolved `location`.
+fn location_under(location: Option<&Path>, file: &Path) -> bool {
+    let Some(want) = location else {
+        return false;
+    };
+    let Ok(have) = std::fs::canonicalize(file) else {
+        return false;
+    };
+    have == want || have.starts_with(want)
+}
+
+/// Whether `file` sits at or under the location `value` names, resolving
+/// both sides. Only consulted when the substring match above missed, and in
+/// practice only through the pre-resolved form above.
 fn location_contains(value: &str, file: &Path) -> bool {
-    // A bare word is a name fragment, not a location: resolving it against the
-    // working directory would silently retarget the query to whatever Toka
-    // happened to be started from. Anything path-shaped resolves there, which
-    // is exactly right for `ts search` and best-effort for a running app.
-    if !value.contains(['/', '\\']) && !value.starts_with('~') {
+    if !is_path_shaped(value) {
         return false;
     }
     let location = expand_location(value);
@@ -3468,6 +3547,74 @@ mod tests {
     }
 
     #[test]
+    fn path_fallback_logs_the_index_failure_it_survived() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let log_path = directory.path().join("search.log");
+        let engine = SearchEngine::new_with_logger(
+            Arc::new(ErrorProvider),
+            Arc::new(SearchLogger::new(log_path.clone())),
+        );
+        let query = format!("path:\"{}\"", directory.path().display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+        let line = fs::read_to_string(&log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["kind"], "error");
+        assert_eq!(entry["error"], "backend unavailable");
+    }
+
+    #[test]
+    fn only_path_shaped_values_touch_the_filesystem() {
+        for bare in ["clip", "clip.mp4", "Holiday"] {
+            assert!(!is_path_shaped(bare), "{bare}");
+        }
+        for shaped in [
+            "/Videos",
+            "./clips",
+            "my shoots/clip.mp4",
+            "~",
+            "~/clips",
+            "C:\\Videos",
+        ] {
+            assert!(is_path_shaped(shaped), "{shaped}");
+        }
+    }
+
+    #[test]
+    fn home_shorthand_expands_to_the_viewers_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_location("~/clips"), home.join("clips"));
+        assert_eq!(expand_location("~"), home);
+        assert_eq!(expand_location("/Videos"), PathBuf::from("/Videos"));
+        assert_eq!(
+            expand_location("~other/clips"),
+            PathBuf::from("~other/clips")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_walks_follow_a_symlinked_folder_only_once() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let shoots = directory.path().join("shoots");
+        fs::create_dir(&shoots).unwrap();
+        fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        symlink(&shoots, shoots.join("loop")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", shoots.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
     fn not_binds_tighter_than_and_and_or() {
         let directory = tempdir().unwrap();
         let summer_draft = directory.path().join("summer draft.mp4");
@@ -3628,14 +3775,23 @@ mod tests {
             path_query_for(Path::new("/Videos/a\\b \"c\"")),
             "path:\"/Videos/a\\\\b \\\"c\\\"\""
         );
-        // And the quoted form parses back to the location it names.
-        assert_eq!(
-            parse_query("path:\"/My Videos/trip (2024)\"").unwrap(),
-            QueryExpr::Term(QueryTerm::Text {
-                field: QueryField::Path,
-                value: "/My Videos/trip (2024)".to_owned(),
-            })
-        );
+        // And every escaped form parses back to the location it names.
+        for location in [
+            "/Videos/trip",
+            "/My Videos/trip (2024)",
+            "/Videos/say \"hi\"",
+            "/Videos/a\\b \"c\"",
+        ] {
+            let query = path_query_for(Path::new(location));
+            assert_eq!(
+                parse_query(&query).unwrap(),
+                QueryExpr::Term(QueryTerm::Text {
+                    field: QueryField::Path,
+                    value: location.to_owned(),
+                }),
+                "{query}"
+            );
+        }
     }
 
     #[test]

@@ -600,7 +600,7 @@ fn launch_page(path: &std::path::Path, engine: &SearchEngine) -> Result<SearchPa
     if path.is_dir() {
         return directory_page(path, engine);
     }
-    if search::is_supported_video(path) {
+    if search::is_supported_media(path, search::MediaType::Both) {
         return single_file_page(path, engine);
     }
     let videos = playlist::videos(path).map_err(|message| CommandError {
@@ -633,6 +633,15 @@ fn single_file_page(
     path: &std::path::Path,
     engine: &SearchEngine,
 ) -> Result<SearchPage, CommandError> {
+    if path.is_dir() {
+        return Err(CommandError {
+            kind: "Playlist",
+            message: format!(
+                "{} is a folder. Open it as a folder to play everything inside.",
+                playlist::name(path)
+            ),
+        });
+    }
     if !path.is_file() {
         return Err(CommandError {
             kind: "Playlist",
@@ -1789,6 +1798,31 @@ mod tests {
     }
 
     #[test]
+    fn a_launched_image_is_named_by_its_own_path_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let photo = directory.path().join("trip.jpg");
+        std::fs::write(&photo, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let page = launch_page(&photo, &engine).unwrap();
+
+        let canonical = std::fs::canonicalize(&photo).unwrap();
+        assert_eq!(page.query, format!("path:{}", canonical.display()));
+        assert_eq!(page.total_results, 1);
+    }
+
+    #[test]
+    fn a_folder_opened_as_a_file_says_so() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let error = single_file_page(directory.path(), &engine).unwrap_err();
+
+        assert_eq!(error.kind, "Playlist");
+        assert!(error.message.contains("is a folder"), "{}", error.message);
+    }
+
+    #[test]
     fn a_launched_playlist_carries_no_query_to_mistake_for_a_path() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("beach.mp4"), b"test").unwrap();
@@ -1811,6 +1845,12 @@ mod tests {
 
         assert_eq!(error.kind, "Playlist");
         assert!(error.message.contains("notes.txt"), "{}", error.message);
+
+        // Playlists stay a launch-only way to play: the file browser opens
+        // one file.
+        let error = check_openable_file(Path::new("/Videos/summer.m3u8")).unwrap_err();
+
+        assert_eq!(error.kind, "Playlist");
     }
 
     #[test]

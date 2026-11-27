@@ -5,7 +5,7 @@
 //! format carries no structure beyond one entry per line, so a playlist made
 //! anywhere — by Toka's own handoff, by VLC, by hand — opens the same way.
 
-use crate::search::{is_supported_media, is_supported_video, MediaType};
+use crate::search::{is_supported_media, MediaType};
 use std::collections::HashSet;
 use std::{
     borrow::Cow,
@@ -20,16 +20,19 @@ use std::{
 const PLAYLIST_EXTENSIONS: [&str; 2] = ["m3u8", "m3u"];
 
 /// The argument Toka was launched with that names what to play: a playlist
-/// file, a single video, or a folder whose videos become the playlist.
-/// `arguments` is the whole command line, program name included, the way the
-/// operating system hands it over — including when the viewer opened the item
-/// in a file manager rather than typing the command themselves.
+/// file, a single video or image, or a folder whose videos become the
+/// playlist. `arguments` is the whole command line, program name included,
+/// the way the operating system hands it over — including when the viewer
+/// opened the item in a file manager rather than typing the command
+/// themselves.
 pub fn from_arguments(arguments: impl IntoIterator<Item = OsString>) -> Option<PathBuf> {
     arguments
         .into_iter()
         .skip(1)
         .map(PathBuf::from)
-        .find(|path| is_playlist(path) || is_supported_video(path) || path.is_dir())
+        .find(|path| {
+            is_playlist(path) || is_supported_media(path, MediaType::Both) || path.is_dir()
+        })
 }
 
 fn is_playlist(path: &Path) -> bool {
@@ -197,7 +200,7 @@ mod tests {
     fn launching_toka_without_a_playlist_names_none() {
         assert_eq!(from_arguments(arguments(&["toka"])), None);
         // A bare flag or unsupported file carries no launch — a playlist is not
-        // assumed. Video files are handled separately via is_supported_video.
+        // assumed. Media files are handled separately by extension.
         assert_eq!(
             from_arguments(arguments(&["toka", "--flag", "notes.txt"])),
             None
@@ -220,6 +223,18 @@ mod tests {
         assert_eq!(
             from_arguments(arguments(&["toka", "/Videos/notes.txt"])),
             None
+        );
+    }
+
+    #[test]
+    fn launching_toka_with_a_single_image_is_recognised() {
+        assert_eq!(
+            from_arguments(arguments(&["toka", "/Photos/trip.jpg"])),
+            Some(PathBuf::from("/Photos/trip.jpg"))
+        );
+        assert_eq!(
+            from_arguments(arguments(&["toka", "--flag", "photo.HEIC"])),
+            Some(PathBuf::from("photo.HEIC"))
         );
     }
 

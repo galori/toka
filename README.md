@@ -72,7 +72,8 @@ Text can target `tags:`, `filename:`, `path:`, or `folder:`. `folder:`
 searches every parent path component; `path:` searches the whole path including
 the file's own name, so `path:/Videos/trip` finds everything under that folder
 and `path:/Videos/trip/clip.mp4` finds the one file — even where the index has
-never looked. Quote values with spaces, such as `path:"/My Videos/trip"`.
+never looked. Quote values with spaces, such as `path:"/My Videos/trip"`. The
+path scope toggle still covers only the folders above the file.
 `type:image` and `type:video` match media kinds. `extension:jpg` matches an
 exact extension without regard to case.
 

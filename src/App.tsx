@@ -4923,6 +4923,7 @@ export default function App() {
   const playOpenedPage = (opened: SearchPage) => {
     searchedQuery.current = opened.query;
     launchedResults.current = undefined;
+    setAddonSearch(undefined);
     // A search still in flight answers an older question than this one.
     requestNumber.current += 1;
     setIndexRefreshAvailable(false);
