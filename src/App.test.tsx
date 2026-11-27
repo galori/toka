@@ -1639,7 +1639,7 @@ async function playWithTags(tags: string[]) {
 
 test("sets a favorite level from Shift+F and a digit", async () => {
   const user = await playWithTags(["work", "fv", "fv2"]);
-  invokeMock.mockResolvedValueOnce({
+  invokeMock.mockResolvedValue({
     fileName: "clip [fv fv5 work].mp4",
     tags: ["fv", "fv5", "work"],
   });
@@ -1652,10 +1652,16 @@ test("sets a favorite level from Shift+F and a digit", async () => {
   expect(screen.getByRole("group", { name: "Favorite level" })).toBeVisible();
   await user.keyboard("5");
 
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
     resultId: "video-1",
-    tags: ["work", "fv", "fv5"],
+    tags: ["fv2"],
   });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv5"],
+    }),
+  );
   await waitFor(() =>
     expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull(),
   );
@@ -1669,9 +1675,9 @@ test("sets and clears a favorite with the mouse", async () => {
   );
   // Choosing the current level again clears the favorite.
   await user.click(screen.getByRole("button", { name: "Level 3" }));
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
     resultId: "video-1",
-    tags: [],
+    tags: ["fv", "fv3"],
   });
 });
 
@@ -1680,16 +1686,20 @@ test("plain favorite on Enter, clear on 0, and Escape closes", async () => {
   invokeMock.mockResolvedValue({ fileName: "clip [fv].mp4", tags: ["fv"] });
   fireEvent.keyDown(window, { key: "F", shiftKey: true });
   await user.keyboard("{Enter}");
-  expect(invokeMock).toHaveBeenCalledWith("set_video_tags", {
-    resultId: "video-1",
-    tags: ["fv"],
-  });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv"],
+    }),
+  );
   fireEvent.keyDown(window, { key: "F", shiftKey: true });
   await user.keyboard("0");
-  expect(invokeMock).toHaveBeenLastCalledWith("set_video_tags", {
-    resultId: "video-1",
-    tags: [],
-  });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenLastCalledWith("remove_video_tags", {
+      resultId: "video-1",
+      tags: ["fv"],
+    }),
+  );
   fireEvent.keyDown(window, { key: "F", shiftKey: true });
   await user.keyboard("{Escape}");
   expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
@@ -1706,8 +1716,8 @@ test("opening the tag field closes the picker so digits type into it", async () 
     screen.getByRole("textbox", { name: "Add tag to clip.mp4" }),
   ).toHaveValue("720p");
   expect(invokeMock).not.toHaveBeenCalledWith(
-    "set_video_tags",
-    expect.anything(),
+    "add_video_tags",
+    expect.objectContaining({ tags: ["fv2"] }),
   );
 });
 

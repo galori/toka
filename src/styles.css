@@ -1818,9 +1818,3 @@ button:focus-visible {
   margin-left: 4px;
   font-size: 0.75rem;
 }
-.favorite-hint {
-  margin-left: 6px;
-  font-size: 0.7rem;
-  color: #8fa3bf;
-  white-space: nowrap;
-}

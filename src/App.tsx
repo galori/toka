@@ -48,7 +48,6 @@ import {
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
   addVideoTags,
-  setVideoTags,
   addTagsToVideos,
   removeVideoTags,
   addFolderTags,
@@ -386,10 +385,12 @@ function favoriteLevel(tags: string[]): number | undefined {
 
 // Favorites are `fv`, plus `fvN` for a level. Setting a level replaces any
 // other; `null` clears the favorite, `0` favorites without a level.
+function isFavoriteTag(tag: string): boolean {
+  return tag === FAVORITE_TAG || /^fv[1-5]$/.test(tag);
+}
+
 function withFavoriteLevel(tags: string[], level: number | null): string[] {
-  const rest = tags.filter(
-    (tag) => tag !== FAVORITE_TAG && !/^fv[1-5]$/.test(tag),
-  );
+  const rest = tags.filter((tag) => !isFavoriteTag(tag));
   if (level === null) return rest;
   return level === 0
     ? [...rest, FAVORITE_TAG]
@@ -458,7 +459,13 @@ function FavoritePicker({
           >
             Clear
           </ControlButton>
-          <span className="favorite-hint">Enter: no level</span>
+          <ControlButton
+            shortcut="Enter"
+            className="favorite-clear"
+            onClick={() => onChoose(0)}
+          >
+            No level
+          </ControlButton>
         </div>
       ) : null}
       {error ? (
@@ -2059,6 +2066,7 @@ function Player({
       setPickingFavorite(false);
       return;
     }
+    setFavoriteError(undefined);
     if (fullscreen) {
       controlsLastNear.current = Date.now();
       setControlsRevealed(true);
@@ -2070,24 +2078,50 @@ function Player({
   // One favorite change at a time: a second built from the same old tags
   // could land first and be overwritten by the slower reply.
   const favoriteBusy = useRef(false);
+  const favoriteQueued = useRef<{ level: number | null } | undefined>(
+    undefined,
+  );
   const chooseFavorite = async (level: number | null) => {
     setPickingFavorite(false);
-    if (favoriteBusy.current) return;
+    if (favoriteBusy.current) {
+      // The latest choice wins once the save in flight lands.
+      favoriteQueued.current = { level };
+      return;
+    }
     favoriteBusy.current = true;
     try {
-      updateVideoTags(
-        await setVideoTags(
-          video.id,
-          withFavoriteLevel(video.tags ?? [], level),
-        ),
-      );
+      // Only the favorite tags change: sending the whole tag list could
+      // overwrite a tag edit that is still saving.
+      const old = (video.tags ?? []).filter(isFavoriteTag);
+      const next = withFavoriteLevel([], level);
+      const remove = old.filter((tag) => !next.includes(tag));
+      const add = next.filter((tag) => !old.includes(tag));
+      let update: VideoTagUpdate | undefined;
+      if (remove.length) update = await removeVideoTags(video.id, remove);
+      if (add.length) update = await addVideoTags(video.id, add);
+      if (update) updateVideoTags(update);
       setFavoriteError(undefined);
     } catch (reason) {
       setFavoriteError(`Could not update favorite: ${errorMessage(reason)}`);
     } finally {
       favoriteBusy.current = false;
+      const queued = favoriteQueued.current;
+      favoriteQueued.current = undefined;
+      if (queued) void chooseFavoriteRef.current(queued.level);
     }
   };
+  const chooseFavoriteRef = useRef(chooseFavorite);
+  useEffect(() => {
+    chooseFavoriteRef.current = chooseFavorite;
+  });
+  // A picker or error from one video must not carry over to the next.
+  useEffect(() => {
+    setPickingFavorite(false);
+    setFavoriteError(undefined);
+  }, [video.id]);
+  useEffect(() => {
+    if (addonOpen) setPickingFavorite(false);
+  }, [addonOpen]);
 
   const restart = (from = 0) => {
     if (native) {
