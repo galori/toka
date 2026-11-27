@@ -164,7 +164,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn owned_index_search_excludes_a_folder_hidden_after_indexing() {
-        use crate::search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE};
+        use crate::search::{
+            MediaType, SearchEngine, SearchFields, SearchRequest, SearchSort, PAGE_SIZE,
+        };
 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("media");
@@ -199,6 +201,7 @@ mod tests {
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             })
             .unwrap();
 

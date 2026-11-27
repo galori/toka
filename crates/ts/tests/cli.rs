@@ -421,7 +421,7 @@ fn candidates_json_matches_the_direct_provider_on_the_same_index() {
     use toka_search::{
         owned_index::{OwnedIndex, OwnedIndexManager},
         providers::OwnedIndexSearchProvider,
-        search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE},
+        search::{MediaType, SearchFields, SearchProvider, SearchRequest, SearchSort, PAGE_SIZE},
         search_log::SearchLogContext,
     };
 
@@ -476,6 +476,7 @@ fn candidates_json_matches_the_direct_provider_on_the_same_index() {
             search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::Both,
+            sort: SearchSort::default(),
         };
         let context = SearchLogContext::from(&request);
         let mut direct_paths: Vec<String> = provider

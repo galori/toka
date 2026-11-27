@@ -6990,7 +6990,9 @@ mod tests {
     #[test]
     fn read_only_inspection_reads_a_version_1_database_without_migrating() {
         use crate::providers::OwnedIndexSearchProvider;
-        use crate::search::{MediaType, SearchFields, SearchProvider, SearchRequest, PAGE_SIZE};
+        use crate::search::{
+            MediaType, SearchFields, SearchProvider, SearchRequest, SearchSort, PAGE_SIZE,
+        };
         use crate::search_log::SearchLogContext;
 
         let directory = tempdir().unwrap();
@@ -7036,6 +7038,7 @@ mod tests {
             search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::Videos,
+            sort: SearchSort::default(),
         };
         let context = SearchLogContext::from(&request);
         let candidates = provider.candidates("family", false, &context).unwrap();

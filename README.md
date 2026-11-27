@@ -93,6 +93,12 @@ as `30m ago`. An unqualified day or week value such as `modified:"3 days ago"`
 matches that local calendar day; explicit calendar dates use the same local-day
 matching.
 
+Results arrive shuffled, so a broad search stays a mix. The sort control
+beside the results orders them instead: by name, size, or creation,
+modification, or access date, ascending or descending. `Ctrl+S` steps
+through the orders and `Ctrl+Shift+S` turns the order around. The order
+holds across every page of the search.
+
 ### Search from the command line
 
 Run a search from a terminal with `toka search`:

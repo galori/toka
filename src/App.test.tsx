@@ -193,6 +193,8 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
     screen.getByRole("button", { name: "Close keyboard shortcuts" }),
   ).toHaveAttribute("aria-keyshortcuts", "Escape");
   expect(help).toHaveTextContent("Ctrl+Shift+L");
+  expect(help).toHaveTextContent("Change what results are sorted by");
+  expect(help).toHaveTextContent("Toggle ascending or descending sort");
 
   await user.keyboard("{Escape}");
   expect(
@@ -473,6 +475,7 @@ test("opens an add-on launch as an exact search result list", async () => {
         pageSize: 24,
         fields: { tags: true, fileName: true, path: false },
         mediaType: "videos",
+        sort: { field: "shuffle", direction: "desc" },
       },
       addonSearch,
     }),
@@ -782,6 +785,7 @@ test("starts with a focused search field and displays submitted results", async 
       pageSize: 24,
       fields: { tags: true, fileName: true, path: true },
       mediaType: "videos",
+      sort: { field: "shuffle", direction: "desc" },
     },
   });
 });
@@ -801,6 +805,26 @@ const lastSearchFields = () => {
     .at(-1);
   return (call?.[1] as { request: { fields: unknown } } | undefined)?.request
     .fields;
+};
+
+const twoResultPage = (query: string) => ({
+  query,
+  page: 1,
+  pageSize: 24 as const,
+  totalResults: 2,
+  totalPages: 1,
+  results: [
+    { id: "video-1", fileName: "b.mp4", extension: "mp4" },
+    { id: "video-2", fileName: "a.mp4", extension: "mp4" },
+  ],
+});
+
+const lastSearchSort = () => {
+  const call = invokeMock.mock.calls
+    .filter(([command]) => command === "search_videos")
+    .at(-1);
+  return (call?.[1] as { request: { sort: unknown } } | undefined)?.request
+    .sort;
 };
 
 test("chooses which parts of a video a search looks at", async () => {
@@ -866,6 +890,182 @@ test("jumps to the search field from its keyboard shortcut", async () => {
   expect(field).toHaveValue("holiday");
   await user.keyboard("beach");
   expect(field).toHaveValue("beach");
+});
+
+test("searches start shuffled and re-run in the chosen sort order", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+
+  expect(lastSearchSort()).toEqual({ field: "shuffle", direction: "desc" });
+
+  const sort = screen.getByRole("combobox", { name: "Sort results" });
+  expect(sort).toHaveValue("shuffle");
+  await user.selectOptions(sort, "name");
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+  expect(screen.getByRole("combobox", { name: "Sort results" })).toHaveValue(
+    "name",
+  );
+});
+
+test("turns the sort order around from its direction toggle", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+
+  // Shuffling answers to no direction, so the toggle waits for an order.
+  const waiting = screen.getByRole("button", {
+    name: "Sort direction: descending",
+  });
+  expect(waiting).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+S");
+  expect(waiting).toBeDisabled();
+
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Sort results" }),
+    "name",
+  );
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+
+  const ascending = screen.getByRole("button", {
+    name: "Sort direction: ascending",
+  });
+  expect(ascending).toBeEnabled();
+  await user.click(ascending);
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "desc" }),
+  );
+
+  fireEvent.keyDown(window, { key: "S", ctrlKey: true, shiftKey: true });
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+  expect(
+    screen.getByRole("button", { name: "Sort direction: ascending" }),
+  ).toBeEnabled();
+});
+
+test("cycles what results are sorted by from its keyboard shortcut", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+
+  const sort = screen.getByRole("combobox", { name: "Sort results" });
+  expect(sort).toHaveAttribute("aria-keyshortcuts", "Ctrl+S");
+  expect(sort.parentElement?.querySelector(".key-hint")).toHaveTextContent(
+    "Ctrl+S",
+  );
+
+  fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+  expect(screen.getByRole("combobox", { name: "Sort results" })).toHaveValue(
+    "name",
+  );
+
+  fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "size", direction: "desc" }),
+  );
+});
+
+test("shuffling an ordered search returns it to a shuffled search", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Sort results" }),
+    "name",
+  );
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  // The whole search is dealt again rather than only the page on screen.
+  // The direction the name order used is kept, and ignored while shuffling.
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "shuffle", direction: "asc" }),
+  );
+  expect(screen.getByRole("combobox", { name: "Sort results" })).toHaveValue(
+    "shuffle",
+  );
+});
+
+test("shuffling a shuffled search re-deals the page on screen", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+  invokeMock.mockClear();
+
+  randomMock.mockReturnValueOnce(0);
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  expect(
+    screen
+      .getAllByRole("button", { name: /^Play .*\.mp4$/ })
+      .map((tile) => tile.getAttribute("aria-label")),
+  ).toEqual(["Play a.mp4", "Play b.mp4"]);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
+});
+
+test("shuffling a launched folder re-deals its page", async () => {
+  launchIntentMock.mockResolvedValue({ page: twoResultPage("folder") });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/b.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing b.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(screen.getByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  invokeMock.mockClear();
+
+  randomMock.mockReturnValueOnce(0);
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  expect(
+    screen
+      .getAllByRole("button", { name: /^Play .*\.mp4$/ })
+      .map((tile) => tile.getAttribute("aria-label")),
+  ).toEqual(["Play a.mp4", "Play b.mp4"]);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
 });
 
 test("searches again as soon as the parts being searched change", async () => {
