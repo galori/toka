@@ -5579,6 +5579,62 @@ test("keeps native video clear of the player controls and playlist drawer", asyn
   }
 });
 
+test("hides the native surface while a tag popover is open", async () => {
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          { id: "native-1", fileName: "native-1.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({
+        filePath: `/Videos/${(args as { resultId: string }).resultId}.mp4`,
+        playbackBackend: "native",
+      });
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state")
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 1,
+        paused: false,
+        ended: false,
+      });
+    if (command === "get_top_tags") return Promise.resolve([]);
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native-1.mp4" }),
+  );
+  await screen.findByLabelText("Playing native-1.mp4");
+
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "y" });
+  await screen.findByRole("group", { name: "Common tags" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: false }),
+    ),
+  );
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "Escape" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_native_video_bounds",
+      expect.objectContaining({ visible: true }),
+    ),
+  );
+});
+
 test("hides the native surface while the Add-ons menu is open", async () => {
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "search_videos") {

@@ -1585,6 +1585,7 @@ function Player({
   const addonMenuWrap = useRef<HTMLDivElement>(null);
   const addonMenuElement = useRef<HTMLDivElement>(null);
   const addonOpenRef = useRef(false);
+  const popoverOpenRef = useRef(false);
   const refreshNativeBounds = useRef<(() => void) | undefined>(undefined);
   const addonVideoGeneration = useRef(0);
   useLayoutEffect(() => {
@@ -1992,6 +1993,12 @@ function Player({
     addonOpenRef.current = addonOpen;
     refreshNativeBounds.current?.();
   }, [addonOpen]);
+  // The native picture paints above the page, so a popover that reaches into
+  // the video area would sit behind it; the picture waits while one is open.
+  useEffect(() => {
+    popoverOpenRef.current = pickingFavorite || pickingQuickTag;
+    refreshNativeBounds.current?.();
+  }, [pickingFavorite, pickingQuickTag]);
   useEffect(() => {
     // The error view replaces the surface these measurements come from, so the
     // watchers have to go with it: left running, the next resize would measure
@@ -2034,7 +2041,11 @@ function Player({
         height: Math.round(visibleHeight),
         // The Add-ons menu drops over the picture, and GTK paints the native
         // surface above it, so the picture steps aside while the menu is open.
-        visible: !addonOpenRef.current && visibleWidth > 0 && visibleHeight > 0,
+        visible:
+          !addonOpenRef.current &&
+          !popoverOpenRef.current &&
+          visibleWidth > 0 &&
+          visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
