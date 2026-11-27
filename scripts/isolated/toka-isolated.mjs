@@ -25,6 +25,7 @@ import {
   isSupervisorOf,
   isolatedEnv,
   isolatedPaths,
+  launchctlShimScript,
   loginctlShimScript,
   parseArguments,
   readState,
@@ -39,7 +40,7 @@ const USAGE = `Usage: node scripts/isolated/toka-isolated.mjs <command> [flags]
 
 Runs a worktree's build of Toka with its own config, data, cache and indexer,
 beside the installed app. It never installs anything and never touches the
-installed app, ~/.config/toka, ~/.local/share/toka or toka-search.service.
+installed app, the user's data directories or the indexer service.
 
 Commands:
   build    Build the worktree's release binaries without installing them.
@@ -73,18 +74,9 @@ function targetWorktree(flags) {
   return gitToplevel(path.resolve(flags.worktree ?? process.cwd()));
 }
 
-function requireLinux() {
-  if (process.platform !== "linux") {
-    fail(
-      "Isolated runs are Linux-only for now (see the toka-isolated-run skill for the macOS notes).",
-    );
-  }
-}
-
 // ---------------------------------------------------------------- build
 
 async function build(flags) {
-  requireLinux();
   const worktree = targetWorktree(flags);
   const paths = isolatedPaths(worktree);
   // The build rewrites this tracked file. Restore it afterwards, but only if it
@@ -175,6 +167,24 @@ async function build(flags) {
 
 // --------------------------------------------------------------- launch
 
+/**
+ * Puts this platform's service-manager shims first on PATH: systemctl and
+ * loginctl on Linux, launchctl on macOS (where `ts install` uses launchd).
+ */
+function writeShims(paths) {
+  const shims =
+    process.platform === "darwin"
+      ? [[paths.launchctlShim, launchctlShimScript(paths)]]
+      : [
+          [paths.shim, shimScript(paths)],
+          [paths.loginctlShim, loginctlShimScript()],
+        ];
+  for (const [file, script] of shims) {
+    writeFileSync(file, script);
+    chmodSync(file, 0o755);
+  }
+}
+
 function prepareHome(paths, flags) {
   for (const directory of [
     paths.config,
@@ -186,10 +196,7 @@ function prepareHome(paths, flags) {
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  writeFileSync(paths.shim, shimScript(paths));
-  chmodSync(paths.shim, 0o755);
-  writeFileSync(paths.loginctlShim, loginctlShimScript());
-  chmodSync(paths.loginctlShim, 0o755);
+  writeShims(paths);
   if (flags["no-seed"] || existsSync(paths.indexFolders)) return;
   const source = path.resolve(
     paths.worktree,
@@ -245,7 +252,6 @@ function killGroup(pid, signal) {
 }
 
 async function launch(flags) {
-  requireLinux();
   const worktree = targetWorktree(flags);
   const paths = isolatedPaths(worktree);
   if (!existsSync(paths.binary) || !existsSync(paths.tsBinary)) {
@@ -273,12 +279,17 @@ async function launch(flags) {
       env: { ...process.env, TOKA_ISOLATED_SUPERVISOR: "1" },
     });
     supervisor.unref();
+    // Our own child: its exit event says it is gone, with no PID lookup.
+    let supervisorExited = false;
+    supervisor.on("exit", () => {
+      supervisorExited = true;
+    });
     for (let waited = 0; waited < 15000; waited += 100) {
       if (describeRun(paths).appRunning) {
         report(describeRun(paths));
         return;
       }
-      if (!isSupervisorOf(supervisor.pid, scriptPath)) break;
+      if (supervisorExited) break;
       await sleepMs(100);
     }
     killGroup(supervisor.pid, "SIGTERM");
@@ -412,7 +423,6 @@ function report(run) {
 }
 
 function status(flags) {
-  requireLinux();
   const here = targetWorktree(flags);
   const candidates = flags.all || !flags.worktree ? gitWorktrees(here) : [here];
   const runs = candidates
@@ -437,10 +447,7 @@ function printEnv(flags) {
   const paths = isolatedPaths(targetWorktree(flags));
   mkdirSync(paths.shimDir, { recursive: true });
   mkdirSync(paths.runDir, { recursive: true });
-  writeFileSync(paths.shim, shimScript(paths));
-  chmodSync(paths.shim, 0o755);
-  writeFileSync(paths.loginctlShim, loginctlShimScript());
-  chmodSync(paths.loginctlShim, 0o755);
+  writeShims(paths);
   const env = isolatedEnv(paths, {});
   mkdirSync(paths.tmp, { recursive: true });
   const quoted = (value) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -476,7 +483,6 @@ if (command === "help" || flags.help) {
 } else if (command === "launch") {
   await launch(flags);
 } else if (command === "stop") {
-  requireLinux();
   const worktree = targetWorktree(flags);
   const targets = flags.all ? gitWorktrees(worktree) : [worktree];
   let ok = true;

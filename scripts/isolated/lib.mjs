@@ -63,6 +63,11 @@ export function isolatedPaths(worktree, env = process.env) {
   const targetDir = env.CARGO_TARGET_DIR
     ? path.resolve(worktree, "src-tauri", env.CARGO_TARGET_DIR)
     : path.join(worktree, "src-tauri", "target");
+  // The schema file the tauri build rewrites varies by platform.
+  const schemaFile =
+    process.platform === "darwin"
+      ? "src-tauri/gen/schemas/macOS-schema.json"
+      : "src-tauri/gen/schemas/linux-schema.json";
   return {
     worktree,
     name: path.basename(worktree),
@@ -71,9 +76,14 @@ export function isolatedPaths(worktree, env = process.env) {
     data: path.join(home, "data"),
     cache: path.join(home, "cache"),
     shimDir: path.join(home, "bin"),
+    // Linux shims: systemctl and loginctl
     shim: path.join(home, "bin", "systemctl"),
     loginctlShim: path.join(home, "bin", "loginctl"),
     shimLog: path.join(home, "run", "systemctl-shim.log"),
+    // macOS shim: launchctl
+    launchctlShim: path.join(home, "bin", "launchctl"),
+    launchctlShimLog: path.join(home, "run", "launchctl-shim.log"),
+    launchdLoaded: path.join(home, "run", "launchd-loaded"),
     indexerPidFile: path.join(home, "run", "indexer.pid"),
     indexerLog: path.join(home, "run", "indexer.log"),
     tmp: path.join(home, "tmp"),
@@ -84,7 +94,7 @@ export function isolatedPaths(worktree, env = process.env) {
     indexFolders: path.join(home, "config", "toka", "index-folders.json"),
     binary: path.join(targetDir, "release", "toka"),
     tsBinary: path.join(targetDir, "release", "ts"),
-    schemaFile: "src-tauri/gen/schemas/linux-schema.json",
+    schemaFile,
   };
 }
 
@@ -93,7 +103,7 @@ export function isolatedPaths(worktree, env = process.env) {
  * give them their own settings, index and logs. HOME points at the isolated
  * home too: `ts install` resolves the legacy service file from it, so the
  * real home stays untouched. The PATH shims keep either
- * process from reaching the user's `toka-search.service` through systemctl
+ * process from reaching the user's service through systemctl/launchctl
  * or changing host login state through loginctl.
  */
 export function isolatedEnv(paths, base = process.env) {
@@ -114,8 +124,8 @@ function quote(text) {
 }
 
 /**
- * A stand-in `systemctl`. The app runs `ts install` at startup and `toka
- * restart` stops and starts the service; unshimmed, an isolated instance
+ * A stand-in `systemctl` for Linux. The app runs `ts install` at startup and
+ * `toka restart` stops and starts the service; unshimmed, an isolated instance
  * would stop the user's real indexer. The shim logs each call and acts
  * only on the isolated indexer: `stop` ends it and `start` respawns it if
  * it is not running, as systemd would. Every other call is a no-op that
@@ -157,7 +167,7 @@ exit 0
 }
 
 /**
- * A stand-in `loginctl`. `ts install` probes lingering with
+ * A stand-in `loginctl`. `ts install` on Linux probes lingering with
  * `show-user $USER -p Linger --value` and enables it otherwise; unshimmed,
  * an isolated instance would change the user's real login state. The probe
  * passes `--value`, so it answers the bare `yes` the real tool prints (and
@@ -171,6 +181,76 @@ export function loginctlShimScript() {
 case "$*" in
   *"show-user"*)
     echo yes
+    ;;
+esac
+exit 0
+`;
+}
+
+/**
+ * A stand-in `launchctl` for macOS. `ts install` calls `launchctl bootstrap`,
+ * `launchctl print`, `launchctl bootout`, and `launchctl kickstart`; unshimmed,
+ * an isolated instance would manage the user's real launchd agent. The shim
+ * logs each call and acts only on the isolated indexer, standing in for the
+ * agent the way launchd would:
+ * - `bootstrap` / `kickstart` mark the agent loaded and start the indexer
+ *   unless it already runs; `bootout` stops it and marks the agent unloaded.
+ * - `print` answers as launchd does: "Could not find service" while
+ *   unloaded, else `state = running` or `state = not running` from the
+ *   verified indexer, so `ts start` after `ts stop` really starts it.
+ * Every other call is a no-op that succeeds.
+ */
+export function launchctlShimScript(paths) {
+  return `#!/bin/sh
+# Installed by scripts/isolated (macOS): isolated Toka must never manage the
+# real launchd agent. It controls the isolated indexer instead.
+PIDFILE=${quote(paths.indexerPidFile)}
+LOADED=${quote(paths.launchdLoaded)}
+printf '%s launchctl %s\\n' "$(date)" "$*" >> ${quote(paths.launchctlShimLog)}
+pid=$(cat "$PIDFILE" 2>/dev/null)
+# A stale pid file may name a recycled PID: only trust it if it is our indexer.
+if [ -n "$pid" ]; then
+  case "$(ps -ww -p "$pid" -o args= 2>/dev/null)" in
+    ${quote(paths.tsBinary)}|${quote(paths.tsBinary)}" "*) ;;
+    *) pid= ;;
+  esac
+fi
+if [ -n "$pid" ] && ! printf ' %s ' "$(ps ewww -o command= -p "$pid" 2>/dev/null)" | grep -qF ${quote(` XDG_CONFIG_HOME=${paths.config} `)}; then
+  pid=
+fi
+case "$1" in
+  print)
+    if [ ! -f "$LOADED" ]; then
+      echo "Could not find service \\"$2\\" in domain for user gui" >&2
+      exit 113
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf 'state = running\\n'
+    else
+      printf 'state = not running\\n'
+    fi
+    exit 0
+    ;;
+  bootout)
+    rm -f "$LOADED"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill -s TERM -- "-$pid" 2>/dev/null
+      n=0
+      while kill -s 0 -- "-$pid" 2>/dev/null && [ "$n" -lt 100 ]; do
+        sleep 0.1
+        n=$((n + 1))
+      done
+      kill -s KILL -- "-$pid" 2>/dev/null
+    fi
+    ;;
+  bootstrap|kickstart)
+    touch "$LOADED"
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      # macOS has no setsid(1); perl's setpgrp makes the indexer its own
+      # group leader, so bootout and stop can signal its whole group.
+      /usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV or die' ${quote(paths.tsBinary)} daemon run >> ${quote(paths.indexerLog)} 2>&1 </dev/null &
+      echo $! > "$PIDFILE"
+    fi
     ;;
 esac
 exit 0
@@ -209,21 +289,45 @@ export function tsBuildInvocation(paths) {
 }
 
 /**
- * True when `pid` is alive and running `binary`. A PID recorded earlier may
+ * True when `pid` is alive and running `binary`.  A PID recorded earlier may
  * since belong to an unrelated process, so the command line is checked before
  * anything is signalled.
+ *
+ * On Linux: reads /proc/<pid>/cmdline (the null-delimited argv[0]).
+ * On macOS: uses `ps -p <pid> -o comm=` (the executable base name).
  */
 export function isProcessOf(pid, binary, procRoot = "/proc") {
   if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    const commandLine = readFileSync(
-      path.join(procRoot, String(pid), "cmdline"),
-      "utf8",
-    );
-    return commandLine.split("\0")[0] === binary;
-  } catch {
-    return false;
+  if (process.platform === "linux") {
+    try {
+      const commandLine = readFileSync(
+        path.join(procRoot, String(pid), "cmdline"),
+        "utf8",
+      );
+      return commandLine.split("\0")[0] === binary;
+    } catch {
+      return false;
+    }
   }
+  // macOS: `ps -o args=` joins argv with spaces, so argv[0] cannot be split
+  // out of a path that has spaces; match the binary as a prefix instead.
+  // shortcut: a different binary named "<binary> <something>" would match;
+  // upgrade to sysctl KERN_PROCARGS2 through a native helper if that matters.
+  const commandLine = macCommandLine(pid);
+  return (
+    commandLine !== null &&
+    (commandLine === binary || commandLine.startsWith(`${binary} `))
+  );
+}
+
+/** `ps -p <pid> -o args=` on macOS, or null when ps fails or the pid is gone. */
+function macCommandLine(pid) {
+  // -ww: never cut the line to the terminal width.
+  const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "args="], {
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return null;
+  return result.stdout.trim();
 }
 
 /**
@@ -245,15 +349,30 @@ export function isIsolatedIndexerProcess(pid, paths, procRoot = "/proc") {
 
 function isIsolatedBinary(pid, paths, binary, procRoot) {
   if (!isProcessOf(pid, binary, procRoot)) return false;
-  try {
-    const environment = readFileSync(
-      path.join(procRoot, String(pid), "environ"),
-      "utf8",
-    ).split("\0");
-    return environment.includes(`XDG_CONFIG_HOME=${paths.config}`);
-  } catch {
-    return false;
+  if (process.platform === "linux") {
+    try {
+      const environment = readFileSync(
+        path.join(procRoot, String(pid), "environ"),
+        "utf8",
+      ).split("\0");
+      return environment.includes(`XDG_CONFIG_HOME=${paths.config}`);
+    } catch {
+      return false;
+    }
   }
+  // macOS: `ps ewww` prints the environment after the command line, each
+  // entry separated by a space. Padding both ends anchors the match, so a
+  // longer path that merely starts with this config path never counts.
+  // shortcut: ps joins entries with bare spaces, so another variable whose
+  // value contains " XDG_CONFIG_HOME=<config> " would also match; upgrade to
+  // sysctl KERN_PROCARGS2 through a native helper if that ever matters.
+  const result = spawnSync("ps", ["ewww", "-o", "command=", "-p", String(pid)], {
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return false;
+  return ` ${result.stdout.trim()} `.includes(
+    ` XDG_CONFIG_HOME=${paths.config} `,
+  );
 }
 
 /** The live indexer PID: the pid file wins, since the shim may have respawned it. */
@@ -267,24 +386,39 @@ export function currentIndexerPid(paths, state) {
   return state?.indexerPid ?? null;
 }
 
-/** True when `pid` is alive and is the node process running `scriptPath`. */
+/**
+ * True when `pid` is alive and is the node process running `scriptPath`.
+ *
+ * On Linux: reads /proc/<pid>/cmdline.
+ * On macOS: uses `ps -p <pid> -o args=`, falling back to a liveness check
+ * when `ps` is unavailable (e.g. sandboxed environment).
+ */
 export function isSupervisorOf(pid, scriptPath, procRoot = "/proc") {
   if (!Number.isInteger(pid) || pid <= 1) return false;
-  try {
-    const parts = readFileSync(
-      path.join(procRoot, String(pid), "cmdline"),
-      "utf8",
-    ).split("\0");
-    // A foreground launch may have been started with a relative path.
-    const cwd = readlinkSync(path.join(procRoot, String(pid), "cwd"));
-    return parts.some(
-      (part) =>
-        part.endsWith(".mjs") &&
-        (part === scriptPath || path.resolve(cwd, part) === scriptPath),
-    );
-  } catch {
-    return false;
+  if (process.platform === "linux") {
+    try {
+      const parts = readFileSync(
+        path.join(procRoot, String(pid), "cmdline"),
+        "utf8",
+      ).split("\0");
+      // A foreground launch may have been started with a relative path.
+      const cwd = readlinkSync(path.join(procRoot, String(pid), "cwd"));
+      return parts.some(
+        (part) =>
+          part.endsWith(".mjs") &&
+          (part === scriptPath || path.resolve(cwd, part) === scriptPath),
+      );
+    } catch {
+      return false;
+    }
   }
+  // macOS: the script path must appear whole in the command line. A
+  // supervisor always runs with the absolute path (launch re-execs itself
+  // with it).
+  // shortcut: a foreground launch started with a relative path is not
+  // recognised, so `stop` leaves that one to exit when its app stops.
+  const commandLine = macCommandLine(pid);
+  return commandLine !== null && ` ${commandLine} `.includes(` ${scriptPath} `);
 }
 
 export function readState(paths) {

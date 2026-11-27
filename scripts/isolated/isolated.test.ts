@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmod,
   mkdir,
@@ -15,6 +15,7 @@ import {
   isProcessOf,
   isolatedEnv,
   isolatedPaths,
+  launchctlShimScript,
   loginctlShimScript,
   parseArguments,
   seedConfig,
@@ -88,6 +89,10 @@ describe("isolatedPaths and isolatedEnv", () => {
   it("shadows both systemctl and loginctl in the shim dir", () => {
     expect(paths.shim).toBe(path.join(paths.shimDir, "systemctl"));
     expect(paths.loginctlShim).toBe(path.join(paths.shimDir, "loginctl"));
+  });
+
+  it("shadows launchctl in the shim dir", () => {
+    expect(paths.launchctlShim).toBe(path.join(paths.shimDir, "launchctl"));
   });
 
   it("runs the indexer as ts daemon run", () => {
@@ -165,6 +170,51 @@ describe("shimScript and seedConfig", () => {
       expect(enable.status).toBe(0);
       expect(enable.stdout).toBe("");
     } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("launchctl shim logs, answers print as launchd would, and never signals a PID that is not the isolated indexer", async () => {
+    await mkdir(path.resolve(".scratch"), { recursive: true });
+    const dir = await mkdtemp(path.resolve(".scratch/launchctl-test-"));
+    // An unrelated process whose PID a stale pid file names.
+    const bystander = spawn("sleep", ["30"], { detached: true });
+    try {
+      const pidFile = path.join(dir, "indexer.pid");
+      const log = path.join(dir, "it's.log");
+      await writeFile(pidFile, `${bystander.pid}\n`);
+      const shim = path.join(dir, "launchctl");
+      await writeFile(
+        shim,
+        launchctlShimScript({
+          ...isolatedPaths(dir, {}),
+          indexerPidFile: pidFile,
+          launchctlShimLog: log,
+          launchdLoaded: path.join(dir, "loaded"),
+        }),
+      );
+      await chmod(shim, 0o755);
+      const print = () =>
+        spawnSync(shim, ["print", "gui/501/app.toka.ts"], { encoding: "utf8" });
+      // Not loaded yet: launchd's own "no such job" answer, which `ts`
+      // reads as not bootstrapped.
+      expect(print().status).toBe(113);
+      expect(print().stderr).toContain("Could not find service");
+      // Loaded, but the pid file names no isolated indexer (and this
+      // home's ts was never built, so none starts): loaded, not running.
+      expect(spawnSync(shim, ["kickstart", "-k", "gui/501/app.toka.ts"]).status).toBe(0);
+      await writeFile(pidFile, `${bystander.pid}\n`);
+      expect(print().status).toBe(0);
+      expect(print().stdout).toContain("state = not running");
+      const bootout = spawnSync(shim, ["bootout", "gui/501/app.toka.ts"]);
+      expect(bootout.status).toBe(0);
+      expect(() => process.kill(bystander.pid!, 0)).not.toThrow();
+      expect(print().status).toBe(113);
+      expect(await readFile(log, "utf8")).toContain(
+        "launchctl bootout gui/501/app.toka.ts",
+      );
+    } finally {
+      bystander.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -314,6 +364,157 @@ setInterval(() => {}, 1000);
         ),
       );
       expect(() => process.kill(second, 0)).not.toThrow();
+
+      expect(run("stop").status).toBe(0);
+      await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
+    }, 30000);
+
+    it("refuses to launch when nothing has been built", () => {
+      env.CARGO_TARGET_DIR = path.join(repo, "missing");
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
+    });
+
+    it("refuses to launch when the ts binary is missing", async () => {
+      await rm(path.join(repo, "target/release/ts"));
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
+    });
+  },
+);
+
+describe.skipIf(process.platform !== "darwin")(
+  "toka-isolated launch, status and stop (macOS)",
+  () => {
+    const cli = path.resolve("scripts/isolated/toka-isolated.mjs");
+    let repo: string;
+    let env: NodeJS.ProcessEnv;
+
+    const run = (...args: string[]) =>
+      spawnSync(process.execPath, [cli, ...args, "--worktree", repo], {
+        encoding: "utf8",
+        env,
+      });
+
+    beforeEach(async () => {
+      await mkdir(path.resolve(".scratch"), { recursive: true });
+      repo = await mkdtemp(path.resolve(".scratch/isolated-test-darwin-"));
+      spawnSync("git", ["init", "-q"], { cwd: repo });
+      await mkdir(path.join(repo, "test/fixtures"), { recursive: true });
+      await writeFile(path.join(repo, "test/fixtures/a.mp4"), "x");
+      // Stand-ins for the real binaries. On macOS, `ps -p <pid> -o args=`
+      // returns the full argv[0], so we use a plain node script whose
+      // process.argv[0] is the binary path (node does this automatically
+      // when exec'd via the wrapper below, via exec -a).
+      const target = path.join(repo, "target");
+      await mkdir(path.join(target, "release"), { recursive: true });
+      // On macOS, /bin/bash exec -a sets argv[0] to the given name, which
+      // is the full path; that is what `ps -o args=` returns.
+      const fake = `#!/bin/bash
+exec -a "$0" node "$(dirname "$0")/fake.mjs" "$@"
+`;
+      for (const name of ["toka", "ts"]) {
+        const binary = path.join(target, "release", name);
+        await writeFile(binary, fake);
+        await chmod(binary, 0o755);
+      }
+      await writeFile(
+        path.join(target, "release/fake.mjs"),
+        `import fs from "node:fs";
+const role = process.argv[2] === "daemon" ? "indexer" : "app";
+fs.writeFileSync(process.env.XDG_DATA_HOME + "/" + role + ".json",
+  JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+setInterval(() => {}, 1000);
+`,
+      );
+      env = { ...process.env, CARGO_TARGET_DIR: target };
+      delete env.TOKA_ISOLATED_SUPERVISOR;
+    });
+
+    afterEach(async () => {
+      run("stop", "--clean");
+      await rm(repo, { recursive: true, force: true });
+    });
+
+    it("runs app and indexer with isolated env, seeds a copy, and stops both with no orphans", async () => {
+      const launched = run("launch", "--detach");
+      expect(launched.status, launched.stderr).toBe(0);
+
+      const status = JSON.parse(run("status", "--json").stdout);
+      const here = status.find(
+        (s: { worktree: string }) => s.worktree === repo,
+      );
+      expect(here.appRunning).toBe(true);
+      expect(here.indexerRunning).toBe(true);
+      const { appPid, indexerPid } = here;
+
+      const home = path.join(repo, ".scratch/isolated-home");
+      await vi.waitFor(async () => {
+        await stat(path.join(home, "data/app.json"));
+        await stat(path.join(home, "data/indexer.json"));
+      });
+      const indexer = JSON.parse(
+        await readFile(path.join(home, "data/indexer.json"), "utf8"),
+      );
+      expect(indexer.argv).toEqual(["daemon", "run"]);
+      expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
+      expect(indexer.env.HOME).toBe(home);
+      expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
+
+      const config = JSON.parse(
+        await readFile(
+          path.join(home, "config/toka/index-folders.json"),
+          "utf8",
+        ),
+      );
+      expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
+      await stat(path.join(home, "fixtures/a.mp4"));
+      // macOS shim: launchctl (not systemctl/loginctl)
+      await stat(path.join(home, "bin/launchctl"));
+
+      expect(run("launch", "--detach").status).not.toBe(0);
+
+      const stopped = run("stop");
+      expect(stopped.status, stopped.stderr).toBe(0);
+      for (const pid of [appPid, indexerPid]) {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+      expect(JSON.parse(run("status", "--json").stdout)[0].running).toBe(false);
+
+      expect(run("stop", "--clean").status).toBe(0);
+      await expect(stat(home)).rejects.toThrow();
+    }, 30000);
+
+    it("lets the app's launchctl bootout and bootstrap act on the isolated indexer only, and cleans up the respawned one", async () => {
+      expect(run("launch", "--detach").status).toBe(0);
+      const home = path.join(repo, ".scratch/isolated-home");
+      const shim = path.join(home, "bin/launchctl");
+      const first = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
+
+      spawnSync(shim, ["bootout", "gui/501/app.toka.ts"]);
+      await vi.waitFor(() => expect(() => process.kill(first, 0)).toThrow());
+
+      spawnSync(shim, ["bootstrap", "gui/501", "app.toka.ts.plist"], {
+        env: isolatedEnv(isolatedPaths(repo, env), env),
+      });
+      const second = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
+      expect(second).not.toBe(first);
+      await vi.waitFor(() =>
+        expect(isIsolatedIndexerProcess(second, isolatedPaths(repo, env))).toBe(
+          true,
+        ),
+      );
+      // Loaded and running again, as `ts start` and `ts status` read it.
+      expect(
+        spawnSync(shim, ["print", "gui/501/app.toka.ts"], { encoding: "utf8" })
+          .stdout,
+      ).toContain("state = running");
 
       expect(run("stop").status).toBe(0);
       await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
