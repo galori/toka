@@ -48,6 +48,7 @@ import {
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
   addVideoTags,
+  setVideoTags,
   addTagsToVideos,
   removeVideoTags,
   addFolderTags,
@@ -372,6 +373,129 @@ function TagRemoveIcon() {
       <path d="M3 3 9 9" />
       <path d="M9 3 3 9" />
     </svg>
+  );
+}
+
+const FAVORITE_TAG = "fv";
+const FAVORITE_LEVELS = [1, 2, 3, 4, 5];
+
+// The level in `fvN` form, if the tags carry one.
+function favoriteLevel(tags: string[]): number | undefined {
+  return FAVORITE_LEVELS.find((level) => tags.includes(`fv${level}`));
+}
+
+// Favorites are `fv`, plus `fvN` for a level. Setting a level replaces any
+// other; `null` clears the favorite, `0` favorites without a level.
+function withFavoriteLevel(tags: string[], level: number | null): string[] {
+  const rest = tags.filter(
+    (tag) => tag !== FAVORITE_TAG && !/^fv[1-5]$/.test(tag),
+  );
+  if (level === null) return rest;
+  return level === 0
+    ? [...rest, FAVORITE_TAG]
+    : [...rest, FAVORITE_TAG, `fv${level}`];
+}
+
+function FavoritePicker({
+  video,
+  open,
+  onOpenChange,
+  onChange,
+  shortcut,
+}: {
+  video: VideoResult;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onChange: (update: Pick<VideoResult, "fileName" | "tags">) => void;
+  shortcut: string;
+}) {
+  const [hover, setHover] = useState<number>();
+  const [error, setError] = useState<string>();
+  const tags = video.tags ?? [];
+  const current = favoriteLevel(tags);
+  const favorite = tags.includes(FAVORITE_TAG) || current !== undefined;
+  const choose = async (level: number | null) => {
+    onOpenChange(false);
+    try {
+      onChange(await setVideoTags(video.id, withFavoriteLevel(tags, level)));
+      setError(undefined);
+    } catch (reason) {
+      setError(`Could not update favorite: ${errorMessage(reason)}`);
+    }
+  };
+  // Keys are claimed while the picker is open, like the tag field.
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      let handled = true;
+      if (/^[1-5]$/.test(event.key)) {
+        const level = Number(event.key);
+        void choose(level === current ? null : level);
+      } else if (event.key === "0" || event.key === "Backspace") {
+        void choose(null);
+      } else if (event.key === "Enter") {
+        void choose(0);
+      } else if (event.key === "Escape") {
+        onOpenChange(false);
+      } else {
+        handled = false;
+      }
+      if (handled) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  });
+  const shown = hover ?? current ?? 0;
+  return (
+    <div className="favorite-picker">
+      <ControlButton
+        shortcut={shortcut}
+        className={`tag-add favorite-toggle${favorite ? " is-favorite" : ""}`}
+        aria-label={`Favorite level for ${video.fileName}`}
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <Label>{favorite ? `★${current ?? ""}` : "☆"}</Label>
+      </ControlButton>
+      {open ? (
+        <div
+          role="group"
+          aria-label="Favorite level"
+          className="favorite-levels"
+        >
+          {FAVORITE_LEVELS.map((level) => (
+            <button
+              key={level}
+              type="button"
+              className={`favorite-star${level <= shown ? " is-lit" : ""}`}
+              aria-label={`Level ${level}`}
+              aria-pressed={level === current}
+              onMouseEnter={() => setHover(level)}
+              onMouseLeave={() => setHover(undefined)}
+              onClick={() => void choose(level === current ? null : level)}
+            >
+              {level <= shown ? "★" : "☆"}
+            </button>
+          ))}
+          <button
+            type="button"
+            className="favorite-clear"
+            onClick={() => void choose(null)}
+          >
+            Clear
+          </button>
+        </div>
+      ) : null}
+      {error ? (
+        <p className="tag-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -1028,6 +1152,10 @@ const HELP_SECTIONS: HelpSection[] = [
       },
       { shortcut: "T", description: "Edit tags" },
       { shortcut: "Shift+T", description: "Tag the video's folder" },
+      {
+        shortcut: "Shift+F",
+        description: "Set favorite level 1-5",
+      },
       { shortcut: "Ctrl+Shift+A", description: "Open actions from add-ons" },
       {
         shortcut: "F",
@@ -1349,7 +1477,8 @@ function Player({
   }>();
   const [addingTag, setAddingTag] = useState(false);
   const [addingFolderTag, setAddingFolderTag] = useState(false);
-  const tagFieldOpen = addingTag || addingFolderTag;
+  const [pickingFavorite, setPickingFavorite] = useState(false);
+  const tagFieldOpen = addingTag || addingFolderTag || pickingFavorite;
   // An open tag editor keeps the controls up however fullscreen was entered.
   const controlsIdle =
     fullscreen && !controlsRevealed && !controlsPinned && !tagFieldOpen;
@@ -1949,6 +2078,16 @@ function Player({
     // One field at a time: both claim every keystroke while open.
     setAddingTag(!folder);
     setAddingFolderTag(folder);
+  };
+
+  const openFavoritePicker = () => {
+    if (fullscreen) {
+      controlsLastNear.current = Date.now();
+      setControlsRevealed(true);
+    }
+    setAddingTag(false);
+    setAddingFolderTag(false);
+    setPickingFavorite(true);
   };
 
   const restart = (from = 0) => {
@@ -2779,6 +2918,8 @@ function Player({
         run(cycleAspect);
       } else if (event.key.toLowerCase() === "c") {
         run(() => void copyPathRef.current());
+      } else if (event.key.toLowerCase() === "f" && event.shiftKey) {
+        run(openFavoritePicker);
       } else if (event.key.toLowerCase() === "t" && event.shiftKey) {
         run(() => openTagField(true));
       } else if (event.key.toLowerCase() === "t") {
@@ -3268,6 +3409,13 @@ function Player({
                 onAddingChange={(adding) =>
                   adding ? openTagField() : setAddingTag(false)
                 }
+              />
+              <FavoritePicker
+                video={video}
+                shortcut="Shift+F"
+                open={pickingFavorite}
+                onOpenChange={setPickingFavorite}
+                onChange={updateVideoTags}
               />
               <FolderTags
                 video={video}

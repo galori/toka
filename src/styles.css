@@ -1777,3 +1777,44 @@ button:focus-visible {
 .player-heading .copy-button {
   padding: 9px 16px;
 }
+
+.favorite-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.favorite-toggle.is-favorite {
+  color: #ffd166;
+}
+.favorite-levels {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  padding: 4px 6px;
+  border: 1px solid #40506a;
+  border-radius: 8px;
+  background: #172235;
+}
+.favorite-star,
+.favorite-clear {
+  border: 0;
+  background: transparent;
+  color: #8fa3bf;
+  font: inherit;
+  cursor: pointer;
+}
+.favorite-star {
+  font-size: 1.1rem;
+  padding: 0 2px;
+}
+.favorite-star.is-lit {
+  color: #ffd166;
+}
+.favorite-clear {
+  margin-left: 4px;
+  font-size: 0.75rem;
+}
