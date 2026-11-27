@@ -15,6 +15,7 @@ import {
   isProcessOf,
   isolatedEnv,
   isolatedPaths,
+  launchctlShimScript,
   loginctlShimScript,
   parseArguments,
   seedConfig,
@@ -88,6 +89,10 @@ describe("isolatedPaths and isolatedEnv", () => {
   it("shadows both systemctl and loginctl in the shim dir", () => {
     expect(paths.shim).toBe(path.join(paths.shimDir, "systemctl"));
     expect(paths.loginctlShim).toBe(path.join(paths.shimDir, "loginctl"));
+  });
+
+  it("shadows launchctl in the shim dir", () => {
+    expect(paths.launchctlShim).toBe(path.join(paths.shimDir, "launchctl"));
   });
 
   it("runs the indexer as ts daemon run", () => {
@@ -164,6 +169,49 @@ describe("shimScript and seedConfig", () => {
       });
       expect(enable.status).toBe(0);
       expect(enable.stdout).toBe("");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("launchctl shim reports agent as running and no-ops bootout/bootstrap", async () => {
+    await mkdir(path.resolve(".scratch"), { recursive: true });
+    const dir = await mkdtemp(path.resolve(".scratch/launchctl-test-"));
+    try {
+      const pidFile = path.join(dir, "indexer.pid");
+      const logFile = path.join(dir, "launchctl-shim.log");
+      const fakeTs = path.join(dir, "ts");
+      // A stand-in ts that just records it was called.
+      const called = path.join(dir, "ts-called");
+      await writeFile(
+        fakeTs,
+        `#!/bin/sh\ntouch ${called}\nsleep 60 &\necho $! > ${pidFile}\n`,
+      );
+      await chmod(fakeTs, 0o755);
+      const shim = path.join(dir, "launchctl");
+      await writeFile(
+        shim,
+        launchctlShimScript({
+          ...isolatedPaths(dir, {}),
+          tsBinary: fakeTs,
+          indexerPidFile: pidFile,
+          launchctlShimLog: logFile,
+        }),
+      );
+      await chmod(shim, 0o755);
+      // print should report running
+      const print = spawnSync(shim, ["print", "gui/501/app.toka.ts"], {
+        encoding: "utf8",
+      });
+      expect(print.status).toBe(0);
+      expect(print.stdout).toContain("state = running");
+      // bootout should succeed as a no-op when nothing is running
+      const bootout = spawnSync(shim, ["bootout", "gui/501"], {
+        encoding: "utf8",
+      });
+      expect(bootout.status).toBe(0);
+      // Log file should exist
+      await stat(logFile);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -317,6 +365,139 @@ setInterval(() => {}, 1000);
 
       expect(run("stop").status).toBe(0);
       await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
+    }, 30000);
+
+    it("refuses to launch when nothing has been built", () => {
+      env.CARGO_TARGET_DIR = path.join(repo, "missing");
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
+    });
+
+    it("refuses to launch when the ts binary is missing", async () => {
+      await rm(path.join(repo, "target/release/ts"));
+      const result = run("launch");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/No built binaries at .+ and .+\. Run: /);
+    });
+  },
+);
+
+describe.skipIf(process.platform !== "darwin")(
+  "toka-isolated launch, status and stop (macOS)",
+  () => {
+    const cli = path.resolve("scripts/isolated/toka-isolated.mjs");
+    let repo: string;
+    let env: NodeJS.ProcessEnv;
+
+    const run = (...args: string[]) =>
+      spawnSync(process.execPath, [cli, ...args, "--worktree", repo], {
+        encoding: "utf8",
+        env,
+      });
+
+    beforeEach(async () => {
+      await mkdir(path.resolve(".scratch"), { recursive: true });
+      repo = await mkdtemp(path.resolve(".scratch/isolated-test-darwin-"));
+      spawnSync("git", ["init", "-q"], { cwd: repo });
+      await mkdir(path.join(repo, "test/fixtures"), { recursive: true });
+      await writeFile(path.join(repo, "test/fixtures/a.mp4"), "x");
+      // Stand-ins for the real binaries. On macOS, `ps -p <pid> -o args=`
+      // returns the full argv[0], so we use a plain node script whose
+      // process.argv[0] is the binary path (node does this automatically
+      // when exec'd via the wrapper below, via exec -a).
+      const target = path.join(repo, "target");
+      await mkdir(path.join(target, "release"), { recursive: true });
+      // On macOS, /bin/bash exec -a sets argv[0] to the given name, which
+      // is the full path; that is what `ps -o args=` returns.
+      const fake = `#!/bin/bash
+exec -a "$0" node "$(dirname "$0")/fake.mjs" "$@"
+`;
+      for (const name of ["toka", "ts"]) {
+        const binary = path.join(target, "release", name);
+        await writeFile(binary, fake);
+        await chmod(binary, 0o755);
+      }
+      await writeFile(
+        path.join(target, "release/fake.mjs"),
+        `import fs from "node:fs";
+const role = process.argv[2] === "daemon" ? "indexer" : "app";
+fs.writeFileSync(process.env.XDG_DATA_HOME + "/" + role + ".json",
+  JSON.stringify({ argv: process.argv.slice(2), env: process.env }));
+setInterval(() => {}, 1000);
+`,
+      );
+      env = { ...process.env, CARGO_TARGET_DIR: target };
+      delete env.TOKA_ISOLATED_SUPERVISOR;
+    });
+
+    afterEach(async () => {
+      run("stop", "--clean");
+      await rm(repo, { recursive: true, force: true });
+    });
+
+    it("runs app and indexer with isolated env, seeds a copy, and stops both with no orphans", async () => {
+      const launched = run("launch", "--detach");
+      expect(launched.status, launched.stderr).toBe(0);
+
+      const status = JSON.parse(run("status", "--json").stdout);
+      const here = status.find(
+        (s: { worktree: string }) => s.worktree === repo,
+      );
+      expect(here.appRunning).toBe(true);
+      expect(here.indexerRunning).toBe(true);
+      const { appPid, indexerPid } = here;
+
+      const home = path.join(repo, ".scratch/isolated-home");
+      await vi.waitFor(async () => {
+        await stat(path.join(home, "data/app.json"));
+        await stat(path.join(home, "data/indexer.json"));
+      });
+      const indexer = JSON.parse(
+        await readFile(path.join(home, "data/indexer.json"), "utf8"),
+      );
+      expect(indexer.argv).toEqual(["daemon", "run"]);
+      expect(indexer.env.XDG_CONFIG_HOME).toBe(path.join(home, "config"));
+      expect(indexer.env.HOME).toBe(home);
+      expect(indexer.env.PATH.startsWith(path.join(home, "bin"))).toBe(true);
+
+      const config = JSON.parse(
+        await readFile(
+          path.join(home, "config/toka/index-folders.json"),
+          "utf8",
+        ),
+      );
+      expect(config.folders[0].path).toBe(path.join(home, "fixtures"));
+      await stat(path.join(home, "fixtures/a.mp4"));
+      // macOS shim: launchctl (not systemctl/loginctl)
+      await stat(path.join(home, "bin/launchctl"));
+
+      expect(run("launch", "--detach").status).not.toBe(0);
+
+      const stopped = run("stop");
+      expect(stopped.status, stopped.stderr).toBe(0);
+      for (const pid of [appPid, indexerPid]) {
+        expect(() => process.kill(pid, 0)).toThrow();
+      }
+      expect(JSON.parse(run("status", "--json").stdout)[0].running).toBe(false);
+
+      expect(run("stop", "--clean").status).toBe(0);
+      await expect(stat(home)).rejects.toThrow();
+    }, 30000);
+
+    it("launchctl shim prevents ts install from managing the real launchd agent", async () => {
+      expect(run("launch", "--detach").status).toBe(0);
+      const home = path.join(repo, ".scratch/isolated-home");
+      const shim = path.join(home, "bin/launchctl");
+
+      // The shim's print subcommand reports running so ts install short-circuits.
+      const print = spawnSync(shim, ["print", "gui/501/app.toka.ts"], {
+        encoding: "utf8",
+      });
+      expect(print.status).toBe(0);
+      expect(print.stdout).toContain("state = running");
+
+      expect(run("stop").status).toBe(0);
     }, 30000);
 
     it("refuses to launch when nothing has been built", () => {
