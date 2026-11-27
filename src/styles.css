@@ -995,6 +995,73 @@ button:focus-visible {
 .fullscreen-time {
   flex: none;
 }
+.seek-feedback {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  max-width: calc(100% - 32px);
+  border: 1px solid oklch(1 0 0 / 0.18);
+  border-radius: 10px;
+  padding: 12px 18px;
+  color: #fff;
+  background: oklch(0.12 0.015 40 / 0.88);
+  box-shadow: 0 8px 32px rgb(0 0 0 / 45%);
+  font:
+    700 22px ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  text-align: center;
+  text-shadow: 1px 1px 2px #000;
+  pointer-events: none;
+}
+.seek-guide {
+  position: absolute;
+  z-index: 4;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(450px, calc(100% - 32px));
+  max-height: calc(100% - 48px);
+  overflow: auto;
+  border: 1px solid oklch(1 0 0 / 0.2);
+  border-radius: 14px;
+  padding: 18px 22px;
+  color: #fff;
+  background: oklch(0.12 0.015 40 / 0.94);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 55%);
+  pointer-events: none;
+}
+.seek-guide h2 {
+  margin: 0 0 12px;
+  font-size: 16px;
+}
+.seek-guide dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+.seek-guide dl > div {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.9fr) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+}
+.seek-guide dt {
+  color: oklch(0.92 0.015 60);
+  font-size: 13px;
+  font-weight: 700;
+}
+.seek-guide dd {
+  margin: 0;
+  color: oklch(0.76 0.015 60);
+  font-size: 13px;
+}
+.seek-guide kbd {
+  font: inherit;
+}
 /* Only reachable in fullscreen, where the effect that sets it runs. The bar
    collapses onto the scrubber rather than disappearing outright, and the
    scrubber drops into the sliver the picture left for it along the bottom. */

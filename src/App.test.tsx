@@ -177,6 +177,11 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
+  expect(help).toHaveTextContent("Seek 5 seconds; move between images");
+  expect(help).toHaveTextContent("Seek 30 seconds backward or forward");
+  expect(help).toHaveTextContent("5% of the video duration (Option on macOS)");
+  expect(help).toHaveTextContent("step one frame backward or forward");
+  expect(help).toHaveTextContent("Show the seek shortcut guide");
   expect(help).toHaveTextContent("Enter or leave fullscreen");
   expect(help).toHaveTextContent("Keep fullscreen controls visible");
   expect(help).toHaveTextContent("Change image display duration");
@@ -2651,7 +2656,9 @@ test("opens a selected result in the player and restores the grid on back", asyn
     await screen.findByRole("button", { name: "Play clip.mp4" }),
   );
 
-  const video = await screen.findByLabelText("Playing clip.mp4");
+  const video = (await screen.findByLabelText(
+    "Playing clip.mp4",
+  )) as HTMLVideoElement;
   Object.defineProperty(video, "duration", { configurable: true, value: 120 });
   fireEvent.loadedMetadata(video);
   expect(convertFileSrcMock).toHaveBeenCalledWith("/Videos/clip.mp4");
@@ -2778,9 +2785,11 @@ test("uses the overlay player controls from the design", async () => {
 
   for (const name of [
     "Previous video",
-    "Skip back 10 seconds",
+    /Skip back 5 seconds/,
+    /Step backward one frame/,
     "Play",
-    "Skip forward 10 seconds",
+    /Skip forward 5 seconds/,
+    /Step forward one frame/,
     "Next video",
   ]) {
     expect(transport).toContainElement(screen.getByRole("button", { name }));
@@ -2971,9 +2980,7 @@ test("shows the moved file path after its folder is retagged", async () => {
     await screen.findByRole("button", { name: "Play clip-a.mp4" }),
   );
   await screen.findByLabelText("Playing clip-a.mp4");
-  expect(
-    screen.getByDisplayValue("/Videos/Trip/clip-a.mp4"),
-  ).toBeVisible();
+  expect(screen.getByDisplayValue("/Videos/Trip/clip-a.mp4")).toBeVisible();
 
   fireEvent.keyDown(window, { key: "T", shiftKey: true });
   await user.keyboard("beach{Enter}");
@@ -3396,7 +3403,9 @@ test("refreshes the current video when a late folder rename moved it", async () 
   await act(async () => {
     answerPrepareB({ filePath: "/Videos/Trip/clip-b.mp4" });
   });
-  expect(screen.getByDisplayValue("/Videos/Trip [beach]/clip-b.mp4")).toBeVisible();
+  expect(
+    screen.getByDisplayValue("/Videos/Trip [beach]/clip-b.mp4"),
+  ).toBeVisible();
   expect(preparations).toBe(3);
 });
 
@@ -3623,7 +3632,9 @@ test("retries the retag refresh once when it fails", async () => {
       if (preparations === 1)
         return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
       if (preparations === 2)
-        return Promise.reject(new Error("The video is momentarily unavailable."));
+        return Promise.reject(
+          new Error("The video is momentarily unavailable."),
+        );
       return Promise.resolve({ filePath: "/Videos/tagged [review].mp4" });
     }
     if (command === "remove_video_tags")
@@ -4458,6 +4469,24 @@ test("shows its keyboard shortcut on every control that has one", async () => {
       .getByRole("button", { name: "Back to results" })
       .querySelector(".key-hint"),
   ).toHaveTextContent("Esc");
+
+  const skipBack = screen.getByRole("button", { name: /Skip back 5 seconds/ });
+  expect(skipBack).toHaveAttribute(
+    "aria-keyshortcuts",
+    "ArrowLeft Shift+ArrowLeft Alt+ArrowLeft",
+  );
+  expect(skipBack.querySelector(".key-hint")).toHaveTextContent(
+    "←/Shift+←/Alt+←",
+  );
+  for (const [name, shortcut] of [
+    [/Step backward one frame/, ","],
+    [/Step forward one frame/, "."],
+    ["Show seek shortcut guide", "J"],
+  ]) {
+    const control = screen.getByRole("button", { name });
+    expect(control).toHaveAttribute("aria-keyshortcuts", shortcut);
+    expect(control.querySelector(".key-hint")).toHaveTextContent(shortcut);
+  }
 });
 
 test("steps playback speed with the keyboard", async () => {
@@ -5756,7 +5785,7 @@ test("supports playback speeds from 0.1x through 4x", async () => {
   expect(speed).toHaveValue("3");
 });
 
-test("skips web playback by ten seconds", async () => {
+test("the skip button seeks web playback by five seconds", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -5782,12 +5811,12 @@ test("skips web playback by ten seconds", async () => {
   });
   fireEvent.timeUpdate(video);
   await user.click(
-    screen.getByRole("button", { name: "Skip forward 10 seconds" }),
+    screen.getByRole("button", { name: /Skip forward 5 seconds/ }),
   );
-  expect((video as HTMLVideoElement).currentTime).toBe(30);
+  expect((video as HTMLVideoElement).currentTime).toBe(25);
 });
 
-test("uses left and right arrows for ten-second seeking", async () => {
+test("uses Shift and Alt arrows for larger seeks, then restores five seconds", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -5805,24 +5834,230 @@ test("uses left and right arrows for ten-second seeking", async () => {
     await screen.findByRole("button", { name: "Play clip.mp4" }),
   );
   const video = await screen.findByLabelText("Playing clip.mp4");
-  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "duration", { configurable: true, value: 3600 });
   Object.defineProperty(video, "currentTime", {
     configurable: true,
     writable: true,
-    value: 20,
+    value: 1800,
   });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  expect(await screen.findByRole("button", { name: "Pause" })).toBeVisible();
+
+  const timeline = screen.getByLabelText("Video timeline");
+  timeline.focus();
+  const timelineAltArrow = new KeyboardEvent("keydown", {
+    key: "ArrowRight",
+    altKey: true,
+    bubbles: true,
+    cancelable: true,
+  });
+  timeline.dispatchEvent(timelineAltArrow);
+  expect(timelineAltArrow.defaultPrevented).toBe(false);
+  expect(video).toHaveProperty("currentTime", 1800);
+
+  fireEvent.keyDown(window, { key: "ArrowRight", shiftKey: true });
+  expect(video).toHaveProperty("currentTime", 1830);
+  expect(screen.getByRole("status")).toHaveTextContent("+30s · 30:30");
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 1835);
+  expect(screen.getByRole("status")).toHaveTextContent("+5s · 30:35");
+
+  const altSeek = new KeyboardEvent("keydown", {
+    key: "ArrowRight",
+    altKey: true,
+    cancelable: true,
+  });
+  act(() => void window.dispatchEvent(altSeek));
+  expect(altSeek.defaultPrevented).toBe(true);
+  expect(video).toHaveProperty("currentTime", 2015);
+  expect(screen.getByRole("status")).toHaveTextContent("+3m (5%) · 33:35");
+  fireEvent.keyDown(window, { key: "ArrowLeft", altKey: true });
+  expect(video).toHaveProperty("currentTime", 1835);
+  expect(screen.getByRole("status")).toHaveTextContent("−3m (5%) · 30:35");
+  fireEvent.keyDown(window, { key: "ArrowLeft", shiftKey: true });
+  expect(video).toHaveProperty("currentTime", 1805);
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(video).toHaveProperty("currentTime", 1800);
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+  await user.click(screen.getByRole("button", { name: /Skip back 5 seconds/ }));
+  expect(video).toHaveProperty("currentTime", 1795);
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+
+  expect(
+    screen.getByRole("button", { name: /Skip back 5 seconds/ }),
+  ).toHaveAttribute(
+    "aria-keyshortcuts",
+    "ArrowLeft Shift+ArrowLeft Alt+ArrowLeft",
+  );
+  expect(
+    screen.getByRole("button", { name: /Skip forward 5 seconds/ }),
+  ).toHaveAttribute(
+    "aria-keyshortcuts",
+    "ArrowRight Shift+ArrowRight Alt+ArrowRight",
+  );
+});
+
+test("clamps five-second seeks to the ends of a very short video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 4 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 1,
+  });
+  fireEvent.loadedMetadata(video);
   fireEvent.timeUpdate(video);
 
   fireEvent.keyDown(window, { key: "ArrowLeft" });
-  expect(video).toHaveProperty("currentTime", 10);
+  expect(video).toHaveProperty("currentTime", 0);
+  expect(screen.getByRole("status")).toHaveTextContent("−1s · 0:00");
   fireEvent.keyDown(window, { key: "ArrowRight" });
-  expect(video).toHaveProperty("currentTime", 20);
+  expect(video).toHaveProperty("currentTime", 4);
+  expect(screen.getByRole("status")).toHaveTextContent("+4s · 0:04");
+});
+
+test("seeks five percent of a four-hour video and formats the resulting time", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", {
+    configurable: true,
+    value: 4 * 60 * 60,
+  });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 72 * 60,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+
+  fireEvent.keyDown(window, { key: "ArrowRight", altKey: true });
+  expect(video).toHaveProperty("currentTime", 84 * 60);
+  expect(screen.getByRole("status")).toHaveTextContent("+12m (5%) · 1:24:00");
+  fireEvent.keyDown(window, { key: "ArrowLeft", altKey: true });
+  expect(video).toHaveProperty("currentTime", 72 * 60);
+  expect(screen.getByRole("status")).toHaveTextContent("−12m (5%) · 1:12:00");
+});
+
+test("does not seek by percentage until video duration is known", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", {
+    configurable: true,
+    value: Number.NaN,
+  });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 23,
+  });
+  fireEvent.timeUpdate(video);
+
+  const event = new KeyboardEvent("keydown", {
+    key: "ArrowRight",
+    altKey: true,
+    cancelable: true,
+  });
+  act(() => void window.dispatchEvent(event));
+  expect(event.defaultPrevented).toBe(true);
+  expect(video).toHaveProperty("currentTime", 23);
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "Duration unavailable · position unchanged",
+  );
+});
+
+test("keeps arrow navigation on images and scopes video seek modifiers", async () => {
+  const results = [1, 2].map((number) => ({
+    id: `image-${number}`,
+    fileName: `photo-${number}.jpg`,
+    extension: "jpg",
+  }));
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "photo",
+      page: 1,
+      pageSize: 24,
+      totalResults: results.length,
+      totalPages: 1,
+      results,
+    })
+    .mockResolvedValue({ filePath: "/Photos/photo-1.jpg" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(screen.getByRole("button", { name: "Images" }));
+  await user.type(screen.getByRole("searchbox"), "photo{Enter}");
+  await user.click(screen.getByRole("button", { name: "Play photo-1.jpg" }));
+  await screen.findByLabelText("Playing photo-1.jpg");
+
+  const nextImage = screen.getByRole("button", { name: "Next image" });
+  expect(nextImage).toHaveAttribute("aria-keyshortcuts", "ArrowRight");
+  expect(nextImage.querySelector(".key-hint")).toHaveTextContent("→");
+  fireEvent.keyDown(window, { key: "ArrowRight", shiftKey: true });
+  await screen.findByLabelText("Playing photo-2.jpg");
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  await screen.findByLabelText("Playing photo-1.jpg");
+
+  const altArrow = new KeyboardEvent("keydown", {
+    key: "ArrowRight",
+    altKey: true,
+    cancelable: true,
+  });
+  act(() => void window.dispatchEvent(altArrow));
+  expect(altArrow.defaultPrevented).toBe(false);
+  expect(screen.getByLabelText("Playing photo-1.jpg")).toBeVisible();
   expect(
-    screen.getByRole("button", { name: "Skip back 10 seconds" }),
-  ).toHaveAttribute("aria-keyshortcuts", "ArrowLeft");
+    screen.queryByRole("button", { name: /Step .* one frame/ }),
+  ).not.toBeInTheDocument();
   expect(
-    screen.getByRole("button", { name: "Skip forward 10 seconds" }),
-  ).toHaveAttribute("aria-keyshortcuts", "ArrowRight");
+    screen.queryByRole("button", { name: "Show seek shortcut guide" }),
+  ).not.toBeInTheDocument();
 });
 
 test("changes volume with the discoverable keyboard shortcuts", async () => {
@@ -6112,7 +6347,7 @@ test("keeps keyboard shortcuts active after a transport button is clicked", asyn
   });
   fireEvent.timeUpdate(video);
 
-  const skipBack = screen.getByRole("button", { name: "Skip back 10 seconds" });
+  const skipBack = screen.getByRole("button", { name: /Skip back 5 seconds/ });
   await user.click(skipBack);
   // The button used to keep the focus it was given, and the ring that came with
   // it, on a control that had already done its work.
@@ -7439,8 +7674,8 @@ test("wraps every button label so the stylesheet can trim it", async () => {
 
   for (const name of [
     "Back to results",
-    "Skip back 10 seconds",
-    "Skip forward 10 seconds",
+    /Skip back 5 seconds/,
+    /Skip forward 5 seconds/,
     "Subtitles",
   ]) {
     expect(
@@ -8450,10 +8685,9 @@ test("sends the chosen aspect ratio to native playback", async () => {
   });
 });
 
-// Ten seconds is a compromise: too far for finding the frame a face appears
-// on, too short for walking through an hour of footage. The step is therefore
-// a choice of its own, and whatever is chosen has to move both skips.
-test("cycles the skip step and applies it to both directions", async () => {
+// Seeking starts from the last requested position, so two presses made before
+// the backend reports a new time still add up to ten seconds.
+test("seeks by five seconds per arrow press in either direction", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -8479,55 +8713,87 @@ test("cycles the skip step and applies it to both directions", async () => {
   });
   fireEvent.timeUpdate(video);
 
-  const control = screen.getByRole("button", { name: "Skip step: 10 seconds" });
-  expect(control).toHaveAttribute("aria-keyshortcuts", "J");
-  expect(control.querySelector(".key-hint")).toHaveTextContent("J");
+  const skipBack = screen.getByRole("button", {
+    name: /Skip back 5 seconds/,
+  });
+  const skipForward = screen.getByRole("button", {
+    name: /Skip forward 5 seconds/,
+  });
+  expect(skipBack).toHaveAttribute(
+    "aria-keyshortcuts",
+    "ArrowLeft Shift+ArrowLeft Alt+ArrowLeft",
+  );
+  expect(skipBack.querySelector(".key-hint")).toHaveTextContent(
+    "←/Shift+←/Alt+←",
+  );
+  expect(skipForward).toHaveAttribute(
+    "aria-keyshortcuts",
+    "ArrowRight Shift+ArrowRight Alt+ArrowRight",
+  );
+  expect(skipForward.querySelector(".key-hint")).toHaveTextContent(
+    "→/Shift+→/Alt+→",
+  );
 
-  // The step it starts on is the one both skips used before they could be
-  // changed.
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(video).toHaveProperty("currentTime", 1005);
+  expect(screen.getByRole("status")).toHaveTextContent("+5s · 16:45");
   fireEvent.keyDown(window, { key: "ArrowRight" });
   expect(video).toHaveProperty("currentTime", 1010);
-
-  await user.click(control);
-  expect(
-    screen.getByRole("button", { name: "Skip step: 30 seconds" }),
-  ).toBeVisible();
-  fireEvent.keyDown(window, { key: "ArrowRight" });
-  expect(video).toHaveProperty("currentTime", 1040);
-  // Backwards moves by exactly what forwards did.
-  await user.click(
-    screen.getByRole("button", { name: "Skip back 30 seconds" }),
-  );
-  expect(video).toHaveProperty("currentTime", 1010);
-
-  fireEvent.keyDown(window, { key: "j" });
-  await user.click(
-    screen.getByRole("button", { name: "Skip forward 1 minute" }),
-  );
-  expect(video).toHaveProperty("currentTime", 1070);
-
-  for (const name of ["5 minutes", "10 minutes"]) {
-    fireEvent.keyDown(window, { key: "j" });
-    expect(
-      screen.getByRole("button", { name: `Skip step: ${name}` }),
-    ).toBeVisible();
-  }
-
-  // Round the cycle: the frame and the short steps come next, and it wraps
-  // back to where it started rather than sticking at the far end.
-  for (const name of [
-    "1 frame (assumed 30 fps)",
-    "1 second",
-    "5 seconds",
-    "10 seconds",
-  ]) {
-    fireEvent.keyDown(window, { key: "j" });
-    expect(
-      screen.getByRole("button", { name: `Skip step: ${name}` }),
-    ).toBeVisible();
-  }
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+  expect(screen.getByRole("status")).toHaveTextContent("+5s · 16:50");
   fireEvent.keyDown(window, { key: "ArrowLeft" });
-  expect(video).toHaveProperty("currentTime", 1060);
+  expect(video).toHaveProperty("currentTime", 1005);
+  expect(screen.getByRole("status")).toHaveTextContent("−5s · 16:45");
+  await user.click(skipBack);
+  expect(video).toHaveProperty("currentTime", 1000);
+  expect(screen.getByRole("status")).toHaveTextContent("−5s · 16:40");
+});
+
+test("repeated seeks replace one feedback overlay and restart its timer", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    invokeMock
+      .mockResolvedValueOnce({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      })
+      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
+    const video = await screen.findByLabelText("Playing clip.mp4");
+    Object.defineProperty(video, "duration", {
+      configurable: true,
+      value: 120,
+    });
+    Object.defineProperty(video, "currentTime", {
+      configurable: true,
+      writable: true,
+      value: 30,
+    });
+    fireEvent.loadedMetadata(video);
+    fireEvent.timeUpdate(video);
+
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    act(() => vi.advanceTimersByTime(1_500));
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+    expect(screen.getByRole("status")).toHaveTextContent("+5s · 0:40");
+
+    act(() => vi.advanceTimersByTime(1_999));
+    expect(screen.getByRole("status")).toBeVisible();
+    act(() => vi.advanceTimersByTime(1));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 // VLC's A-B loop: one key marks where the range starts, another where it
@@ -8578,6 +8844,7 @@ test("marks a range with B and E and plays only that range", async () => {
   expect(screen.getByLabelText("Range start marker")).toBeInTheDocument();
   vi.mocked(HTMLMediaElement.prototype.play).mockClear();
   fireEvent.ended(video);
+  fireEvent.seeked(video);
   expect(video).toHaveProperty("currentTime", 10);
   expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
   expect(screen.queryByLabelText("Range end marker")).not.toBeInTheDocument();
@@ -8585,6 +8852,7 @@ test("marks a range with B and E and plays only that range", async () => {
   video.currentTime = 30;
   fireEvent.timeUpdate(video);
   fireEvent.keyDown(window, { key: "e" });
+  fireEvent.seeked(video);
   expect(
     screen.getByRole("button", { name: "Range end: 0:30" }),
   ).toHaveAttribute("aria-pressed", "true");
@@ -8600,6 +8868,7 @@ test("marks a range with B and E and plays only that range", async () => {
   video.currentTime = 30.2;
   fireEvent.timeUpdate(video);
   expect(video).toHaveProperty("currentTime", 10);
+  fireEvent.seeked(video);
 
   // Inside the range, playback is left alone.
   video.currentTime = 20;
@@ -8640,6 +8909,7 @@ test("an end marked alone loops from the start of the video", async () => {
   fireEvent.loadedMetadata(video);
   fireEvent.timeUpdate(video);
   fireEvent.keyDown(window, { key: "e" });
+  fireEvent.seeked(video);
   expect(screen.getByLabelText("Range end marker")).toBeInTheDocument();
   expect(screen.queryByLabelText("Range start marker")).not.toBeInTheDocument();
   video.currentTime = 30.2;
@@ -8716,9 +8986,8 @@ test("clears the range when moving to another video", async () => {
   ).toHaveAttribute("aria-pressed", "false");
 });
 
-// Ten seconds is a nudge through a feature and a third of a short clip, so the
-// step each video starts on is read from that video's own length.
-test("starts each video on the skip step closest to a tenth of its length", async () => {
+// Seek size stays predictable across clips rather than changing with length.
+test("uses the same five-second skip buttons on short and long videos", async () => {
   const results = [1, 2].map((number) => ({
     id: `video-${number}`,
     fileName: `clip-${number}.mp4`,
@@ -8739,32 +9008,122 @@ test("starts each video on the skip step closest to a tenth of its length", asyn
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
   await user.click(await screen.findByRole("button", { name: "Play all" }));
 
-  // Fifty minutes: a tenth of it is exactly one of the steps on offer.
+  // A long video still uses the same five-second skip action.
   const first = await screen.findByLabelText("Playing clip-1.mp4");
   Object.defineProperty(first, "duration", {
     configurable: true,
-    value: 3000,
+    value: 36000,
+  });
+  Object.defineProperty(first, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 1200,
   });
   fireEvent.loadedMetadata(first);
+  fireEvent.timeUpdate(first);
   expect(
-    await screen.findByRole("button", { name: "Skip step: 5 minutes" }),
+    await screen.findByRole("button", { name: /Skip back 5 seconds/ }),
   ).toBeVisible();
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  expect(first).toHaveProperty("currentTime", 1205);
+  expect(screen.getByRole("status")).toHaveTextContent("+5s · 20:05");
 
-  // The next video is read on its own terms rather than inheriting the last
-  // one's step: two minutes wants ten seconds, the closest step to twelve.
+  // A short clip uses the same action instead of selecting a fraction of its
+  // own duration.
   fireEvent.keyDown(window, { key: "PageDown" });
   const second = await screen.findByLabelText("Playing clip-2.mp4");
-  Object.defineProperty(second, "duration", { configurable: true, value: 120 });
+  expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  Object.defineProperty(second, "duration", { configurable: true, value: 20 });
+  Object.defineProperty(second, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 10,
+  });
   fireEvent.loadedMetadata(second);
+  fireEvent.timeUpdate(second);
   expect(
-    await screen.findByRole("button", { name: "Skip step: 10 seconds" }),
+    await screen.findByRole("button", { name: /Skip forward 5 seconds/ }),
   ).toBeVisible();
+  fireEvent.keyDown(window, { key: "ArrowLeft" });
+  expect(second).toHaveProperty("currentTime", 5);
 });
 
-// The length arrives a moment after the file opens, and on the native path a
-// poll keeps repeating it. Neither may undo a choice the viewer has already
-// made about the file they are watching.
-test("leaves a chosen skip step alone when the length arrives late", async () => {
+test("shows the seek guide from J and its button, then dismisses it", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    invokeMock
+      .mockResolvedValueOnce({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      })
+      .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play clip.mp4" }),
+    );
+    await screen.findByLabelText("Playing clip.mp4");
+    const guideButton = screen.getByRole("button", {
+      name: "Show seek shortcut guide",
+    });
+    expect(guideButton).toHaveAttribute("aria-keyshortcuts", "J");
+    expect(guideButton.querySelector(".key-hint")).toHaveTextContent("J");
+    await user.click(guideButton);
+    expect(
+      screen.getByRole("region", { name: "Seek shortcut guide" }),
+    ).toBeVisible();
+    const focusedElement = document.activeElement;
+    fireEvent.keyDown(window, { key: "j" });
+    expect(document.activeElement).toBe(focusedElement);
+    expect(
+      screen.getByRole("region", { name: "Seek shortcut guide" }),
+    ).toBeVisible();
+    act(() => vi.advanceTimersByTime(4_999));
+    expect(
+      screen.getByRole("region", { name: "Seek shortcut guide" }),
+    ).toBeVisible();
+    act(() => vi.advanceTimersByTime(1));
+    expect(
+      screen.queryByRole("region", { name: "Seek shortcut guide" }),
+    ).not.toBeInTheDocument();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("shows J's seek guide in fullscreen while the controls stay hidden", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const userAgent = vi
+    .spyOn(window.navigator, "userAgent", "get")
+    .mockReturnValue("AppleWebKit Mac OS X");
+  try {
+    await playForFullscreen();
+    fireEvent.keyDown(window, { key: "f" });
+    await waitFor(() =>
+      expect(document.querySelector(".player-shell")).toHaveClass("fullscreen"),
+    );
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+    const focusedElement = document.activeElement;
+
+    fireEvent.keyDown(window, { key: "j" });
+    expect(
+      screen.getByRole("region", { name: "Seek shortcut guide" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Video controls")).toHaveClass("idle");
+    expect(document.activeElement).toBe(focusedElement);
+  } finally {
+    reportFullscreen(false);
+    userAgent.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
+test("pauses and steps an approximate web frame on the first press", async () => {
   invokeMock
     .mockResolvedValueOnce({
       query: "clip",
@@ -8781,74 +9140,55 @@ test("leaves a chosen skip step alone when the length arrives late", async () =>
   await user.click(
     await screen.findByRole("button", { name: "Play clip.mp4" }),
   );
-  const video = await screen.findByLabelText("Playing clip.mp4");
-
-  fireEvent.keyDown(window, { key: "j" });
-  expect(
-    screen.getByRole("button", { name: "Skip step: 30 seconds" }),
-  ).toBeVisible();
-
-  Object.defineProperty(video, "duration", { configurable: true, value: 3000 });
-  fireEvent.loadedMetadata(video);
-  expect(
-    await screen.findByRole("button", { name: "Skip step: 30 seconds" }),
-  ).toBeVisible();
-});
-
-// A `<video>` element never says how fast its frames run, so the web path can
-// only assume — and the control says so rather than presenting a guess as a
-// measurement.
-test("steps an assumed frame on the web backend and names the assumption", async () => {
-  invokeMock
-    .mockResolvedValueOnce({
-      query: "clip",
-      page: 1,
-      pageSize: 24,
-      totalResults: 1,
-      totalPages: 1,
-      results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
-    })
-    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
-  const user = userEvent.setup();
-  render(<App />);
-  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
-  await user.click(
-    await screen.findByRole("button", { name: "Play clip.mp4" }),
-  );
-  const video = await screen.findByLabelText("Playing clip.mp4");
+  const video = (await screen.findByLabelText(
+    "Playing clip.mp4",
+  )) as HTMLVideoElement;
   Object.defineProperty(video, "duration", { configurable: true, value: 120 });
   Object.defineProperty(video, "currentTime", {
     configurable: true,
     writable: true,
     value: 20,
   });
+  vi.mocked(HTMLMediaElement.prototype.play).mockClear();
+  vi.mocked(HTMLMediaElement.prototype.pause).mockClear();
+  fireEvent.loadedMetadata(video);
+  await screen.findByRole("button", { name: "Pause" });
+  expect(
+    screen.getByRole("button", { name: /Step backward one frame/ }),
+  ).toHaveAttribute("aria-keyshortcuts", ",");
+  expect(
+    screen
+      .getByRole("button", { name: /Step forward one frame/ })
+      .querySelector(".key-hint"),
+  ).toHaveTextContent(".");
   fireEvent.timeUpdate(video);
 
-  await user.click(
-    screen.getByRole("button", { name: "Skip step: 10 seconds" }),
+  fireEvent.keyDown(window, { key: "." });
+  expect(video.currentTime).toBeCloseTo(20 + 1 / 30, 12);
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+  expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
+  expect(screen.getByRole("status")).toHaveTextContent(
+    "+1 frame (approx.) · 0:20",
   );
-  for (let press = 0; press < 4; press += 1)
-    fireEvent.keyDown(window, { key: "j" });
-  expect(
-    screen.getByRole("button", { name: "Skip step: 1 frame (assumed 30 fps)" }),
-  ).toBeVisible();
 
-  fireEvent.keyDown(window, { key: "ArrowRight" });
-  expect((video as HTMLVideoElement).currentTime).toBeCloseTo(20 + 1 / 30, 5);
-  fireEvent.keyDown(window, { key: "ArrowLeft" });
-  expect((video as HTMLVideoElement).currentTime).toBeCloseTo(20, 5);
+  fireEvent.keyDown(window, { key: "." });
+  expect(video.currentTime).toBeCloseTo(20 + 2 / 30, 12);
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+  fireEvent.keyDown(window, { key: "," });
+  expect(video.currentTime).toBeCloseTo(20 + 1 / 30, 12);
+
+  await user.click(
+    screen.getByRole("button", { name: /Step backward one frame/ }),
+  );
+  expect(video.currentTime).toBeCloseTo(20, 12);
 });
 
-// mpv knows the real rate once the file is open, so on that backend a frame is
-// a frame rather than a thirtieth of a second.
-test("steps a real frame using the rate native playback reports", async () => {
-  // mpv answers with wherever the last seek left the file, so the polling that
-  // follows a skip reports the position that skip asked for.
-  let nativeTime = 10;
+test("uses mpv frame-step commands and native OSD feedback", async () => {
+  let nativeTime = 20;
   invokeMock.mockImplementation((command: string, args?: unknown) => {
-    if (command === "seek_native_video") {
-      nativeTime = (args as { seconds: number }).seconds;
-      return Promise.resolve();
+    if (command === "step_native_video") {
+      nativeTime += (args as { forward: boolean }).forward ? 1 / 25 : -1 / 25;
+      return Promise.resolve(nativeTime);
     }
     if (command === "search_videos") {
       return Promise.resolve({
@@ -8879,10 +9219,10 @@ test("steps a real frame using the rate native playback reports", async () => {
     }
     return Promise.resolve();
   });
-  const seeks = () =>
+  const steps = () =>
     invokeMock.mock.calls
-      .filter(([command]) => command === "seek_native_video")
-      .map(([, args]) => (args as { seconds: number }).seconds);
+      .filter(([command]) => command === "step_native_video")
+      .map(([, args]) => (args as { forward: boolean }).forward);
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "native{Enter}");
@@ -8890,35 +9230,82 @@ test("steps a real frame using the rate native playback reports", async () => {
     await screen.findByRole("button", { name: "Play native.mkv" }),
   );
   await screen.findByLabelText("Playing native.mkv");
-
-  // Two minutes, so the poll that reports the length settles the step on the
-  // ten seconds nearest a tenth of it. Waiting for that rather than for the
-  // opening step keeps the cycle below counting from a known place.
   await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Skip step: 10 seconds" }),
-    ).toBeVisible(),
+    expect(invokeMock).toHaveBeenCalledWith("native_playback_state"),
   );
-  for (let press = 0; press < 5; press += 1)
-    fireEvent.keyDown(window, { key: "j" });
+  expect(
+    screen.getByRole("button", { name: /Step forward one frame/ }),
+  ).toHaveAttribute("aria-keyshortcuts", ".");
+
+  fireEvent.keyDown(window, { key: "." });
+  await waitFor(() => expect(steps().at(-1)).toBe(true));
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
   await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Skip step: 1 frame (25 fps)" }),
-    ).toBeVisible(),
+    expect(screen.getByRole("status")).toHaveTextContent("+1 frame · 0:20"),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("show_native_video_text", {
+    message: "+1 frame · 0:20",
+    durationMs: 2000,
+  });
+
+  fireEvent.keyDown(window, { key: "," });
+  await waitFor(() => expect(steps().at(-1)).toBe(false));
+  await waitFor(() =>
+    expect(screen.getByRole("status")).toHaveTextContent("−1 frame · 0:20"),
+  );
+  await user.click(
+    screen.getByRole("button", { name: /Step forward one frame/ }),
+  );
+  await waitFor(() => expect(steps().at(-1)).toBe(true));
+});
+
+test("adds rapid native arrow seeks while backend position polling is stale", async () => {
+  const nativeTime = 1000;
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "native.mkv", extension: "mkv" }],
+      });
+    if (command === "prepare_video")
+      return Promise.resolve({
+        filePath: "/Videos/native.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
+    if (command === "native_video_rotation") return Promise.resolve(0);
+    if (command === "native_playback_state")
+      return Promise.resolve({
+        duration: 3600,
+        currentTime: nativeTime,
+        paused: false,
+        ended: false,
+      });
+    if (command === "seek_native_video") return Promise.resolve();
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mkv" }),
+  );
+  await screen.findByLabelText("Playing native.mkv");
+  await waitFor(() =>
+    expect(screen.getByText("16:40 / 1:00:00")).toBeVisible(),
   );
 
   fireEvent.keyDown(window, { key: "ArrowRight" });
-  await waitFor(() => expect(seeks().at(-1)).toBeCloseTo(10 + 1 / 25, 5));
-
-  // Backwards takes whichever step is chosen, from where the last one landed.
-  fireEvent.keyDown(window, { key: "j" });
-  await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Skip step: 1 second" }),
-    ).toBeVisible(),
-  );
-  fireEvent.keyDown(window, { key: "ArrowLeft" });
-  await waitFor(() => expect(seeks().at(-1)).toBeCloseTo(10 + 1 / 25 - 1, 5));
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  const seeks = invokeMock.mock.calls
+    .filter(([command]) => command === "seek_native_video")
+    .map(([, args]) => (args as { seconds: number }).seconds);
+  expect(seeks).toEqual([1005, 1010]);
+  expect(screen.getByRole("status")).toHaveTextContent("+5s · 16:50");
 });
 
 test("plays the playlist Toka was launched with and leaves it to come back to", async () => {
@@ -9437,7 +9824,7 @@ test("shows image results and handles slideshow controls", async () => {
     expect(image).toHaveAttribute("src", "asset:///Photos/sunset.jpg");
     expect(screen.getByText("Playlist image 1 of 2")).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: /Skip step:/ }),
+      screen.queryByRole("button", { name: "Show seek shortcut guide" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("combobox", { name: "Playback speed" }),
@@ -9506,7 +9893,7 @@ test("shows image results and handles slideshow controls", async () => {
     // video-specific controls are omitted rather than left as disabled controls
     expect(screen.queryByLabelText("Playback speed")).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Skip step: 10 seconds" }),
+      screen.queryByRole("button", { name: "Show seek shortcut guide" }),
     ).not.toBeInTheDocument();
 
     // slideshow control with shortcut S

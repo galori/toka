@@ -24,6 +24,8 @@ import {
   prepareVideo,
   searchVideos,
   seekNativeVideo,
+  showNativeVideoText,
+  stepNativeVideo,
   setNativePaused,
   setNativeSpeed,
   setNativeVolume,
@@ -1033,54 +1035,14 @@ const VOLUME_PRESETS: {
   { key: "1", volume: 100, name: "Full volume", label: "100%" },
 ];
 
-// How far each skip moves. Ten seconds suits scrubbing past an ad break and
-// nothing else: finding the frame someone walks into shot wants a frame, and
-// walking through an hour of footage wants minutes. So the step is a choice,
-// and both skips take whichever one is chosen.
-// A step without `seconds` is one frame, which is only known in seconds once
-// the backend says how fast the frames run.
-const SKIP_STEPS: { label: string; name: string; seconds?: number }[] = [
-  { label: "1f", name: "1 frame" },
-  { label: "1s", name: "1 second", seconds: 1 },
-  { label: "5s", name: "5 seconds", seconds: 5 },
-  { label: "10s", name: "10 seconds", seconds: 10 },
-  { label: "30s", name: "30 seconds", seconds: 30 },
-  { label: "1m", name: "1 minute", seconds: 60 },
-  { label: "5m", name: "5 minutes", seconds: 300 },
-  { label: "10m", name: "10 minutes", seconds: 600 },
-];
-
-// Where the cycle starts before anything is known about the file: what both
-// skips did before they could be changed.
-const DEFAULT_SKIP_STEP = SKIP_STEPS.findIndex((step) => step.seconds === 10);
-
-// How far a skip should reach depends on what it is moving through: ten seconds
-// is a nudge in a feature and a third of a short clip. A tenth of the file is
-// the yardstick — ten of them cross it — so each video opens on whichever step
-// lands nearest that, and a tie takes the shorter one, since overshooting the
-// moment being looked for is the more tedious mistake to undo.
-// The frame step is not a candidate: it measures a rate, not a length.
-const skipStepForDuration = (duration: number) => {
-  if (!Number.isFinite(duration) || duration <= 0) return undefined;
-  const target = duration / 10;
-  let best: number | undefined;
-  let closest = Number.POSITIVE_INFINITY;
-  SKIP_STEPS.forEach((step, index) => {
-    if (step.seconds === undefined) return;
-    const distance = Math.abs(step.seconds - target);
-    if (distance < closest) {
-      closest = distance;
-      best = index;
-    }
-  });
-  return best;
-};
-
-// mpv reads a real frame rate out of the file, but a `<video>` element exposes
-// none at all, and neither knows one before the file is open. So a frame is a
-// thirtieth of a second until a backend says otherwise — an assumption the
-// control names, so a guess is never presented as a measurement.
-const ASSUMED_FRAME_RATE = 30;
+// The web media API exposes no frame-step command or frame rate. Its fallback
+// seeks by one thirtieth of a second and tells the viewer that the estimate is
+// approximate. mpv uses its native frame-step commands instead.
+const APPROXIMATE_FRAME_SECONDS = 1 / 30;
+const SEEK_FEEDBACK_DURATION = 2000;
+const SEEK_GUIDE_DURATION = 5000;
+const SEEK_GUIDE_TEXT =
+  "SEEK SHORTCUTS\n← / →  ±5 seconds\nShift+← / →  ±30 seconds\nAlt/Option+← / →  ±5% of duration\n, / .  Pause and step one frame\nJ  Show this guide";
 
 // The shapes worth cycling between, starting from the one the file itself
 // declares. Each is written the way it is spoken and both the number mpv wants
@@ -1169,6 +1131,8 @@ type HelpSection = {
   title: string;
   entries: { shortcut: string; description: string }[];
 };
+
+type SeekOverlay = { kind: "seek" | "guide"; text: string };
 
 // Keep this list short enough to scan, but complete enough that the help pane
 // is the place to learn the app rather than a second, partial set of hints.
@@ -1268,10 +1232,23 @@ const HELP_SECTIONS: HelpSection[] = [
       },
       {
         shortcut: "ArrowLeft ArrowRight",
-        description: "Seek, or move between images",
+        description: "Seek 5 seconds; move between images",
+      },
+      {
+        shortcut: "Shift+ArrowLeft Shift+ArrowRight",
+        description: "Seek 30 seconds backward or forward",
+      },
+      {
+        shortcut: "Alt+ArrowLeft Alt+ArrowRight",
+        description: "Seek 5% of the video duration (Option on macOS)",
+      },
+      {
+        shortcut: ", .",
+        description:
+          "Pause and step one frame backward or forward; web playback uses an approximate time step",
       },
       { shortcut: "PageUp PageDown", description: "Previous or next item" },
-      { shortcut: "J", description: "Change the skip step" },
+      { shortcut: "J", description: "Show the seek shortcut guide" },
       {
         shortcut: "B E",
         description:
@@ -1513,7 +1490,11 @@ function HelpButton({
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const wholeSeconds = Math.floor(seconds);
-  return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const remainder = String(wholeSeconds % 60).padStart(2, "0");
+  if (hours) return `${hours}:${String(minutes).padStart(2, "0")}:${remainder}`;
+  return `${minutes}:${remainder}`;
 }
 
 export function playbackSource(filePath: string): string {
@@ -1581,6 +1562,18 @@ function Player({
   const preparedPath = useRef<string | undefined>(undefined);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  // Requested positions stay authoritative until the backend reports that it
+  // has reached them. This lets consecutive keys build on one another while a
+  // native poll or media timeupdate is still catching up.
+  const seekPosition = useRef(0);
+  const pendingSeek = useRef<
+    { target: number; direction: -1 | 1; tolerance: number } | undefined
+  >(undefined);
+  const playbackPositionGeneration = useRef(0);
+  const nativeSeekGeneration = useRef(0);
+  const frameStepGeneration = useRef(0);
+  const [seekOverlay, setSeekOverlay] = useState<SeekOverlay>();
+  const seekOverlayTimeout = useRef<number | undefined>(undefined);
   const [error, setError] = useState<string>();
   const [nativeStarted, setNativeStarted] = useState(false);
   const [fullscreenError, setFullscreenError] = useState<string>();
@@ -1604,9 +1597,30 @@ function Player({
   // later, so a pause that lands in that gap would otherwise be answered by a
   // restart or an advance that starts the video again underneath it.
   const pausedByViewer = useRef(false);
+  const reportPlaybackPosition = useCallback(
+    (position: number, seekCompleted = false) => {
+      if (!Number.isFinite(position)) return false;
+      const reported = Math.max(0, position);
+      const pending = pendingSeek.current;
+      if (pending && !seekCompleted) {
+        // Ignore a poll or timeupdate that was already in flight when the seek
+        // was requested. A forward seek is acknowledged when the backend reaches
+        // or passes its target; backward seeks use the inverse comparison.
+        const reached =
+          pending.direction > 0
+            ? reported >= pending.target - pending.tolerance
+            : reported <= pending.target + pending.tolerance;
+        if (!reached) return false;
+      }
+      pendingSeek.current = undefined;
+      seekPosition.current = reported;
+      setCurrentTime(reported);
+      return true;
+    },
+    [],
+  );
   const [rotation, setRotation] = useState(0);
   const [aspectStep, setAspectStep] = useState(0);
-  const [skipStepIndex, setSkipStepIndex] = useState(DEFAULT_SKIP_STEP);
   // The stretch of this video the viewer has marked to play on its own, the
   // way VLC's A-B loop works. It belongs to the file on screen and is dropped
   // with it, so nothing about it outlives a move to another video.
@@ -1614,7 +1628,6 @@ function Player({
   const [rangeEnd, setRangeEnd] = useState<number>();
   // Whatever the backend has been able to say about the open file, so an
   // undefined rate means "nobody knows yet" rather than "no frames".
-  const [frameRate, setFrameRate] = useState<number>();
   const [nativeBaseRotation, setNativeBaseRotation] = useState(0);
   const [playlistOpen, setPlaylistOpen] = useState(true);
   const [fullscreenPlaylist, setFullscreenPlaylist] =
@@ -1948,8 +1961,7 @@ function Player({
     // the current video rather than the one it started from. The extension
     // never changes under a rename, so the retained list answers truly.
     const target = playlist.find((item) => item.id === id);
-    const targetIsImage =
-      target !== undefined && isImageResult(target);
+    const targetIsImage = target !== undefined && isImageResult(target);
     const webVideo =
       target !== undefined &&
       !targetIsImage &&
@@ -1970,10 +1982,7 @@ function Player({
     };
     const applyRefresh = (next: PreparedVideo, sequence: number) => {
       // A newer preparation, or a newer video, owns the display now.
-      if (
-        currentVideoId.current !== id ||
-        sequence !== prepareSequence.current
-      )
+      if (currentVideoId.current !== id || sequence !== prepareSequence.current)
         return;
       // A tag the name already carried renames nothing: the source stays,
       // so there is no new beginning to resume from.
@@ -1998,10 +2007,7 @@ function Player({
       try {
         applyRefresh(await prepareVideo(id), retry);
       } catch (reason: unknown) {
-        if (
-          currentVideoId.current === id &&
-          retry === prepareSequence.current
-        )
+        if (currentVideoId.current === id && retry === prepareSequence.current)
           setError(errorMessage(reason));
       }
     }
@@ -2040,9 +2046,6 @@ function Player({
   // have to depend on it and restart playback whenever it changes.
   const chosenSpeed = useRef(speed);
   const chosenVolume = useRef(volume);
-  // Whether the step showing is one the viewer picked for this file or one read
-  // from its length, which decides whether the length may still change it.
-  const chosenSkipStep = useRef(false);
   useEffect(() => {
     chosenSpeed.current = speed;
   }, [speed]);
@@ -2059,6 +2062,15 @@ function Player({
     preparedPath.current = undefined;
     setDuration(0);
     setCurrentTime(0);
+    seekPosition.current = 0;
+    pendingSeek.current = undefined;
+    playbackPositionGeneration.current += 1;
+    nativeSeekGeneration.current += 1;
+    frameStepGeneration.current += 1;
+    if (seekOverlayTimeout.current !== undefined)
+      window.clearTimeout(seekOverlayTimeout.current);
+    seekOverlayTimeout.current = undefined;
+    setSeekOverlay(undefined);
     imageElapsed.current = 0;
     resumeAfterRetag.current = undefined;
     setError(undefined);
@@ -2068,13 +2080,8 @@ function Player({
     pausedByViewer.current = false;
     setRotation(0);
     setAspectStep(0);
-    // Both the step and the rate it may be measured against belong to this
-    // file: the next one is read from its own length once that is known.
-    setSkipStepIndex(DEFAULT_SKIP_STEP);
-    chosenSkipStep.current = false;
     setRangeStart(undefined);
     setRangeEnd(undefined);
-    setFrameRate(undefined);
     setNativeBaseRotation(0);
     setNativeSubtitles([]);
     setEmbeddedSubtitles([]);
@@ -2113,7 +2120,12 @@ function Player({
       });
     return () => {
       active = false;
+      frameStepGeneration.current += 1;
+      if (seekOverlayTimeout.current !== undefined)
+        window.clearTimeout(seekOverlayTimeout.current);
+      seekOverlayTimeout.current = undefined;
       if (nativeActive) {
+        void showNativeVideoText("", 1).catch(() => {});
         void setNativeVideoBounds({
           x: 0,
           y: 0,
@@ -2260,13 +2272,12 @@ function Player({
     observer.observe(surface);
     window.addEventListener("resize", updateBounds);
     const poll = window.setInterval(() => {
+      const generation = playbackPositionGeneration.current;
       void nativePlaybackState()
         .then((state) => {
+          if (generation !== playbackPositionGeneration.current) return;
           setDuration(state.duration);
-          setCurrentTime(state.currentTime);
-          // mpv only knows the rate once it has read the file, so this arrives
-          // with the polling rather than with the load.
-          if (state.frameRate) setFrameRate(state.frameRate);
+          reportPlaybackPosition(state.currentTime);
           if (!state.ended) advancing = false;
           if (state.ended && !advancing && !pausedByViewer.current) {
             advancing = true;
@@ -2304,6 +2315,7 @@ function Player({
     fullscreen,
     index,
     native,
+    reportPlaybackPosition,
     showFullscreenInfo,
   ]);
 
@@ -2517,21 +2529,42 @@ function Player({
   }, [addonOpen]);
 
   const restart = (from = 0) => {
+    const target = clampSeekPosition(from);
+    const previous = seekPosition.current;
+    const direction: -1 | 1 | undefined =
+      target > previous ? 1 : target < previous ? -1 : undefined;
+    pendingSeek.current = direction
+      ? {
+          target,
+          direction,
+          tolerance: Math.min(0.05, Math.abs(target - from) / 2),
+        }
+      : undefined;
+    seekPosition.current = target;
     if (native) {
-      void seekNativeVideo(from)
+      const generation = ++nativeSeekGeneration.current;
+      playbackPositionGeneration.current += 1;
+      void seekNativeVideo(target)
         .then(() => {
+          if (generation !== nativeSeekGeneration.current) return;
+          playbackPositionGeneration.current += 1;
+          pendingSeek.current = undefined;
           if (!pausedByViewer.current) return setNativePaused(false);
         })
         .then(() => {
-          if (!pausedByViewer.current) setPlayingBack(true);
+          if (
+            generation === nativeSeekGeneration.current &&
+            !pausedByViewer.current
+          )
+            setPlayingBack(true);
         })
         .catch((reason: unknown) => setError(errorMessage(reason)));
     } else if (element.current) {
-      element.current.currentTime = from;
+      element.current.currentTime = target;
       play();
     }
-    setCurrentTime(from);
-    noteSeek(from);
+    setCurrentTime(target);
+    noteSeek(target);
   };
 
   // Search playlists start with the results already on screen. Fetching the
@@ -2563,7 +2596,11 @@ function Player({
     // Neither engine reports a final time that quite reaches the duration, so
     // the scrubber stopped five to ten percent short and made every video look
     // as though its ending had been skipped.
-    if (endTime > 0) setCurrentTime(endTime);
+    if (endTime > 0) {
+      seekPosition.current = endTime;
+      pendingSeek.current = undefined;
+      setCurrentTime(endTime);
+    }
     // A marked range that runs to the end of the file can reach it before the
     // range's own end is seen, and it still has to start over rather than
     // hand playback to the next entry.
@@ -2639,47 +2676,165 @@ function Player({
     });
   };
 
-  // The length lands after the file opens — and on the native path a poll
-  // repeats it — so the default waits for it, and stands aside for good once
-  // the viewer has said what they want for this file.
-  useEffect(() => {
-    if (isImage || chosenSkipStep.current) return;
-    const step = skipStepForDuration(duration);
-    if (step !== undefined) setSkipStepIndex(step);
-  }, [duration, isImage]);
-
-  const skipStep = SKIP_STEPS[skipStepIndex];
-  // A frame is only as exact as the rate behind it, so the control says which
-  // rate that is and whether anybody measured it.
-  const skipSeconds = skipStep.seconds ?? 1 / (frameRate ?? ASSUMED_FRAME_RATE);
-  const measuredRate = frameRate
-    ? `${Number(frameRate.toFixed(3))} fps`
-    : `assumed ${ASSUMED_FRAME_RATE} fps`;
-  const skipStepName = skipStep.seconds
-    ? skipStep.name
-    : `${skipStep.name} (${measuredRate})`;
-
-  const cycleSkipStep = () => {
-    chosenSkipStep.current = true;
-    setSkipStepIndex((current) => (current + 1) % SKIP_STEPS.length);
+  const showSeekOverlay = (overlay: SeekOverlay, delay: number) => {
+    if (seekOverlayTimeout.current !== undefined)
+      window.clearTimeout(seekOverlayTimeout.current);
+    setSeekOverlay(overlay);
+    if (native)
+      void showNativeVideoText(overlay.text, delay).catch((reason: unknown) =>
+        setError(errorMessage(reason)),
+      );
+    seekOverlayTimeout.current = window.setTimeout(() => {
+      seekOverlayTimeout.current = undefined;
+      setSeekOverlay(undefined);
+    }, delay);
   };
 
-  const skip = (amount: number) => {
-    const next = Math.max(
-      0,
-      Math.min(duration || Number.POSITIVE_INFINITY, currentTime + amount),
-    );
-    seekTo(next);
+  const clampSeekPosition = (position: number) => {
+    let target = Math.max(0, Number.isFinite(position) ? position : 0);
+    if (duration > 0) target = Math.min(duration, target);
+    // A marked end wraps manual seeks the same way the existing range
+    // enforcement wraps playback when it reaches that end.
+    if (rangeEnd !== undefined && target >= rangeEnd) target = rangeStart ?? 0;
+    return target;
   };
 
   const seekTo = (next: number) => {
-    if (native)
-      void seekNativeVideo(next).catch((reason: unknown) =>
-        setError(errorMessage(reason)),
+    const from = seekPosition.current;
+    const target = clampSeekPosition(next);
+    const direction: -1 | 1 | undefined =
+      target > from ? 1 : target < from ? -1 : undefined;
+    pendingSeek.current = direction
+      ? {
+          target,
+          direction,
+          tolerance: Math.min(0.05, Math.abs(target - from) / 2),
+        }
+      : undefined;
+    seekPosition.current = target;
+    if (native) {
+      const generation = ++nativeSeekGeneration.current;
+      playbackPositionGeneration.current += 1;
+      void seekNativeVideo(target)
+        .then(() => {
+          if (generation !== nativeSeekGeneration.current) return;
+          playbackPositionGeneration.current += 1;
+          pendingSeek.current = undefined;
+        })
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+    } else if (element.current) element.current.currentTime = target;
+    setCurrentTime(target);
+    noteSeek(target);
+    return target;
+  };
+
+  const formatSeekDistance = (distance: number) => {
+    const absolute = Math.round(Math.abs(distance) * 10) / 10;
+    if (absolute < 60) return `${Number(absolute.toFixed(1))}s`;
+    const total = Math.round(absolute);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    if (hours && minutes) return `${hours}h ${minutes}m`;
+    if (hours) return `${hours}h`;
+    if (minutes && seconds) return `${minutes}m ${seconds}s`;
+    if (minutes) return `${minutes}m`;
+    return `${seconds}s`;
+  };
+
+  const seekRelative = (amount: number, percentage?: number) => {
+    if (
+      percentage !== undefined &&
+      (!Number.isFinite(duration) || duration <= 0)
+    ) {
+      showSeekOverlay(
+        { kind: "seek", text: "Duration unavailable · position unchanged" },
+        SEEK_FEEDBACK_DURATION,
       );
-    else if (element.current) element.current.currentTime = next;
-    setCurrentTime(next);
-    noteSeek(next);
+      return;
+    }
+    const from = seekPosition.current;
+    const target = seekTo(from + amount);
+    const sign = target < from ? "−" : "+";
+    const percentageLabel = percentage === undefined ? "" : ` (${percentage}%)`;
+    showSeekOverlay(
+      {
+        kind: "seek",
+        text: `${sign}${formatSeekDistance(target - from)}${percentageLabel} · ${formatTime(target)}`,
+      },
+      SEEK_FEEDBACK_DURATION,
+    );
+  };
+
+  const showSeekGuide = () =>
+    showSeekOverlay(
+      { kind: "guide", text: SEEK_GUIDE_TEXT },
+      SEEK_GUIDE_DURATION,
+    );
+
+  const stepFrame = (direction: -1 | 1) => {
+    pausedByViewer.current = true;
+    setPlayingBack(false);
+    if (native) {
+      const estimated = clampSeekPosition(
+        seekPosition.current + direction * APPROXIMATE_FRAME_SECONDS,
+      );
+      const from = seekPosition.current;
+      seekPosition.current = estimated;
+      pendingSeek.current =
+        estimated === from
+          ? undefined
+          : { target: estimated, direction, tolerance: 0.000001 };
+      setCurrentTime(estimated);
+      const generation = ++frameStepGeneration.current;
+      const seekGeneration = ++nativeSeekGeneration.current;
+      playbackPositionGeneration.current += 1;
+      void stepNativeVideo(direction > 0)
+        .then((actual) => {
+          if (
+            generation !== frameStepGeneration.current ||
+            seekGeneration !== nativeSeekGeneration.current
+          )
+            return;
+          playbackPositionGeneration.current += 1;
+          const measured = Number.isFinite(actual);
+          const reached = measured ? clampSeekPosition(actual) : estimated;
+          const fromPosition = seekPosition.current;
+          seekPosition.current = reached;
+          if (measured)
+            pendingSeek.current =
+              reached === fromPosition
+                ? undefined
+                : {
+                    target: reached,
+                    direction,
+                    tolerance: 0.000001,
+                  };
+          setCurrentTime(reached);
+          const sign = direction < 0 ? "−" : "+";
+          showSeekOverlay(
+            {
+              kind: "seek",
+              text: `${sign}1 frame${measured ? "" : " (approx.)"} · ${formatTime(reached)}`,
+            },
+            SEEK_FEEDBACK_DURATION,
+          );
+        })
+        .catch((reason: unknown) => setError(errorMessage(reason)));
+      return;
+    }
+
+    pause();
+    const from = seekPosition.current;
+    const target = seekTo(from + direction * APPROXIMATE_FRAME_SECONDS);
+    const sign = direction < 0 ? "−" : "+";
+    showSeekOverlay(
+      {
+        kind: "seek",
+        text: `${sign}1 frame (approx.) · ${formatTime(target)}`,
+      },
+      SEEK_FEEDBACK_DURATION,
+    );
   };
 
   // A new start past the end would leave a range that runs backwards, so it
@@ -3266,10 +3421,14 @@ function Player({
           !(event.shiftKey && event.key === "Delete") &&
           !addonShortcut) ||
         event.metaKey ||
-        event.altKey ||
         acceptsTypedText(target)
       )
         return;
+
+      const run = (action: () => void) => {
+        event.preventDefault();
+        action();
+      };
 
       if (
         target instanceof HTMLInputElement &&
@@ -3278,10 +3437,6 @@ function Player({
       )
         return;
 
-      const run = (action: () => void) => {
-        event.preventDefault();
-        action();
-      };
       const volumePreset = VOLUME_PRESETS.find(
         (preset) => preset.key === event.key,
       );
@@ -3342,6 +3497,16 @@ function Player({
           });
         return;
       }
+      if (event.altKey) {
+        if (
+          isImage ||
+          (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+        )
+          return;
+        const direction = event.key === "ArrowLeft" ? -1 : 1;
+        run(() => seekRelative(direction * duration * 0.05, 5));
+        return;
+      }
       if (event.key === " " || event.key === "Spacebar") {
         run(isImage ? toggleSlideshow : playingBack ? pause : play);
       } else if (event.key === "[") {
@@ -3349,11 +3514,19 @@ function Player({
       } else if (event.key === "]") {
         run(() => rotate(90));
       } else if (event.key === "ArrowLeft") {
-        run(() => (isImage ? moveVideo(-1) : skip(-skipSeconds)));
+        run(() =>
+          isImage ? moveVideo(-1) : seekRelative(event.shiftKey ? -30 : -5),
+        );
       } else if (event.key === "ArrowRight") {
-        run(() => (isImage ? moveVideo(1) : skip(skipSeconds)));
+        run(() =>
+          isImage ? moveVideo(1) : seekRelative(event.shiftKey ? 30 : 5),
+        );
+      } else if (event.key === "," && !isImage) {
+        run(() => stepFrame(-1));
+      } else if (event.key === "." && !isImage) {
+        run(() => stepFrame(1));
       } else if (event.key.toLowerCase() === "j") {
-        if (!isImage) run(cycleSkipStep);
+        if (!isImage) run(showSeekGuide);
         else return;
       } else if (event.key.toLowerCase() === "b") {
         if (!isImage) run(markRangeStart);
@@ -3442,8 +3615,10 @@ function Player({
     playlist.length,
     rangeEnd,
     rangeStart,
-    skipSeconds,
+    seekRelative,
+    showSeekGuide,
     slideshowPlaying,
+    stepFrame,
     speed,
     subtitleIndex,
     subtitles,
@@ -3714,9 +3889,7 @@ function Player({
             }}
             onLoadedMetadata={(event) => {
               const media = event.currentTarget;
-              setDuration(
-                Number.isFinite(media.duration) ? media.duration : 0,
-              );
+              setDuration(Number.isFinite(media.duration) ? media.duration : 0);
               media.playbackRate = speed;
               media.volume = volume / 100;
               // A retag swapped the source under the playing video, and the
@@ -3729,7 +3902,10 @@ function Player({
               // a resume, or the video's own ending since has overruled.
               const resume = resumeAfterRetag.current;
               if (resume) {
-                resumeAfterRetag.current = { time: resume.time, pending: false };
+                resumeAfterRetag.current = {
+                  time: resume.time,
+                  pending: false,
+                };
                 media.currentTime = resume.time;
               }
               if (pausedByViewer.current) {
@@ -3747,8 +3923,11 @@ function Player({
               // arrives; that zero is the load talking, not the viewer, so
               // it must not overwrite the position being resumed to.
               if (resumeAfterRetag.current?.pending) return;
-              setCurrentTime(event.currentTarget.currentTime);
+              reportPlaybackPosition(event.currentTarget.currentTime);
             }}
+            onSeeked={(event) =>
+              reportPlaybackPosition(event.currentTarget.currentTime, true)
+            }
             onEnded={(event) =>
               endOfVideo(duration || event.currentTarget.duration || 0)
             }
@@ -3759,6 +3938,57 @@ function Player({
             }
           ></video>
         )}
+        {seekOverlay ? (
+          native ? (
+            <div className="sr-only" role="status" aria-live="polite">
+              {seekOverlay.text}
+            </div>
+          ) : seekOverlay.kind === "seek" ? (
+            <div className="seek-feedback" role="status" aria-live="polite">
+              {seekOverlay.text}
+            </div>
+          ) : (
+            <div
+              className="seek-guide"
+              role="region"
+              aria-label="Seek shortcut guide"
+            >
+              <h2>Seek shortcuts</h2>
+              <dl>
+                <div>
+                  <dt>
+                    <kbd>← / →</kbd>
+                  </dt>
+                  <dd>Seek 5 seconds</dd>
+                </div>
+                <div>
+                  <dt>
+                    <kbd>Shift + ← / →</kbd>
+                  </dt>
+                  <dd>Seek 30 seconds</dd>
+                </div>
+                <div>
+                  <dt>
+                    <kbd>Alt / Option + ← / →</kbd>
+                  </dt>
+                  <dd>Seek 5% of the video duration</dd>
+                </div>
+                <div>
+                  <dt>
+                    <kbd>, / .</kbd>
+                  </dt>
+                  <dd>Pause and step one frame</dd>
+                </div>
+                <div>
+                  <dt>
+                    <kbd>J</kbd>
+                  </dt>
+                  <dd>Show this guide</dd>
+                </div>
+              </dl>
+            </div>
+          )
+        ) : null}
         {fullscreen && showFullscreenInfo ? (
           <div
             ref={fullscreenInfo}
@@ -3811,17 +4041,11 @@ function Player({
                 const nextTime = Number(event.currentTarget.value);
                 if (isImage) {
                   imageElapsed.current = nextTime;
+                  seekPosition.current = nextTime;
                   setCurrentTime(nextTime);
                   return;
                 }
-                if (native)
-                  void seekNativeVideo(nextTime).catch((reason: unknown) =>
-                    setError(errorMessage(reason)),
-                  );
-                else if (element.current)
-                  element.current.currentTime = nextTime;
-                setCurrentTime(nextTime);
-                noteSeek(nextTime);
+                seekTo(nextTime);
               }}
             />
             {rangeMarkers.map((marker) => (
@@ -3842,15 +4066,31 @@ function Player({
               <PreviousIcon />
             </ControlButton>
             <ControlButton
-              shortcut="ArrowLeft"
-              onClick={() => (isImage ? moveVideo(-1) : skip(-skipSeconds))}
+              shortcut={
+                isImage
+                  ? "ArrowLeft"
+                  : "ArrowLeft Shift+ArrowLeft Alt+ArrowLeft"
+              }
+              onClick={() => (isImage ? moveVideo(-1) : seekRelative(-5))}
               aria-label={
-                isImage ? "Previous image" : `Skip back ${skipStep.name}`
+                isImage
+                  ? "Previous image"
+                  : "Skip back 5 seconds; Shift+Left 30 seconds; Alt+Left 5 percent of duration"
               }
               disabled={isImage ? false : undefined}
             >
-              <Label>{isImage ? "←" : `−${skipStep.label}`}</Label>
+              <Label>{isImage ? "←" : "−5s"}</Label>
             </ControlButton>
+            {!isImage ? (
+              <ControlButton
+                shortcut=","
+                onClick={() => stepFrame(-1)}
+                aria-label="Step backward one frame (approximate in web playback)"
+                title="Step backward one frame; approximate in web playback"
+              >
+                <Label>−1f</Label>
+              </ControlButton>
+            ) : null}
             {/* Playing and pausing are one action whose meaning follows the
                 state, so they are one control rather than two, the way every
                 other player draws them. */}
@@ -3878,14 +4118,30 @@ function Player({
               />
             </ControlButton>
             <ControlButton
-              shortcut="ArrowRight"
-              onClick={() => (isImage ? moveVideo(1) : skip(skipSeconds))}
+              shortcut={
+                isImage
+                  ? "ArrowRight"
+                  : "ArrowRight Shift+ArrowRight Alt+ArrowRight"
+              }
+              onClick={() => (isImage ? moveVideo(1) : seekRelative(5))}
               aria-label={
-                isImage ? "Next image" : `Skip forward ${skipStep.name}`
+                isImage
+                  ? "Next image"
+                  : "Skip forward 5 seconds; Shift+Right 30 seconds; Alt+Right 5 percent of duration"
               }
             >
-              <Label>{isImage ? "→" : `+${skipStep.label}`}</Label>
+              <Label>{isImage ? "→" : "+5s"}</Label>
             </ControlButton>
+            {!isImage ? (
+              <ControlButton
+                shortcut="."
+                onClick={() => stepFrame(1)}
+                aria-label="Step forward one frame (approximate in web playback)"
+                title="Step forward one frame; approximate in web playback"
+              >
+                <Label>+1f</Label>
+              </ControlButton>
+            ) : null}
             <ControlButton
               shortcut="PageDown"
               onClick={() => moveVideo(1)}
@@ -3989,15 +4245,12 @@ function Player({
               ) : null}
               {!isImage ? (
                 <>
-                  {/* Named after the step it is on rather than the one it moves
-                      to, like the aspect and loop controls, so the button reads
-                      as the setting it is. */}
                   <ControlButton
                     shortcut="J"
-                    onClick={cycleSkipStep}
-                    aria-label={`Skip step: ${skipStepName}`}
+                    onClick={showSeekGuide}
+                    aria-label="Show seek shortcut guide"
                   >
-                    <Label>{skipStep.label}</Label>
+                    <Label>Guide</Label>
                   </ControlButton>
                   <ControlButton
                     shortcut="B"

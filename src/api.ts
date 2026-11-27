@@ -368,6 +368,17 @@ export function seekNativeVideo(seconds: number): Promise<void> {
   return invoke("seek_native_video", { seconds });
 }
 
+export function stepNativeVideo(forward: boolean): Promise<number> {
+  return invoke("step_native_video", { forward });
+}
+
+export function showNativeVideoText(
+  message: string,
+  durationMs: number,
+): Promise<void> {
+  return invoke("show_native_video_text", { message, durationMs });
+}
+
 export function nativePlaybackState(): Promise<PlaybackState> {
   return invoke("native_playback_state");
 }
