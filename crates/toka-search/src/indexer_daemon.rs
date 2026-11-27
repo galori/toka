@@ -1129,10 +1129,12 @@ impl OwnedSupervisor {
         if self.thumbnails.pending_count_excluding(&[]) != 0 {
             return;
         }
-        if let Ok(revision) = index.revision() {
-            if self.backfill_exhausted_at == Some(revision) {
-                return;
-            }
+        // Read once, before the listing: a write landing mid-scan must
+        // leave the stored revision behind, so the next pass rescans
+        // instead of trusting an exhausted stamp taken after the write.
+        let revision = index.revision().ok();
+        if revision.is_some() && self.backfill_exhausted_at == revision {
+            return;
         }
         let mut folders = Vec::new();
         let mut offset = 0u32;
@@ -1163,7 +1165,7 @@ impl OwnedSupervisor {
             offset = offset.saturating_add(200);
         }
         if folders.is_empty() {
-            self.backfill_exhausted_at = index.revision().ok();
+            self.backfill_exhausted_at = revision;
             return;
         }
         for folder in folders {
