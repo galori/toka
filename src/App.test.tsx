@@ -753,6 +753,53 @@ test("opening a folder drops the previous add-on filter", async () => {
   );
 });
 
+test("a slow open does not supersede a newer search", async () => {
+  const opened = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  const searched = {
+    query: "other",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-2", fileName: "other.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots");
+  let resolveOpen!: (page: typeof opened) => void;
+  const openPending = new Promise<typeof opened>((resolve) => {
+    resolveOpen = resolve;
+  });
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "open_folder") return openPending;
+    if (command === "search_videos") return Promise.resolve(searched);
+    return Promise.resolve({ filePath: "/Videos/other.mp4" });
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+  await waitFor(() => expect(openMock).toHaveBeenCalled());
+  await user.type(screen.getByRole("searchbox"), "other{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play other.mp4" }),
+  ).toBeVisible();
+
+  await act(async () => {
+    resolveOpen(opened);
+  });
+
+  expect(screen.queryByLabelText("Playing clip.mp4")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Play other.mp4" })).toBeVisible();
+  expect(screen.getByRole("searchbox")).toHaveValue("other");
+});
+
 test("a launch playlist bypasses first-launch folder setup", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,

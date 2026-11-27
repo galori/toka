@@ -4938,25 +4938,37 @@ export default function App() {
 
   const openFolderToPlay = async () => {
     setError(undefined);
+    let ticket = requestNumber.current;
     try {
       const path = await open({ directory: true, multiple: false });
       if (typeof path !== "string") return;
-      playOpenedPage(await openFolder(path));
+      // Reserved after the dialog: a search typed while the disk is busy
+      // answers a newer question than this open.
+      ticket = ++requestNumber.current;
+      const opened = await openFolder(path);
+      if (ticket !== requestNumber.current) return;
+      playOpenedPage(opened);
     } catch (reason) {
+      if (ticket !== requestNumber.current) return;
       setError(errorMessage(reason));
     }
   };
 
   const openFileToPlay = async () => {
     setError(undefined);
+    let ticket = requestNumber.current;
     try {
       const path = await open({
         multiple: false,
         filters: [MEDIA_FILE_FILTER],
       });
       if (typeof path !== "string") return;
-      playOpenedPage(await openFile(path));
+      ticket = ++requestNumber.current;
+      const opened = await openFile(path);
+      if (ticket !== requestNumber.current) return;
+      playOpenedPage(opened);
     } catch (reason) {
+      if (ticket !== requestNumber.current) return;
       setError(errorMessage(reason));
     }
   };
