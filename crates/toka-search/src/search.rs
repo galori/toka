@@ -1898,7 +1898,16 @@ fn query_covered_by_direct(expression: &QueryExpr, walked: &HashSet<String>) -> 
             }) => !negated && walked.contains(value),
             QueryExpr::Term(_) => false,
             QueryExpr::Not(inner) => covered(inner, !negated, walked),
+            // Under a negation De Morgan flips the sense: the complement of
+            // an intersection needs both complements covered, while the
+            // complement of a union needs either.
+            QueryExpr::And(left, right) if negated => {
+                covered(left, negated, walked) && covered(right, negated, walked)
+            }
             QueryExpr::And(left, right) => {
+                covered(left, negated, walked) || covered(right, negated, walked)
+            }
+            QueryExpr::Or(left, right) if negated => {
                 covered(left, negated, walked) || covered(right, negated, walked)
             }
             QueryExpr::Or(left, right) => {
@@ -3741,6 +3750,28 @@ mod tests {
         let page = engine.search(request(&query)).unwrap();
 
         assert_eq!(page.total_results, 0);
+    }
+
+    #[test]
+    fn path_fallback_coverage_flips_under_negation() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let dir = directory.path().display().to_string();
+
+        // NOT ((NOT path) AND tags) also matches untagged files outside the
+        // folder: the fallback cannot answer it whole.
+        let partial = format!("NOT (NOT path:\"{dir}\" AND tags:banned)");
+        let error = engine.search(request(&partial)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+
+        // NOT ((NOT path) OR tags) is just the folder minus tagged files.
+        let whole = format!("NOT (NOT path:\"{dir}\" OR tags:banned)");
+        assert_eq!(
+            names(&engine.search(request(&whole)).unwrap()),
+            ["clip.mp4"]
+        );
     }
 
     #[test]
