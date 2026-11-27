@@ -71,6 +71,22 @@ export const DEFAULT_SEARCH_FIELDS: SearchFields = {
 export type MediaType = "videos" | "images" | "both";
 export const DEFAULT_MEDIA_TYPE: MediaType = "videos";
 
+// The order results come back in: shuffled by default, so a broad search
+// stays a mix, or one file property in either direction.
+export type SortField =
+  | "shuffle"
+  | "name"
+  | "size"
+  | "created"
+  | "modified"
+  | "accessed";
+export type SortDirection = "asc" | "desc";
+export type SearchSort = { field: SortField; direction: SortDirection };
+export const DEFAULT_SEARCH_SORT: SearchSort = {
+  field: "shuffle",
+  direction: "desc",
+};
+
 // A directory the indexer has visited: shown as scanning while it is being
 // read, then with what was found directly in it.
 export type ScannedDirectory = {
@@ -136,6 +152,7 @@ export function searchVideos(
   page: number,
   fields: SearchFields = DEFAULT_SEARCH_FIELDS,
   mediaType: MediaType = DEFAULT_MEDIA_TYPE,
+  sort: SearchSort = DEFAULT_SEARCH_SORT,
   addonSearch?: AddonSearch,
   searchId?: string,
 ): Promise<SearchPage> {
@@ -145,6 +162,7 @@ export function searchVideos(
     pageSize: PAGE_SIZE,
     fields,
     mediaType,
+    sort,
     searchId,
   };
   return invoke<SearchPage>(

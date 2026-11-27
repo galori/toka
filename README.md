@@ -88,6 +88,12 @@ years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Quoted relative v
 such as `modified:>"3 days ago"` and `created:>="1 week ago"` resolve once when
 the search starts. Dates use the file's local calendar date, not its time.
 
+Results arrive shuffled, so a broad search stays a mix. The sort control
+beside the results orders them instead: by name, size, or creation,
+modification, or access date, ascending or descending. `Ctrl+S` steps
+through the orders and `Ctrl+Shift+S` turns the order around. The order
+holds across every page of the search.
+
 ### Search from the command line
 
 Run a search from a terminal with `toka search`:

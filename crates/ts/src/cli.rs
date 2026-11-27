@@ -10,7 +10,9 @@ use toka_search::{
     index_stats::{self, IndexStats},
     owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
     reset::{ResetReport, ResetTarget},
-    search::{MediaType, SearchEngine, SearchFields, SearchRequest, VideoResult, PAGE_SIZE},
+    search::{
+        MediaType, SearchEngine, SearchFields, SearchRequest, SearchSort, VideoResult, PAGE_SIZE,
+    },
     service::{Outcome, ServiceOp},
 };
 
@@ -1406,6 +1408,7 @@ fn run_search_count(
         search_id: None,
         fields: SearchFields::default(),
         media_type: options.media_type,
+        sort: SearchSort::default(),
     };
     match engine.match_count(request) {
         Ok(count) => {

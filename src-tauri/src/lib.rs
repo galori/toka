@@ -269,6 +269,7 @@ fn addon_search_page(
         search_id: None,
         fields: addon_search.fields,
         media_type: addon_search.media_type,
+        sort: search::SearchSort::default(),
     };
     search_with_addon(request, &addon_search, engine, registry)
 }
@@ -1865,6 +1866,7 @@ mod tests {
                 search_id: None,
                 fields: Default::default(),
                 media_type: search::MediaType::Videos,
+                sort: search::SearchSort::default(),
             })
             .unwrap();
 
@@ -1898,6 +1900,7 @@ mod tests {
                 search_id: None,
                 fields: Default::default(),
                 media_type: Default::default(),
+                sort: search::SearchSort::default(),
             })
             .unwrap();
         let ids = page.results.iter().map(|r| r.id.clone()).collect();

@@ -55,6 +55,7 @@ import {
   videoPreview,
   DEFAULT_SEARCH_FIELDS,
   DEFAULT_MEDIA_TYPE,
+  DEFAULT_SEARCH_SORT,
   type AddonMenu,
   type AddonSearch,
   type BulkTagUpdate,
@@ -67,6 +68,9 @@ import {
   type ScannedDirectory,
   type SearchPage,
   type SearchLogSettings,
+  type SearchSort,
+  type SortDirection,
+  type SortField,
   type VideoResult,
   type VideoTagUpdate,
 } from "./api";
@@ -114,6 +118,27 @@ const MEDIA_TYPES: { value: MediaType; label: string; shortcut: string }[] = [
   { value: "images", label: "Images", shortcut: "Ctrl+2" },
   { value: "both", label: "Both", shortcut: "Ctrl+3" },
 ];
+
+// The order results come back in, in the order the control lists them.
+const SORT_FIELDS: { value: SortField; label: string }[] = [
+  { value: "shuffle", label: "Shuffle" },
+  { value: "name", label: "Name" },
+  { value: "size", label: "Size" },
+  { value: "created", label: "Created" },
+  { value: "modified", label: "Modified" },
+  { value: "accessed", label: "Accessed" },
+];
+
+// The end each field starts from when it is picked: A to Z, biggest first,
+// newest first. Shuffling answers to no direction, so it keeps whichever
+// one was there.
+const SORT_NATURAL_DIRECTIONS: Partial<Record<SortField, SortDirection>> = {
+  name: "asc",
+  size: "desc",
+  created: "desc",
+  modified: "desc",
+  accessed: "desc",
+};
 
 // A subtitle Toka can turn on, whichever backend supplies it: a sidecar file
 // detected by Rust, an mpv track, or a track the web engine found in the file.
@@ -870,6 +895,12 @@ const SEARCH_SCOPES: {
 // world binds "jump to search" to.
 const SEARCH_SHORTCUT = "Ctrl+K";
 
+// What the results are sorted by, and which end comes first. Ctrl+S is
+// free on the search screen: the player never sees it, and the browser's
+// "save page" has nothing to save in an app window.
+const SORT_FIELD_SHORTCUT = "Ctrl+S";
+const SORT_DIRECTION_SHORTCUT = "Ctrl+Shift+S";
+
 export const THUMBNAIL_SIZE_DEFAULT = 180;
 // Keep three additional 20px steps below the original minimum so large result
 // sets can be scanned quickly without making the default thumbnails smaller.
@@ -959,6 +990,11 @@ const HELP_SECTIONS: HelpSection[] = [
         description: "Refresh results after indexing",
       },
       { shortcut: "R", description: "Shuffle results" },
+      { shortcut: "Ctrl+S", description: "Change what results are sorted by" },
+      {
+        shortcut: "Ctrl+Shift+S",
+        description: "Toggle ascending or descending sort",
+      },
       { shortcut: "- +", description: "Resize thumbnails" },
     ],
   },
@@ -3615,6 +3651,7 @@ async function loadResultPages(
   lastPage: number,
   fields: SearchFields,
   mediaType: MediaType,
+  sort: SearchSort,
   addonSearch?: AddonSearch,
   searchId?: string,
 ): Promise<VideoResult[][]> {
@@ -3631,6 +3668,7 @@ async function loadResultPages(
         firstPage + pageIndex,
         fields,
         mediaType,
+        sort,
         addonSearch,
         searchId,
       );
@@ -3661,6 +3699,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [fields, setFields] = useState<SearchFields>(DEFAULT_SEARCH_FIELDS);
   const [mediaType, setMediaType] = useState<MediaType>(DEFAULT_MEDIA_TYPE);
+  const [sort, setSort] = useState<SearchSort>(DEFAULT_SEARCH_SORT);
   const [page, setPage] = useState<SearchPage>();
   const [addonSearch, setAddonSearch] = useState<AddonSearch>();
   // Playback is always a playlist: choosing one result starts the whole page of
@@ -3771,6 +3810,7 @@ export default function App() {
         requestedPage,
         fields,
         mediaType,
+        sort,
         nextAddonSearch,
       );
       if (currentRequest === requestNumber.current) setPage(response);
@@ -3796,6 +3836,7 @@ export default function App() {
         loadedPages + 1,
         fields,
         mediaType,
+        sort,
         addonSearch,
         page.searchId,
       );
@@ -3823,6 +3864,7 @@ export default function App() {
       loadedPage + 1,
       fields,
       mediaType,
+      sort,
       addonSearch,
       page.searchId,
     );
@@ -3948,6 +3990,41 @@ export default function App() {
     setFields((current) => ({ ...current, [field]: !current[field] }));
   };
 
+  // Picking a field starts it at its natural end — A to Z, biggest first,
+  // newest first — and the direction toggle turns it around from there.
+  // Picking the field that is already picked changes nothing, so the
+  // search below does not run again for it.
+  const setSortField = (field: SortField) => {
+    setSort((current) => {
+      if (current.field === field) return current;
+      return {
+        field,
+        direction: SORT_NATURAL_DIRECTIONS[field] ?? current.direction,
+      };
+    });
+  };
+
+  // Steps through the orders the select lists, for the keyboard: shuffle,
+  // name, size, and the three dates, each at its natural end.
+  const cycleSortField = () => {
+    const current = SORT_FIELDS.findIndex(
+      (field) => field.value === sort.field,
+    );
+    const next = SORT_FIELDS[(current + 1) % SORT_FIELDS.length];
+    setSortField(next.value);
+  };
+
+  // Turns the order around: A to Z becomes Z to A, newest first becomes
+  // oldest first. Shuffling answers to no direction, so the shortcut and
+  // the disabled toggle both leave it alone.
+  const toggleSortDirection = () => {
+    if (sort.field === "shuffle") return;
+    setSort((current) => ({
+      ...current,
+      direction: current.direction === "asc" ? "desc" : "asc",
+    }));
+  };
+
   // Results on screen were found by looking at particular parts of a video, so
   // changing which parts those are asks the question again rather than leaving
   // an answer that no longer matches the controls.
@@ -3955,6 +4032,18 @@ export default function App() {
   useEffect(() => {
     if (searchedFields.current === fields) return;
     searchedFields.current = fields;
+    if (searchedQuery.current)
+      void runSearch(searchedQuery.current, 1, addonSearch);
+  });
+
+  // Results on screen arrived in a particular order, so changing the order
+  // asks the question again rather than leaving them unsorted. A launched
+  // folder was never searched for, so the choice waits for the next search
+  // instead, the way the search fields do.
+  const searchedSort = useRef(sort);
+  useEffect(() => {
+    if (searchedSort.current === sort) return;
+    searchedSort.current = sort;
     if (searchedQuery.current)
       void runSearch(searchedQuery.current, 1, addonSearch);
   });
@@ -4076,6 +4165,37 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  // Shift is what keeps this apart from the Ctrl+S that picks what the
+  // results are sorted by: one chooses the order, the other turns it around.
+  useEffect(() => {
+    if (playing || showFolderSetup || showSearchLogSettings || showHelp) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() !== "s") return;
+      event.preventDefault();
+      toggleSortDirection();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  // Steps through what the results are sorted by. Bare letters would be
+  // typed into the search field instead, so this takes Ctrl like the
+  // search scopes do.
+  useEffect(() => {
+    if (playing || showFolderSetup || showSearchLogSettings || showHelp) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)
+        return;
+      if (event.key.toLowerCase() !== "s") return;
+      event.preventDefault();
+      cycleSortField();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   // Thumbnail size: the grid fills the width with as many minmax columns as fit.
   // Larger thumbs mean fewer per row, smaller mean more. Ctrl with the window's
   // zoom keys also works, so a viewer reaching for the browser's zoom gets this
@@ -4147,6 +4267,7 @@ export default function App() {
           totalPages,
           fields,
           mediaType,
+          sort,
           addonSearch,
           page.searchId,
         )
@@ -4937,6 +5058,48 @@ export default function App() {
               >
                 <Label>Shuffle</Label>
               </ControlButton>
+            ) : null}
+            {/* The order the search asked for. Beside the shuffle it
+                replaces for an ordered search: one re-deals the page on
+                screen, the other asks the whole search again in an order
+                every page keeps. */}
+            {page.results.length > 1 ? (
+              <span className="labelled-control">
+                <select
+                  aria-label="Sort results"
+                  aria-keyshortcuts={SORT_FIELD_SHORTCUT}
+                  title="Sort results"
+                  value={sort.field}
+                  onChange={(event) =>
+                    setSortField(event.currentTarget.value as SortField)
+                  }
+                >
+                  {SORT_FIELDS.map((field) => (
+                    <option key={field.value} value={field.value}>
+                      {field.label}
+                    </option>
+                  ))}
+                </select>
+                {/* A select is its own control rather than a button, so the
+                    hint sits beside it the way it sits in the search field,
+                    reading from the same value the shortcut is declared
+                    with. */}
+                <KeyHint shortcut={SORT_FIELD_SHORTCUT} />
+                <ControlButton
+                  shortcut={SORT_DIRECTION_SHORTCUT}
+                  className="playlist-button"
+                  aria-label={`Sort direction: ${sort.direction === "asc" ? "ascending" : "descending"}`}
+                  disabled={sort.field === "shuffle"}
+                  title={
+                    sort.field === "shuffle"
+                      ? "Shuffling answers to no direction"
+                      : undefined
+                  }
+                  onClick={toggleSortDirection}
+                >
+                  <Label>{sort.direction === "asc" ? "Asc" : "Desc"}</Label>
+                </ControlButton>
+              </span>
             ) : null}
             {/* One tag for the whole search, so a folder's worth of videos does
                 not have to be tagged a tile at a time. The count is in the name

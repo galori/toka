@@ -1,4 +1,4 @@
-use crate::search::{MediaType, SearchFields, SearchRequest};
+use crate::search::{MediaType, SearchFields, SearchRequest, SearchSort};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -19,6 +19,7 @@ pub struct SearchLogContext {
     pub(crate) page_size: usize,
     pub(crate) fields: SearchFields,
     pub(crate) media_type: MediaType,
+    pub(crate) sort: SearchSort,
     pub(crate) addon_id: Option<String>,
     pub(crate) addon_capture: Option<String>,
     verbose: Option<Arc<VerboseSearchLog>>,
@@ -32,6 +33,7 @@ impl From<&SearchRequest> for SearchLogContext {
             page_size: request.page_size,
             fields: request.fields,
             media_type: request.media_type,
+            sort: request.sort,
             addon_id: None,
             addon_capture: None,
             verbose: None,
@@ -286,6 +288,7 @@ fn context_entry(context: &SearchLogContext, kind: &str) -> serde_json::Map<Stri
         }),
     );
     entry.insert("mediaType".into(), json!(context.media_type));
+    entry.insert("sort".into(), json!(context.sort));
     if let Some(addon_id) = &context.addon_id {
         entry.insert("addonId".into(), json!(addon_id));
     }
@@ -444,6 +447,11 @@ fn write_verbose_header(sink: &mut dyn Write, context: &SearchLogContext) -> std
     writeln!(sink, "Page: {}", context.page)?;
     writeln!(sink, "Page size: {}", context.page_size)?;
     writeln!(sink, "Media type: {:?}", context.media_type)?;
+    writeln!(
+        sink,
+        "Sort: {:?} {:?}",
+        context.sort.field, context.sort.direction
+    )?;
     if let (Some(addon_id), Some(capture)) = (&context.addon_id, &context.addon_capture) {
         writeln!(sink, "Add-on: {addon_id} ({capture})")?;
     }
@@ -615,6 +623,7 @@ mod tests {
             page_size: 10,
             fields: SearchFields::default(),
             media_type: MediaType::default(),
+            sort: SearchSort::default(),
             addon_id: None,
             addon_capture: None,
             verbose: None,
@@ -664,6 +673,7 @@ mod tests {
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             },
             true,
         );
@@ -698,6 +708,7 @@ mod tests {
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             },
             true,
         );
@@ -726,6 +737,7 @@ mod tests {
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             },
             false,
         );
@@ -748,6 +760,7 @@ mod tests {
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             },
             true,
         );
@@ -767,6 +780,7 @@ mod tests {
             page_size: 24,
             fields: SearchFields::default(),
             media_type: MediaType::Videos,
+            sort: SearchSort::default(),
             addon_id: None,
             addon_capture: None,
             verbose: None,

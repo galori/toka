@@ -1563,7 +1563,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
 
     #[cfg(unix)]
     fn search_request(query: &str) -> toka_search::search::SearchRequest {
-        use toka_search::search::{MediaType, SearchFields, SearchRequest, PAGE_SIZE};
+        use toka_search::search::{MediaType, SearchFields, SearchRequest, SearchSort, PAGE_SIZE};
         SearchRequest {
             query: query.to_owned(),
             page: 1,
@@ -1571,6 +1571,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
             search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::Videos,
+            sort: SearchSort::default(),
         }
     }
 
@@ -1606,7 +1607,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
         use toka_search::{
             owned_index::{OwnedIndex, OwnedIndexManager},
             providers::OwnedIndexSearchProvider,
-            search::{MediaType, SearchEngine, SearchFields, SearchRequest, PAGE_SIZE},
+            search::{MediaType, SearchEngine, SearchFields, SearchRequest, SearchSort, PAGE_SIZE},
             search_log::SearchLogContext,
         };
 
@@ -1652,6 +1653,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
                 search_id: None,
                 fields: SearchFields::default(),
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             };
             let context = SearchLogContext::from(&request);
             let derived = direct_provider.candidates(query, true, &context).unwrap();
@@ -1741,6 +1743,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
                 search_id: None,
                 fields,
                 media_type: MediaType::Videos,
+                sort: SearchSort::default(),
             };
             let wired_page = wired.search(request.clone()).unwrap();
             let direct_page = direct.search(request.clone()).unwrap();

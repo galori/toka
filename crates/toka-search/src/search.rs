@@ -43,6 +43,42 @@ pub struct SearchRequest {
     pub fields: SearchFields,
     #[serde(default)]
     pub media_type: MediaType,
+    #[serde(default)]
+    pub sort: SearchSort,
+}
+
+/// The order a search's results come back in: a shuffle by default, so a
+/// broad search stays a mix, or one file property in either direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchSort {
+    #[serde(default)]
+    pub field: SortField,
+    #[serde(default)]
+    pub direction: SortDirection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortField {
+    #[default]
+    Shuffle,
+    Name,
+    Size,
+    Created,
+    Modified,
+    Accessed,
+}
+
+/// Which end of a sorted search comes first. Ascending is the file's natural
+/// order — A to Z, smallest first, oldest first — and the default only
+/// because a default is needed: callers always say which one they mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
 }
 
 /// Which part of a video a query is matched against. The three are separate
@@ -347,6 +383,7 @@ struct SearchSnapshot {
     query: String,
     fields: SearchFields,
     media_type: MediaType,
+    sort: SearchSort,
     paths: Vec<PathBuf>,
     index_revision: u64,
     created_at: Instant,
@@ -468,6 +505,7 @@ impl SearchEngine {
             search_id: None,
             fields,
             media_type,
+            sort: SearchSort::default(),
         };
         let context = self.logger.context(&request, true);
         let result = self.search_all_with_context(request, &context);
@@ -492,6 +530,7 @@ impl SearchEngine {
             search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::Both,
+            sort: SearchSort::default(),
         };
         let context = self.logger.context(&request, false);
         // The whole-path set: field matching happens on top of this, and
@@ -556,18 +595,14 @@ impl SearchEngine {
     ) -> Result<SearchPage, SearchError> {
         let snapshot = if request.page == 1 {
             let (query, mut paths) = self.matching_paths(&request, context, filter)?;
-            // Providers may return a different order each time. Sorting before
-            // shuffling makes the saved order depend only on this search's seed.
-            paths.sort_by(|left, right| {
-                let left_name = left.file_name().unwrap_or_default().to_string_lossy();
-                let right_name = right.file_name().unwrap_or_default().to_string_lossy();
-                left_name
-                    .to_lowercase()
-                    .cmp(&right_name.to_lowercase())
-                    .then_with(|| left.cmp(right))
-            });
-            shuffle(&mut paths, fresh_seed());
-            self.remember_snapshot(query, request.fields, request.media_type, paths)
+            order_paths(&mut paths, request.sort);
+            self.remember_snapshot(
+                query,
+                request.fields,
+                request.media_type,
+                request.sort,
+                paths,
+            )
         } else {
             self.snapshot_for(&request)?
         };
@@ -610,6 +645,7 @@ impl SearchEngine {
         query: String,
         fields: SearchFields,
         media_type: MediaType,
+        sort: SearchSort,
         paths: Vec<PathBuf>,
     ) -> SearchSnapshot {
         let snapshot = SearchSnapshot {
@@ -617,6 +653,7 @@ impl SearchEngine {
             query,
             fields,
             media_type,
+            sort,
             paths,
             index_revision: self.provider.revision(),
             created_at: Instant::now(),
@@ -664,6 +701,7 @@ impl SearchEngine {
                 saved.query == query
                     && saved.fields == request.fields
                     && saved.media_type == request.media_type
+                    && saved.sort == request.sort
             })
             .cloned()
             .ok_or(SearchError::SearchExpired)?;
@@ -1066,6 +1104,97 @@ fn next_random(state: &mut u64) -> u64 {
     drawn = (drawn ^ (drawn >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     drawn = (drawn ^ (drawn >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     drawn ^ (drawn >> 31)
+}
+
+/// Puts a search's matches in the order the viewer asked for. Shuffling is
+/// the default: an alphabetical list buries everything past the first
+/// screenful, the wrong answer to "find me something to watch".
+fn order_paths(paths: &mut Vec<PathBuf>, sort: SearchSort) {
+    match sort.field {
+        SortField::Shuffle => {
+            // Providers may return a different order each time. Sorting before
+            // shuffling makes the saved order depend only on this search's seed.
+            sort_by_name(paths, SortDirection::Asc);
+            shuffle(paths, fresh_seed());
+        }
+        SortField::Name => sort_by_name(paths, sort.direction),
+        SortField::Size => sort_by_metadata(paths, sort.direction, |path| {
+            fs::metadata(path).ok().map(|metadata| metadata.len())
+        }),
+        SortField::Created => sort_by_metadata(paths, sort.direction, |path| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.created().ok())
+        }),
+        SortField::Modified => sort_by_metadata(paths, sort.direction, |path| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+        }),
+        SortField::Accessed => sort_by_metadata(paths, sort.direction, |path| {
+            fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.accessed().ok())
+        }),
+    }
+}
+
+/// Alphabetical by file name, ignoring case; the full path breaks ties so
+/// the order never depends on what the provider returned first. The
+/// direction turns the names around, never the tie-break.
+fn sort_by_name(paths: &mut [PathBuf], direction: SortDirection) {
+    paths.sort_by(|left, right| {
+        let ordering = match direction {
+            SortDirection::Asc => compare_names(left, right),
+            SortDirection::Desc => compare_names(left, right).reverse(),
+        };
+        ordering.then_with(|| left.cmp(right))
+    });
+}
+
+fn compare_names(left: &Path, right: &Path) -> std::cmp::Ordering {
+    let left_name = left.file_name().unwrap_or_default().to_string_lossy();
+    let right_name = right.file_name().unwrap_or_default().to_string_lossy();
+    left_name.to_lowercase().cmp(&right_name.to_lowercase())
+}
+
+/// Orders by one filesystem property read off each file. Each file is
+/// statted once. A file with no value — vanished, or a date the platform
+/// cannot read — keeps its result but sinks below every file with one, in
+/// either direction; the path breaks ties.
+fn sort_by_metadata<Key: Ord>(
+    paths: &mut Vec<PathBuf>,
+    direction: SortDirection,
+    key: impl Fn(&Path) -> Option<Key>,
+) {
+    let mut keyed: Vec<(Option<Key>, PathBuf)> = paths
+        .drain(..)
+        .map(|path| {
+            let value = key(&path);
+            (value, path)
+        })
+        .collect();
+    keyed.sort_by(|left, right| {
+        compare_sort_keys(&left.0, &right.0, direction).then_with(|| left.1.cmp(&right.1))
+    });
+    paths.extend(keyed.into_iter().map(|(_, path)| path));
+}
+
+fn compare_sort_keys<Key: Ord>(
+    left: &Option<Key>,
+    right: &Option<Key>,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (left, right) {
+        (Some(left), Some(right)) => match direction {
+            SortDirection::Asc => left.cmp(right),
+            SortDirection::Desc => right.cmp(left),
+        },
+        (None, Some(_)) => Greater,
+        (Some(_), None) => Less,
+        (None, None) => Equal,
+    }
 }
 
 /// Fisher-Yates, so every order is as likely as every other one.
@@ -1853,7 +1982,14 @@ mod tests {
             search_id: None,
             fields: SearchFields::default(),
             media_type: MediaType::default(),
+            sort: SearchSort::default(),
         }
+    }
+
+    fn sorted(query: &str, field: SortField, direction: SortDirection) -> SearchRequest {
+        let mut asked = request(query);
+        asked.sort = SearchSort { field, direction };
+        asked
     }
 
     struct ErrorProvider;
@@ -2123,6 +2259,43 @@ mod tests {
             .collect()
     }
 
+    /// Clips whose names carry their sizes, so the expected order reads
+    /// straight off the names: `sized_clips(dir, [30, 10])` writes a
+    /// 30-byte `clip-30.mp4` and a 10-byte `clip-10.mp4`.
+    fn sized_clips(directory: &Path, sizes: impl IntoIterator<Item = usize>) -> Vec<PathBuf> {
+        sizes
+            .into_iter()
+            .map(|size| {
+                let path = directory.join(format!("clip-{size}.mp4"));
+                fs::write(&path, vec![0u8; size]).unwrap();
+                path
+            })
+            .collect()
+    }
+
+    /// Three clips named for their age, to be stamped old, mid, and new by
+    /// the date sort tests.
+    fn clip_trio(directory: &Path) -> [PathBuf; 3] {
+        ["clip-old.mp4", "clip-mid.mp4", "clip-new.mp4"].map(|name| {
+            let path = directory.join(name);
+            fs::write(&path, b"test").unwrap();
+            path
+        })
+    }
+
+    fn stamp_modified(path: &Path, seconds: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    fn stamp_accessed(path: &Path, seconds: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        let times = fs::FileTimes::new()
+            .set_accessed(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+        file.set_times(times).unwrap();
+    }
+
     fn page_two(query: &str) -> SearchRequest {
         SearchRequest {
             page: 2,
@@ -2374,6 +2547,311 @@ mod tests {
         let second = names(&engine.search(request("clip")).unwrap());
 
         assert_ne!(first, second);
+    }
+
+    /// A viewer who knows the name finds it in an alphabetical list faster
+    /// than in a shuffle.
+    #[test]
+    fn search_lists_names_alphabetically_when_asked() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Name, SortDirection::Asc))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            found,
+            every_clip_name(30).into_iter().take(24).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn name_sort_descending_starts_from_the_end_of_the_alphabet() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Name, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        let mut expected = every_clip_name(30);
+        expected.reverse();
+        assert_eq!(found, expected.into_iter().take(24).collect::<Vec<_>>());
+    }
+
+    /// The smallest file answers "what is this tiny thing" and the largest
+    /// answers "what is eating the disk".
+    #[test]
+    fn size_sort_starts_with_the_smallest_file() {
+        let directory = tempdir().unwrap();
+        let paths = sized_clips(directory.path(), [30, 10, 50, 20, 40]);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Size, SortDirection::Asc))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            found,
+            [
+                "clip-10.mp4",
+                "clip-20.mp4",
+                "clip-30.mp4",
+                "clip-40.mp4",
+                "clip-50.mp4"
+            ]
+        );
+    }
+
+    #[test]
+    fn size_sort_descending_starts_with_the_largest_file() {
+        let directory = tempdir().unwrap();
+        let paths = sized_clips(directory.path(), [30, 10, 50, 20, 40]);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Size, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(
+            found,
+            [
+                "clip-50.mp4",
+                "clip-40.mp4",
+                "clip-30.mp4",
+                "clip-20.mp4",
+                "clip-10.mp4"
+            ]
+        );
+    }
+
+    /// A file that vanished between the index read and the sort has no size
+    /// to sort by. It stays in the results — the viewer may still want its
+    /// name — but always at the end, whichever direction was asked for.
+    #[test]
+    fn a_vanished_file_sorts_last_in_either_direction() {
+        let directory = tempdir().unwrap();
+        let mut paths = sized_clips(directory.path(), [20, 10]);
+        let gone = directory.path().join("clip-gone.mp4");
+        fs::write(&gone, b"test").unwrap();
+        paths.push(gone.clone());
+        fs::remove_file(&gone).unwrap();
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let ascending = names(
+            &engine
+                .search(sorted("clip", SortField::Size, SortDirection::Asc))
+                .unwrap(),
+        );
+        let descending = names(
+            &engine
+                .search(sorted("clip", SortField::Size, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(ascending, ["clip-10.mp4", "clip-20.mp4", "clip-gone.mp4"]);
+        assert_eq!(descending, ["clip-20.mp4", "clip-10.mp4", "clip-gone.mp4"]);
+    }
+
+    /// "What did I just download" is newest first. "What have I kept the
+    /// longest" is oldest first.
+    #[test]
+    fn modified_sort_starts_with_the_oldest_file() {
+        let directory = tempdir().unwrap();
+        let [old, mid, new] = clip_trio(directory.path());
+        stamp_modified(&old, 10);
+        stamp_modified(&mid, 20);
+        stamp_modified(&new, 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![new, old, mid])));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Modified, SortDirection::Asc))
+                .unwrap(),
+        );
+
+        assert_eq!(found, ["clip-old.mp4", "clip-mid.mp4", "clip-new.mp4"]);
+    }
+
+    #[test]
+    fn modified_sort_descending_starts_with_the_newest_file() {
+        let directory = tempdir().unwrap();
+        let [old, mid, new] = clip_trio(directory.path());
+        stamp_modified(&old, 10);
+        stamp_modified(&mid, 20);
+        stamp_modified(&new, 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![new, old, mid])));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Modified, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(found, ["clip-new.mp4", "clip-mid.mp4", "clip-old.mp4"]);
+    }
+
+    /// The last-watched video answers "what was I just watching".
+    #[test]
+    fn accessed_sort_starts_with_the_least_recently_read_file() {
+        let directory = tempdir().unwrap();
+        let [old, mid, new] = clip_trio(directory.path());
+        stamp_accessed(&old, 10);
+        stamp_accessed(&mid, 20);
+        stamp_accessed(&new, 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![new, old, mid])));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Accessed, SortDirection::Asc))
+                .unwrap(),
+        );
+
+        assert_eq!(found, ["clip-old.mp4", "clip-mid.mp4", "clip-new.mp4"]);
+    }
+
+    #[test]
+    fn accessed_sort_descending_starts_with_the_most_recently_read_file() {
+        let directory = tempdir().unwrap();
+        let [old, mid, new] = clip_trio(directory.path());
+        stamp_accessed(&old, 10);
+        stamp_accessed(&mid, 20);
+        stamp_accessed(&new, 30);
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![new, old, mid])));
+        let found = names(
+            &engine
+                .search(sorted("clip", SortField::Accessed, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(found, ["clip-new.mp4", "clip-mid.mp4", "clip-old.mp4"]);
+    }
+
+    /// Birthtime is a filesystem promise, not a portable one: where the
+    /// platform reads distinct birthtimes the order follows them, and where
+    /// it cannot the search still answers every match in a stable order.
+    #[test]
+    fn created_sort_follows_birthtimes_where_the_platform_reads_them() {
+        let directory = tempdir().unwrap();
+        let paths = clip_trio(directory.path());
+
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths.to_vec())));
+        let ascending = names(
+            &engine
+                .search(sorted("clip", SortField::Created, SortDirection::Asc))
+                .unwrap(),
+        );
+        let repeated = names(
+            &engine
+                .search(sorted("clip", SortField::Created, SortDirection::Asc))
+                .unwrap(),
+        );
+
+        // A sorted search is stable: the same question twice keeps its
+        // order, which a shuffle would not.
+        assert_eq!(ascending, repeated);
+        let mut set = ascending.clone();
+        set.sort();
+        assert_eq!(set, ["clip-mid.mp4", "clip-new.mp4", "clip-old.mp4"]);
+
+        let birthtimes: Vec<_> = paths
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().created().ok())
+            .collect();
+        let distinct = birthtimes.iter().all(Option::is_some)
+            && birthtimes.iter().collect::<HashSet<_>>().len() == birthtimes.len();
+        if distinct {
+            let mut expected = paths.to_vec();
+            expected.sort_by_key(|path| fs::metadata(path).unwrap().created().unwrap());
+            let expected: Vec<String> = expected
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(ascending, expected);
+        }
+    }
+
+    #[test]
+    fn sorted_searches_keep_one_order_across_pages() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = engine
+            .search(sorted("clip", SortField::Name, SortDirection::Asc))
+            .unwrap();
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id.clone());
+        next_request.sort = SearchSort {
+            field: SortField::Name,
+            direction: SortDirection::Asc,
+        };
+
+        let second = engine.search(next_request).unwrap();
+
+        assert_eq!(
+            [names(&first), names(&second)].concat(),
+            every_clip_name(30)
+        );
+    }
+
+    /// Older frontends send no sort: they keep the shuffle they always had.
+    #[test]
+    fn a_request_without_a_sort_still_shuffles() {
+        let request: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "clip",
+            "page": 1,
+            "pageSize": 24,
+        }))
+        .unwrap();
+
+        assert_eq!(request.sort, SearchSort::default());
+        assert_eq!(request.sort.field, SortField::Shuffle);
+
+        let explicit: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "clip",
+            "page": 1,
+            "pageSize": 24,
+            "sort": {"field": "modified", "direction": "desc"},
+        }))
+        .unwrap();
+
+        assert_eq!(explicit.sort.field, SortField::Modified);
+        assert_eq!(explicit.sort.direction, SortDirection::Desc);
+    }
+
+    /// A later page belongs to the order the first page set. Asking for it
+    /// in a different order restarts from page one rather than mixing two
+    /// orders on one screen.
+    #[test]
+    fn a_later_page_in_a_different_sort_restarts_from_page_one() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = engine
+            .search(sorted("clip", SortField::Name, SortDirection::Asc))
+            .unwrap();
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id.clone());
+        next_request.sort = SearchSort {
+            field: SortField::Size,
+            direction: SortDirection::Desc,
+        };
+
+        let error = engine.search(next_request).unwrap_err();
+
+        assert!(matches!(error, SearchError::SearchExpired));
     }
 
     #[test]
@@ -2672,6 +3150,7 @@ mod tests {
         let engine = SearchEngine::new(provider.clone());
         let both = |query: &str| SearchRequest {
             media_type: MediaType::Both,
+            sort: SearchSort::default(),
             ..request(query)
         };
 
