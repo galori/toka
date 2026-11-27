@@ -1201,7 +1201,7 @@ pub fn step_frame(player: &NativePlayer, forward: bool) -> Result<Option<f64>, S
             "frame-back-step"
         };
         mpv.command(&[command])?;
-        Ok(mpv.get_double("time-pos").ok())
+        Ok(mpv.get_double("time-pos"))
     })
 }
 

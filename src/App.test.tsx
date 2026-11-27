@@ -9342,6 +9342,14 @@ test("uses mpv frame-step commands and native OSD feedback", async () => {
       "+1 frame (approx.) · 0:20",
     ),
   );
+
+  // The estimate does not stay pending: the next poll reporting the true
+  // frame position is accepted instead of being rejected forever.
+  await waitFor(() =>
+    expect(screen.getByRole("slider", { name: "Video timeline" })).toHaveValue(
+      "20.04",
+    ),
+  );
 });
 
 test("a failed native OSD message leaves playback running", async () => {
@@ -10381,5 +10389,73 @@ test("a native frame step rejected after a file change fails nothing", async () 
   });
 
   expect(await screen.findByLabelText("Playing clip-2.mkv")).toBeVisible();
+  expect(screen.queryByText("This video could not be played")).toBeNull();
+});
+
+test("a native frame step rejected after a newer seek fails nothing", async () => {
+  let rejectStep!: (reason: unknown) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "native.mkv", extension: "mkv" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
+    }
+    if (command === "step_native_video") {
+      return new Promise<number>((_resolve, reject) => {
+        rejectStep = reject;
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 20,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mkv" }),
+  );
+  await screen.findByLabelText("Playing native.mkv");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("native_playback_state"),
+  );
+
+  fireEvent.keyDown(window, { key: "." });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("step_native_video", {
+      forward: true,
+    }),
+  );
+  // The seek supersedes the step, so only the seek's own outcome matters.
+  // It builds on the step's estimate, which is still awaiting its answer.
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("seek_native_video", {
+      seconds: 20 + 1 / 30 + 5,
+    }),
+  );
+  await act(async () => {
+    rejectStep(new Error("mpv dropped the step"));
+  });
+
+  expect(await screen.findByLabelText("Playing native.mkv")).toBeVisible();
   expect(screen.queryByText("This video could not be played")).toBeNull();
 });

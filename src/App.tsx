@@ -2824,6 +2824,10 @@ function Player({
           const reached = measured ? clampSeekPosition(actual) : estimated;
           const fromPosition = seekPosition.current;
           seekPosition.current = reached;
+          // Without a measurement the estimate above must not stay pending:
+          // the true frame sits a fraction off it, and a paused backend
+          // would report that same true position forever without reaching it.
+          if (!measured) pendingSeek.current = undefined;
           if (measured)
             pendingSeek.current =
               reached === fromPosition
@@ -2844,9 +2848,13 @@ function Player({
           );
         })
         .catch((reason: unknown) => {
-          // A step left behind by a move to another video must not fail the
-          // file that replaced it.
-          if (generation !== frameStepGeneration.current) return;
+          // A step left behind by a move to another video, or superseded by
+          // a newer seek, must not fail the playback that replaced it.
+          if (
+            generation !== frameStepGeneration.current ||
+            seekGeneration !== nativeSeekGeneration.current
+          )
+            return;
           setError(errorMessage(reason));
         });
       return;
