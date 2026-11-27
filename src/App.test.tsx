@@ -1757,6 +1757,37 @@ test("a mouse choice leaves no stale hover when the picker reopens", async () =>
   );
 });
 
+test("a favorite chosen during a slow save is applied after it, from its result", async () => {
+  const user = await playWithTags([]);
+  let finish: (value: unknown) => void = () => {};
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    const tags = (args as { tags?: string[] } | undefined)?.tags ?? [];
+    if (command === "add_video_tags" && tags.includes("fv3"))
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    if (command === "remove_video_tags")
+      return Promise.resolve({ fileName: "clip [fv].mp4", tags: ["fv"] });
+    return Promise.resolve({ fileName: "clip.mp4", tags: ["fv", "fv5"] });
+  });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("3");
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("5");
+  finish({ fileName: "clip [fv fv3].mp4", tags: ["fv", "fv3"] });
+  // The queued choice removes the level that just landed, not nothing.
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+      resultId: "video-1",
+      tags: ["fv3"],
+    }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["fv5"],
+  });
+});
+
 test("lists favorites in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });
