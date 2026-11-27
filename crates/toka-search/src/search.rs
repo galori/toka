@@ -1220,6 +1220,11 @@ enum DateThreshold {
     Timestamp(SystemTime),
 }
 
+struct RelativeDate {
+    timestamp: SystemTime,
+    calendar_date: Option<CalendarDate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum QueryExpr {
     Term(QueryTerm),
@@ -1505,7 +1510,18 @@ fn parse_date_term(
     let (comparison, value) = split_comparison(value);
     let date = parse_calendar_date(value)
         .map(DateThreshold::Calendar)
-        .or_else(|_| parse_relative_date(value, now).map(DateThreshold::Timestamp))?;
+        .or_else(|_| {
+            parse_relative_date(value, now, comparison == Comparison::Equal).map(|relative| {
+                if comparison == Comparison::Equal {
+                    relative.calendar_date.map_or(
+                        DateThreshold::Timestamp(relative.timestamp),
+                        DateThreshold::Calendar,
+                    )
+                } else {
+                    DateThreshold::Timestamp(relative.timestamp)
+                }
+            })
+        })?;
     Ok(QueryTerm::Date {
         field,
         comparison,
@@ -1513,7 +1529,11 @@ fn parse_date_term(
     })
 }
 
-fn parse_relative_date(value: &str, now: SystemTime) -> Result<SystemTime, SearchError> {
+fn parse_relative_date(
+    value: &str,
+    now: SystemTime,
+    include_calendar_date: bool,
+) -> Result<RelativeDate, SearchError> {
     let lower = value.to_ascii_lowercase();
     let parts = lower.split_whitespace().collect::<Vec<_>>();
     let amount_and_unit = match parts.as_slice() {
@@ -1532,19 +1552,57 @@ fn parse_relative_date(value: &str, now: SystemTime) -> Result<SystemTime, Searc
         .ok()
         .filter(|amount| *amount > 0)
         .ok_or(SearchError::InvalidQuery)?;
-    let unit_seconds = match amount_and_unit.1 {
-        "second" | "seconds" | "sec" | "secs" | "s" => 1,
-        "minute" | "minutes" | "min" | "mins" | "m" => 60,
-        "hour" | "hours" | "hr" | "hrs" | "h" => 60 * 60,
-        "day" | "days" | "d" => 24 * 60 * 60,
-        "week" | "weeks" | "wk" | "wks" | "w" => 7 * 24 * 60 * 60,
+    let (unit_seconds, calendar_days) = match amount_and_unit.1 {
+        "second" | "seconds" | "sec" | "secs" | "s" => (1, None),
+        "minute" | "minutes" | "min" | "mins" | "m" => (60, None),
+        "hour" | "hours" | "hr" | "hrs" | "h" => (60 * 60, None),
+        "day" | "days" | "d" => (24 * 60 * 60, Some(1)),
+        "week" | "weeks" | "wk" | "wks" | "w" => (7 * 24 * 60 * 60, Some(7)),
         _ => return Err(SearchError::InvalidQuery),
     };
     let seconds = amount
         .checked_mul(unit_seconds)
         .ok_or(SearchError::InvalidQuery)?;
-    now.checked_sub(Duration::from_secs(seconds))
-        .ok_or(SearchError::InvalidQuery)
+    let timestamp = now
+        .checked_sub(Duration::from_secs(seconds))
+        .ok_or(SearchError::InvalidQuery)?;
+    let calendar_date = if include_calendar_date {
+        calendar_days
+            .map(|days_per_unit| {
+                let days = amount
+                    .checked_mul(days_per_unit)
+                    .ok_or(SearchError::InvalidQuery)?;
+                subtract_calendar_days(calendar_date(now).ok_or(SearchError::InvalidQuery)?, days)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(RelativeDate {
+        timestamp,
+        calendar_date,
+    })
+}
+
+fn subtract_calendar_days(
+    mut date: CalendarDate,
+    mut days: u64,
+) -> Result<CalendarDate, SearchError> {
+    while days >= u64::from(date.day) {
+        days -= u64::from(date.day);
+        if date.month == 1 {
+            date.year = date.year.checked_sub(1).ok_or(SearchError::InvalidQuery)?;
+            if date.year < 1 {
+                return Err(SearchError::InvalidQuery);
+            }
+            date.month = 12;
+        } else {
+            date.month -= 1;
+        }
+        date.day = days_in_month(date.year, date.month);
+    }
+    date.day -= days as u32;
+    CalendarDate::new(date.year, date.month, date.day).ok_or(SearchError::InvalidQuery)
 }
 
 fn parse_calendar_date(value: &str) -> Result<CalendarDate, SearchError> {
@@ -2728,6 +2786,16 @@ mod tests {
                 field: DateField::Modified,
                 comparison: Comparison::Greater,
                 date: DateThreshold::Timestamp(now - Duration::from_secs(3 * 24 * 60 * 60)),
+            })
+        );
+        assert_eq!(
+            parse_query_at("modified:\"3 days ago\"", now).unwrap(),
+            QueryExpr::Term(QueryTerm::Date {
+                field: DateField::Modified,
+                comparison: Comparison::Equal,
+                date: DateThreshold::Calendar(
+                    subtract_calendar_days(calendar_date(now).unwrap(), 3).unwrap()
+                ),
             })
         );
         assert_eq!(

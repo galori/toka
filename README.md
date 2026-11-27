@@ -89,7 +89,9 @@ such as `created:">= 1 day ago"`, `modified:">= 30 minutes ago"`, and
 `modified:">= last 30 minutes"` resolve once when the search starts and compare
 the exact file timestamp, so a one-day window means the last 24 hours. Relative
 values accept seconds, minutes, hours, days, and weeks, plus compact units such
-as `30m ago`. Explicit calendar dates use the file's local calendar date.
+as `30m ago`. An unqualified day or week value such as `modified:"3 days ago"`
+matches that local calendar day; explicit calendar dates use the same local-day
+matching.
 
 ### Search from the command line
 
