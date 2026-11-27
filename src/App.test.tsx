@@ -2246,8 +2246,11 @@ test("plain favorite on Enter, clear on 0, and Escape closes", async () => {
   );
   fireEvent.keyDown(window, { key: "F", shiftKey: true });
   await user.keyboard("0");
+  // Since #385 the player re-reads the prepared video after every retag, so a
+  // prepare_video call follows the removal: assert the removal happened, not
+  // that nothing followed it.
   await waitFor(() =>
-    expect(invokeMock).toHaveBeenLastCalledWith("remove_video_tags", {
+    expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
       resultId: "video-1",
       tags: ["fv"],
     }),
@@ -2360,6 +2363,10 @@ function mockTopTags(topTags: string[], applied: string[] = []) {
     const tags = (args as { tags?: string[] } | undefined)?.tags ?? [];
     if (command === "get_top_tags")
       return Promise.resolve(topTags.map((tag, i) => ({ tag, count: 9 - i })));
+    // Since #385 every retag re-reads the prepared video. These tag commands
+    // rename nothing, so the re-read answers the path already on screen.
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
     if (command === "add_video_tags") {
       current = [...current, ...tags];
       return Promise.resolve({ fileName: "clip.mp4", tags: current });
@@ -2884,6 +2891,8 @@ test("shows the renamed file everywhere the player names it after tagging", asyn
       ],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    // Since #389 opening the tag field fetches the common tags first.
+    .mockResolvedValueOnce([])
     .mockResolvedValueOnce({
       fileName: "tagged [review work].mp4",
       tags: ["review", "work"],
