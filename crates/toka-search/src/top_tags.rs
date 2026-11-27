@@ -77,6 +77,17 @@ pub fn read(database: &Path) -> Option<Vec<TopTag>> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// [`read`], but `None` when the file is older than `max_age`: the daemon may
+/// have stopped, or the app may be running the index itself, and a frozen
+/// list would hide every tag used since.
+pub fn read_fresh(database: &Path, max_age: std::time::Duration) -> Option<Vec<TopTag>> {
+    let modified = fs::metadata(path_for(database)).ok()?.modified().ok()?;
+    if modified.elapsed().is_ok_and(|age| age > max_age) {
+        return None;
+    }
+    read(database)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +137,16 @@ mod tests {
         let top = compute(&index, 2).unwrap();
 
         assert_eq!(tags(&top), [("x", 1), ("y", 1)]);
+    }
+
+    #[test]
+    fn read_fresh_ignores_a_list_older_than_the_limit() {
+        let (_directory, database) = indexed(&["a [beach].mp4"]);
+        refresh(&database).unwrap();
+
+        assert!(read_fresh(&database, std::time::Duration::from_secs(60)).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(read_fresh(&database, std::time::Duration::ZERO).is_none());
     }
 
     #[test]

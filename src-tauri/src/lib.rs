@@ -1056,7 +1056,7 @@ fn update_video_tags(
 }
 
 #[tauri::command]
-fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
+async fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
     let failed = |message: String| CommandError {
         kind: "Tags",
         message,
@@ -1064,7 +1064,11 @@ fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
     let database = toka_search::owned_index::database_path().map_err(failed)?;
     // The indexer daemon keeps this list fresh; count on demand until it has.
     // An empty list may predate the first scan, so it is counted again.
-    if let Some(tags) = toka_search::top_tags::read(&database).filter(|tags| !tags.is_empty()) {
+    // A stale list (daemon stopped, or the app owns the index) is counted again.
+    let max_age = std::time::Duration::from_secs(10 * 60);
+    if let Some(tags) =
+        toka_search::top_tags::read_fresh(&database, max_age).filter(|tags| !tags.is_empty())
+    {
         return Ok(tags);
     }
     if !database.exists() {
