@@ -165,17 +165,19 @@ const SORT_FIELDS: { value: SortField; label: string }[] = [
   { value: "shuffle", label: "Shuffle" },
   { value: "name", label: "Name" },
   { value: "size", label: "Size" },
+  { value: "duration", label: "Duration" },
   { value: "created", label: "Created" },
   { value: "modified", label: "Modified" },
   { value: "accessed", label: "Accessed" },
 ];
 
 // The end each field starts from when it is picked: A to Z, biggest first,
-// newest first. Shuffling answers to no direction, so it keeps whichever
-// one was there.
+// longest first, newest first. Shuffling answers to no direction, so it
+// keeps whichever one was there.
 const SORT_NATURAL_DIRECTIONS: Partial<Record<SortField, SortDirection>> = {
   name: "asc",
   size: "desc",
+  duration: "desc",
   created: "desc",
   modified: "desc",
   accessed: "desc",
@@ -394,6 +396,15 @@ function VideoThumbnail({
           {image ? <ImageIcon /> : <VideoIcon />}
         </span>
       </span>
+      {video.durationMs !== undefined ? (
+        <span
+          className="duration-badge"
+          role="img"
+          aria-label={`Duration ${formatTime(video.durationMs / 1000)}`}
+        >
+          {formatTime(video.durationMs / 1000)}
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -1161,9 +1172,9 @@ const HELP_SECTIONS: HelpSection[] = [
         description: "Combine terms and group them with parentheses",
       },
       {
-        shortcut: "tags: filename: path: size: created: modified:",
+        shortcut: "tags: filename: path: size: duration: created: modified:",
         description:
-          'Limit terms by field, size, or date: created:today, modified:yesterday, ranges like modified:2026-01-01..2026-12-31, or quoted windows like created:">= 1 day ago"',
+          'Limit terms by field, size, length, or date: created:today, modified:yesterday, ranges like modified:2026-01-01..2026-12-31, or quoted windows like created:">= 1 day ago"',
       },
       {
         shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",
@@ -4922,7 +4933,8 @@ export default function App() {
   };
 
   // Picking a field starts it at its natural end — A to Z, biggest first,
-  // newest first — and the direction toggle turns it around from there.
+  // longest first, newest first — and the direction toggle turns it around
+  // from there.
   // Picking the field that is already picked changes nothing, so the
   // search below does not run again for it.
   const setSortField = (field: SortField) => {
@@ -4936,7 +4948,7 @@ export default function App() {
   };
 
   // Steps through the orders the select lists, for the keyboard: shuffle,
-  // name, size, and the three dates, each at its natural end.
+  // name, size, duration, and the three dates, each at its natural end.
   const cycleSortField = () => {
     const current = SORT_FIELDS.findIndex(
       (field) => field.value === sort.field,

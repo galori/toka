@@ -1,6 +1,6 @@
-use crate::search::{tokenize_query, SearchError, SearchProvider};
+use crate::search::{tokenize_query, CandidateSet, SearchError, SearchProvider};
 use crate::search_log::SearchLogContext;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 pub struct OwnedIndexSearchProvider {
     database: PathBuf,
@@ -59,11 +59,16 @@ impl SearchProvider for OwnedIndexSearchProvider {
         query: &str,
         _whole_path: bool,
         _context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
+    ) -> Result<CandidateSet, SearchError> {
         let terms = query_terms(query)?;
-        self.open_index()?
+        let index = self.open_index()?;
+        let paths = index
             .search_candidates(&terms)
-            .map_err(|error| SearchError::Provider(error.to_string()))
+            .map_err(|error| SearchError::Provider(error.to_string()))?;
+        // Best-effort: a search answers even when its lengths cannot be
+        // read — they all show as unknown.
+        let durations = index.durations_for(&paths).unwrap_or_default();
+        Ok(CandidateSet { paths, durations })
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
@@ -74,6 +79,16 @@ impl SearchProvider for OwnedIndexSearchProvider {
             .map_err(|error| SearchError::Provider(error.to_string()))?;
         retain_visible_under_roots(&roots, paths);
         Ok(())
+    }
+
+    fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+        self.open_index()
+            .and_then(|index| {
+                index
+                    .durations_for(paths)
+                    .map_err(|error| SearchError::Provider(error.to_string()))
+            })
+            .unwrap_or_default()
     }
 
     fn revision(&self) -> u64 {
@@ -104,7 +119,7 @@ fn query_terms(query: &str) -> Result<Vec<String>, SearchError> {
         }
         if let Some((field, value)) = token.split_once(':') {
             match field.to_ascii_lowercase().as_str() {
-                "size" | "created" | "modified" | "type" | "extension" | "ext" => {
+                "size" | "created" | "modified" | "duration" | "type" | "extension" | "ext" => {
                     needs_all_candidates = true;
                     continue;
                 }
@@ -159,6 +174,39 @@ mod tests {
         provider.retain_visible_paths(&mut paths).unwrap();
 
         assert_eq!(paths, vec![visible]);
+    }
+
+    #[test]
+    fn owned_index_provider_serves_indexed_durations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let known = root.join("known.mp4");
+        let unknown = root.join("unknown.mp4");
+        std::fs::write(&known, b"video").unwrap();
+        std::fs::write(&unknown, b"video").unwrap();
+        let database = directory.path().join("state").join("index.sqlite3");
+        {
+            let mut index = crate::owned_index::OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            let metadata = std::fs::metadata(&known).unwrap();
+            index
+                .set_duration_ms(
+                    &known,
+                    metadata.len() as i64,
+                    crate::timestamp::time_ns(metadata.modified().unwrap()).unwrap(),
+                    61_500,
+                )
+                .unwrap();
+        }
+        let provider = OwnedIndexSearchProvider::new(database);
+
+        let durations = provider.durations_for(&[known.clone(), unknown]);
+
+        assert_eq!(durations.len(), 1);
+        assert_eq!(durations[&known], 61_500);
     }
 
     #[test]
@@ -244,6 +292,8 @@ mod tests {
         for query in [
             "type:image",
             "extension:jpg",
+            "duration:>5m",
+            "duration:90",
             "NOT tags:hidden",
             "filename:trip OR NOT folder:private",
         ] {

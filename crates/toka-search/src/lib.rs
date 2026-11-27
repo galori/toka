@@ -10,6 +10,7 @@ pub mod daemon_state;
 pub mod index_stats;
 pub mod indexer_daemon;
 pub mod lossy_path;
+pub mod media;
 pub mod owned_index;
 pub mod providers;
 pub mod reset;

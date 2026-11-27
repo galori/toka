@@ -10,6 +10,9 @@ export type VideoResult = {
   tags?: string[];
   // The tags of the folder the video sits in.
   folderTags?: string[];
+  // How long the video runs, in whole milliseconds. Missing while the
+  // background probe has not reached the file yet.
+  durationMs?: number;
 };
 
 export type VideoTagUpdate = Pick<VideoResult, "fileName" | "tags">;
@@ -74,7 +77,13 @@ export const DEFAULT_MEDIA_TYPE: MediaType = "videos";
 // The order results come back in: shuffled by default, so a broad search
 // stays a mix, or one file property in either direction.
 export type SortField =
-  "shuffle" | "name" | "size" | "created" | "modified" | "accessed";
+  | "shuffle"
+  | "name"
+  | "size"
+  | "duration"
+  | "created"
+  | "modified"
+  | "accessed";
 export type SortDirection = "asc" | "desc";
 export type SearchSort = { field: SortField; direction: SortDirection };
 export const DEFAULT_SEARCH_SORT: SearchSort = {

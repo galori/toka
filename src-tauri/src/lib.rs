@@ -1458,7 +1458,7 @@ fn platform_provider(_logger: Arc<SearchLogger>) -> Result<Arc<dyn SearchProvide
                 _query: &str,
                 _whole_path: bool,
                 _context: &search_log::SearchLogContext,
-            ) -> Result<Vec<std::path::PathBuf>, SearchError> {
+            ) -> Result<search::CandidateSet, SearchError> {
                 Err(SearchError::Provider(
                     "Toka currently supports video search on macOS and Linux.".into(),
                 ))
@@ -2133,8 +2133,11 @@ mod tests {
             _query: &str,
             _whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
-            Ok(self.0.clone())
+        ) -> Result<search::CandidateSet, SearchError> {
+            Ok(search::CandidateSet {
+                paths: self.0.clone(),
+                durations: Default::default(),
+            })
         }
     }
 

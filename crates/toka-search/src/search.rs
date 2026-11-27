@@ -68,6 +68,7 @@ pub enum SortField {
     Created,
     Modified,
     Accessed,
+    Duration,
 }
 
 /// Which end of a sorted search comes first. Ascending is the file's natural
@@ -121,6 +122,10 @@ pub struct VideoResult {
     pub tags: Vec<String>,
     /// The tags of the folder the file sits in, read from that folder's name.
     pub folder_tags: Vec<String>,
+    /// How long the video runs, in whole milliseconds. Absent while the
+    /// background probe has not reached the file yet — never zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -164,22 +169,44 @@ pub enum SearchError {
     VideoUnavailable,
 }
 
+/// One provider answer: candidate paths with the durations known for
+/// them. The two travel together so concurrent searches can never mix
+/// one search's paths with another's lengths.
+#[derive(Debug, Clone, Default)]
+pub struct CandidateSet {
+    pub paths: Vec<PathBuf>,
+    pub durations: HashMap<PathBuf, u64>,
+}
+
 pub trait SearchProvider: Send + Sync {
     /// Candidate videos for `query`, which the engine then filters by the
     /// fields the viewer chose. `whole_path` asks for the wider set a folder
     /// search needs: every index Toka reads answers on file names alone unless
     /// it is told otherwise, and a video in a matching folder has no reason to
-    /// carry the term in its own name.
+    /// carry the term in its own name. Known durations ride along keyed by
+    /// path; unknown paths are absent.
     fn candidates(
         &self,
         query: &str,
         whole_path: bool,
         context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError>;
+    ) -> Result<CandidateSet, SearchError>;
 
     /// Apply provider scope and visibility rules after recent renames are added.
     fn retain_visible_paths(&self, _paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
         Ok(())
+    }
+
+    /// The known video durations of `paths`, in whole milliseconds, for
+    /// videos handed in outside any search — playlists and folder or file
+    /// launches. Searches never call this: their durations ride along
+    /// with their candidates instead, so concurrent searches cannot mix
+    /// one search's paths with another's lengths. Best-effort: unknown
+    /// paths are absent, and a failing provider answers empty rather
+    /// than failing the caller.
+    fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+        let _ = paths;
+        HashMap::new()
     }
 
     fn revision(&self) -> u64 {
@@ -385,6 +412,7 @@ struct SearchSnapshot {
     media_type: MediaType,
     sort: SearchSort,
     paths: Vec<PathBuf>,
+    durations: Arc<HashMap<PathBuf, u64>>,
     index_revision: u64,
     created_at: Instant,
 }
@@ -394,6 +422,10 @@ struct SearchSnapshots {
     active: Option<String>,
     by_id: HashMap<String, SearchSnapshot>,
 }
+
+/// A query's matches: the trimmed query, the matching paths, and the
+/// durations the provider knew for them.
+type MatchSet = (String, Vec<PathBuf>, HashMap<PathBuf, u64>);
 
 impl SearchEngine {
     // Unconditional (not just `cfg(test)`): the app's tests build engines too,
@@ -522,7 +554,7 @@ impl SearchEngine {
     /// back), exactly as a search sees them — only the filtering is left
     /// to the caller. `ts candidates` serves this to the app's engine,
     /// which filters it with the viewer's own fields.
-    pub fn raw_candidates(&self, query: &str) -> Result<(Vec<PathBuf>, u64), SearchError> {
+    pub fn raw_candidates(&self, query: &str) -> Result<(CandidateSet, u64), SearchError> {
         let request = SearchRequest {
             query: query.to_owned(),
             page: 1,
@@ -535,8 +567,15 @@ impl SearchEngine {
         let context = self.logger.context(&request, false);
         // The whole-path set: field matching happens on top of this, and
         // a path-only term must already be here to survive it.
-        let paths = self.candidates(query, true, &context)?;
-        Ok((paths, self.provider.revision()))
+        let found = self.candidates(query, true, &context)?;
+        Ok((found, self.provider.revision()))
+    }
+
+    /// The known video durations of `paths`, in whole milliseconds,
+    /// straight from the provider. Unknown paths are absent; a failing
+    /// provider answers empty rather than failing the caller.
+    pub fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+        self.provider.durations_for(paths)
     }
 
     /// The verbose per-search trace recorded since the last call, from
@@ -552,13 +591,13 @@ impl SearchEngine {
         context: &SearchLogContext,
     ) -> Result<SearchAllResults, SearchError> {
         let filter = |_: &Path| true;
-        let (query, paths) = self.matching_paths(&request, context, &filter)?;
+        let (query, paths, durations) = self.matching_paths(&request, context, &filter)?;
         self.logger.record_returned(context, &paths);
         let mut known_paths = self.result_paths.lock().unwrap();
         let results = paths
             .into_iter()
             .map(|path| {
-                let result = video_result(&path);
+                let result = video_result(&path, durations.get(&path).copied());
                 known_paths.insert(result.id.clone(), path);
                 result
             })
@@ -594,14 +633,15 @@ impl SearchEngine {
         filter: &dyn Fn(&Path) -> bool,
     ) -> Result<SearchPage, SearchError> {
         let snapshot = if request.page == 1 {
-            let (query, mut paths) = self.matching_paths(&request, context, filter)?;
-            order_paths(&mut paths, request.sort);
+            let (query, mut paths, durations) = self.matching_paths(&request, context, filter)?;
+            order_paths(&mut paths, request.sort, &durations);
             self.remember_snapshot(
                 query,
                 request.fields,
                 request.media_type,
                 request.sort,
                 paths,
+                durations,
             )
         } else {
             self.snapshot_for(&request)?
@@ -622,7 +662,7 @@ impl SearchEngine {
         let results = page_paths
             .into_iter()
             .map(|path| {
-                let result = video_result(&path);
+                let result = video_result(&path, snapshot.durations.get(&path).copied());
                 known_paths.insert(result.id.clone(), path);
                 result
             })
@@ -647,6 +687,7 @@ impl SearchEngine {
         media_type: MediaType,
         sort: SearchSort,
         paths: Vec<PathBuf>,
+        durations: HashMap<PathBuf, u64>,
     ) -> SearchSnapshot {
         let snapshot = SearchSnapshot {
             id: Uuid::new_v4().to_string(),
@@ -655,6 +696,7 @@ impl SearchEngine {
             media_type,
             sort,
             paths,
+            durations: Arc::new(durations),
             index_revision: self.provider.revision(),
             created_at: Instant::now(),
         };
@@ -758,7 +800,7 @@ impl SearchEngine {
     ) -> Result<usize, SearchError> {
         let result = self
             .matching_paths(&request, &context, &filter)
-            .map(|(_, paths)| paths.len());
+            .map(|(_, paths, _)| paths.len());
         if let Err(error) = &result {
             self.logger.record_error(&context, &error.to_string());
         }
@@ -770,7 +812,7 @@ impl SearchEngine {
         request: &SearchRequest,
         context: &SearchLogContext,
         filter: &dyn Fn(&Path) -> bool,
-    ) -> Result<(String, Vec<PathBuf>), SearchError> {
+    ) -> Result<MatchSet, SearchError> {
         let query = request.query.trim();
         let expression = parse_query(query)?;
         if !request.fields.any() {
@@ -794,8 +836,8 @@ impl SearchEngine {
         // half. An existing folder with no media in it answers empty — that
         // needs no index either.
         let covered = query_covered_by_direct(&expression, &walked);
-        let mut candidates = match self.candidates(query, needs_whole_path, context) {
-            Ok(candidates) => candidates,
+        let found = match self.candidates(query, needs_whole_path, context) {
+            Ok(found) => found,
             Err(error) => {
                 if !covered {
                     return Err(error);
@@ -803,9 +845,14 @@ impl SearchEngine {
                 // The index failed but the named files still answer whole:
                 // logged, so the failure never passes unseen.
                 self.logger.record_error(context, &error.to_string());
-                Vec::new()
+                CandidateSet::default()
             }
         };
+        let mut candidates = found.paths;
+        // The durations that rode along with these very paths: sorting,
+        // duration filters, badges, and the snapshot all read from this
+        // map, so later pages never ask the provider again.
+        let durations = found.durations;
         if let Err(error) = self.provider.retain_visible_paths(&mut candidates) {
             if !covered {
                 return Err(error);
@@ -825,7 +872,7 @@ impl SearchEngine {
                 self.logger.record_filtered(context, &path, "empty file");
                 continue;
             }
-            if !matches_query(&path, &expression, request.fields, &resolved) {
+            if !matches_query(&path, &expression, request.fields, &resolved, &durations) {
                 self.logger
                     .record_filtered(context, &path, "query did not match");
                 continue;
@@ -842,7 +889,7 @@ impl SearchEngine {
             }
             paths.push(path);
         }
-        Ok((query.to_owned(), paths))
+        Ok((query.to_owned(), paths, durations))
     }
 
     /// The provider's candidates, corrected for renames Toka has recorded: a
@@ -855,8 +902,10 @@ impl SearchEngine {
         query: &str,
         whole_path: bool,
         context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
-        let mut paths = self.provider.candidates(query, whole_path, context)?;
+    ) -> Result<CandidateSet, SearchError> {
+        let found = self.provider.candidates(query, whole_path, context)?;
+        let mut paths = found.paths;
+        let mut durations = found.durations;
         let indexed_paths: HashSet<PathBuf> = paths.iter().cloned().collect();
         let _update = self.rename_overlay_write.lock().unwrap();
         if let Some(path) = self.rename_overlay_path.as_deref() {
@@ -874,15 +923,26 @@ impl SearchEngine {
             let renamed = self.renamed_paths.lock().unwrap();
             let folders = self.renamed_folders.lock().unwrap();
             if renamed.is_empty() && folders.is_empty() {
-                return Ok(paths);
+                return Ok(CandidateSet { paths, durations });
             }
-            for path in &mut paths {
+            // One resolver for paths and durations alike: a renamed file
+            // keeps its length under its new name.
+            let resolve = |path: &PathBuf| -> PathBuf {
                 if let Some(current) = renamed.get(path) {
-                    *path = current.clone();
+                    current.clone()
                 } else if let Some(current) = through_folders(folders.iter(), path) {
-                    *path = current;
+                    current
+                } else {
+                    path.clone()
                 }
+            };
+            for path in &mut paths {
+                *path = resolve(path);
             }
+            durations = durations
+                .into_iter()
+                .map(|(path, ms)| (resolve(&path), ms))
+                .collect();
             let should_prune = renamed
                 .values()
                 .any(|current| !current.is_file() || indexed_paths.contains(current));
@@ -910,7 +970,7 @@ impl SearchEngine {
                 renamed.len() != before
             });
         }
-        Ok(paths)
+        Ok(CandidateSet { paths, durations })
     }
 
     fn reload_rename_overlay_locked(&self, path: &Path) -> bool {
@@ -986,10 +1046,11 @@ impl SearchEngine {
     /// invites the frontend to ask for a second page that no search backs.
     pub fn page_of_videos(&self, query: String, paths: Vec<PathBuf>) -> SearchPage {
         let mut known_paths = self.result_paths.lock().unwrap();
+        let durations = self.provider.durations_for(&paths);
         let results: Vec<VideoResult> = paths
             .into_iter()
             .map(|path| {
-                let result = video_result(&path);
+                let result = video_result(&path, durations.get(&path).copied());
                 known_paths.insert(result.id.clone(), path);
                 result
             })
@@ -1148,7 +1209,7 @@ fn same_sort(left: SearchSort, right: SearchSort) -> bool {
 /// Puts a search's matches in the order the viewer asked for. Shuffling is
 /// the default: an alphabetical list buries everything past the first
 /// screenful, the wrong answer to "find me something to watch".
-fn order_paths(paths: &mut Vec<PathBuf>, sort: SearchSort) {
+fn order_paths(paths: &mut Vec<PathBuf>, sort: SearchSort, durations: &HashMap<PathBuf, u64>) {
     match sort.field {
         SortField::Shuffle => {
             // Providers may return a different order each time. Sorting before
@@ -1175,6 +1236,9 @@ fn order_paths(paths: &mut Vec<PathBuf>, sort: SearchSort) {
                 .ok()
                 .and_then(|metadata| metadata.accessed().ok())
         }),
+        SortField::Duration => {
+            sort_by_metadata(paths, sort.direction, |path| durations.get(path).copied())
+        }
     }
 }
 
@@ -1247,7 +1311,7 @@ fn shuffle(paths: &mut [PathBuf], seed: u64) {
 
 /// A result for `path` under a fresh id, which is what the frontend names the
 /// video by from then on: an id the engine minted, never a filesystem path.
-fn video_result(path: &Path) -> VideoResult {
+fn video_result(path: &Path, duration_ms: Option<u64>) -> VideoResult {
     VideoResult {
         id: Uuid::new_v4().to_string(),
         file_name: path
@@ -1271,6 +1335,7 @@ fn video_result(path: &Path) -> VideoResult {
             .and_then(Path::file_name)
             .map(|name| tags::Tags::parse_dir_name(&name.to_string_lossy()).into_values())
             .unwrap_or_default(),
+        duration_ms,
     }
 }
 
@@ -1377,6 +1442,13 @@ enum QueryTerm {
         bytes: u64,
         /// For a bare size such as `18mb`, the exclusive end of the range that
         /// starts at `bytes` (18.0 MB up to, not including, 19 MB).
+        upper: Option<u64>,
+    },
+    Duration {
+        comparison: Comparison,
+        ms: u64,
+        /// For a bare length such as `5m`, the exclusive end of the range
+        /// that starts at `ms` (5 minutes up to, not including, 6).
         upper: Option<u64>,
     },
     Date {
@@ -1553,6 +1625,7 @@ fn parse_query_term(token: &str, now: SystemTime) -> Result<QueryExpr, SearchErr
         let field = raw_field.to_ascii_lowercase();
         let term = match field.as_str() {
             "size" => parse_size_term(value)?,
+            "duration" => parse_duration_term(value)?,
             "created" => parse_date_term(DateField::Created, value, now)?,
             "modified" => parse_date_term(DateField::Modified, value, now)?,
             "type" => QueryTerm::MediaType(parse_media_type(value)?),
@@ -1648,7 +1721,7 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     // endpoints are computed exactly and independently, so `1.1kib` spans
     // [1126.4, 1228.8) bytes, i.e. 1127..=1228. An explicit `=` stays exact.
     let upper = if bare && multiplier > 1 {
-        bare_size_range(number_text, multiplier)
+        bare_unit_range(number_text, multiplier)
     } else {
         None
     };
@@ -1666,10 +1739,81 @@ fn parse_size_term(value: &str) -> Result<QueryTerm, SearchError> {
     })
 }
 
-/// The half-open byte range `[lower, upper)` that a bare decimal size such as
+/// Parses a `duration:` value the way `size:` parses its own: a comparison
+/// operator, a decimal number, and a unit — hours, minutes, seconds, or
+/// milliseconds, long names included, bare numbers read as seconds. A bare
+/// length covers one step of its last digit (`5m` is the sixth minute);
+/// an explicit operator keeps its plain threshold.
+fn parse_duration_term(value: &str) -> Result<QueryTerm, SearchError> {
+    let (comparison, number) = split_comparison(value);
+    let bare = !value.starts_with(['<', '>', '=']);
+    let number = number.to_ascii_lowercase();
+    // Longest suffixes first: `find_map` keeps the first match, and
+    // `5ms` must read as milliseconds, never as `5m` with a trailing
+    // `s` — just as `500milliseconds` must beat the `seconds` suffix.
+    let units = [
+        ("ms", 1u64),
+        ("milliseconds", 1u64),
+        ("millisecond", 1u64),
+        ("hours", 3_600_000u64),
+        ("hour", 3_600_000u64),
+        ("hrs", 3_600_000u64),
+        ("hr", 3_600_000u64),
+        ("h", 3_600_000u64),
+        ("minutes", 60_000u64),
+        ("minute", 60_000u64),
+        ("mins", 60_000u64),
+        ("min", 60_000u64),
+        ("m", 60_000u64),
+        ("seconds", 1_000u64),
+        ("second", 1_000u64),
+        ("secs", 1_000u64),
+        ("sec", 1_000u64),
+        ("s", 1_000u64),
+        ("", 1_000u64),
+    ];
+    let (number, multiplier) = units
+        .iter()
+        .find_map(|(suffix, multiplier)| {
+            number
+                .strip_suffix(suffix)
+                .map(|number| (number, *multiplier))
+        })
+        .ok_or(SearchError::InvalidQuery)?;
+    let number_text = number;
+    let number = number
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite() && *number >= 0.0)
+        .ok_or(SearchError::InvalidQuery)?;
+    let ms = number * multiplier as f64;
+    if !ms.is_finite() || ms > u64::MAX as f64 {
+        return Err(SearchError::InvalidQuery);
+    }
+    let upper = if bare && multiplier > 1 {
+        bare_unit_range(number_text, multiplier)
+    } else {
+        None
+    };
+    if let Some((lower, upper)) = upper {
+        return Ok(QueryTerm::Duration {
+            comparison,
+            ms: lower,
+            upper: Some(upper),
+        });
+    }
+    Ok(QueryTerm::Duration {
+        comparison,
+        ms: ms.round() as u64,
+        upper: None,
+    })
+}
+
+/// The half-open range `[lower, upper)` that a bare decimal number such as
 /// `36.3` times `multiplier` covers, or `None` when the text is not plain
-/// digits with an optional fraction.
-fn bare_size_range(number_text: &str, multiplier: u64) -> Option<(u64, u64)> {
+/// digits with an optional fraction. Shared by sizes (bytes) and durations
+/// (milliseconds), so both read one step of their last digit.
+fn bare_unit_range(number_text: &str, multiplier: u64) -> Option<(u64, u64)> {
     let (whole, fraction) = number_text.split_once('.').unwrap_or((number_text, ""));
     let digits = format!("{whole}{fraction}");
     if digits.is_empty()
@@ -1986,7 +2130,8 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
             | QueryTerm::Extension(_)
             | QueryTerm::Size { .. }
             | QueryTerm::Date { .. }
-            | QueryTerm::DateRange { .. },
+            | QueryTerm::DateRange { .. }
+            | QueryTerm::Duration { .. },
         ) => false,
         QueryExpr::Not(expression) => query_needs_whole_path(expression),
         QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
@@ -2000,6 +2145,7 @@ fn matches_query(
     expression: &QueryExpr,
     fields: SearchFields,
     resolved: &[ResolvedPathTerm],
+    durations: &HashMap<PathBuf, u64>,
 ) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, value }) => match field {
@@ -2042,6 +2188,17 @@ fn matches_query(
                 }
             })
             .unwrap_or(false),
+        QueryExpr::Term(QueryTerm::Duration {
+            comparison,
+            ms,
+            upper,
+        }) => durations
+            .get(path)
+            .copied()
+            .is_some_and(|length| match upper {
+                Some(upper) => length >= *ms && length < *upper,
+                None => compare(length, *comparison, *ms),
+            }),
         QueryExpr::Term(QueryTerm::Date {
             field,
             comparison,
@@ -2057,14 +2214,14 @@ fn matches_query(
                 .and_then(calendar_date)
                 .is_some_and(|actual| *start <= actual && actual <= *end)
         }
-        QueryExpr::Not(expression) => !matches_query(path, expression, fields, resolved),
+        QueryExpr::Not(expression) => !matches_query(path, expression, fields, resolved, durations),
         QueryExpr::And(left, right) => {
-            matches_query(path, left, fields, resolved)
-                && matches_query(path, right, fields, resolved)
+            matches_query(path, left, fields, resolved, durations)
+                && matches_query(path, right, fields, resolved, durations)
         }
         QueryExpr::Or(left, right) => {
-            matches_query(path, left, fields, resolved)
-                || matches_query(path, right, fields, resolved)
+            matches_query(path, left, fields, resolved, durations)
+                || matches_query(path, right, fields, resolved, durations)
         }
     }
 }
@@ -2420,13 +2577,19 @@ mod tests {
     struct FakeProvider {
         paths: Mutex<Vec<PathBuf>>,
         whole_path_asks: Mutex<Vec<bool>>,
+        durations: HashMap<PathBuf, u64>,
     }
 
     impl FakeProvider {
         fn new(paths: Vec<PathBuf>) -> Self {
+            Self::with_durations(paths, HashMap::new())
+        }
+
+        fn with_durations(paths: Vec<PathBuf>, durations: HashMap<PathBuf, u64>) -> Self {
             Self {
                 paths: Mutex::new(paths),
                 whole_path_asks: Mutex::new(Vec::new()),
+                durations,
             }
         }
     }
@@ -2437,9 +2600,19 @@ mod tests {
             _query: &str,
             whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
+        ) -> Result<CandidateSet, SearchError> {
             self.whole_path_asks.lock().unwrap().push(whole_path);
-            Ok(self.paths.lock().unwrap().clone())
+            Ok(CandidateSet {
+                paths: self.paths.lock().unwrap().clone(),
+                durations: self.durations.clone(),
+            })
+        }
+
+        fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+            paths
+                .iter()
+                .filter_map(|path| self.durations.get(path).map(|ms| (path.clone(), *ms)))
+                .collect()
         }
     }
 
@@ -2469,7 +2642,7 @@ mod tests {
             _query: &str,
             _whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
+        ) -> Result<CandidateSet, SearchError> {
             Err(SearchError::Provider("backend unavailable".into()))
         }
     }
@@ -2841,8 +3014,11 @@ mod tests {
                 _query: &str,
                 _whole_path: bool,
                 _context: &SearchLogContext,
-            ) -> Result<Vec<PathBuf>, SearchError> {
-                Ok(self.paths.clone())
+            ) -> Result<CandidateSet, SearchError> {
+                Ok(CandidateSet {
+                    paths: self.paths.clone(),
+                    durations: HashMap::new(),
+                })
             }
             fn revision(&self) -> u64 {
                 41
@@ -2858,9 +3034,10 @@ mod tests {
 
         // A negation the engine would narrow: raw candidates keep the
         // provider's whole set, verbatim and in order.
-        let (candidates, revision) = engine.raw_candidates("clip NOT archive").unwrap();
+        let (found, revision) = engine.raw_candidates("clip NOT archive").unwrap();
 
-        assert_eq!(candidates, paths);
+        assert_eq!(found.paths, paths);
+        assert!(found.durations.is_empty());
         assert_eq!(revision, 41);
     }
 
@@ -2886,11 +3063,33 @@ mod tests {
             .update_video_path(&page.results[0].id, current.clone())
             .unwrap();
 
-        let (mut candidates, _) = engine.raw_candidates("old").unwrap();
+        let (mut found, _) = engine.raw_candidates("old").unwrap();
 
-        candidates.sort();
-        candidates.dedup();
-        assert_eq!(candidates, vec![current]);
+        found.paths.sort();
+        found.paths.dedup();
+        assert_eq!(found.paths, vec![current]);
+    }
+
+    #[test]
+    fn renamed_videos_keep_their_durations_under_the_new_name() {
+        let directory = tempdir().unwrap();
+        let previous = directory.path().join("old.mp4");
+        let current = directory.path().join("new.mp4");
+        fs::write(&current, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            vec![previous.clone()],
+            [(previous, 61_500)].into_iter().collect(),
+        )));
+        let page = engine.search(request("old")).unwrap();
+        engine
+            .update_video_path(&page.results[0].id, current)
+            .unwrap();
+
+        let page = engine.search(request("new")).unwrap();
+
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].file_name, "new.mp4");
+        assert_eq!(page.results[0].duration_ms, Some(61_500));
     }
 
     #[test]
@@ -3133,6 +3332,78 @@ mod tests {
         assert_eq!(descending, ["clip-20.mp4", "clip-10.mp4", "clip-gone.mp4"]);
     }
 
+    /// "Something short" is shortest first. "Something to settle into" is
+    /// longest first.
+    #[test]
+    fn duration_sort_orders_by_length() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 3);
+        let durations: HashMap<PathBuf, u64> = [
+            (paths[0].clone(), 3_000),
+            (paths[1].clone(), 1_000),
+            (paths[2].clone(), 2_000),
+        ]
+        .into_iter()
+        .collect();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(paths, durations)));
+
+        let ascending = names(
+            &engine
+                .search(sorted("clip", SortField::Duration, SortDirection::Asc))
+                .unwrap(),
+        );
+        let descending = names(
+            &engine
+                .search(sorted("clip", SortField::Duration, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(ascending, ["clip-01.mp4", "clip-00.mp4", "clip-02.mp4"]);
+        assert_eq!(descending, ["clip-02.mp4", "clip-00.mp4", "clip-01.mp4"]);
+    }
+
+    /// A clip the probe has not reached yet has no length to sort by. It
+    /// stays in the results, but always at the end, whichever direction
+    /// was asked for.
+    #[test]
+    fn an_unprobed_clip_sorts_last_in_either_direction() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 3);
+        let durations: HashMap<PathBuf, u64> =
+            [(paths[1].clone(), 1_000), (paths[0].clone(), 3_000)]
+                .into_iter()
+                .collect();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(paths, durations)));
+
+        let ascending = names(
+            &engine
+                .search(sorted("clip", SortField::Duration, SortDirection::Asc))
+                .unwrap(),
+        );
+        let descending = names(
+            &engine
+                .search(sorted("clip", SortField::Duration, SortDirection::Desc))
+                .unwrap(),
+        );
+
+        assert_eq!(ascending, ["clip-01.mp4", "clip-02.mp4", "clip-00.mp4"]);
+        assert_eq!(descending, ["clip-02.mp4", "clip-01.mp4", "clip-00.mp4"]);
+    }
+
+    #[test]
+    fn duration_sort_parses_from_a_request() {
+        let explicit: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "clip",
+            "page": 1,
+            "pageSize": 24,
+            "sort": {"field": "duration", "direction": "desc"},
+        }))
+        .unwrap();
+
+        assert_eq!(explicit.sort.field, SortField::Duration);
+        assert_eq!(explicit.sort.direction, SortDirection::Desc);
+    }
+
     /// "What did I just download" is newest first. "What have I kept the
     /// longest" is oldest first.
     #[test]
@@ -3273,6 +3544,70 @@ mod tests {
             [names(&first), names(&second)].concat(),
             every_clip_name(30)
         );
+    }
+
+    #[test]
+    fn results_carry_provider_durations_on_every_page() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let durations: HashMap<PathBuf, u64> = paths
+            .iter()
+            .enumerate()
+            // Every third clip unknown: gaps must read as unknown, never
+            // zero, on both pages.
+            .filter(|(number, _)| number % 3 != 0)
+            .map(|(number, path)| (path.clone(), (number as u64 + 1) * 1000))
+            .collect();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            paths.clone(),
+            durations.clone(),
+        )));
+        let first = engine
+            .search(sorted("clip", SortField::Name, SortDirection::Asc))
+            .unwrap();
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id.clone());
+        next_request.sort = SearchSort {
+            field: SortField::Name,
+            direction: SortDirection::Asc,
+        };
+        let second = engine.search(next_request).unwrap();
+
+        for page in [&first, &second] {
+            for result in &page.results {
+                let path = paths
+                    .iter()
+                    .find(|path| path.file_name().unwrap().to_string_lossy() == result.file_name)
+                    .unwrap();
+                assert_eq!(result.duration_ms, durations.get(path).copied());
+            }
+        }
+        assert!(first
+            .results
+            .iter()
+            .any(|result| result.duration_ms.is_none()));
+        assert!(first
+            .results
+            .iter()
+            .any(|result| result.duration_ms.is_some()));
+    }
+
+    #[test]
+    fn handed_pages_carry_provider_durations() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 3);
+        let durations: HashMap<PathBuf, u64> = [(paths[0].clone(), 61_500)].into_iter().collect();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            paths.clone(),
+            durations,
+        )));
+
+        let page = engine.page_of_videos("playlist".into(), paths.clone());
+
+        assert_eq!(page.results.len(), 3);
+        assert_eq!(page.results[0].duration_ms, Some(61_500));
+        assert_eq!(page.results[1].duration_ms, None);
+        assert_eq!(page.results[2].duration_ms, None);
     }
 
     /// Older frontends send no sort: they keep the shuffle they always had.
@@ -4379,6 +4714,141 @@ mod tests {
         let mut at_least = names(&engine.search(request("size:>=100kb")).unwrap());
         at_least.sort();
         assert_eq!(at_least, ["huge.mp4", "mid.mp4", "small.mp4", "target.mp4"]);
+    }
+
+    #[test]
+    fn duration_predicates_match_lengths_units_and_ranges() {
+        let directory = tempdir().unwrap();
+        let short = directory.path().join("short.mp4");
+        let medium = directory.path().join("medium.mp4");
+        let long = directory.path().join("long.mp4");
+        let unknown = directory.path().join("unknown.mp4");
+        for path in [&short, &medium, &long, &unknown] {
+            fs::write(path, b"test").unwrap();
+        }
+        let durations: HashMap<PathBuf, u64> = [
+            (short.clone(), 45_500),
+            (medium.clone(), 150_000),
+            (long.clone(), 3_700_000),
+        ]
+        .into_iter()
+        .collect();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            vec![short, medium, long, unknown],
+            durations,
+        )));
+
+        // A bare length covers one step of its last digit: `45s` is the
+        // 45th second, `2m` the third minute, `1h` the second hour.
+        assert_eq!(
+            names(&engine.search(request("duration:45s")).unwrap()),
+            ["short.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("duration:2m")).unwrap()),
+            ["medium.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("duration:1h")).unwrap()),
+            ["long.mp4"]
+        );
+        assert!(names(&engine.search(request("duration:46s")).unwrap()).is_empty());
+        // Bare numbers are seconds.
+        assert_eq!(
+            names(&engine.search(request("duration:150")).unwrap()),
+            ["medium.mp4"]
+        );
+        // Long unit names read as their short ones do.
+        let mut minute = names(&engine.search(request("duration:>1minute")).unwrap());
+        minute.sort();
+        assert_eq!(minute, ["long.mp4", "medium.mp4"]);
+        let mut over = names(&engine.search(request("duration:>1m")).unwrap());
+        over.sort();
+        assert_eq!(over, ["long.mp4", "medium.mp4"]);
+        let mut under = names(&engine.search(request("duration:<1m")).unwrap());
+        under.sort();
+        assert_eq!(under, ["short.mp4"]);
+        let mut at_least = names(&engine.search(request("duration:>=150s")).unwrap());
+        at_least.sort();
+        assert_eq!(at_least, ["long.mp4", "medium.mp4"]);
+        // Long millisecond names read as `ms` does.
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("duration:150000milliseconds"))
+                    .unwrap()
+            ),
+            ["medium.mp4"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("duration:150000millisecond"))
+                    .unwrap()
+            ),
+            ["medium.mp4"]
+        );
+        // An explicit `=` stays an exact match.
+        assert_eq!(
+            names(&engine.search(request("duration:=150000ms")).unwrap()),
+            ["medium.mp4"]
+        );
+        assert!(names(&engine.search(request("duration:=151s")).unwrap()).is_empty());
+        // Operators keep their plain threshold even with a fraction.
+        let mut half = names(&engine.search(request("duration:>=2.5m")).unwrap());
+        half.sort();
+        assert_eq!(half, ["long.mp4", "medium.mp4"]);
+        // The unprobed clip answers to no positive length.
+        let mut all = names(&engine.search(request("duration:>1ms")).unwrap());
+        all.sort();
+        assert_eq!(all, ["long.mp4", "medium.mp4", "short.mp4"]);
+    }
+
+    #[test]
+    fn unprobed_clips_match_only_a_negated_duration() {
+        let directory = tempdir().unwrap();
+        let known = directory.path().join("known.mp4");
+        let unknown = directory.path().join("unknown.mp4");
+        fs::write(&known, b"test").unwrap();
+        fs::write(&unknown, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            vec![known.clone(), unknown.clone()],
+            [(known, 61_500)].into_iter().collect(),
+        )));
+
+        assert_eq!(
+            names(&engine.search(request("duration:>1s")).unwrap()),
+            ["known.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("NOT duration:>1s")).unwrap()),
+            ["unknown.mp4"]
+        );
+    }
+
+    #[test]
+    fn duration_predicates_reject_garbage() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 2);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+
+        for query in [
+            "duration:",
+            "duration:abc",
+            "duration:-5",
+            "duration:5x",
+            "duration:1d",
+            "duration:>= ",
+            "duration:1.2.3m",
+        ] {
+            assert!(
+                matches!(
+                    engine.search(request(query)).unwrap_err(),
+                    SearchError::InvalidQuery
+                ),
+                "{query} should not parse"
+            );
+        }
     }
 
     #[test]
