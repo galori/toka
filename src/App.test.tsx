@@ -1695,13 +1695,65 @@ test("plain favorite on Enter, clear on 0, and Escape closes", async () => {
   expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
 });
 
+test("opening the tag field closes the picker so digits type into it", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockResolvedValue({ fileName: "clip [720p].mp4", tags: ["720p"] });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.click(screen.getByRole("button", { name: "Add tag to clip.mp4" }));
+  expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
+  await user.keyboard("720p");
+  expect(
+    screen.getByRole("textbox", { name: "Add tag to clip.mp4" }),
+  ).toHaveValue("720p");
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "set_video_tags",
+    expect.anything(),
+  );
+});
+
+test("the open picker swallows other player shortcuts and Shift+F toggles it", async () => {
+  const user = await playWithTags([]);
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("{Shift>}{Delete}{/Shift}");
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "delete_video",
+    expect.anything(),
+  );
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
+});
+
+test("shows an error when the favorite cannot be saved", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockRejectedValueOnce(new Error("disk full"));
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("4");
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not update favorite",
+  );
+});
+
+test("a mouse choice leaves no stale hover when the picker reopens", async () => {
+  const user = await playWithTags(["fv", "fv4"]);
+  invokeMock.mockResolvedValue({ fileName: "clip.mp4", tags: [] });
+  const toggle = screen.getByRole("button", {
+    name: "Favorite level for clip.mp4",
+  });
+  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: "Level 4" }));
+  await user.click(toggle);
+  expect(screen.getByRole("button", { name: "Level 4" })).toHaveTextContent(
+    "☆",
+  );
+});
+
 test("lists favorites in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });
   const help = await screen.findByRole("dialog", {
     name: "Keyboard shortcuts",
   });
-  expect(within(help).getByText("Set favorite level 1-5")).toBeVisible();
+  expect(within(help).getByText(/Pick a favorite level/)).toBeVisible();
 });
 
 test("lists folder tagging in the help pane", async () => {
