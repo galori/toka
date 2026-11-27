@@ -2623,6 +2623,10 @@ test("keeps a scrub made after the swapped source starts loading", async () => {
   fireEvent.change(screen.getByRole("slider", { name: "Video timeline" }), {
     target: { value: "40" },
   });
+  // The scrub moved the pending resume along; the element's own clock is
+  // reset again so the assertion below proves the handler restores the
+  // scrub rather than the mock retaining it.
+  (video as HTMLVideoElement).currentTime = 0;
 
   fireEvent.loadedMetadata(video);
   // The metadata handler keeps the scrub instead of undoing it.
@@ -2680,6 +2684,110 @@ test("stays stopped when a retag lands after loop-off ended the video", async ()
   // The position is restored, but the video does not start on its own.
   expect(video).toHaveProperty("currentTime", 10);
   expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+});
+
+test("retries the retag refresh once when it fails", async () => {
+  let preparations = 0;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      if (preparations === 2)
+        return Promise.reject(new Error("The video is momentarily unavailable."));
+      return Promise.resolve({ filePath: "/Videos/tagged [review].mp4" });
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // The first refresh failed, but the retry brings the display up to date
+  // rather than leaving it behind.
+  expect(
+    await screen.findByDisplayValue("/Videos/tagged [review].mp4"),
+  ).toBeVisible();
+  expect(preparations).toBe(3);
+});
+
+test("shows an error when the retag refresh fails twice", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      const calls = invokeMock.mock.calls.filter(
+        ([name]) => name === "prepare_video",
+      ).length;
+      if (calls === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return Promise.reject(new Error("That video is no longer available."));
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // Both the refresh and its retry failed, so the player says so instead
+  // of preparing forever.
+  expect(
+    await screen.findByRole("heading", {
+      name: "This video could not be played",
+    }),
+  ).toBeVisible();
 });
 
 test("uses one control for playing and pausing", async () => {

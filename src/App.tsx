@@ -1397,9 +1397,19 @@ function Player({
   const prepareSequence = useRef(0);
   // A retag swapped the web source underneath the playing video, and the
   // engine starts the new file at the beginning — so the metadata handler
-  // puts the viewer back at the scrubber's position, which follows every
-  // seek the viewer makes while the new source loads. A new video clears it.
-  const resumeAfterRetag = useRef(false);
+  // puts the viewer back here instead. Seeks made while the new source
+  // loads move it along (timeupdate events must not: the reset clock
+  // reports zero before its metadata arrives). A new video clears it.
+  const resumeAfterRetag = useRef<
+    { time: number; pending: boolean } | undefined
+  >(undefined);
+  // The scrubber's position, read live so a resume captured for a video
+  // that has no element yet — still preparing — does not take a stale
+  // render's value.
+  const currentTimeRef = useRef(currentTime);
+  useEffect(() => {
+    currentTimeRef.current = currentTime;
+  });
   const focusAddonButton = useCallback(() => {
     const button = addonMenuWrap.current?.firstElementChild;
     if (button instanceof HTMLButtonElement) button.focus();
@@ -1621,22 +1631,55 @@ function Player({
   // brings every display up to date, and re-allows the new file for the web
   // engine. Native playback and images are untouched by the swap; the web
   // engine reloads the new source, so it resumes where the rename found it.
+  // Installs a preparation both the effect and a tag refresh can supply.
+  // Whoever first shows this video also starts its slideshow clock; a
+  // superseded answer must neither start it twice nor reset progress made.
+  const applyPrepared = (result: PreparedVideo, image: boolean) => {
+    const first = preparedPath.current === undefined;
+    setPrepared(result);
+    preparedPath.current = result.filePath;
+    if (first && image) {
+      imageElapsed.current = 0;
+      setCurrentTime(0);
+      setDuration(imageDurationSeconds);
+      setPlayingBack(true);
+    }
+  };
+  // A seek the viewer makes while a swapped source loads moves the pending
+  // resume along with it; the clock's own reports must not (see the ref).
+  const noteSeek = (next: number) => {
+    const pending = resumeAfterRetag.current;
+    if (pending?.pending) resumeAfterRetag.current = { ...pending, time: next };
+  };
   const refreshPreparedAfterRetag = async (id: string) => {
     // A tag command that answered after the viewer moved on still updates
     // its own video's tags — but the display belongs to the new video now.
     if (currentVideoId.current !== id) return;
-    prepareSequence.current += 1;
-    const sequence = prepareSequence.current;
     // Looked up, not closed over: a folder tag that answered late refreshes
     // the current video rather than the one it started from. The extension
     // never changes under a rename, so the retained list answers truly.
     const target = playlist.find((item) => item.id === id);
+    const targetIsImage =
+      target !== undefined && isImageResult(target);
     const webVideo =
       target !== undefined &&
-      !isImageResult(target) &&
+      !targetIsImage &&
       prepared?.playbackBackend !== "native";
-    try {
-      const next = await prepareVideo(id);
+    // Captured once the new path is accepted, so a seek made while it was
+    // loading is the position kept. While a previous swap is still loading,
+    // the element's clock is the new source's reset one rather than the
+    // viewer's position, so the pending resume carries forward instead.
+    const captureResume = () => {
+      const pending = resumeAfterRetag.current;
+      resumeAfterRetag.current = {
+        time:
+          pending?.pending === true
+            ? pending.time
+            : (element.current?.currentTime ?? currentTimeRef.current),
+        pending: true,
+      };
+    };
+    const applyRefresh = (next: PreparedVideo, sequence: number) => {
       // A newer preparation, or a newer video, owns the display now.
       if (
         currentVideoId.current !== id ||
@@ -1646,12 +1689,32 @@ function Player({
       // A tag the name already carried renames nothing: the source stays,
       // so there is no new beginning to resume from.
       if (next.filePath === preparedPath.current) return;
-      preparedPath.current = next.filePath;
-      if (webVideo) resumeAfterRetag.current = true;
-      setPrepared(next);
+      if (webVideo) captureResume();
+      applyPrepared(next, targetIsImage);
+    };
+    prepareSequence.current += 1;
+    const sequence = prepareSequence.current;
+    try {
+      applyRefresh(await prepareVideo(id), sequence);
     } catch {
-      // The tags themselves were saved; only the displayed path stays
-      // behind until the next video is prepared.
+      // The tags themselves were saved. If nothing usable is on screen, a
+      // failed refresh must not strand the player preparing forever, so it
+      // retries once for the current path — only a second failure errors.
+      // A newer preparation owns recovery now, so a superseded failure
+      // stays silent.
+      if (currentVideoId.current !== id || sequence !== prepareSequence.current)
+        return;
+      prepareSequence.current += 1;
+      const retry = prepareSequence.current;
+      try {
+        applyRefresh(await prepareVideo(id), retry);
+      } catch (reason: unknown) {
+        if (
+          currentVideoId.current === id &&
+          retry === prepareSequence.current
+        )
+          setError(errorMessage(reason));
+      }
     }
   };
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
@@ -1708,7 +1771,7 @@ function Player({
     setDuration(0);
     setCurrentTime(0);
     imageElapsed.current = 0;
-    resumeAfterRetag.current = false;
+    resumeAfterRetag.current = undefined;
     setError(undefined);
     setNativeStarted(false);
     setFullscreenError(undefined);
@@ -1750,22 +1813,11 @@ function Player({
           await setNativePaused(false);
           if (active) setPlayingBack(true);
         }
-        if (active) {
-          // A tag refresh that started after this effect owns the path now —
-          // typically a folder tag that answered while its video was still
-          // preparing — so this older answer must not overwrite it. The
-          // slideshow setup below is the effect's own and still runs.
-          if (sequence === prepareSequence.current) {
-            setPrepared(result);
-            preparedPath.current = result.filePath;
-          }
-          if (isImage) {
-            imageElapsed.current = 0;
-            setCurrentTime(0);
-            setDuration(imageDurationSeconds);
-            setPlayingBack(true);
-          }
-        }
+        // A tag refresh that started after this effect owns the path now —
+        // typically a folder tag that answered while its video was still
+        // preparing — so this older answer must not overwrite it.
+        if (active && sequence === prepareSequence.current)
+          applyPrepared(result, isImage);
       })
       .catch((reason: unknown) => {
         if (active) setError(errorMessage(reason));
@@ -2042,6 +2094,7 @@ function Player({
       play();
     }
     setCurrentTime(from);
+    noteSeek(from);
   };
 
   // Search playlists start with the results already on screen. Fetching the
@@ -2189,6 +2242,7 @@ function Player({
       );
     else if (element.current) element.current.currentTime = next;
     setCurrentTime(next);
+    noteSeek(next);
   };
 
   // A new start past the end would leave a range that runs backwards, so it
@@ -3186,12 +3240,17 @@ function Player({
               media.volume = volume / 100;
               // A retag swapped the source under the playing video, and the
               // engine starts the new file at the beginning — so the player
-              // puts the viewer back at the scrubber's position, which
-              // follows every seek made while the new source loads.
-              // Whether playback resumes follows the viewer's latest intent,
-              // not the state the retag found, which a pause, a resume, or
-              // the video's own ending since has overruled.
-              if (resumeAfterRetag.current) media.currentTime = currentTime;
+              // puts the viewer back at the saved position. The record
+              // outlives this event for a retag that lands while this swap
+              // is still loading, which carries it forward; a new video
+              // clears it. Whether playback resumes follows the viewer's
+              // latest intent, not the state the retag found, which a pause,
+              // a resume, or the video's own ending since has overruled.
+              const resume = resumeAfterRetag.current;
+              if (resume) {
+                resumeAfterRetag.current = { time: resume.time, pending: false };
+                media.currentTime = resume.time;
+              }
               if (pausedByViewer.current) {
                 media.pause();
                 setPlayingBack(false);
@@ -3202,9 +3261,13 @@ function Player({
             onClick={togglePlayback}
             onPlay={() => setPlayingBack(true)}
             onPause={() => setPlayingBack(false)}
-            onTimeUpdate={(event) =>
-              setCurrentTime(event.currentTarget.currentTime)
-            }
+            onTimeUpdate={(event) => {
+              // A swapped source reports its reset clock before its metadata
+              // arrives; that zero is the load talking, not the viewer, so
+              // it must not overwrite the position being resumed to.
+              if (resumeAfterRetag.current?.pending) return;
+              setCurrentTime(event.currentTarget.currentTime);
+            }}
             onEnded={(event) =>
               endOfVideo(duration || event.currentTarget.duration || 0)
             }
@@ -3277,6 +3340,7 @@ function Player({
                 else if (element.current)
                   element.current.currentTime = nextTime;
                 setCurrentTime(nextTime);
+                noteSeek(nextTime);
               }}
             />
             {rangeMarkers.map((marker) => (
