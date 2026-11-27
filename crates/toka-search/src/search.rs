@@ -1748,10 +1748,13 @@ fn parse_duration_term(value: &str) -> Result<QueryTerm, SearchError> {
     let (comparison, number) = split_comparison(value);
     let bare = !value.starts_with(['<', '>', '=']);
     let number = number.to_ascii_lowercase();
-    // Longest suffixes first: `find_map` keeps the first match, and `5ms`
-    // must read as milliseconds, never as `5m` with a trailing `s`.
+    // Longest suffixes first: `find_map` keeps the first match, and
+    // `5ms` must read as milliseconds, never as `5m` with a trailing
+    // `s` — just as `500milliseconds` must beat the `seconds` suffix.
     let units = [
         ("ms", 1u64),
+        ("milliseconds", 1u64),
+        ("millisecond", 1u64),
         ("hours", 3_600_000u64),
         ("hour", 3_600_000u64),
         ("hrs", 3_600_000u64),
@@ -4768,6 +4771,23 @@ mod tests {
         let mut at_least = names(&engine.search(request("duration:>=150s")).unwrap());
         at_least.sort();
         assert_eq!(at_least, ["long.mp4", "medium.mp4"]);
+        // Long millisecond names read as `ms` does.
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("duration:150000milliseconds"))
+                    .unwrap()
+            ),
+            ["medium.mp4"]
+        );
+        assert_eq!(
+            names(
+                &engine
+                    .search(request("duration:150000millisecond"))
+                    .unwrap()
+            ),
+            ["medium.mp4"]
+        );
         // An explicit `=` stays an exact match.
         assert_eq!(
             names(&engine.search(request("duration:=150000ms")).unwrap()),

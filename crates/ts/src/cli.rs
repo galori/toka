@@ -1817,6 +1817,13 @@ fn run_durations_command(
             return 1;
         }
     };
+    // The index stores canonical absolute paths; typed paths arrive in
+    // every spelling, so they are normalized first, exactly as thumbnail
+    // and preview paths are. Output keys are the normalized paths.
+    let paths: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| toka_search::owned_index::canonical_spelling(path))
+        .collect();
     let durations = engine.durations_for(&paths);
     if json {
         // Lossy keys, never `PathBuf`s: real paths can hold non-UTF-8
@@ -3657,8 +3664,9 @@ mod tests {
     #[test]
     fn durations_json_prints_known_lengths_by_path() {
         let directory = tempdir().unwrap();
-        let known = directory.path().join("clip-known.mp4");
-        let unknown = directory.path().join("clip-unknown.mp4");
+        let root = directory.path().canonicalize().unwrap();
+        let known = root.join("clip-known.mp4");
+        let unknown = root.join("clip-unknown.mp4");
         fs::write(&known, b"video").unwrap();
         fs::write(&unknown, b"video").unwrap();
         let engine = SearchEngine::new(Arc::new(DurationProvider {
@@ -3710,8 +3718,9 @@ mod tests {
     #[test]
     fn durations_text_prints_tabbed_lengths_sorted_by_path() {
         let directory = tempdir().unwrap();
-        let one = directory.path().join("b-clip.mp4");
-        let two = directory.path().join("a-clip.mp4");
+        let root = directory.path().canonicalize().unwrap();
+        let one = root.join("b-clip.mp4");
+        let two = root.join("a-clip.mp4");
         fs::write(&one, b"video").unwrap();
         fs::write(&two, b"video").unwrap();
         let engine = SearchEngine::new(Arc::new(DurationProvider {

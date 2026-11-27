@@ -578,6 +578,47 @@ fn durations_json_reads_indexed_lengths() {
 
 #[cfg(not(feature = "fixtures"))]
 #[test]
+fn durations_resolves_relative_paths_from_the_working_directory() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let root = media.canonicalize().unwrap();
+    let known = create_video(&root, 0);
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE files SET duration_ms = 61500 WHERE display_path = ?1",
+            [known.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+
+    // Asked by relative path from the watched folder: the lookup
+    // resolves it to the indexed spelling first.
+    let output = run_at_in(&home, &root, &["durations", "--", "family-trip-00.mp4"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("61500\t{}\n", known.display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
 fn durations_with_no_index_reads_empty_without_creating_one() {
     let home = scratch_home();
     let missing = home
