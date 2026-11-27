@@ -783,8 +783,38 @@ impl SearchEngine {
         let mut seen = HashSet::new();
         let needs_whole_path = request.fields.path || query_needs_whole_path(&expression);
         let mut paths = Vec::new();
-        let mut candidates = self.candidates(query, needs_whole_path, context)?;
-        self.provider.retain_visible_paths(&mut candidates)?;
+        // Files the query names directly, whatever the index holds: a folder
+        // opened straight from disk was never indexed, and a broken index
+        // must not hide a folder that is right there.
+        let terms = path_terms(&expression);
+        let (direct, walked) = filesystem_candidates(&terms, request.media_type);
+        // Falling back to named files is honest only when every branch of
+        // the query was actually walked: `path:/x AND tags:y` narrows the
+        // walked set, but `path:/x OR tags:y` would silently drop the index
+        // half. An existing folder with no media in it answers empty — that
+        // needs no index either.
+        let covered = query_covered_by_direct(&expression, &walked);
+        let mut candidates = match self.candidates(query, needs_whole_path, context) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                if !covered {
+                    return Err(error);
+                }
+                // The index failed but the named files still answer whole:
+                // logged, so the failure never passes unseen.
+                self.logger.record_error(context, &error.to_string());
+                Vec::new()
+            }
+        };
+        if let Err(error) = self.provider.retain_visible_paths(&mut candidates) {
+            if !covered {
+                return Err(error);
+            }
+            self.logger.record_error(context, &error.to_string());
+            candidates = Vec::new();
+        }
+        candidates.extend(direct);
+        let resolved = resolve_path_terms(&terms);
         for path in candidates {
             if !is_supported_media(&path, request.media_type) {
                 self.logger
@@ -795,7 +825,7 @@ impl SearchEngine {
                 self.logger.record_filtered(context, &path, "empty file");
                 continue;
             }
-            if !matches_query(&path, &expression, request.fields) {
+            if !matches_query(&path, &expression, request.fields, &resolved) {
                 self.logger
                     .record_filtered(context, &path, "query did not match");
                 continue;
@@ -1334,6 +1364,10 @@ enum QueryMediaType {
 enum QueryTerm {
     Text {
         field: QueryField,
+        /// Lowercased for every field except `Path` and `Folder`, which keep
+        /// the query's own spelling: the value may name a real location, and
+        /// that has to resolve against a case-sensitive filesystem before
+        /// anything is folded. Matching lowercases them instead.
         value: String,
     },
     MediaType(QueryMediaType),
@@ -1529,9 +1563,16 @@ fn parse_query_term(token: &str, now: SystemTime) -> Result<QueryExpr, SearchErr
                     "folder" => QueryField::Folder,
                     _ => unreachable!(),
                 };
+                // Lowercased everywhere except `path:` and `folder:` — see the
+                // note on `QueryTerm::Text::value`.
+                let keep_case = matches!(field, QueryField::Path | QueryField::Folder);
                 QueryTerm::Text {
                     field,
-                    value: value.to_lowercase(),
+                    value: if keep_case {
+                        value.to_owned()
+                    } else {
+                        value.to_lowercase()
+                    },
                 }
             }
             _ => QueryTerm::Text {
@@ -1842,6 +1883,41 @@ fn split_comparison(value: &str) -> (Comparison, &str) {
     (Comparison::Equal, value)
 }
 
+/// Whether every possible match of the query comes from the folders and
+/// files its `path:`/`folder:` terms name: a positive term whose value the
+/// walk actually visited anchors its branch to the walked set, anything else
+/// can match beyond it, `AND` narrows to either side, `OR` needs both, and
+/// `NOT` flips the sense. Substring matches outside the walk stay
+/// best-effort-dropped during fallback.
+fn query_covered_by_direct(expression: &QueryExpr, walked: &HashSet<String>) -> bool {
+    fn covered(expression: &QueryExpr, negated: bool, walked: &HashSet<String>) -> bool {
+        match expression {
+            QueryExpr::Term(QueryTerm::Text {
+                field: QueryField::Path | QueryField::Folder,
+                value,
+            }) => !negated && walked.contains(value),
+            QueryExpr::Term(_) => false,
+            QueryExpr::Not(inner) => covered(inner, !negated, walked),
+            // Under a negation De Morgan flips the sense: the complement of
+            // an intersection needs both complements covered, while the
+            // complement of a union needs either.
+            QueryExpr::And(left, right) if negated => {
+                covered(left, negated, walked) && covered(right, negated, walked)
+            }
+            QueryExpr::And(left, right) => {
+                covered(left, negated, walked) || covered(right, negated, walked)
+            }
+            QueryExpr::Or(left, right) if negated => {
+                covered(left, negated, walked) || covered(right, negated, walked)
+            }
+            QueryExpr::Or(left, right) => {
+                covered(left, negated, walked) && covered(right, negated, walked)
+            }
+        }
+    }
+    covered(expression, false, walked)
+}
+
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, .. }) => {
@@ -1860,7 +1936,12 @@ fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     }
 }
 
-fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> bool {
+fn matches_query(
+    path: &Path,
+    expression: &QueryExpr,
+    fields: SearchFields,
+    resolved: &[ResolvedPathTerm],
+) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, value }) => match field {
             QueryField::Any => haystacks(path, fields)
@@ -1868,7 +1949,19 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 .any(|hay| hay.contains(value)),
             QueryField::Tags => tags_haystack(path).contains(value),
             QueryField::FileName => file_name_haystack(path).contains(value),
-            QueryField::Path | QueryField::Folder => path_haystack(path).contains(value),
+            // `path:` is the whole location including the file's own name, so
+            // a full path finds its file; `folder:` stays with the parents.
+            // Either also matches by canonical location, so a relative query
+            // still finds an absolute answer and the other way around.
+            QueryField::Path => {
+                match_location_term(resolved, value, &full_path_haystack(path), path)
+            }
+            QueryField::Folder => match_location_term(
+                resolved,
+                value,
+                &path_haystack(path),
+                path.parent().unwrap_or_else(|| Path::new("")),
+            ),
         },
         QueryExpr::Term(QueryTerm::MediaType(media_type)) => match media_type {
             QueryMediaType::Video => is_supported_video(path),
@@ -1906,12 +1999,14 @@ fn matches_query(path: &Path, expression: &QueryExpr, fields: SearchFields) -> b
                 }
                 DateThreshold::Timestamp(timestamp) => compare(actual, *comparison, *timestamp),
             }),
-        QueryExpr::Not(expression) => !matches_query(path, expression, fields),
+        QueryExpr::Not(expression) => !matches_query(path, expression, fields, resolved),
         QueryExpr::And(left, right) => {
-            matches_query(path, left, fields) && matches_query(path, right, fields)
+            matches_query(path, left, fields, resolved)
+                && matches_query(path, right, fields, resolved)
         }
         QueryExpr::Or(left, right) => {
-            matches_query(path, left, fields) || matches_query(path, right, fields)
+            matches_query(path, left, fields, resolved)
+                || matches_query(path, right, fields, resolved)
         }
     }
 }
@@ -1961,6 +2056,245 @@ fn path_haystack(path: &Path) -> String {
         .unwrap_or_else(|| Path::new(""))
         .to_string_lossy()
         .to_lowercase()
+}
+
+fn full_path_haystack(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+/// The `path:` query naming `location`: quoted when the value carries
+/// whitespace, quotes, or parentheses the tokenizer would otherwise split,
+/// with `\` and `"` escaped for the quoted form.
+pub fn path_query_for(location: &Path) -> String {
+    let value = location.to_string_lossy();
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '"' | '(' | ')'))
+    {
+        let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("path:\"{escaped}\"")
+    } else {
+        format!("path:{value}")
+    }
+}
+
+/// Every `path:` and `folder:` value in the query with whether it stands
+/// outside a `NOT`, quotes already stripped by the tokenizer. A negated term
+/// only ever removes candidates, so walking its folder would list files
+/// merely to throw them away — but matching still needs its value.
+fn path_terms(expression: &QueryExpr) -> Vec<(String, bool)> {
+    let mut terms = Vec::new();
+    collect_path_terms(expression, false, &mut terms);
+    terms
+}
+
+fn collect_path_terms(expression: &QueryExpr, negated: bool, out: &mut Vec<(String, bool)>) {
+    match expression {
+        QueryExpr::Term(QueryTerm::Text {
+            field: QueryField::Path | QueryField::Folder,
+            value,
+        }) => out.push((value.clone(), !negated)),
+        QueryExpr::Term(_) => {}
+        QueryExpr::Not(inner) => collect_path_terms(inner, !negated, out),
+        QueryExpr::And(left, right) | QueryExpr::Or(left, right) => {
+            collect_path_terms(left, negated, out);
+            collect_path_terms(right, negated, out);
+        }
+    }
+}
+
+/// Whether a `path:`/`folder:` value is shaped like a location rather than a
+/// name fragment. A bare word resolved against the working directory would
+/// silently retarget the query to whatever Toka happened to be started from,
+/// so only path-shaped values ever touch the filesystem.
+fn is_path_shaped(value: &str) -> bool {
+    value.contains(['/', '\\']) || value.starts_with('~')
+}
+
+/// A `path:` or `folder:` value as a filesystem path: `~/` names the viewer's
+/// home (`~other/` is not expanded), everything else is taken as given,
+/// relative to wherever Toka runs.
+fn expand_location(value: &str) -> PathBuf {
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            // Without the trim, `~//etc` joins an absolute rest and escapes
+            // the home folder entirely.
+            return home.join(rest.trim_start_matches(['/', '\\']));
+        }
+    } else if value == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(value)
+}
+
+/// Every playable file of the requested kind the query names directly: each
+/// positive `path:` or `folder:` value that exists on disk contributes its
+/// file, or a folder's whole contents. Walked from the canonical top with
+/// traversal spellings below it, the way a scan stores its rows, so files
+/// the index already knows deduplicate. Each value walks with a fresh visited
+/// set: sharing one across values would prune traversal spellings another
+/// value still needs to match by. Values naming nothing are left to the
+/// index's substring match.
+fn filesystem_candidates(
+    terms: &[(String, bool)],
+    media_type: MediaType,
+) -> (Vec<PathBuf>, HashSet<String>) {
+    let mut files = Vec::new();
+    let mut walked = HashSet::new();
+    for (value, positive) in terms {
+        if !positive || !is_path_shaped(value) {
+            continue;
+        }
+        let Ok(real) = std::fs::canonicalize(expand_location(value)) else {
+            continue;
+        };
+        if real.parent().is_none() {
+            // A whole-machine walk is never what a search means.
+            continue;
+        }
+        if real.is_file() {
+            if is_supported_media(&real, media_type) {
+                walked.insert(value.clone());
+                files.push(real);
+            }
+        } else if real.is_dir() {
+            walked.insert(value.clone());
+            collect_media_recursive(&real, &mut files, &mut HashSet::new(), media_type);
+        }
+    }
+    (files, walked)
+}
+
+/// Every supported video and image under `directory` and its subfolders.
+/// Symlinked folders are followed once each, so a link back up the tree
+/// cannot loop; entries that cannot be read are skipped.
+fn collect_media_recursive(
+    directory: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+    media_type: MediaType,
+) {
+    let Ok(real) = std::fs::canonicalize(directory) else {
+        return;
+    };
+    if real.parent().is_none() {
+        // A symlink to the filesystem root: following it would scan the
+        // whole machine.
+        return;
+    }
+    if !visited.insert(real) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_media_recursive(&path, out, visited, media_type);
+        } else if path.is_file() && is_supported_media(&path, media_type) {
+            // Joined, not canonicalized: a file reached through a symlink
+            // keeps the traversal spelling the query names, the way a scan
+            // stores it — canonicalizing here would strand it outside the
+            // folder it was found under.
+            out.push(path);
+        }
+    }
+}
+
+/// A `path:`/`folder:` value resolved once per search: the folded form for
+/// substring matching and, for values naming somewhere real, the canonical
+/// location for prefix matching. The query side is resolved once; each
+/// candidate file is still canonicalized on a substring miss.
+struct ResolvedPathTerm {
+    value: String,
+    folded: String,
+    location: Option<PathBuf>,
+}
+
+fn resolve_path_terms(terms: &[(String, bool)]) -> Vec<ResolvedPathTerm> {
+    let mut resolved = Vec::new();
+    for (value, _) in terms {
+        if resolved
+            .iter()
+            .any(|term: &ResolvedPathTerm| term.value == *value)
+        {
+            continue;
+        }
+        let location = if is_path_shaped(value) {
+            let candidate = expand_location(value);
+            if candidate.exists() {
+                std::fs::canonicalize(candidate).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        resolved.push(ResolvedPathTerm {
+            value: value.clone(),
+            folded: value.to_lowercase(),
+            location,
+        });
+    }
+    resolved
+}
+
+/// A `path:`/`folder:` term against its haystack. Values that resolve to a
+/// real location match by containment only — the spelling prefix first
+/// (free), canonicalization for spelling variants — so `path:/trip` never
+/// pulls in `/trip-old`; anything else falls back to substring matching.
+/// `target` is the file itself for `path:`, its parent for `folder:`.
+fn match_location_term(
+    resolved: &[ResolvedPathTerm],
+    value: &str,
+    haystack: &str,
+    target: &Path,
+) -> bool {
+    match resolved.iter().find(|term| term.value == value) {
+        Some(term) => match term.location.as_deref() {
+            Some(want) => target.starts_with(want) || location_under(Some(want), target),
+            None => haystack.contains(&term.folded),
+        },
+        // Unreachable: `resolved` covers every value in the expression.
+        // Recompute rather than mis-match if it ever isn't.
+        None => haystack.contains(&value.to_lowercase()) || location_contains(value, target),
+    }
+}
+
+/// Whether `target` sits at or under the resolved `location`.
+fn location_under(location: Option<&Path>, target: &Path) -> bool {
+    let Some(want) = location else {
+        return false;
+    };
+    let Ok(have) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    have == want || have.starts_with(want)
+}
+
+/// Whether `target` sits at or under the location `value` names, resolving
+/// both sides. In practice only reached through the pre-resolved form above.
+fn location_contains(value: &str, target: &Path) -> bool {
+    if !is_path_shaped(value) {
+        return false;
+    }
+    let location = expand_location(value);
+    if !location.exists() {
+        return false;
+    }
+    let (Ok(want), Ok(have)) = (
+        std::fs::canonicalize(&location),
+        std::fs::canonicalize(target),
+    ) else {
+        return false;
+    };
+    have == want || have.starts_with(&want)
 }
 
 pub fn is_supported_video(path: &Path) -> bool {
@@ -3202,6 +3536,363 @@ mod tests {
     }
 
     #[test]
+    fn path_searches_the_whole_path_while_folder_stays_with_the_parents() {
+        let directory = tempdir().unwrap();
+        let holiday = directory.path().join("Holiday");
+        fs::create_dir(&holiday).unwrap();
+        let video = holiday.join("clip.mp4");
+        fs::write(&video, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![video])));
+
+        assert_eq!(
+            names(&engine.search(request("path:clip")).unwrap()),
+            ["clip.mp4"]
+        );
+        assert!(names(&engine.search(request("folder:clip")).unwrap()).is_empty());
+        assert_eq!(
+            names(&engine.search(request("path:Holiday")).unwrap()),
+            ["clip.mp4"]
+        );
+        assert_eq!(
+            names(&engine.search(request("folder:Holiday")).unwrap()),
+            ["clip.mp4"]
+        );
+    }
+
+    #[test]
+    fn path_queries_find_videos_in_folders_the_index_does_not_cover() {
+        let directory = tempdir().unwrap();
+        let shoots = directory.path().join("my shoots");
+        let nested = shoots.join("day one");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        fs::write(nested.join("extra.mkv"), b"test").unwrap();
+        fs::write(nested.join("notes.txt"), b"test").unwrap();
+        // The index knows nothing: every answer has to come from the folder.
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", shoots.display());
+
+        let mut found = names(&engine.search(request(&query)).unwrap());
+        found.sort();
+
+        assert_eq!(found, ["clip.mp4", "extra.mkv"]);
+    }
+
+    #[test]
+    fn path_queries_match_a_single_video_by_its_full_path() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", clip.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
+    fn path_queries_survive_a_broken_index_when_the_folder_exists() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let query = format!("path:\"{}\"", directory.path().display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
+    fn path_queries_without_an_index_still_report_a_missing_folder() {
+        // `ts` gone and nothing on disk: the provider failure stands, rather
+        // than a quiet empty answer.
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+
+        let error = engine
+            .search(request("path:/no/such/folder/anywhere"))
+            .unwrap_err();
+
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+    }
+
+    #[test]
+    fn path_fallback_refuses_queries_it_cannot_answer_whole() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let or_query = format!("path:\"{}\" OR tags:elsewhere", directory.path().display());
+
+        // The `tags:` half needs the index: failing honestly beats a partial
+        // answer dressed as complete.
+        let error = engine.search(request(&or_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+
+        // Every match still comes from named folders here, so the fallback
+        // stands: narrowing with `AND`, or another `path:` branch.
+        let and_query = format!("path:\"{}\" AND filename:clip", directory.path().display());
+        assert_eq!(
+            names(&engine.search(request(&and_query)).unwrap()),
+            ["clip.mp4"]
+        );
+        let both_query = format!(
+            "path:\"{}\" OR path:\"{}\"",
+            directory.path().display(),
+            directory.path().display()
+        );
+        assert_eq!(
+            names(&engine.search(request(&both_query)).unwrap()),
+            ["clip.mp4"]
+        );
+
+        // A branch the walk never visited still needs the index, even beside
+        // a covered one: a bare fragment, or a missing location.
+        let bare_query = format!("path:\"{}\" OR path:clip", directory.path().display());
+        let error = engine.search(request(&bare_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+        let missing_query = format!(
+            "path:\"{}\" OR path:/no/such/folder/anywhere",
+            directory.path().display()
+        );
+        let error = engine.search(request(&missing_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+    }
+
+    #[test]
+    fn resolved_path_queries_match_by_containment_not_substring() {
+        let directory = tempdir().unwrap();
+        let trip = directory.path().join("trip");
+        let old = directory.path().join("trip-old");
+        fs::create_dir_all(&trip).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(trip.join("clip.mp4"), b"test").unwrap();
+        fs::write(old.join("other.mp4"), b"test").unwrap();
+        // Canonical, as the production index stores its paths.
+        let clip = std::fs::canonicalize(trip.join("clip.mp4")).unwrap();
+        let stale = std::fs::canonicalize(old.join("other.mp4")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![clip, stale])));
+        let query = format!(
+            "path:\"{}\"",
+            std::fs::canonicalize(&trip).unwrap().display()
+        );
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
+    fn a_path_query_for_one_file_excludes_its_suffixed_sibling() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("clip.mp4"), b"test").unwrap();
+        fs::write(directory.path().join("clip.mp4-copy.mp4"), b"test").unwrap();
+        let clip = std::fs::canonicalize(directory.path().join("clip.mp4")).unwrap();
+        let copy = std::fs::canonicalize(directory.path().join("clip.mp4-copy.mp4")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![clip.clone(), copy])));
+        let query = format!("path:\"{}\"", clip.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
+    fn folder_queries_check_the_parent_even_for_exact_files() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("clip.mp4"), b"test").unwrap();
+        let clip = std::fs::canonicalize(directory.path().join("clip.mp4")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(vec![clip.clone()])));
+        let file_query = format!("folder:\"{}\"", clip.display());
+
+        assert!(names(&engine.search(request(&file_query)).unwrap()).is_empty());
+
+        let dir_query = format!("folder:\"{}\"", clip.parent().unwrap().display());
+        assert_eq!(
+            names(&engine.search(request(&dir_query)).unwrap()),
+            ["clip.mp4"]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_queries_keep_media_reached_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let opened = directory.path().join("opened");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&opened).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(opened.join("clip.mp4"), b"test").unwrap();
+        fs::write(outside.join("other.mp4"), b"test").unwrap();
+        symlink(&outside, opened.join("link")).unwrap();
+        // The index knows nothing: the walk must carry the linked file in a
+        // spelling the query still recognizes.
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", opened.display());
+
+        let mut found = names(&engine.search(request(&query)).unwrap());
+        found.sort();
+
+        assert_eq!(found, ["clip.mp4", "other.mp4"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn overlapping_path_terms_keep_each_locations_traversal_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let opened = directory.path().join("opened");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&opened).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(opened.join("clip.mp4"), b"test").unwrap();
+        fs::write(outside.join("other.mp4"), b"test").unwrap();
+        symlink(&outside, opened.join("link")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        // Either order answers the same: the linked spelling satisfies both
+        // branches however the walks run.
+        for (first, second) in [(&outside, &opened), (&opened, &outside)] {
+            let query = format!(
+                "path:\"{}\" AND path:\"{}\"",
+                first.display(),
+                second.display()
+            );
+            assert_eq!(
+                names(&engine.search(request(&query)).unwrap()),
+                ["other.mp4"],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_fallback_answers_an_empty_folder_without_an_index() {
+        let directory = tempdir().unwrap();
+        let empty = directory.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let query = format!("path:\"{}\"", empty.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(page.total_results, 0);
+    }
+
+    #[test]
+    fn path_fallback_coverage_flips_under_negation() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let dir = directory.path().display().to_string();
+
+        // NOT ((NOT path) AND tags) also matches untagged files outside the
+        // folder: the fallback cannot answer it whole.
+        let partial = format!("NOT (NOT path:\"{dir}\" AND tags:banned)");
+        let error = engine.search(request(&partial)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+
+        // NOT ((NOT path) OR tags) is just the folder minus tagged files.
+        let whole = format!("NOT (NOT path:\"{dir}\" OR tags:banned)");
+        assert_eq!(
+            names(&engine.search(request(&whole)).unwrap()),
+            ["clip.mp4"]
+        );
+    }
+
+    #[test]
+    fn path_fallback_logs_the_index_failure_it_survived() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let log_path = directory.path().join("search.log");
+        let engine = SearchEngine::new_with_logger(
+            Arc::new(ErrorProvider),
+            Arc::new(SearchLogger::new(log_path.clone())),
+        );
+        let query = format!("path:\"{}\"", directory.path().display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+        let line = fs::read_to_string(&log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry["kind"], "error");
+        assert_eq!(entry["error"], "backend unavailable");
+    }
+
+    #[test]
+    fn only_path_shaped_values_touch_the_filesystem() {
+        for bare in ["clip", "clip.mp4", "Holiday"] {
+            assert!(!is_path_shaped(bare), "{bare}");
+        }
+        for shaped in [
+            "/Videos",
+            "./clips",
+            "my shoots/clip.mp4",
+            "~",
+            "~/clips",
+            "C:\\Videos",
+        ] {
+            assert!(is_path_shaped(shaped), "{shaped}");
+        }
+    }
+
+    #[test]
+    fn home_shorthand_expands_to_the_viewers_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_location("~/clips"), home.join("clips"));
+        assert_eq!(expand_location("~//clips"), home.join("clips"));
+        assert_eq!(expand_location("~\\clips"), home.join("clips"));
+        assert_eq!(expand_location("~"), home);
+        assert_eq!(expand_location("/Videos"), PathBuf::from("/Videos"));
+        assert_eq!(
+            expand_location("~other/clips"),
+            PathBuf::from("~other/clips")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_walks_follow_a_symlinked_folder_only_once() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let shoots = directory.path().join("shoots");
+        fs::create_dir(&shoots).unwrap();
+        fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        symlink(&shoots, shoots.join("loop")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", shoots.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_walks_do_not_follow_a_symlink_to_the_filesystem_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let shoots = directory.path().join("shoots");
+        fs::create_dir(&shoots).unwrap();
+        fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        symlink("/", shoots.join("root")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        let query = format!("path:\"{}\"", shoots.display());
+
+        let page = engine.search(request(&query)).unwrap();
+
+        assert_eq!(names(&page), ["clip.mp4"]);
+    }
+
+    #[test]
     fn not_binds_tighter_than_and_and_or() {
         let directory = tempdir().unwrap();
         let summer_draft = directory.path().join("summer draft.mp4");
@@ -3342,6 +4033,43 @@ mod tests {
                 date: DateThreshold::Timestamp(now - Duration::from_secs(30 * 60)),
             })
         );
+    }
+
+    #[test]
+    fn path_queries_quote_values_the_tokenizer_would_split() {
+        assert_eq!(
+            path_query_for(Path::new("/Videos/trip")),
+            "path:/Videos/trip"
+        );
+        assert_eq!(
+            path_query_for(Path::new("/My Videos/trip (2024)")),
+            "path:\"/My Videos/trip (2024)\""
+        );
+        assert_eq!(
+            path_query_for(Path::new("/Videos/say \"hi\"")),
+            "path:\"/Videos/say \\\"hi\\\"\""
+        );
+        assert_eq!(
+            path_query_for(Path::new("/Videos/a\\b \"c\"")),
+            "path:\"/Videos/a\\\\b \\\"c\\\"\""
+        );
+        // And every escaped form parses back to the location it names.
+        for location in [
+            "/Videos/trip",
+            "/My Videos/trip (2024)",
+            "/Videos/say \"hi\"",
+            "/Videos/a\\b \"c\"",
+        ] {
+            let query = path_query_for(Path::new(location));
+            assert_eq!(
+                parse_query(&query).unwrap(),
+                QueryExpr::Term(QueryTerm::Text {
+                    field: QueryField::Path,
+                    value: location.to_owned(),
+                }),
+                "{query}"
+            );
+        }
     }
 
     #[test]

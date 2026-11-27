@@ -44,6 +44,8 @@ import {
   openNewWindow,
   openFolderInNewWindow,
   openParentFolderInNewWindow,
+  openFolder,
+  openFile,
   searchMatchCount,
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
@@ -103,6 +105,41 @@ function matchesMediaType(result: VideoResult, mediaType: MediaType): boolean {
   if (mediaType === "both") return true;
   return isImageResult(result) === (mediaType === "images");
 }
+
+// The toggle starts on whatever an opened folder holds, so nothing in it is
+// hidden until the viewer asks for that.
+function mediaTypeOf(videos: VideoResult[]): MediaType {
+  const images = videos.some(isImageResult);
+  const files = videos.some((video) => !isImageResult(video));
+  return images && files ? "both" : images ? "images" : "videos";
+}
+
+// What the file browser offers for "Open file": every extension Toka plays.
+const MEDIA_FILE_FILTER = {
+  name: "Videos and images",
+  extensions: [
+    "mp4",
+    "mov",
+    "mkv",
+    "avi",
+    "webm",
+    "m4v",
+    "mpeg",
+    "mpg",
+    "mpe",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+    "tiff",
+    "tif",
+    "heic",
+    "heif",
+    "avif",
+  ],
+};
 
 export const SLIDESHOW_INTERVAL = 3_000;
 const DEFAULT_IMAGE_DURATION_SECONDS = SLIDESHOW_INTERVAL / 1_000;
@@ -1087,6 +1124,11 @@ const HELP_SECTIONS: HelpSection[] = [
       },
       { shortcut: "Ctrl+N", description: "Open a new Toka window" },
       { shortcut: "Ctrl+O", description: "Open results in another player" },
+      { shortcut: "Ctrl+Shift+P", description: "Open a folder to play" },
+      {
+        shortcut: "Ctrl+Shift+F",
+        description: "Open one video or image to play",
+      },
       { shortcut: "Ctrl+Shift+T", description: "Tag all results" },
       {
         shortcut: "Ctrl+Shift+R",
@@ -4546,6 +4588,25 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
+  // Shift separates these from the Ctrl+P and Ctrl+F that choose what a search
+  // looks at: one asks about paths and names, the other opens them to play.
+  useEffect(() => {
+    if (playing || showFolderSetup || showSearchLogSettings || showHelp) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.metaKey || event.altKey)
+        return;
+      if (event.key.toLowerCase() === "p") {
+        event.preventDefault();
+        void openFolderToPlay();
+      } else if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        void openFileToPlay();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   // Shift is what separates this from the Ctrl+T that chooses whether tags are
   // searched: one asks a question about tags, the other writes them.
   useEffect(() => {
@@ -4767,18 +4828,23 @@ export default function App() {
         setMediaType(launched.addonSearch.mediaType);
         setAddonSearch(launched.addonSearch);
         setPlaying(undefined);
+      } else if (launchedPage.query.startsWith("path:")) {
+        // A folder or file launch is a search for that location: the field
+        // shows the query, so asking again finds the same files. Playlists
+        // carry an empty query, so this prefix is unambiguous.
+        setQuery(launchedPage.query);
+        setAddonSearch(undefined);
+        searchedQuery.current = launchedPage.query;
+        launchedResults.current = undefined;
+        const launchedType = mediaTypeOf(launchedPage.results);
+        searchedMediaType.current = launchedType;
+        setMediaType(launchedType);
+        setPlaying({ videos: launchedPage.results, startIndex: 0 });
       } else {
         setQuery("");
         setAddonSearch(undefined);
         launchedResults.current = launchedPage.results;
-        // The toggle starts on whatever the launch holds, so nothing in it is
-        // hidden until the viewer asks for that.
-        const images = launchedPage.results.some(isImageResult);
-        const videos = launchedPage.results.some(
-          (video) => !isImageResult(video),
-        );
-        const launchedType: MediaType =
-          images && videos ? "both" : images ? "images" : "videos";
+        const launchedType = mediaTypeOf(launchedPage.results);
         searchedMediaType.current = launchedType;
         setMediaType(launchedType);
         setPlaying({ videos: launchedPage.results, startIndex: 0 });
@@ -4848,6 +4914,69 @@ export default function App() {
       if (typeof path === "string") setLogPathDraft(path);
     } catch (reason) {
       setLogError(errorMessage(reason));
+    }
+  };
+
+  // A folder or file picked from the browser plays at once, the way a launch
+  // with it would — and leaves its `path:` query behind, so the results stay
+  // a search that can be asked again.
+  const playOpenedPage = (opened: SearchPage) => {
+    searchedQuery.current = opened.query;
+    launchedResults.current = undefined;
+    setAddonSearch(undefined);
+    // Fresh results start at the top: the old search's scrolled offset must
+    // not follow into them when playback ends.
+    resultsScrollOffset.current = 0;
+    // A search still in flight answers an older question than this one.
+    requestNumber.current += 1;
+    setIndexRefreshAvailable(false);
+    setLoading(false);
+    setQuery(opened.query);
+    setPage(opened);
+    const openedType = mediaTypeOf(opened.results);
+    searchedMediaType.current = openedType;
+    setMediaType(openedType);
+    setPlaying({ videos: opened.results, startIndex: 0 });
+  };
+
+  const openFolderToPlay = async () => {
+    setError(undefined);
+    let ticket = requestNumber.current;
+    try {
+      const path = await open({ directory: true, multiple: false });
+      if (typeof path !== "string") return;
+      // Reserved after the dialog: a search typed while the disk is busy
+      // answers a newer question than this open.
+      ticket = ++requestNumber.current;
+      const opened = await openFolder(path);
+      if (ticket !== requestNumber.current) return;
+      playOpenedPage(opened);
+    } catch (reason) {
+      if (ticket !== requestNumber.current) return;
+      // The ticket already took loading away from any pending search, so a
+      // failed open has to release it — otherwise "Searching…" sticks.
+      setLoading(false);
+      setError(errorMessage(reason));
+    }
+  };
+
+  const openFileToPlay = async () => {
+    setError(undefined);
+    let ticket = requestNumber.current;
+    try {
+      const path = await open({
+        multiple: false,
+        filters: [MEDIA_FILE_FILTER],
+      });
+      if (typeof path !== "string") return;
+      ticket = ++requestNumber.current;
+      const opened = await openFile(path);
+      if (ticket !== requestNumber.current) return;
+      playOpenedPage(opened);
+    } catch (reason) {
+      if (ticket !== requestNumber.current) return;
+      setLoading(false);
+      setError(errorMessage(reason));
     }
   };
 
@@ -5322,6 +5451,22 @@ export default function App() {
             onClick={() => void startNewWindow()}
           >
             <Label>New window</Label>
+          </ControlButton>
+          <ControlButton
+            shortcut="Ctrl+Shift+P"
+            className="scope-toggle"
+            aria-label="Open folder"
+            onClick={() => void openFolderToPlay()}
+          >
+            <Label>Open folder</Label>
+          </ControlButton>
+          <ControlButton
+            shortcut="Ctrl+Shift+F"
+            className="scope-toggle"
+            aria-label="Open file"
+            onClick={() => void openFileToPlay()}
+          >
+            <Label>Open file</Label>
           </ControlButton>
           <HelpButton onClick={() => setShowHelp(true)} />
         </div>

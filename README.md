@@ -68,10 +68,15 @@ Searches accept implicit `AND`, explicit `AND`, `OR`, and `NOT`. `AND` binds
 more tightly than `OR`, while `NOT` binds most tightly. Parentheses change the
 order. Quoted values keep spaces, such as `filename:"family trip"`.
 
-Text can target `tags:`, `filename:`, `path:`, or `folder:`. `path:` and
-`folder:` search every parent path component. `type:image` and `type:video`
-match media kinds. `extension:jpg` matches an exact extension without regard to
-case.
+Text can target `tags:`, `filename:`, `path:`, or `folder:`. `folder:`
+searches every parent path component; `path:` searches the whole path including
+the file's own name, so `path:/Videos/trip` finds everything under that folder
+and `path:/Videos/trip/clip.mp4` finds the one file — even where the index has
+never looked. Quote values with spaces, such as `path:"/My Videos/trip"`.
+`~/` names your home folder; `~other/` is not expanded. The
+path scope toggle still covers only the folders above the file.
+`type:image` and `type:video` match media kinds. `extension:jpg` matches an
+exact extension without regard to case.
 
 File-size predicates can be added to a search without a separate control:
 `size:18mb` matches 18.0 MB up to (not including) 19 MB, and `size:36.3mb`
@@ -117,6 +122,19 @@ output error returns exit code `1`. A missing query returns exit code `2`. Use
 `-v`) prints the installed Toka version and the Git SHA it was built from
 (the same SHA shown when the app first launches), e.g.
 `toka <version> (Git SHA 1a2b3c…)`.
+
+Run `toka` with a folder, video, image, or playlist to play it straight away:
+
+```sh
+toka ~/Videos/trip
+toka ~/Videos/trip/clip.mp4
+toka ~/Photos/trip/beach.jpg
+```
+
+The folder or file opens playing, with its `path:` query in the search field,
+so the results stay a search that can be asked again. The same opening is on
+the search screen as Open folder (`Ctrl+Shift+P`) and Open file
+(`Ctrl+Shift+F`).
 
 ### Reset Toka
 

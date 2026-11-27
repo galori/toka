@@ -11,7 +11,7 @@ use toka_search::{
 
 const SEARCH_USAGE: &str = "Usage: toka search <query>";
 const RESET_USAGE: &str = "Usage: toka reset --yes";
-const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  restart         Restart this Toka and its indexer\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version and Git SHA\n  --index-stats   Show what the indexer has found and whether it is running";
+const GENERAL_HELP: &str = "Usage: toka <command> [arguments]\n       toka [path]\n\nCommands:\n  search <query>  Search indexed media and print file paths\n  reset --yes     Remove Toka's search folders, index, caches, and logs\n  restart         Restart this Toka and its indexer\n\nRun with a folder, video, image, or playlist to play it instead of opening an empty search.\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the Toka version and Git SHA\n  --index-stats   Show what the indexer has found and whether it is running";
 const RESET_HELP: &str = "Usage: toka reset --yes\n\nPut Toka back to a first-run state. Removes every search folder, the search index and its caches, thumbnail and other caches, and Toka's log files.\nYour media files are not touched. Without --yes, lists what would be removed and changes nothing.";
 const INDEX_STATS_HELP: &str = "Usage: toka --index-stats\n\nShow whether the indexer is active, the indexer service state, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing.";
 const SEARCH_HELP: &str =
