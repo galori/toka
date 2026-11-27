@@ -1612,6 +1612,208 @@ test("tags the playing video's folder from its control and Shift+T", async () =>
   );
 });
 
+async function playWithTags(tags: string[]) {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "clip.mp4",
+          extension: "mp4",
+          tags,
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/clip.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip.mp4");
+  return user;
+}
+
+test("sets a favorite level from Shift+F and a digit", async () => {
+  const user = await playWithTags(["work", "fv", "fv2"]);
+  invokeMock.mockResolvedValue({
+    fileName: "clip [fv fv5 work].mp4",
+    tags: ["fv", "fv5", "work"],
+  });
+  const control = screen.getByRole("button", {
+    name: "Favorite level for clip.mp4",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Shift+F");
+
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  expect(screen.getByRole("group", { name: "Favorite level" })).toBeVisible();
+  await user.keyboard("5");
+
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["fv2"],
+  });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv5"],
+    }),
+  );
+  await waitFor(() =>
+    expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull(),
+  );
+});
+
+test("sets and clears a favorite with the mouse", async () => {
+  const user = await playWithTags(["fv", "fv3"]);
+  invokeMock.mockResolvedValue({ fileName: "clip.mp4", tags: [] });
+  await user.click(
+    screen.getByRole("button", { name: "Favorite level for clip.mp4" }),
+  );
+  // Choosing the current level again clears the favorite.
+  await user.click(screen.getByRole("button", { name: "Level 3" }));
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["fv", "fv3"],
+  });
+});
+
+test("plain favorite on Enter, clear on 0, and Escape closes", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockResolvedValue({ fileName: "clip [fv].mp4", tags: ["fv"] });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv"],
+    }),
+  );
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("0");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenLastCalledWith("remove_video_tags", {
+      resultId: "video-1",
+      tags: ["fv"],
+    }),
+  );
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
+});
+
+test("opening the tag field closes the picker so digits type into it", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockResolvedValue({ fileName: "clip [720p].mp4", tags: ["720p"] });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.click(screen.getByRole("button", { name: "Add tag to clip.mp4" }));
+  expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
+  await user.keyboard("720p");
+  expect(
+    screen.getByRole("textbox", { name: "Add tag to clip.mp4" }),
+  ).toHaveValue("720p");
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "add_video_tags",
+    expect.objectContaining({ tags: ["fv2"] }),
+  );
+});
+
+test("the open picker swallows other player shortcuts and Shift+F toggles it", async () => {
+  const user = await playWithTags([]);
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("{Shift>}{Delete}{/Shift}");
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "delete_video",
+    expect.anything(),
+  );
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
+});
+
+test("shows an error when the favorite cannot be saved", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockRejectedValueOnce(new Error("disk full"));
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("4");
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not update favorite",
+  );
+});
+
+test("a mouse choice leaves no stale hover when the picker reopens", async () => {
+  const user = await playWithTags(["fv", "fv4"]);
+  invokeMock.mockResolvedValue({ fileName: "clip.mp4", tags: [] });
+  const toggle = screen.getByRole("button", {
+    name: "Favorite level for clip.mp4",
+  });
+  await user.click(toggle);
+  await user.click(screen.getByRole("button", { name: "Level 4" }));
+  await user.click(toggle);
+  expect(screen.getByRole("button", { name: "Level 4" })).toHaveTextContent(
+    "☆",
+  );
+});
+
+test("a favorite chosen during a slow save is applied after it, from its result", async () => {
+  const user = await playWithTags([]);
+  let finish: (value: unknown) => void = () => {};
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    const tags = (args as { tags?: string[] } | undefined)?.tags ?? [];
+    if (command === "add_video_tags" && tags.includes("fv3"))
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    if (command === "remove_video_tags")
+      return Promise.resolve({ fileName: "clip [fv].mp4", tags: ["fv"] });
+    return Promise.resolve({ fileName: "clip.mp4", tags: ["fv", "fv5"] });
+  });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("3");
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  await user.keyboard("5");
+  finish({ fileName: "clip [fv fv3].mp4", tags: ["fv", "fv3"] });
+  // The queued choice removes the level that just landed, not nothing.
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+      resultId: "video-1",
+      tags: ["fv3"],
+    }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["fv5"],
+  });
+});
+
+test("Enter on a focused level button picks that level, not a plain favorite", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockResolvedValue({ fileName: "clip.mp4", tags: ["fv", "fv3"] });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  screen.getByRole("button", { name: "Level 3" }).focus();
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv", "fv3"],
+    }),
+  );
+});
+
+test("lists favorites in the help pane", async () => {
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(within(help).getByText(/Pick a favorite level/)).toBeVisible();
+});
+
 test("lists folder tagging in the help pane", async () => {
   const user = userEvent.setup();
   render(<App />);
