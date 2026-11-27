@@ -1380,6 +1380,18 @@ function Player({
   useLayoutEffect(() => {
     addonVideoGeneration.current += 1;
   }, [video.id]);
+  // Numbers each video so a tag refresh that finishes late cannot put an
+  // old video's path under the one now playing.
+  const videoGeneration = useRef(0);
+  useLayoutEffect(() => {
+    videoGeneration.current += 1;
+  }, [video.id]);
+  // Where web playback was when a retag swapped the source underneath it:
+  // the engine starts the new file at the beginning, so the metadata
+  // handler puts the viewer back here — paused or playing as they were.
+  const resumeAfterRetag = useRef<
+    { time: number; paused: boolean } | undefined
+  >(undefined);
   const focusAddonButton = useCallback(() => {
     const button = addonMenuWrap.current?.firstElementChild;
     if (button instanceof HTMLButtonElement) button.focus();
@@ -1595,6 +1607,40 @@ function Player({
   useEffect(() => {
     copyPathRef.current = copyPath;
   });
+  // Retagging renames the file on disk, but `prepared` still carries the
+  // path it was read from — the windowed path field and the fullscreen
+  // overlay would keep showing the old name. Re-reading the prepared video
+  // brings every display up to date, and re-allows the new file for the web
+  // engine. Native playback and images are untouched by the swap; the web
+  // engine reloads the new source, so it resumes where the rename found it.
+  const refreshPreparedAfterRetag = async () => {
+    const id = video.id;
+    const generation = videoGeneration.current;
+    if (!isImage && prepared?.playbackBackend !== "native") {
+      resumeAfterRetag.current = {
+        time: element.current?.currentTime ?? currentTime,
+        paused: !playingBack,
+      };
+    }
+    try {
+      const next = await prepareVideo(id);
+      if (videoGeneration.current !== generation) {
+        resumeAfterRetag.current = undefined;
+        return;
+      }
+      // A tag the name already carried renames nothing: the source stays,
+      // so there is no new beginning to resume from.
+      if (next.filePath === prepared?.filePath) {
+        resumeAfterRetag.current = undefined;
+        return;
+      }
+      setPrepared(next);
+    } catch {
+      // The tags themselves were saved; only the displayed path stays
+      // behind until the next video is prepared.
+      resumeAfterRetag.current = undefined;
+    }
+  };
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
     setPlaylist((current) =>
       current.map((item) =>
@@ -1602,6 +1648,7 @@ function Player({
       ),
     );
     onTagsChange(video.id, update);
+    void refreshPreparedAfterRetag();
   };
   // Every video in the renamed folder carries its new tags, not just this one.
   const updateFolderTags = ({ folderTags, resultIds }: FolderTagUpdate) => {
@@ -1612,6 +1659,7 @@ function Player({
       ),
     );
     for (const id of resultIds) onTagsChange(id, { folderTags });
+    if (moved.has(video.id)) void refreshPreparedAfterRetag();
   };
   useEffect(() => {
     if (!deletedVideo) return;
@@ -1640,6 +1688,7 @@ function Player({
     setDuration(0);
     setCurrentTime(0);
     imageElapsed.current = 0;
+    resumeAfterRetag.current = undefined;
     setError(undefined);
     setNativeStarted(false);
     setFullscreenError(undefined);
@@ -3097,13 +3146,27 @@ function Player({
                 : {}),
             }}
             onLoadedMetadata={(event) => {
+              const media = event.currentTarget;
               setDuration(
-                Number.isFinite(event.currentTarget.duration)
-                  ? event.currentTarget.duration
-                  : 0,
+                Number.isFinite(media.duration) ? media.duration : 0,
               );
-              event.currentTarget.playbackRate = speed;
-              event.currentTarget.volume = volume / 100;
+              media.playbackRate = speed;
+              media.volume = volume / 100;
+              // A retag swaps the source under the playing video, and the
+              // engine starts the new file at the beginning — so the player
+              // puts the viewer back where the rename found them, paused or
+              // playing as they were.
+              const resume = resumeAfterRetag.current;
+              resumeAfterRetag.current = undefined;
+              if (resume) {
+                media.currentTime = resume.time;
+                setCurrentTime(resume.time);
+                if (resume.paused) {
+                  pausedByViewer.current = true;
+                  setPlayingBack(false);
+                  return;
+                }
+              }
               play();
             }}
             onClick={togglePlayback}
