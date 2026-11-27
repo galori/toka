@@ -1064,17 +1064,22 @@ async fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandErr
     let database = toka_search::owned_index::database_path().map_err(failed)?;
     // The indexer daemon keeps this list fresh; count on demand until it has.
     // An empty list may predate the first scan, so it is counted again.
-    // A stale list (daemon stopped, or the app owns the index) is counted again.
-    let max_age = std::time::Duration::from_secs(10 * 60);
-    if let Some(tags) =
-        toka_search::top_tags::read_fresh(&database, max_age).filter(|tags| !tags.is_empty())
-    {
-        return Ok(tags);
+    // A stale list (daemon stopped, or the app owns the index) is counted
+    // again. An empty one may predate the first scan, so it holds for a minute.
+    let minutes = |minutes: u64| std::time::Duration::from_secs(minutes * 60);
+    if let Some(tags) = toka_search::top_tags::read_fresh(&database, minutes(10)) {
+        if !tags.is_empty() || toka_search::top_tags::read_fresh(&database, minutes(1)).is_some() {
+            return Ok(tags);
+        }
     }
     if !database.exists() {
         return Ok(Vec::new());
     }
-    toka_search::top_tags::refresh(&database).map_err(failed)
+    // A full count reads every file's tags: off the async runtime's threads.
+    tauri::async_runtime::spawn_blocking(move || toka_search::top_tags::refresh(&database))
+        .await
+        .map_err(|error| failed(error.to_string()))?
+        .map_err(failed)
 }
 
 #[tauri::command]

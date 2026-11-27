@@ -1905,6 +1905,34 @@ test("common tags match the file's tags without regard to case", async () => {
   });
 });
 
+test("a common tag pressed during a slow save is ignored, not guessed from stale tags", async () => {
+  const user = await playWithTags([]);
+  let finish: (value: unknown) => void = () => {};
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "get_top_tags")
+      return Promise.resolve([{ tag: "cat", count: 3 }]);
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  fireEvent.keyDown(window, { key: "y" });
+  await screen.findByRole("button", { name: "Tag cat" });
+  await user.keyboard("1");
+  fireEvent.keyDown(window, { key: "y" });
+  await screen.findByRole("button", { name: "Tag cat" });
+  await user.keyboard("1");
+  finish({ fileName: "clip [cat].mp4", tags: ["cat"] });
+  await waitFor(() =>
+    expect(
+      invokeMock.mock.calls.filter(([command]) => command === "add_video_tags"),
+    ).toHaveLength(1),
+  );
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "remove_video_tags",
+    expect.anything(),
+  );
+});
+
 test("lists common tags in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });

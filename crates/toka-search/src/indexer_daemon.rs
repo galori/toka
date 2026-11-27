@@ -208,10 +208,17 @@ pub fn run_daemon() -> Result<(), String> {
                 let logger = Arc::clone(&logger);
                 let running = Arc::clone(&top_tags_running);
                 std::thread::spawn(move || {
+                    // Cleared on drop, so a panic cannot stop recounts for good.
+                    struct Done(Arc<AtomicBool>);
+                    impl Drop for Done {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _done = Done(running);
                     if let Err(error) = crate::top_tags::refresh(&database) {
                         logger.record(format!("top tags not refreshed: {error}"));
                     }
-                    running.store(false, Ordering::Release);
                 });
             }
         }

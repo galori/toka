@@ -2194,19 +2194,27 @@ function Player({
     setPickingFavorite(false);
     setPickingQuickTag(true);
   };
+  // One quick-tag save at a time, decided from the newest known tags: a
+  // second toggle deciding from stale tags could add what it meant to remove.
+  const quickTagBusy = useRef(false);
   const toggleQuickTag = async (tag: string) => {
     setPickingQuickTag(false);
+    if (quickTagBusy.current || favoriteBusy.current) return;
+    quickTagBusy.current = true;
     const videoId = video.id;
     try {
-      updateVideoTags(
-        await (findTag(video.tags ?? [], tag)
-          ? removeVideoTags(videoId, [findTag(video.tags ?? [], tag) ?? tag])
-          : addVideoTags(videoId, [tag])),
-      );
+      const applied = findTag(knownTags.current, tag);
+      const update = await (applied
+        ? removeVideoTags(videoId, [applied])
+        : addVideoTags(videoId, [tag]));
+      if (videoIdRef.current === videoId) knownTags.current = update.tags ?? [];
+      updateVideoTags(update);
       setQuickTagError(undefined);
     } catch (reason) {
       if (videoIdRef.current === videoId)
         setQuickTagError(`Could not update tags: ${errorMessage(reason)}`);
+    } finally {
+      quickTagBusy.current = false;
     }
   };
   // The list is fetched fresh whenever a control that offers it opens.

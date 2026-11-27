@@ -63,7 +63,10 @@ pub fn refresh(database: &Path) -> Result<Vec<TopTag>, String> {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let json = serde_json::to_vec(&tags).map_err(|error| error.to_string())?;
-    fs::write(&temporary, json).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::write(&temporary, json) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
     if let Err(error) = fs::rename(&temporary, &target) {
         let _ = fs::remove_file(&temporary);
         return Err(error.to_string());
