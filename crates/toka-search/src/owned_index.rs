@@ -1254,6 +1254,8 @@ pub fn index_data_files(database: &Path) -> Vec<PathBuf> {
         database.with_file_name(crate::indexer_daemon::LEGACY_DAEMON_LOCK_FILE_NAME),
         database.with_file_name(RENAME_OVERLAY_FILE_NAME),
         database.with_file_name(RENAME_OVERLAY_LOCK_FILE_NAME),
+        // Derived from the index, so it goes with it.
+        crate::top_tags::path_for(database),
     ];
     for suffix in ["", "-wal", "-shm", "-journal"] {
         files.push(database.with_file_name(format!("{}{suffix}", crate::config::INDEX_FILE_NAME)));
@@ -6734,6 +6736,7 @@ mod tests {
                 "daemon.lock",
                 "search-renames.json",
                 "search-renames.lock",
+                "top-tags.json",
                 "index.sqlite3",
                 "index.sqlite3-wal",
                 "index.sqlite3-shm",

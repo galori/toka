@@ -1825,15 +1825,16 @@ button:focus-visible {
   align-items: center;
 }
 .quick-tags-list {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 0;
+  /* Fixed, so a narrow window never pushes the panel past its edge. */
+  position: fixed;
+  bottom: 5.5rem;
+  left: 16px;
   z-index: 5;
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
   width: max-content;
-  max-width: min(520px, 80vw);
+  max-width: min(520px, calc(100vw - 32px));
   padding: 6px;
   border: 1px solid #40506a;
   border-radius: 8px;
