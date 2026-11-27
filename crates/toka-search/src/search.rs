@@ -2136,16 +2136,16 @@ fn expand_location(value: &str) -> PathBuf {
 /// positive `path:` or `folder:` value that exists on disk contributes its
 /// file, or a folder's whole contents. Walked from the canonical top with
 /// traversal spellings below it, the way a scan stores its rows, so files
-/// the index already knows deduplicate. One visited set across values, so
-/// overlapping folders are walked once. Values naming nothing are left to
-/// the index's substring match.
+/// the index already knows deduplicate. Each value walks with a fresh visited
+/// set: sharing one across values would prune traversal spellings another
+/// value still needs to match by. Values naming nothing are left to the
+/// index's substring match.
 fn filesystem_candidates(
     terms: &[(String, bool)],
     media_type: MediaType,
 ) -> (Vec<PathBuf>, HashSet<String>) {
     let mut files = Vec::new();
     let mut walked = HashSet::new();
-    let mut visited = HashSet::new();
     for (value, positive) in terms {
         if !positive || !is_path_shaped(value) {
             continue;
@@ -2164,7 +2164,7 @@ fn filesystem_candidates(
             }
         } else if real.is_dir() {
             walked.insert(value.clone());
-            collect_media_recursive(&real, &mut files, &mut visited, media_type);
+            collect_media_recursive(&real, &mut files, &mut HashSet::new(), media_type);
         }
     }
     (files, walked)
@@ -3737,6 +3737,36 @@ mod tests {
         found.sort();
 
         assert_eq!(found, ["clip.mp4", "other.mp4"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn overlapping_path_terms_keep_each_locations_traversal_spellings() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let opened = directory.path().join("opened");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&opened).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(opened.join("clip.mp4"), b"test").unwrap();
+        fs::write(outside.join("other.mp4"), b"test").unwrap();
+        symlink(&outside, opened.join("link")).unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(Vec::new())));
+        // Either order answers the same: the linked spelling satisfies both
+        // branches however the walks run.
+        for (first, second) in [(&outside, &opened), (&opened, &outside)] {
+            let query = format!(
+                "path:\"{}\" AND path:\"{}\"",
+                first.display(),
+                second.display()
+            );
+            assert_eq!(
+                names(&engine.search(request(&query)).unwrap()),
+                ["other.mp4"],
+                "{query}"
+            );
+        }
     }
 
     #[test]

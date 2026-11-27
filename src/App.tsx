@@ -4953,6 +4953,9 @@ export default function App() {
       playOpenedPage(opened);
     } catch (reason) {
       if (ticket !== requestNumber.current) return;
+      // The ticket already took loading away from any pending search, so a
+      // failed open has to release it — otherwise "Searching…" sticks.
+      setLoading(false);
       setError(errorMessage(reason));
     }
   };
@@ -4972,6 +4975,7 @@ export default function App() {
       playOpenedPage(opened);
     } catch (reason) {
       if (ticket !== requestNumber.current) return;
+      setLoading(false);
       setError(errorMessage(reason));
     }
   };

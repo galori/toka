@@ -800,6 +800,36 @@ test("a slow open does not supersede a newer search", async () => {
   expect(screen.getByRole("searchbox")).toHaveValue("other");
 });
 
+test("a failed open clears a pending search's loading state", async () => {
+  openMock.mockResolvedValue("/Videos/shoots");
+  let resolveSearch!: (page: unknown) => void;
+  const searchPending = new Promise((resolve) => {
+    resolveSearch = resolve;
+  });
+  // Never resolved: the search stays pending while the open fails.
+  void resolveSearch;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return searchPending;
+    if (command === "open_folder")
+      return Promise.reject(
+        new Error("empty contains no videos or images Toka can play."),
+      );
+    return Promise.resolve({ filePath: "/Videos/x.mp4" });
+  });
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  expect(await screen.findByText("Searching…")).toBeVisible();
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "no videos or images",
+  );
+  expect(screen.queryByText("Searching…")).not.toBeInTheDocument();
+});
+
 test("a launch playlist bypasses first-launch folder setup", async () => {
   indexStateMock.mockResolvedValue({
     supported: true,
