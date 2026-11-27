@@ -195,6 +195,8 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent("Ctrl+Shift+L");
   expect(help).toHaveTextContent("Change what results are sorted by");
   expect(help).toHaveTextContent("Toggle ascending or descending sort");
+  expect(help).toHaveTextContent("Open a folder to play");
+  expect(help).toHaveTextContent("Open one video or image to play");
 
   await user.keyboard("{Escape}");
   expect(
@@ -479,6 +481,218 @@ test("opens an add-on launch as an exact search result list", async () => {
       },
       addonSearch,
     }),
+  );
+});
+
+test("shows a launched folder as its path query", async () => {
+  const page = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  launchIntentMock.mockResolvedValue({ page });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/shoots/clip.mp4" });
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+
+  expect(await screen.findByDisplayValue("path:/Videos/shoots")).toBeVisible();
+});
+
+test("opens a folder from the file browser and plays it", async () => {
+  const page = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots");
+  invokeMock.mockImplementation((command: string) =>
+    command === "open_folder"
+      ? Promise.resolve(page)
+      : Promise.resolve({ filePath: "/Videos/shoots/clip.mp4" }),
+  );
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  const openFolder = await screen.findByRole("button", { name: "Open folder" });
+  expect(openFolder).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+P");
+  expect(openFolder.querySelector(".key-hint")).toHaveTextContent(
+    "Ctrl+Shift+P",
+  );
+  await user.click(openFolder);
+
+  await waitFor(() =>
+    expect(openMock).toHaveBeenCalledWith({ directory: true, multiple: false }),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("open_folder", {
+    path: "/Videos/shoots",
+  });
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(await screen.findByDisplayValue("path:/Videos/shoots")).toBeVisible();
+});
+
+test("opens a folder with Ctrl+Shift+P", async () => {
+  const page = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots");
+  invokeMock.mockImplementation((command: string) =>
+    command === "open_folder"
+      ? Promise.resolve(page)
+      : Promise.resolve({ filePath: "/Videos/shoots/clip.mp4" }),
+  );
+
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Open folder" });
+  fireEvent.keyDown(window, { key: "P", ctrlKey: true, shiftKey: true });
+
+  await waitFor(() => expect(openMock).toHaveBeenCalled());
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+});
+
+test("opens one file from the file browser and plays it", async () => {
+  const page = {
+    query: "path:/Videos/shoots/clip.mp4",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots/clip.mp4");
+  invokeMock.mockImplementation((command: string) =>
+    command === "open_file"
+      ? Promise.resolve(page)
+      : Promise.resolve({ filePath: "/Videos/shoots/clip.mp4" }),
+  );
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  const openFile = await screen.findByRole("button", { name: "Open file" });
+  expect(openFile).toHaveAttribute("aria-keyshortcuts", "Ctrl+Shift+F");
+  expect(openFile.querySelector(".key-hint")).toHaveTextContent("Ctrl+Shift+F");
+  await user.click(openFile);
+
+  await waitFor(() => expect(openMock).toHaveBeenCalled());
+  const options = openMock.mock.calls[0][0] as {
+    directory?: boolean;
+    filters: { extensions: string[] }[];
+  };
+  expect(options.directory).not.toBe(true);
+  expect(options.filters[0].extensions).toEqual(
+    expect.arrayContaining(["mp4", "mkv", "jpg"]),
+  );
+  expect(invokeMock).toHaveBeenCalledWith("open_file", {
+    path: "/Videos/shoots/clip.mp4",
+  });
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(
+    await screen.findByDisplayValue("path:/Videos/shoots/clip.mp4"),
+  ).toBeVisible();
+});
+
+test("opens one file with Ctrl+Shift+F", async () => {
+  const page = {
+    query: "path:/Videos/shoots/clip.mp4",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots/clip.mp4");
+  invokeMock.mockImplementation((command: string) =>
+    command === "open_file"
+      ? Promise.resolve(page)
+      : Promise.resolve({ filePath: "/Videos/shoots/clip.mp4" }),
+  );
+
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Open file" });
+  fireEvent.keyDown(window, { key: "F", ctrlKey: true, shiftKey: true });
+
+  await waitFor(() => expect(openMock).toHaveBeenCalled());
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+});
+
+test("stays on search when the open dialog is cancelled", async () => {
+  openMock.mockResolvedValue(null);
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+
+  await waitFor(() => expect(openMock).toHaveBeenCalled());
+  expect(invokeMock).not.toHaveBeenCalledWith("open_folder", expect.anything());
+  expect(screen.queryByLabelText(/^Playing /)).not.toBeInTheDocument();
+  expect(screen.getByRole("searchbox")).toHaveValue("");
+});
+
+test("says on screen when a picked folder cannot be played", async () => {
+  openMock.mockResolvedValue("/Videos/empty");
+  invokeMock.mockRejectedValue(
+    new Error("empty contains no videos or images Toka can play."),
+  );
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "no videos or images",
+  );
+  expect(screen.queryByLabelText(/^Playing /)).not.toBeInTheDocument();
+});
+
+test("an opened folder of images starts on the images toggle", async () => {
+  const page = {
+    query: "path:/Photos/trip",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "photo-1", fileName: "beach.jpg", extension: "jpg" }],
+  };
+  openMock.mockResolvedValue("/Photos/trip");
+  invokeMock.mockImplementation((command: string) =>
+    command === "open_folder"
+      ? Promise.resolve(page)
+      : Promise.resolve({ filePath: "/Photos/trip/beach.jpg" }),
+  );
+  const user = userEvent.setup();
+
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+  expect(await screen.findByLabelText("Playing beach.jpg")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+
+  await screen.findByDisplayValue("path:/Photos/trip");
+  expect(screen.getByRole("button", { name: "Images" })).toHaveAttribute(
+    "aria-pressed",
+    "true",
   );
 });
 

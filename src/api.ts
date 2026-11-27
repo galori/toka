@@ -401,3 +401,11 @@ export function openFolderInNewWindow(resultId: string): Promise<void> {
 export function openParentFolderInNewWindow(resultId: string): Promise<void> {
   return invoke("open_parent_folder_in_new_window", { resultId });
 }
+
+export function openFolder(path: string): Promise<SearchPage> {
+  return invoke<SearchPage>("open_folder", { path });
+}
+
+export function openFile(path: string): Promise<SearchPage> {
+  return invoke<SearchPage>("open_file", { path });
+}

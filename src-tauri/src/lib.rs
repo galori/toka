@@ -598,31 +598,110 @@ async fn launch_intent(
 
 fn launch_page(path: &std::path::Path, engine: &SearchEngine) -> Result<SearchPage, CommandError> {
     if path.is_dir() {
-        let mut videos =
-            playlist::collect_directory_media(path).map_err(|message| CommandError {
-                kind: "Playlist",
-                message,
-            })?;
-        playlist::shuffle_paths(&mut videos);
-        let name = playlist::name(path).into_owned();
-        return Ok(engine.page_of_videos(name, videos));
+        return directory_page(path, engine);
     }
     if search::is_supported_video(path) {
-        if !path.is_file() {
-            return Err(CommandError {
-                kind: "Playlist",
-                message: format!("{} could not be found.", playlist::name(path)),
-            });
-        }
-        let name = playlist::name(path).into_owned();
-        return Ok(engine.page_of_videos(name, vec![path.to_path_buf()]));
+        return single_file_page(path, engine);
     }
     let videos = playlist::videos(path).map_err(|message| CommandError {
         kind: "Playlist",
         message,
     })?;
-    let name = playlist::name(path).into_owned();
-    Ok(engine.page_of_videos(name, videos))
+    // No query: a playlist's entries come from its lines rather than a
+    // search, and only folder and file launches may speak `path:` — the
+    // frontend tells them apart by exactly that.
+    Ok(engine.page_of_videos(String::new(), videos))
+}
+
+/// A page over a folder's own media, named by the `path:` query that finds
+/// the same files again: launching with a folder and searching for it are
+/// the same question.
+fn directory_page(
+    path: &std::path::Path,
+    engine: &SearchEngine,
+) -> Result<SearchPage, CommandError> {
+    let mut videos = playlist::collect_directory_media(path).map_err(|message| CommandError {
+        kind: "Playlist",
+        message,
+    })?;
+    playlist::shuffle_paths(&mut videos);
+    Ok(engine.page_of_videos(query_for_location(path), videos))
+}
+
+/// A page over the one file, named the same way.
+fn single_file_page(
+    path: &std::path::Path,
+    engine: &SearchEngine,
+) -> Result<SearchPage, CommandError> {
+    if !path.is_file() {
+        return Err(CommandError {
+            kind: "Playlist",
+            message: format!("{} could not be found.", playlist::name(path)),
+        });
+    }
+    Ok(engine.page_of_videos(query_for_location(path), vec![path.to_path_buf()]))
+}
+
+/// The `path:` query the search field shows for an opened location:
+/// canonical, so a relative launch still names files the search finds after
+/// the working directory has moved on.
+fn query_for_location(path: &std::path::Path) -> String {
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    search::path_query_for(&absolute)
+}
+
+fn check_openable_file(path: &std::path::Path) -> Result<(), CommandError> {
+    if search::is_supported_video(path) || search::is_supported_image(path) {
+        return Ok(());
+    }
+    Err(CommandError {
+        kind: "Playlist",
+        message: format!(
+            "{} is not a video or image Toka can play.",
+            playlist::name(path)
+        ),
+    })
+}
+
+/// Plays a folder picked from the file browser: the same page a
+/// `toka /that/folder` launch opens, under the same `path:` query.
+#[tauri::command]
+async fn open_folder(
+    path: String,
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<SearchPage, CommandError> {
+    let engine = Arc::clone(engine.inner());
+    let page =
+        tauri::async_runtime::spawn_blocking(move || directory_page(Path::new(&path), &engine))
+            .await
+            .map_err(|error| CommandError {
+                kind: "Playlist",
+                message: format!("The folder worker stopped unexpectedly: {error}"),
+            })??;
+    expose_cached_thumbnails(&app, &page)?;
+    Ok(page)
+}
+
+/// Plays one file picked from the file browser, named by its own `path:`
+/// query the way a `toka /that/video.mp4` launch is.
+#[tauri::command]
+async fn open_file(
+    path: String,
+    app: tauri::AppHandle,
+    engine: State<'_, Arc<SearchEngine>>,
+) -> Result<SearchPage, CommandError> {
+    check_openable_file(Path::new(&path))?;
+    let engine = Arc::clone(engine.inner());
+    let page =
+        tauri::async_runtime::spawn_blocking(move || single_file_page(Path::new(&path), &engine))
+            .await
+            .map_err(|error| CommandError {
+                kind: "Playlist",
+                message: format!("The file worker stopped unexpectedly: {error}"),
+            })??;
+    expose_cached_thumbnails(&app, &page)?;
+    Ok(page)
 }
 
 /// The players installed on this computer that Toka can hand a playlist to.
@@ -1453,6 +1532,8 @@ pub fn run() {
         set_search_log_settings,
         index_state,
         launch_intent,
+        open_folder,
+        open_file,
         video_thumbnail,
         video_preview,
         delete_video,
@@ -1489,6 +1570,8 @@ pub fn run() {
                 add_index_folder,
                 remove_index_folder,
                 launch_intent,
+                open_folder,
+                open_file,
                 video_thumbnail,
                 video_preview,
                 delete_video,
@@ -1533,6 +1616,8 @@ pub fn run() {
         add_index_folder,
         remove_index_folder,
         launch_intent,
+        open_folder,
+        open_file,
         video_thumbnail,
         video_preview,
         delete_video,
@@ -1561,6 +1646,8 @@ pub fn run() {
         set_search_log_settings,
         index_state,
         launch_intent,
+        open_folder,
+        open_file,
         video_thumbnail,
         video_preview,
         delete_video,
@@ -1589,6 +1676,8 @@ pub fn run() {
         set_search_log_settings,
         index_state,
         launch_intent,
+        open_folder,
+        open_file,
         video_thumbnail,
         video_preview,
         delete_video,
@@ -1654,6 +1743,74 @@ mod tests {
             page.results[0].file_name,
             "2026-10-10_@sam_18938383490812348343.mp4"
         );
+    }
+
+    #[test]
+    fn a_launched_folder_is_named_by_the_path_query_that_finds_it_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let shoots = directory.path().join("shoots");
+        std::fs::create_dir(&shoots).unwrap();
+        std::fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let page = launch_page(&shoots, &engine).unwrap();
+
+        let canonical = std::fs::canonicalize(&shoots).unwrap();
+        assert_eq!(page.query, format!("path:{}", canonical.display()));
+        assert_eq!(page.total_results, 1);
+    }
+
+    #[test]
+    fn a_launched_folder_with_spaces_is_quoted_in_its_path_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let shoots = directory.path().join("my shoots");
+        std::fs::create_dir(&shoots).unwrap();
+        std::fs::write(shoots.join("clip.mp4"), b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let page = launch_page(&shoots, &engine).unwrap();
+
+        let canonical = std::fs::canonicalize(&shoots).unwrap();
+        assert_eq!(page.query, format!("path:\"{}\"", canonical.display()));
+    }
+
+    #[test]
+    fn a_launched_video_is_named_by_its_own_path_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        std::fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let page = launch_page(&clip, &engine).unwrap();
+
+        let canonical = std::fs::canonicalize(&clip).unwrap();
+        assert_eq!(page.query, format!("path:{}", canonical.display()));
+        assert_eq!(page.total_results, 1);
+    }
+
+    #[test]
+    fn a_launched_playlist_carries_no_query_to_mistake_for_a_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("beach.mp4"), b"test").unwrap();
+        let playlist = directory.path().join("summer.m3u8");
+        std::fs::write(&playlist, "beach.mp4\n").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider(Vec::new())));
+
+        let page = launch_page(&playlist, &engine).unwrap();
+
+        assert_eq!(page.query, "");
+        assert_eq!(page.total_results, 1);
+    }
+
+    #[test]
+    fn an_opened_file_may_be_a_video_or_an_image_but_nothing_else() {
+        assert!(check_openable_file(Path::new("/Videos/clip.mp4")).is_ok());
+        assert!(check_openable_file(Path::new("/Photos/trip.JPG")).is_ok());
+
+        let error = check_openable_file(Path::new("/Videos/notes.txt")).unwrap_err();
+
+        assert_eq!(error.kind, "Playlist");
+        assert!(error.message.contains("notes.txt"), "{}", error.message);
     }
 
     #[test]
