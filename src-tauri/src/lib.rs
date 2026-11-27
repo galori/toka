@@ -1063,7 +1063,8 @@ fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
     };
     let database = toka_search::owned_index::database_path().map_err(failed)?;
     // The indexer daemon keeps this list fresh; count on demand until it has.
-    if let Some(tags) = toka_search::top_tags::read(&database) {
+    // An empty list may predate the first scan, so it is counted again.
+    if let Some(tags) = toka_search::top_tags::read(&database).filter(|tags| !tags.is_empty()) {
         return Ok(tags);
     }
     if !database.exists() {

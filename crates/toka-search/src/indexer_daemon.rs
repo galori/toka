@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -194,15 +194,26 @@ pub fn run_daemon() -> Result<(), String> {
     let top_tags_database = database.clone();
     let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
     let mut top_tags_counted: Option<Instant> = None;
+    let top_tags_running = Arc::new(AtomicBool::new(false));
     loop {
         supervisor.reconcile();
         let now = Instant::now();
         if top_tags_due(top_tags_counted, now) {
-            // Best effort: the app counts on demand when no list exists.
-            if let Err(error) = crate::top_tags::refresh(&top_tags_database) {
-                logger.record(format!("top tags not refreshed: {error}"));
-            }
             top_tags_counted = Some(now);
+            // On its own thread, so a big index never stalls reconciling or
+            // the heartbeat. Best effort: the app counts on demand when no
+            // list exists.
+            if !top_tags_running.swap(true, Ordering::AcqRel) {
+                let database = top_tags_database.clone();
+                let logger = Arc::clone(&logger);
+                let running = Arc::clone(&top_tags_running);
+                std::thread::spawn(move || {
+                    if let Err(error) = crate::top_tags::refresh(&database) {
+                        logger.record(format!("top tags not refreshed: {error}"));
+                    }
+                    running.store(false, Ordering::Release);
+                });
+            }
         }
         // An activity change publishes immediately; the wait below keeps
         // the heartbeat fresh while nothing changes.

@@ -55,10 +55,19 @@ pub fn refresh(database: &Path) -> Result<Vec<TopTag>, String> {
     let index = OwnedIndex::open_read_only(database).map_err(|error| error.to_string())?;
     let tags = compute(&index, TOP_TAG_LIMIT)?;
     let target = path_for(database);
-    let temporary = target.with_extension("json.tmp");
+    // Unique per call: the daemon and the app may recount at the same moment.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temporary = target.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let json = serde_json::to_vec(&tags).map_err(|error| error.to_string())?;
     fs::write(&temporary, json).map_err(|error| error.to_string())?;
-    fs::rename(&temporary, &target).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::rename(&temporary, &target) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
     Ok(tags)
 }
 

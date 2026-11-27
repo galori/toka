@@ -479,6 +479,13 @@ function FavoritePicker({
   );
 }
 
+// Tag names are matched without regard to case: the index lowercases them,
+// while a file name may carry its own spelling.
+function findTag(tags: string[], tag: string): string | undefined {
+  const lower = tag.toLowerCase();
+  return tags.find((candidate) => candidate.toLowerCase() === lower);
+}
+
 // The digit that picks the n-th common tag: 1-9, then 0 for the tenth.
 const QUICK_TAG_KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
 
@@ -522,7 +529,7 @@ function QuickTags({
               shortcut={QUICK_TAG_KEYS[index]}
               className="tag-pill quick-tag"
               aria-label={`Tag ${tag}`}
-              aria-pressed={tags.includes(tag)}
+              aria-pressed={findTag(tags, tag) !== undefined}
               onClick={() => onToggle(tag)}
             >
               <span className="tag-name">{tag}</span>
@@ -606,7 +613,7 @@ function VideoTags({
       ))}
       {adding
         ? suggestions
-            .filter(({ tag }) => !tags.includes(tag))
+            .filter(({ tag }) => findTag(tags, tag) === undefined)
             .map(({ tag }) => (
               <button
                 key={tag}
@@ -2192,8 +2199,8 @@ function Player({
     const videoId = video.id;
     try {
       updateVideoTags(
-        await ((video.tags ?? []).includes(tag)
-          ? removeVideoTags(videoId, [tag])
+        await (findTag(video.tags ?? [], tag)
+          ? removeVideoTags(videoId, [findTag(video.tags ?? [], tag) ?? tag])
           : addVideoTags(videoId, [tag])),
       );
       setQuickTagError(undefined);

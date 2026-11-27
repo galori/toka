@@ -1890,6 +1890,21 @@ test("the tag field suggests common tags that are not yet applied", async () => 
   });
 });
 
+test("common tags match the file's tags without regard to case", async () => {
+  const user = await playWithTags(["Beach"]);
+  mockTopTags(["beach"], ["Beach"]);
+  await user.click(
+    screen.getByRole("button", { name: "Common tags for clip.mp4" }),
+  );
+  const chip = await screen.findByRole("button", { name: "Tag beach" });
+  expect(chip).toHaveAttribute("aria-pressed", "true");
+  await user.click(chip);
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["Beach"],
+  });
+});
+
 test("lists common tags in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });
