@@ -1,4 +1,4 @@
-use crate::search::{tokenize_query, SearchError, SearchProvider};
+use crate::search::{tokenize_query, CandidateSet, SearchError, SearchProvider};
 use crate::search_log::SearchLogContext;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -59,11 +59,16 @@ impl SearchProvider for OwnedIndexSearchProvider {
         query: &str,
         _whole_path: bool,
         _context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
+    ) -> Result<CandidateSet, SearchError> {
         let terms = query_terms(query)?;
-        self.open_index()?
+        let index = self.open_index()?;
+        let paths = index
             .search_candidates(&terms)
-            .map_err(|error| SearchError::Provider(error.to_string()))
+            .map_err(|error| SearchError::Provider(error.to_string()))?;
+        // Best-effort: a search answers even when its lengths cannot be
+        // read — they all show as unknown.
+        let durations = index.durations_for(&paths).unwrap_or_default();
+        Ok(CandidateSet { paths, durations })
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {

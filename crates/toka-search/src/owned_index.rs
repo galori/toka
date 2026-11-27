@@ -2409,10 +2409,12 @@ impl OwnedIndex {
     /// Up to `limit` indexed videos still missing a duration, for the
     /// background probe pass. Images never want one, and neither do files
     /// under offline roots: their storage is gone, so a probe could only
-    /// fail and be retried every pass.
+    /// fail and be retried every pass. Paged by row id, so callers can
+    /// walk past rows they mean to skip without seeing them again.
     pub(crate) fn videos_missing_durations(
         &self,
         limit: u32,
+        offset: u32,
     ) -> Result<Vec<PathBuf>, OwnedIndexError> {
         if self.is_empty_database() || !self.has_duration_column() {
             return Ok(Vec::new());
@@ -2424,9 +2426,10 @@ impl OwnedIndex {
              WHERE files.media_type = 'video'
                AND files.duration_ms IS NULL
                AND roots.state != 'offline'
-             LIMIT ?1",
+             ORDER BY files.id
+             LIMIT ?1 OFFSET ?2",
         )?;
-        let rows = statement.query_map([limit], |row| {
+        let rows = statement.query_map(params![limit, offset], |row| {
             Ok(path_from_bytes(row.get::<_, Vec<u8>>(0)?))
         })?;
         rows.collect::<Result<_, _>>()
@@ -7217,11 +7220,40 @@ mod tests {
         let (size, mtime) = file_size_and_mtime(&index, &one);
         assert!(index.set_duration_ms(&one, size, mtime, 61_500).unwrap());
 
-        let missing = index.videos_missing_durations(100).unwrap();
+        let missing = index.videos_missing_durations(100, 0).unwrap();
 
         // The probed clip, the image, and the offline root's clip are all
         // absent: only the unprobed online video wants a probe.
         assert_eq!(missing, vec![two]);
+    }
+
+    #[test]
+    fn videos_missing_durations_pages_stably_by_row_id() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        for name in ["a.mp4", "b.mp4", "c.mp4"] {
+            std::fs::write(root.join(name), b"video").unwrap();
+        }
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        let first = index.videos_missing_durations(1, 0).unwrap();
+        let second = index.videos_missing_durations(1, 1).unwrap();
+        let third = index.videos_missing_durations(1, 2).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(third.len(), 1);
+        // Three pages, three different videos, same order every time.
+        assert_ne!(first, second);
+        assert_ne!(second, third);
+        assert_ne!(first, third);
+        assert_eq!(index.videos_missing_durations(1, 0).unwrap(), first);
+        assert!(index.videos_missing_durations(1, 3).unwrap().is_empty());
+        assert_eq!(index.videos_missing_durations(100, 0).unwrap().len(), 3);
     }
 
     #[test]
@@ -7253,7 +7285,7 @@ mod tests {
         let index = OwnedIndex::open_read_only(&database).unwrap();
 
         assert!(index.durations_for(&[one]).unwrap().is_empty());
-        assert!(index.videos_missing_durations(100).unwrap().is_empty());
+        assert!(index.videos_missing_durations(100, 0).unwrap().is_empty());
     }
 
     #[test]
@@ -7442,7 +7474,8 @@ mod tests {
         };
         let context = SearchLogContext::from(&request);
         let candidates = provider.candidates("family", false, &context).unwrap();
-        assert_eq!(candidates, vec![root.join("family-trip.mp4")]);
+        assert_eq!(candidates.paths, vec![root.join("family-trip.mp4")]);
+        assert!(candidates.durations.is_empty());
         assert!(provider.revision() > 0);
         let mut paths = vec![
             root.join("family-trip.mp4"),

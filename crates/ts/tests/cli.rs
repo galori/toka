@@ -482,6 +482,7 @@ fn candidates_json_matches_the_direct_provider_on_the_same_index() {
         let mut direct_paths: Vec<String> = provider
             .candidates(query, true, &context)
             .unwrap()
+            .paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect();
@@ -491,6 +492,114 @@ fn candidates_json_matches_the_direct_provider_on_the_same_index() {
         assert_eq!(document["indexRevision"], provider.revision());
         assert!(output.stderr.is_empty());
     }
+}
+
+#[test]
+fn durations_without_paths_prints_usage_and_exits_with_a_usage_error() {
+    let output = run_ts(&["durations"], &[]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Durations needs at least one path.\nUsage: ts durations [--json] -- <path> [<path>...]\n"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn durations_help_prints_usage_and_exits_successfully() {
+    let output = run_ts(&["durations", "--help"], &[]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        help.starts_with("Usage: ts durations [--json] -- <path> [<path>...]\n"),
+        "{help}"
+    );
+    assert!(help.contains("milliseconds"), "{help}");
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn durations_json_reads_indexed_lengths() {
+    use toka_search::owned_index::{OwnedIndex, OwnedIndexManager};
+
+    let home = scratch_home();
+    let media = home.home.path().join("media");
+    fs::create_dir_all(&media).unwrap();
+    let root = media.canonicalize().unwrap();
+    let known = create_video(&root, 0);
+    let unknown = create_video(&root, 1);
+    let media_argument = root.to_string_lossy().into_owned();
+    let output = run_at(&home, &["folders", "add", &media_argument]);
+    assert_eq!(output.status.code(), Some(0));
+    let database = index_database_path(home.home.path(), &home.data_home);
+    let folders = OwnedIndexManager::under(database.clone())
+        .folders()
+        .unwrap();
+    OwnedIndex::open(&database)
+        .unwrap()
+        .scan_root(&folders[0].id, &root, |_| {})
+        .unwrap();
+    // One probed length, written as the enrichment worker would leave
+    // it; the other clip stays unknown.
+    rusqlite::Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE files SET duration_ms = 61500 WHERE display_path = ?1",
+            [known.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+
+    let known_argument = known.to_string_lossy().into_owned();
+    let unknown_argument = unknown.to_string_lossy().into_owned();
+    let output = run_at(
+        &home,
+        &[
+            "durations",
+            "--json",
+            "--",
+            &known_argument,
+            &unknown_argument,
+        ],
+    );
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(
+        document["durations"],
+        serde_json::json!({ known_argument: 61_500 })
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[cfg(not(feature = "fixtures"))]
+#[test]
+fn durations_with_no_index_reads_empty_without_creating_one() {
+    let home = scratch_home();
+    let missing = home
+        .home
+        .path()
+        .join("media")
+        .join("clip.mp4")
+        .to_string_lossy()
+        .into_owned();
+
+    let output = run_at(&home, &["durations", "--json", "--", &missing]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
+    assert_eq!(document["schema"], 1);
+    assert_eq!(document["durations"], serde_json::json!({}));
+    assert!(output.stderr.is_empty());
+    assert!(
+        !index_database_path(home.home.path(), &home.data_home).exists(),
+        "a read-only command leaves no index behind"
+    );
 }
 
 #[test]

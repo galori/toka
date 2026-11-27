@@ -22,11 +22,13 @@ use toka_search::{
 /// so readers gate on the exit status.
 const JSON_SCHEMA_VERSION: u32 = 1;
 
-const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  candidates <query> Print the raw candidate paths behind a search query\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  reset [--yes]    Remove Toka's search state\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
+const GENERAL_HELP: &str = "Usage: ts <command> [arguments]\n\nCommands:\n  search <query>   Search indexed media and print file paths\n  candidates <query> Print the raw candidate paths behind a search query\n  durations <path>... Print the indexed lengths of videos in milliseconds\n  stats            Show what the indexer has found\n  status           Show whether the indexer daemon is running\n  install          Install the indexer as a background service\n  uninstall        Remove the indexer service\n  restart          Restart the indexer service\n  start            Start the indexer service\n  stop             Stop the indexer service\n  reset [--yes]    Remove Toka's search state\n  folders ...      Add, remove, or list the folders the index watches\n  sync-path <path> Refresh one changed path in the index\n  sync-rename <from> <to>   Move one indexed path to its new name\n  thumbnail <path> Show or generate one file's thumbnail\n  preview <path>   Show or generate one video's preview frames\n\nOptions:\n  -h, --help      Show this help\n  -v, --version   Show the ts version and Git SHA";
 const SEARCH_USAGE: &str = "Usage: ts search <query> [--json] [--limit N] [--page N] [--type video|image|all] [--count] [--verbose]";
 
 const CANDIDATES_USAGE: &str = "Usage: ts candidates <query> [--json]";
 const CANDIDATES_HELP: &str = "Usage: ts candidates <query> [--json]\n\nPrint the raw candidate paths behind a search query: the OR-widened set the search engine filters by fields, media type, and visibility, with recorded renames applied. The Toka app searches through this and filters it with the viewer's own fields; `ts search` runs the same engine's filters itself. Prints one full path per result line, or one JSON document (schema 1) with --json. A missing index reads empty, never created. Changes nothing in the index.\n\nUse -- to ask for text starting with a dash.";
+const DURATIONS_USAGE: &str = "Usage: ts durations [--json] -- <path> [<path>...]";
+const DURATIONS_HELP: &str = "Usage: ts durations [--json] -- <path> [<path>...]\n\nPrint the indexed lengths of the named videos in whole milliseconds: one `milliseconds<TAB>path` line per known video, or one JSON document (schema 1) with --json. Unknown paths — never probed, or not indexed — are absent, never zero. A missing index reads empty, never created. Changes nothing in the index.\n\nPaths start after --, so names starting with a dash still work.";
 const STATS_USAGE: &str = "Usage: ts stats [--json]";
 const STATS_HELP: &str = "Usage: ts stats [--json]\n\nShow whether the indexer is active, the number of videos and images indexed, and each search folder's status and file counts. Changes nothing in the index.";
 const STATUS_USAGE: &str = "Usage: ts status [--json] [--watch]";
@@ -142,6 +144,10 @@ pub fn run_command(
 
     if command == OsStr::new("candidates") {
         return run_candidates_command(&arguments[2..], create_engine, stdout, stderr);
+    }
+
+    if command == OsStr::new("durations") {
+        return run_durations_command(&arguments[2..], create_engine, stdout, stderr);
     }
 
     if command == OsStr::new("stats") {
@@ -1702,19 +1708,20 @@ fn run_candidates_command(
             return 1;
         }
     };
-    let (candidates, revision) = match engine.raw_candidates(&options.query) {
+    let (found, revision) = match engine.raw_candidates(&options.query) {
         Ok(found) => found,
         Err(error) => {
             let _ = writeln!(stderr, "ts candidates: {error}");
             return 1;
         }
     };
+    let candidates = found.paths;
     if options.json {
         // Known durations ride along, keyed by lossy path, so the app
         // sorts and badges without a second call. Unknown paths are
         // absent, never zero.
-        let durations: serde_json::Map<String, serde_json::Value> = engine
-            .durations_for(&candidates)
+        let durations: serde_json::Map<String, serde_json::Value> = found
+            .durations
             .into_iter()
             .map(|(path, ms)| (path.to_string_lossy().into_owned(), serde_json::json!(ms)))
             .collect();
@@ -1778,6 +1785,67 @@ fn parse_candidates_arguments(arguments: &[OsString]) -> Result<CandidatesOption
     Ok(options)
 }
 
+fn run_durations_command(
+    arguments: &[OsString],
+    create_engine: impl FnOnce() -> Result<SearchEngine, String>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    if arguments.len() == 1
+        && (arguments[0] == OsStr::new("--help") || arguments[0] == OsStr::new("-h"))
+    {
+        return print_text(DURATIONS_HELP, stdout, stderr);
+    }
+    let (paths, json) = match parse_path_arguments(arguments, true) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            let _ = writeln!(stderr, "{message}\n{DURATIONS_USAGE}");
+            return 2;
+        }
+    };
+    if paths.is_empty() {
+        let _ = writeln!(
+            stderr,
+            "Durations needs at least one path.\n{DURATIONS_USAGE}"
+        );
+        return 2;
+    }
+    let engine = match create_engine() {
+        Ok(engine) => engine,
+        Err(error) => {
+            let _ = writeln!(stderr, "ts durations: {error}");
+            return 1;
+        }
+    };
+    let durations = engine.durations_for(&paths);
+    if json {
+        // Lossy keys, never `PathBuf`s: real paths can hold non-UTF-8
+        // bytes on Unix, and those must not break this document.
+        let durations: serde_json::Map<String, serde_json::Value> = durations
+            .into_iter()
+            .map(|(path, ms)| (path.to_string_lossy().into_owned(), serde_json::json!(ms)))
+            .collect();
+        let document = serde_json::json!({
+            "schema": JSON_SCHEMA_VERSION,
+            "durations": durations,
+        });
+        return print_json(&document, "ts durations", stdout, stderr);
+    }
+    let mut lines: Vec<(&PathBuf, u64)> = durations.iter().map(|(path, ms)| (path, *ms)).collect();
+    lines.sort_by(|left, right| left.0.cmp(right.0));
+    for (path, ms) in lines {
+        if let Err(error) = writeln!(stdout, "{ms}\t{}", path.display()) {
+            let _ = writeln!(stderr, "ts durations: could not write a result: {error}");
+            return 1;
+        }
+    }
+    if let Err(error) = stdout.flush() {
+        let _ = writeln!(stderr, "ts durations: could not write results: {error}");
+        return 1;
+    }
+    0
+}
+
 fn print_text(text: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i32 {
     if let Err(error) = writeln!(stdout, "{text}").and_then(|()| stdout.flush()) {
         let _ = writeln!(stderr, "ts: could not write output: {error}");
@@ -1801,7 +1869,7 @@ mod tests {
         daemon_state::{DaemonActivity, DaemonQueue, DaemonStatus},
         index_stats::{FolderState, FolderStats, IndexStats},
         owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState, ScannedDirectory},
-        search::{SearchEngine, SearchError, SearchProvider},
+        search::{CandidateSet, SearchEngine, SearchError, SearchProvider},
         search_log::SearchLogContext,
         service::{Action, Outcome, ServiceOp},
     };
@@ -1923,6 +1991,7 @@ mod tests {
             for command in [
                 "search",
                 "candidates",
+                "durations",
                 "stats",
                 "status",
                 "install",
@@ -1955,8 +2024,11 @@ mod tests {
             _query: &str,
             _whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
-            Ok(self.0.clone())
+        ) -> Result<CandidateSet, SearchError> {
+            Ok(CandidateSet {
+                paths: self.0.clone(),
+                durations: HashMap::new(),
+            })
         }
     }
 
@@ -1968,8 +2040,34 @@ mod tests {
             _query: &str,
             _whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
+        ) -> Result<CandidateSet, SearchError> {
             Err(SearchError::Provider("backend unavailable".into()))
+        }
+    }
+
+    struct DurationProvider {
+        paths: Vec<PathBuf>,
+        durations: HashMap<PathBuf, u64>,
+    }
+
+    impl SearchProvider for DurationProvider {
+        fn candidates(
+            &self,
+            _query: &str,
+            _whole_path: bool,
+            _context: &SearchLogContext,
+        ) -> Result<CandidateSet, SearchError> {
+            Ok(CandidateSet {
+                paths: self.paths.clone(),
+                durations: self.durations.clone(),
+            })
+        }
+
+        fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+            paths
+                .iter()
+                .filter_map(|path| self.durations.get(path).map(|ms| (path.clone(), *ms)))
+                .collect()
         }
     }
 
@@ -3511,29 +3609,6 @@ mod tests {
 
     #[test]
     fn candidates_json_carries_known_durations_by_path() {
-        struct DurationProvider {
-            paths: Vec<PathBuf>,
-            durations: HashMap<PathBuf, u64>,
-        }
-
-        impl SearchProvider for DurationProvider {
-            fn candidates(
-                &self,
-                _query: &str,
-                _whole_path: bool,
-                _context: &SearchLogContext,
-            ) -> Result<Vec<PathBuf>, SearchError> {
-                Ok(self.paths.clone())
-            }
-
-            fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
-                paths
-                    .iter()
-                    .filter_map(|path| self.durations.get(path).map(|ms| (path.clone(), *ms)))
-                    .collect()
-            }
-        }
-
         let directory = tempdir().unwrap();
         let known = directory.path().join("family-known.mp4");
         let unknown = directory.path().join("family-unknown.mp4");
@@ -3577,6 +3652,148 @@ mod tests {
             serde_json::json!({ known.to_string_lossy().into_owned(): 61_500 })
         );
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn durations_json_prints_known_lengths_by_path() {
+        let directory = tempdir().unwrap();
+        let known = directory.path().join("clip-known.mp4");
+        let unknown = directory.path().join("clip-unknown.mp4");
+        fs::write(&known, b"video").unwrap();
+        fs::write(&unknown, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(DurationProvider {
+            paths: vec![known.clone(), unknown.clone()],
+            durations: [(known.clone(), 61_500)].into_iter().collect(),
+        }));
+        let args = vec![
+            OsString::from("ts"),
+            OsString::from("durations"),
+            OsString::from("--json"),
+            OsString::from("--"),
+            known.clone().into_os_string(),
+            unknown.clone().into_os_string(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(document["schema"], 1);
+        assert_eq!(
+            document["durations"],
+            serde_json::json!({ known.to_string_lossy().into_owned(): 61_500 })
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn durations_text_prints_tabbed_lengths_sorted_by_path() {
+        let directory = tempdir().unwrap();
+        let one = directory.path().join("b-clip.mp4");
+        let two = directory.path().join("a-clip.mp4");
+        fs::write(&one, b"video").unwrap();
+        fs::write(&two, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(DurationProvider {
+            paths: vec![one.clone(), two.clone()],
+            durations: [(one.clone(), 61_500), (two.clone(), 3_000)]
+                .into_iter()
+                .collect(),
+        }));
+        // Asked least-sorted first, without the separator: both spellings
+        // reach the same lookup.
+        let args = vec![
+            OsString::from("ts"),
+            OsString::from("durations"),
+            one.clone().into_os_string(),
+            two.clone().into_os_string(),
+        ];
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!("3000\t{}\n61500\t{}\n", two.display(), one.display())
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn durations_without_paths_prints_usage() {
+        let args = ["ts", "durations"].map(OsString::from).to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            no_engine,
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 2);
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            format!(
+                "Durations needs at least one path.\n{}\n",
+                super::DURATIONS_USAGE
+            )
+        );
+        assert!(stdout.is_empty());
     }
 
     // Non-UTF-8 names only exist on Unix filesystems, and Linux alone in

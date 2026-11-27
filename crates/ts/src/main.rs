@@ -30,11 +30,14 @@ impl SearchProvider for FixtureSearchProvider {
         _query: &str,
         _whole_path: bool,
         _context: &SearchLogContext,
-    ) -> Result<Vec<std::path::PathBuf>, SearchError> {
+    ) -> Result<toka_search::search::CandidateSet, SearchError> {
         let paths = std::env::var_os("TS_FIXTURE_VIDEOS").ok_or_else(|| {
             SearchError::Provider("The integration-test videos were not configured.".into())
         })?;
-        Ok(std::env::split_paths(&paths).collect())
+        Ok(toka_search::search::CandidateSet {
+            paths: std::env::split_paths(&paths).collect(),
+            durations: Default::default(),
+        })
     }
 }
 
@@ -52,8 +55,8 @@ impl SearchProvider for EmptyProvider {
         _query: &str,
         _whole_path: bool,
         _context: &SearchLogContext,
-    ) -> Result<Vec<std::path::PathBuf>, SearchError> {
-        Ok(Vec::new())
+    ) -> Result<toka_search::search::CandidateSet, SearchError> {
+        Ok(toka_search::search::CandidateSet::default())
     }
 }
 

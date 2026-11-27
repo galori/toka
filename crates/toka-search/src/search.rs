@@ -169,28 +169,41 @@ pub enum SearchError {
     VideoUnavailable,
 }
 
+/// One provider answer: candidate paths with the durations known for
+/// them. The two travel together so concurrent searches can never mix
+/// one search's paths with another's lengths.
+#[derive(Debug, Clone, Default)]
+pub struct CandidateSet {
+    pub paths: Vec<PathBuf>,
+    pub durations: HashMap<PathBuf, u64>,
+}
+
 pub trait SearchProvider: Send + Sync {
     /// Candidate videos for `query`, which the engine then filters by the
     /// fields the viewer chose. `whole_path` asks for the wider set a folder
     /// search needs: every index Toka reads answers on file names alone unless
     /// it is told otherwise, and a video in a matching folder has no reason to
-    /// carry the term in its own name.
+    /// carry the term in its own name. Known durations ride along keyed by
+    /// path; unknown paths are absent.
     fn candidates(
         &self,
         query: &str,
         whole_path: bool,
         context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError>;
+    ) -> Result<CandidateSet, SearchError>;
 
     /// Apply provider scope and visibility rules after recent renames are added.
     fn retain_visible_paths(&self, _paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
         Ok(())
     }
 
-    /// The known video durations of `paths`, in whole milliseconds.
-    /// Best-effort: unknown paths are absent, and a failing provider
-    /// answers empty rather than failing the search — unknown reads as
-    /// absent everywhere durations are used.
+    /// The known video durations of `paths`, in whole milliseconds, for
+    /// videos handed in outside any search — playlists and folder or file
+    /// launches. Searches never call this: their durations ride along
+    /// with their candidates instead, so concurrent searches cannot mix
+    /// one search's paths with another's lengths. Best-effort: unknown
+    /// paths are absent, and a failing provider answers empty rather
+    /// than failing the caller.
     fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
         let _ = paths;
         HashMap::new()
@@ -541,7 +554,7 @@ impl SearchEngine {
     /// back), exactly as a search sees them — only the filtering is left
     /// to the caller. `ts candidates` serves this to the app's engine,
     /// which filters it with the viewer's own fields.
-    pub fn raw_candidates(&self, query: &str) -> Result<(Vec<PathBuf>, u64), SearchError> {
+    pub fn raw_candidates(&self, query: &str) -> Result<(CandidateSet, u64), SearchError> {
         let request = SearchRequest {
             query: query.to_owned(),
             page: 1,
@@ -554,8 +567,8 @@ impl SearchEngine {
         let context = self.logger.context(&request, false);
         // The whole-path set: field matching happens on top of this, and
         // a path-only term must already be here to survive it.
-        let paths = self.candidates(query, true, &context)?;
-        Ok((paths, self.provider.revision()))
+        let found = self.candidates(query, true, &context)?;
+        Ok((found, self.provider.revision()))
     }
 
     /// The known video durations of `paths`, in whole milliseconds,
@@ -823,8 +836,8 @@ impl SearchEngine {
         // half. An existing folder with no media in it answers empty — that
         // needs no index either.
         let covered = query_covered_by_direct(&expression, &walked);
-        let mut candidates = match self.candidates(query, needs_whole_path, context) {
-            Ok(candidates) => candidates,
+        let found = match self.candidates(query, needs_whole_path, context) {
+            Ok(found) => found,
             Err(error) => {
                 if !covered {
                     return Err(error);
@@ -832,9 +845,14 @@ impl SearchEngine {
                 // The index failed but the named files still answer whole:
                 // logged, so the failure never passes unseen.
                 self.logger.record_error(context, &error.to_string());
-                Vec::new()
+                CandidateSet::default()
             }
         };
+        let mut candidates = found.paths;
+        // The durations that rode along with these very paths: sorting,
+        // duration filters, badges, and the snapshot all read from this
+        // map, so later pages never ask the provider again.
+        let durations = found.durations;
         if let Err(error) = self.provider.retain_visible_paths(&mut candidates) {
             if !covered {
                 return Err(error);
@@ -844,10 +862,6 @@ impl SearchEngine {
         }
         candidates.extend(direct);
         let resolved = resolve_path_terms(&terms);
-        // One lookup for the whole candidate set: duration filters read
-        // from this map below, and sorting, badges, and the snapshot reuse
-        // it, so later pages never ask the provider again.
-        let durations = self.provider.durations_for(&candidates);
         for path in candidates {
             if !is_supported_media(&path, request.media_type) {
                 self.logger
@@ -888,8 +902,10 @@ impl SearchEngine {
         query: &str,
         whole_path: bool,
         context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
-        let mut paths = self.provider.candidates(query, whole_path, context)?;
+    ) -> Result<CandidateSet, SearchError> {
+        let found = self.provider.candidates(query, whole_path, context)?;
+        let mut paths = found.paths;
+        let mut durations = found.durations;
         let indexed_paths: HashSet<PathBuf> = paths.iter().cloned().collect();
         let _update = self.rename_overlay_write.lock().unwrap();
         if let Some(path) = self.rename_overlay_path.as_deref() {
@@ -907,15 +923,26 @@ impl SearchEngine {
             let renamed = self.renamed_paths.lock().unwrap();
             let folders = self.renamed_folders.lock().unwrap();
             if renamed.is_empty() && folders.is_empty() {
-                return Ok(paths);
+                return Ok(CandidateSet { paths, durations });
             }
-            for path in &mut paths {
+            // One resolver for paths and durations alike: a renamed file
+            // keeps its length under its new name.
+            let resolve = |path: &PathBuf| -> PathBuf {
                 if let Some(current) = renamed.get(path) {
-                    *path = current.clone();
+                    current.clone()
                 } else if let Some(current) = through_folders(folders.iter(), path) {
-                    *path = current;
+                    current
+                } else {
+                    path.clone()
                 }
+            };
+            for path in &mut paths {
+                *path = resolve(path);
             }
+            durations = durations
+                .into_iter()
+                .map(|(path, ms)| (resolve(&path), ms))
+                .collect();
             let should_prune = renamed
                 .values()
                 .any(|current| !current.is_file() || indexed_paths.contains(current));
@@ -943,7 +970,7 @@ impl SearchEngine {
                 renamed.len() != before
             });
         }
-        Ok(paths)
+        Ok(CandidateSet { paths, durations })
     }
 
     fn reload_rename_overlay_locked(&self, path: &Path) -> bool {
@@ -2570,9 +2597,12 @@ mod tests {
             _query: &str,
             whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
+        ) -> Result<CandidateSet, SearchError> {
             self.whole_path_asks.lock().unwrap().push(whole_path);
-            Ok(self.paths.lock().unwrap().clone())
+            Ok(CandidateSet {
+                paths: self.paths.lock().unwrap().clone(),
+                durations: self.durations.clone(),
+            })
         }
 
         fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
@@ -2609,7 +2639,7 @@ mod tests {
             _query: &str,
             _whole_path: bool,
             _context: &SearchLogContext,
-        ) -> Result<Vec<PathBuf>, SearchError> {
+        ) -> Result<CandidateSet, SearchError> {
             Err(SearchError::Provider("backend unavailable".into()))
         }
     }
@@ -2981,8 +3011,11 @@ mod tests {
                 _query: &str,
                 _whole_path: bool,
                 _context: &SearchLogContext,
-            ) -> Result<Vec<PathBuf>, SearchError> {
-                Ok(self.paths.clone())
+            ) -> Result<CandidateSet, SearchError> {
+                Ok(CandidateSet {
+                    paths: self.paths.clone(),
+                    durations: HashMap::new(),
+                })
             }
             fn revision(&self) -> u64 {
                 41
@@ -2998,9 +3031,10 @@ mod tests {
 
         // A negation the engine would narrow: raw candidates keep the
         // provider's whole set, verbatim and in order.
-        let (candidates, revision) = engine.raw_candidates("clip NOT archive").unwrap();
+        let (found, revision) = engine.raw_candidates("clip NOT archive").unwrap();
 
-        assert_eq!(candidates, paths);
+        assert_eq!(found.paths, paths);
+        assert!(found.durations.is_empty());
         assert_eq!(revision, 41);
     }
 
@@ -3026,11 +3060,33 @@ mod tests {
             .update_video_path(&page.results[0].id, current.clone())
             .unwrap();
 
-        let (mut candidates, _) = engine.raw_candidates("old").unwrap();
+        let (mut found, _) = engine.raw_candidates("old").unwrap();
 
-        candidates.sort();
-        candidates.dedup();
-        assert_eq!(candidates, vec![current]);
+        found.paths.sort();
+        found.paths.dedup();
+        assert_eq!(found.paths, vec![current]);
+    }
+
+    #[test]
+    fn renamed_videos_keep_their_durations_under_the_new_name() {
+        let directory = tempdir().unwrap();
+        let previous = directory.path().join("old.mp4");
+        let current = directory.path().join("new.mp4");
+        fs::write(&current, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(FakeProvider::with_durations(
+            vec![previous.clone()],
+            [(previous, 61_500)].into_iter().collect(),
+        )));
+        let page = engine.search(request("old")).unwrap();
+        engine
+            .update_video_path(&page.results[0].id, current)
+            .unwrap();
+
+        let page = engine.search(request("new")).unwrap();
+
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(page.results[0].file_name, "new.mp4");
+        assert_eq!(page.results[0].duration_ms, Some(61_500));
     }
 
     #[test]

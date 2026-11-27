@@ -8,29 +8,66 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
+
+/// How long one ffprobe length read may take. Reading a length touches
+/// the file's header, never its frames: anything slower is wedged
+/// storage, and the enrichment worker must not wait it out — one stuck
+/// probe would hold every folder behind it and the daemon's idle report
+/// with them.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How long the video runs, in seconds, so a preview can be spread across
 /// it. A file ffprobe cannot read the length of is one Toka leaves showing
 /// its still.
 pub(crate) fn probe_duration_seconds(video: &Path) -> Result<f64, String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(video)
-        .output()
+    let mut command = Command::new("ffprobe");
+    command.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]);
+    command.arg(video);
+    let output = run_with_timeout(&mut command, PROBE_TIMEOUT)
         .map_err(|error| format!("could not run ffprobe: {error}"))?;
     if !output.status.success() {
         return Err(command_error(&output));
     }
     parse_duration_seconds(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// Runs `command` to completion, killing it past `timeout`. A running
+/// child is always reaped: a timed-out probe must never linger as a
+/// zombie holding the file it wedged on. Only for commands with small
+/// output (a length reading): the pipes are collected after exit, so a
+/// child filling the pipe buffer would wedge instead of timing out.
+fn run_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    use std::io::ErrorKind;
+    use std::process::Stdio;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(_) => return child.wait_with_output(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("timed out after {} seconds", timeout.as_secs()),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
 }
 
 /// Parses ffprobe's `format=duration` output: a bare second count.
@@ -330,6 +367,26 @@ mod tests {
             .durations_for(&[root.join("clip.mp4")])
             .unwrap()
             .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commands_that_outstay_their_timeout_are_killed_and_reaped() {
+        let start = std::time::Instant::now();
+        let error = run_with_timeout(Command::new("sleep").arg("30"), Duration::from_millis(100))
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(10));
+
+        // And a quick command answers normally, pipes and all.
+        let output = run_with_timeout(
+            Command::new("sh").args(["-c", "printf hello"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "hello");
     }
 
     #[test]

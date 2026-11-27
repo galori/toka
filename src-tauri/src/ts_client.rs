@@ -29,7 +29,7 @@ use toka_search::{
     index_stats::IndexStats,
     owned_index::{OwnedFolderStatus, OwnedIndexFolder, OwnedIndexState},
     providers::retain_visible_under_roots,
-    search::{SearchError, SearchProvider},
+    search::{CandidateSet, SearchError, SearchProvider},
     search_log::SearchLogContext,
 };
 
@@ -279,7 +279,7 @@ pub fn run_cli(args: &[OsString]) -> Result<TsOutput, String> {
 /// the typed calls below.
 pub(crate) fn timeout_for(command: &str) -> Duration {
     match command {
-        "search" | "candidates" => TIMEOUT_SEARCH,
+        "search" | "candidates" | "durations" => TIMEOUT_SEARCH,
         "folders" => TIMEOUT_FOLDERS,
         "stats" => TIMEOUT_STATS,
         "status" => TIMEOUT_STATUS,
@@ -410,6 +410,29 @@ pub struct TsCandidates {
     pub durations: HashMap<PathBuf, u64>,
 }
 
+/// The indexed lengths of `paths` in whole milliseconds, straight from
+/// the index. Unknown paths are absent. Best-effort: a failed chunk
+/// reads as unknown rather than failing the caller — a missing helper
+/// fails searches at their candidates call with a clear error already,
+/// and launches simply badge nothing.
+pub fn path_durations(paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+    let mut durations = HashMap::new();
+    // Argv-sized chunks: a whole search's matches never fit one call.
+    for chunk in paths.chunks(500) {
+        let mut args = vec![
+            OsString::from("durations"),
+            OsString::from("--json"),
+            OsString::from("--"),
+        ];
+        args.extend(chunk.iter().map(|path| path.as_os_str().to_owned()));
+        match run_json("durations", &args, TIMEOUT_SEARCH) {
+            Ok(document) => durations.extend(candidate_durations(&document)),
+            Err(_) => continue,
+        }
+    }
+    durations
+}
+
 pub fn search_candidates(query: &str) -> Result<TsCandidates, String> {
     let args = [
         OsString::from("candidates"),
@@ -466,14 +489,12 @@ fn search_error_from_ts(message: String) -> SearchError {
 /// index reads moved across the process boundary.
 pub struct TsSearchProvider {
     revision: Mutex<Option<u64>>,
-    durations: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl TsSearchProvider {
     pub fn new() -> Self {
         Self {
             revision: Mutex::new(None),
-            durations: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -490,29 +511,30 @@ impl SearchProvider for TsSearchProvider {
         query: &str,
         _whole_path: bool,
         _context: &SearchLogContext,
-    ) -> Result<Vec<PathBuf>, SearchError> {
+    ) -> Result<CandidateSet, SearchError> {
         // `ts candidates` always covers whole paths through the full-text
         // index, like the owned provider it replaces — there is no
-        // narrower set to ask for, so the flag stays unused.
+        // narrower set to ask for, so the flag stays unused. Durations
+        // ride along with these very paths: nothing is cached, so
+        // concurrent searches can never mix one search's paths with
+        // another's lengths.
         match search_candidates(query) {
             Ok(found) => {
                 *self.revision.lock().unwrap() = Some(found.revision);
-                *self.durations.lock().unwrap() = found.durations;
-                Ok(found.paths)
+                Ok(CandidateSet {
+                    paths: found.paths,
+                    durations: found.durations,
+                })
             }
             Err(message) => Err(search_error_from_ts(message)),
         }
     }
 
     fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
-        // The last search's durations: every engine call reads candidates
-        // before asking for durations, so this is fresh — and later pages
-        // read the snapshot, never this cache.
-        let durations = self.durations.lock().unwrap();
-        paths
-            .iter()
-            .filter_map(|path| durations.get(path).map(|ms| (path.clone(), *ms)))
-            .collect()
+        // A fresh lookup per call, never a cache: launches ask for paths
+        // no search covered, and a shared cache would race concurrent
+        // searches against each other.
+        path_durations(paths)
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
@@ -1707,6 +1729,7 @@ else echo "unexpected argv: $*" >&2; exit 9; fi
                 "query": query,
                 "indexRevision": revision,
                 "candidates": derived
+                    .paths
                     .iter()
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect::<Vec<_>>(),
@@ -1907,21 +1930,23 @@ EOF
             directory.path(),
             "ts",
             r#"#!/bin/sh
-cat <<'EOF'
+if [ "$1" = durations ]; then
+  if [ "$2" != --json ] || [ "$3" != -- ]; then echo "unexpected durations argv: $*" >&2; exit 9; fi
+  cat <<'EOF'
+{"schema": 1, "durations": {"/media/one.mp4": 61500, "/media/bad.mp4": "soon"}}
+EOF
+else
+  cat <<'EOF'
 {"schema": 1, "query": "clip", "indexRevision": 7, "candidates": ["/media/one.mp4", "/media/two.mp4"], "durations": {"/media/one.mp4": 61500, "/media/bad.mp4": "soon"}}
 EOF
+fi
 "#,
         );
         let _env = use_ts(&shim);
         let provider = TsSearchProvider::new();
 
-        let (paths, revision) = {
-            let found = search_candidates("clip").unwrap();
-            assert_eq!(found.revision, 7);
-            assert_eq!(found.paths.len(), 2);
-            (found.paths, found.revision)
-        };
-        // Through the provider: the search caches, then serves.
+        // Searches carry their own durations: nothing cached, so
+        // concurrent searches cannot mix each other's lengths.
         use toka_search::search::{MediaType, SearchFields, SearchRequest, SearchSort, PAGE_SIZE};
         let request = SearchRequest {
             query: "clip".to_owned(),
@@ -1934,16 +1959,28 @@ EOF
         };
         let context = toka_search::search_log::SearchLogContext::from(&request);
         let found = provider.candidates("clip", false, &context).unwrap();
-        assert_eq!(found, paths);
-        assert_eq!(provider.revision(), revision);
+        assert_eq!(found.paths.len(), 2);
+        assert_eq!(provider.revision(), 7);
+        assert_eq!(found.durations.len(), 1);
+        assert_eq!(found.durations[&PathBuf::from("/media/one.mp4")], 61_500);
+
+        // Launches look arbitrary paths up fresh: the known length
+        // serves, while the unknown path and the malformed entry stay
+        // absent.
         let durations = provider.durations_for(&[
             PathBuf::from("/media/one.mp4"),
             PathBuf::from("/media/two.mp4"),
         ]);
-        // The known length serves; the unknown path and the malformed
-        // entry stay absent.
         assert_eq!(durations.len(), 1);
         assert_eq!(durations[&PathBuf::from("/media/one.mp4")], 61_500);
+
+        // An older helper answers candidates without the key: tolerated,
+        // all unknown.
+        let legacy: serde_json::Value = serde_json::from_str(
+            r#"{"schema": 1, "query": "clip", "indexRevision": 7, "candidates": []}"#,
+        )
+        .unwrap();
+        assert!(candidate_durations(&legacy).is_empty());
     }
 
     #[cfg(unix)]

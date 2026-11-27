@@ -775,6 +775,10 @@ pub(crate) struct OwnedSupervisor {
     watchers: HashMap<String, ActiveWatcher>,
     last_failure: HashMap<String, Instant>,
     heartbeat: DaemonHeartbeat,
+    /// The index revision at the last backfill pass that found nothing
+    /// probeable: while it matches, later passes skip the scan. Any new
+    /// scan or repair bumps the revision and reopens it.
+    backfill_exhausted_at: Option<u64>,
 }
 
 /// How long the supervisor waits before restarting a watcher whose worker
@@ -842,6 +846,7 @@ impl OwnedSupervisor {
             probe_failures,
             watchers: HashMap::new(),
             last_failure: HashMap::new(),
+            backfill_exhausted_at: None,
         }
     }
 
@@ -1116,30 +1121,50 @@ impl OwnedSupervisor {
     /// so a slow probe never stacks the backlog. Videos whose probe
     /// already failed for their current bytes are not backfilled: without
     /// that skip the queue would never drain and the daemon would never
-    /// report idle.
-    fn backfill_durations(&self, index: &OwnedIndex) {
+    /// report idle. Pages past skipped rows instead of stopping at the
+    /// first page, so a stretch of failures cannot strand the probeable
+    /// videos behind it — and once a pass finds nothing at all, later
+    /// passes skip the scan until the index revision moves again.
+    fn backfill_durations(&mut self, index: &OwnedIndex) {
         if self.thumbnails.pending_count_excluding(&[]) != 0 {
             return;
         }
-        let missing = match index.videos_missing_durations(200) {
-            Ok(missing) => missing,
-            Err(error) => {
-                self.logger
-                    .record(format!("could not list videos missing durations: {error}"));
+        if let Ok(revision) = index.revision() {
+            if self.backfill_exhausted_at == Some(revision) {
                 return;
             }
-        };
+        }
         let mut folders = Vec::new();
-        for path in missing {
-            if self.probe_failed(&path) {
-                continue;
-            }
-            let Some(folder) = path.parent().map(Path::to_path_buf) else {
-                continue;
+        let mut offset = 0u32;
+        loop {
+            let missing = match index.videos_missing_durations(200, offset) {
+                Ok(missing) => missing,
+                Err(error) => {
+                    self.logger
+                        .record(format!("could not list videos missing durations: {error}"));
+                    return;
+                }
             };
-            if !folders.contains(&folder) {
-                folders.push(folder);
+            let exhausted = missing.len() < 200;
+            for path in missing {
+                if self.probe_failed(&path) {
+                    continue;
+                }
+                let Some(folder) = path.parent().map(Path::to_path_buf) else {
+                    continue;
+                };
+                if !folders.contains(&folder) {
+                    folders.push(folder);
+                }
             }
+            if !folders.is_empty() || exhausted {
+                break;
+            }
+            offset = offset.saturating_add(200);
+        }
+        if folders.is_empty() {
+            self.backfill_exhausted_at = index.revision().ok();
+            return;
         }
         for folder in folders {
             self.thumbnails.enqueue(&folder);
@@ -1578,6 +1603,74 @@ mod tests {
             media.canonicalize().unwrap()
         );
         assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
+        // The exhausted scan armed the revision gate.
+        assert!(supervisor.backfill_exhausted_at.is_some());
+
+        // A new clip moves the index revision, which reopens the gate:
+        // the next pass backfills its folder.
+        write_media(&media, "fresh.mp4");
+        OwnedIndex::open(&supervisor.database)
+            .unwrap()
+            .scan_root(
+                &manager.folders().unwrap()[0].id,
+                &media.canonicalize().unwrap(),
+                |_| {},
+            )
+            .unwrap();
+        supervisor.reconcile();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            media.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn backfill_pages_past_skipped_videos_to_reach_probeable_ones() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        // More than one backfill page: the deleted rows sort first by
+        // id, so a first-page-only backfill would find nothing to enqueue.
+        for number in 0..205 {
+            write_media(&media, &format!("clip-{number:03}.mp4"));
+        }
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+        let folders = manager.folders().unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&folders[0].id, &folders[0].path, |_| {})
+            .unwrap();
+        // Gone from disk but still indexed: the backfill skips all 200
+        // of these, exactly filling its first page.
+        let missing: Vec<PathBuf> = OwnedIndex::open(&database)
+            .unwrap()
+            .videos_missing_durations(200, 0)
+            .unwrap();
+        assert_eq!(missing.len(), 200);
+        for path in &missing {
+            fs::remove_file(path).unwrap();
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let thumbnails = ThumbnailWorker::with_generator(move |folder| {
+            let _ = sender.send(folder.to_path_buf());
+        });
+        let mut supervisor = test_supervisor(database, thumbnails);
+        supervisor.reconcile();
+
+        // The backfill's own enqueue lands first, synchronously in the
+        // pass; the watcher's scan hook follows it once the scan ends.
+        // Both name the one folder; what matters is that there are two.
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            media.canonicalize().unwrap()
+        );
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            media.canonicalize().unwrap()
+        );
     }
 
     #[test]
