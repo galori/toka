@@ -936,7 +936,8 @@ const HELP_SECTIONS: HelpSection[] = [
       },
       {
         shortcut: "tags: filename: path: size: created: modified:",
-        description: "Limit a term to a search field, size, or date",
+        description:
+          'Limit terms by field or size; use quoted date windows like created:">= 1 day ago"',
       },
       {
         shortcut: "Ctrl+1 Ctrl+2 Ctrl+3",

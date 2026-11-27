@@ -27,6 +27,9 @@ import App, {
 } from "./App";
 import "./styles.css";
 
+const SEARCH_DATE_HELP_DESCRIPTION =
+  'Limit terms by field or size; use quoted date windows like created:">= 1 day ago"';
+
 const windowApiMock = vi.hoisted(() => ({
   close: vi.fn(),
   isFullscreen: vi.fn(),
@@ -171,7 +174,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
     "Combine terms and group them with parentheses",
   );
   expect(help).toHaveTextContent(
-    "Limit a term to a search field, size, or date",
+    SEARCH_DATE_HELP_DESCRIPTION,
   );
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
@@ -1617,6 +1620,19 @@ test("lists folder tagging in the help pane", async () => {
     name: "Keyboard shortcuts",
   });
   expect(within(help).getByText("Tag the video's folder")).toBeVisible();
+  await user.keyboard("{Escape}");
+});
+
+test("lists relative date search syntax in the help pane", async () => {
+  const user = userEvent.setup();
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(
+    within(help).getByText(SEARCH_DATE_HELP_DESCRIPTION),
+  ).toBeVisible();
   await user.keyboard("{Escape}");
 });
 

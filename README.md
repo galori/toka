@@ -85,8 +85,13 @@ operators: `created:10-5-2026`, `modified:>1-1-2026`, and
 `created:<=12-10-2025`. Dates accept `MM-DD-YYYY`, `MM-DD-YY`, and
 `YYYY-MM-DD`; one- or two-digit months and days are accepted, and two-digit
 years use 00–68 for 2000–2068 and 69–99 for 1969–1999. Quoted relative values
-such as `modified:>"3 days ago"` and `created:>="1 week ago"` resolve once when
-the search starts. Dates use the file's local calendar date, not its time.
+such as `created:">= 1 day ago"`, `modified:">= 30 minutes ago"`, and
+`modified:">= last 30 minutes"` resolve once when the search starts and compare
+the exact file timestamp, so a one-day window means the last 24 hours. Relative
+values accept seconds, minutes, hours, days, and weeks, plus compact units such
+as `30m ago`. An unqualified day or week value such as `modified:"3 days ago"`
+matches that local calendar day; explicit calendar dates use the same local-day
+matching.
 
 ### Search from the command line
 
