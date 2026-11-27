@@ -1493,13 +1493,16 @@ mod tests {
     fn reconcile_backfills_folders_missing_durations() {
         let directory = tempdir().unwrap();
         let media = directory.path().join("media");
-        fs::create_dir(&media).unwrap();
-        write_media(&media, "clip.mp4");
+        let sub = media.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        write_media(&sub, "clip.mp4");
         let database = directory.path().join("state").join("index.sqlite3");
         let manager = OwnedIndexManager::under(database.clone());
         manager.add_folder(&media).unwrap();
         // Indexed before the supervisor ever runs, as a migrated database
-        // would be: every duration unknown, no scan hook to fire.
+        // would be: every duration unknown. The clip sits in a subfolder,
+        // so the backfill's enqueue names the subfolder while the scan
+        // hook names the root — the value proves which one fired.
         let folders = manager.folders().unwrap();
         OwnedIndex::open(&database)
             .unwrap()
@@ -1514,7 +1517,7 @@ mod tests {
         supervisor.reconcile();
 
         let backfilled = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(backfilled, media.canonicalize().unwrap());
+        assert_eq!(backfilled, sub.canonicalize().unwrap());
     }
 
     #[test]
@@ -1579,31 +1582,18 @@ mod tests {
             |_, _| {},
         );
 
+        // Straight at the backfill, with no watcher running: the only
+        // enqueues possible are the backfill's own, so silence is
+        // conclusive instead of timing-dependent.
         let (sender, receiver) = mpsc::channel();
         let thumbnails = ThumbnailWorker::with_generator(move |folder| {
             let _ = sender.send(folder.to_path_buf());
         });
         let mut supervisor =
             test_supervisor_with_failures(database, thumbnails, Arc::clone(&probe_failures));
-        supervisor.reconcile();
+        let index = OwnedIndex::open(&supervisor.database).unwrap();
+        supervisor.backfill_durations(&index);
 
-        // The watcher still scans and its hook still fires once; the
-        // backfill, which runs synchronously in the pass above, must stay
-        // silent about the failed clip.
-        assert!(
-            poll_until(Duration::from_secs(10), || {
-                supervisor
-                    .watchers
-                    .values()
-                    .next()
-                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
-            }),
-            "expected the watcher to finish its scan"
-        );
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
-            media.canonicalize().unwrap()
-        );
         assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
         // The exhausted scan armed the revision gate.
         assert!(supervisor.backfill_exhausted_at.is_some());
@@ -1619,7 +1609,7 @@ mod tests {
                 |_| {},
             )
             .unwrap();
-        supervisor.reconcile();
+        supervisor.backfill_durations(&index);
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
             media.canonicalize().unwrap()
@@ -1655,20 +1645,16 @@ mod tests {
             fs::remove_file(path).unwrap();
         }
 
+        // Straight at the backfill, with no watcher running: the only
+        // enqueue possible is the backfill's own, past the skipped page.
         let (sender, receiver) = mpsc::channel();
         let thumbnails = ThumbnailWorker::with_generator(move |folder| {
             let _ = sender.send(folder.to_path_buf());
         });
-        let mut supervisor = test_supervisor(database, thumbnails);
-        supervisor.reconcile();
+        let mut supervisor = test_supervisor(database.clone(), thumbnails);
+        let index = OwnedIndex::open(&database).unwrap();
+        supervisor.backfill_durations(&index);
 
-        // The backfill's own enqueue lands first, synchronously in the
-        // pass; the watcher's scan hook follows it once the scan ends.
-        // Both name the one folder; what matters is that there are two.
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
-            media.canonicalize().unwrap()
-        );
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
             media.canonicalize().unwrap()
