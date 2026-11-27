@@ -1400,6 +1400,25 @@ fn seek_native_video(
 
 #[cfg(target_os = "linux")]
 #[tauri::command]
+fn step_native_video(
+    forward: bool,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<Option<f64>, CommandError> {
+    player_linux::step_frame(player.inner(), forward).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
+fn show_native_video_text(
+    message: String,
+    duration_ms: u32,
+    player: State<'_, Arc<player_linux::NativePlayer>>,
+) -> Result<(), CommandError> {
+    player_linux::show_text(player.inner(), &message, duration_ms).map_err(playback_error)
+}
+
+#[cfg(target_os = "linux")]
+#[tauri::command]
 fn native_playback_state(
     player: State<'_, Arc<player_linux::NativePlayer>>,
 ) -> Result<player_linux::PlaybackState, CommandError> {
@@ -1637,6 +1656,8 @@ pub fn run() {
                 set_native_video_rotation,
                 set_native_video_aspect,
                 seek_native_video,
+                step_native_video,
+                show_native_video_text,
                 native_subtitle_tracks,
                 set_native_subtitle,
                 native_playback_state,

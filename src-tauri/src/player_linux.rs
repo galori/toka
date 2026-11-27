@@ -1189,6 +1189,28 @@ pub fn seek(player: &NativePlayer, seconds: f64) -> Result<(), String> {
     player.with_mpv(|mpv| mpv.command(&["seek", &seconds.max(0.0).to_string(), "absolute+exact"]))
 }
 
+/// Advances or reverses one decoded frame and returns mpv's resulting time.
+/// The command call is synchronous, so the read below observes the frame the
+/// player stepped to; when the property itself is unavailable the caller
+/// falls back to its estimate and says so.
+pub fn step_frame(player: &NativePlayer, forward: bool) -> Result<Option<f64>, String> {
+    player.with_mpv(|mpv| {
+        let command = if forward {
+            "frame-step"
+        } else {
+            "frame-back-step"
+        };
+        mpv.command(&[command])?;
+        Ok(mpv.get_double("time-pos"))
+    })
+}
+
+/// Shows a transient message over the native video surface.
+pub fn show_text(player: &NativePlayer, message: &str, duration_ms: u32) -> Result<(), String> {
+    let duration = duration_ms.clamp(1, 60_000).to_string();
+    player.with_mpv(|mpv| mpv.command(&["show-text", message, &duration]))
+}
+
 /// The open file's frame rate, or zero while nothing plausible is known. The
 /// container's declared rate is what a frame-accurate seek should use; mpv's
 /// running estimate stands in for containers that declare nothing, and both
