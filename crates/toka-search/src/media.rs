@@ -47,6 +47,7 @@ fn parse_duration_seconds(text: &str) -> Result<f64, String> {
         })
 }
 
+/// Whole milliseconds for a probe's second count, for the index.
 pub(crate) fn seconds_to_ms(seconds: f64) -> u64 {
     (seconds * 1000.0).round() as u64
 }

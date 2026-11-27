@@ -1113,10 +1113,10 @@ impl OwnedSupervisor {
     /// Enqueues folders whose videos still lack durations: migrated
     /// databases start with every duration unknown, and repair-added files
     /// never pass the scan hook. Only when the enrichment queue is idle,
-    /// a few folders per pass, so a slow probe never stacks the backlog.
-    /// Videos whose probe already failed for their current bytes are not
-    /// backfilled: without that skip the queue would never drain and the
-    /// daemon would never report idle.
+    /// so a slow probe never stacks the backlog. Videos whose probe
+    /// already failed for their current bytes are not backfilled: without
+    /// that skip the queue would never drain and the daemon would never
+    /// report idle.
     fn backfill_durations(&self, index: &OwnedIndex) {
         if self.thumbnails.pending_count_excluding(&[]) != 0 {
             return;
@@ -1139,9 +1139,6 @@ impl OwnedSupervisor {
             };
             if !folders.contains(&folder) {
                 folders.push(folder);
-            }
-            if folders.len() >= 4 {
-                break;
             }
         }
         for folder in folders {
