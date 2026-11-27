@@ -96,7 +96,11 @@ the exact file timestamp, so a one-day window means the last 24 hours. Relative
 values accept seconds, minutes, hours, days, and weeks, plus compact units such
 as `30m ago`. An unqualified day or week value such as `modified:"3 days ago"`
 matches that local calendar day; explicit calendar dates use the same local-day
-matching.
+matching. `today` and `yesterday` match those local calendar days, bare or
+with operators, such as `created:today` and `modified:>yesterday`. A
+`START..END` range matches an inclusive span of local days, such as
+`modified:2026-01-01..2026-03-31` or `created:yesterday..today`; each
+endpoint accepts any calendar format or named day.
 
 Results arrive shuffled, so a broad search stays a mix. The sort control
 beside the results orders them instead: by name, size, or creation,
