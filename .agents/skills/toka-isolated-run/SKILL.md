@@ -31,8 +31,10 @@ them and pass `--worktree`.
    1 minute, cold about 30. Run it in the background and wait without tight polling.
    Output: `src-tauri/target/release/toka` (and `ts` beside it).
    Afterwards check `pgrep -a -x 'rustc|cargo'`. Terminate only processes that are
-   demonstrably orphans of an interrupted build of this worktree
-   (check `ps -o ppid,cwd`); another project's concurrent build is not yours to kill.
+   demonstrably orphans of an interrupted build of this worktree (check the
+   parent with `ps -o ppid= -p <pid>` and the working directory with
+   `ls -l /proc/<pid>/cwd` on Linux or `lsof -a -p <pid> -d cwd` on macOS);
+   another project's concurrent build is not yours to kill.
 3. `launch --detach`: starts the app and its own `ts daemon run`, returns once the
    app is up. Without `--detach` it runs in the foreground and Ctrl-C stops both.
 4. Tell the user what is running and where: the `status` output (app and indexer
