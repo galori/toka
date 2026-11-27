@@ -1788,6 +1788,20 @@ test("a favorite chosen during a slow save is applied after it, from its result"
   });
 });
 
+test("Enter on a focused level button picks that level, not a plain favorite", async () => {
+  const user = await playWithTags([]);
+  invokeMock.mockResolvedValue({ fileName: "clip.mp4", tags: ["fv", "fv3"] });
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  screen.getByRole("button", { name: "Level 3" }).focus();
+  await user.keyboard("{Enter}");
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+      resultId: "video-1",
+      tags: ["fv", "fv3"],
+    }),
+  );
+});
+
 test("lists favorites in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });

@@ -2925,7 +2925,11 @@ function Player({
           run(() => void chooseFavorite(level === current ? null : level));
         } else if (event.key === "0" || event.key === "Backspace") {
           run(() => void chooseFavorite(null));
-        } else if (event.key === "Enter") {
+        } else if (
+          event.key === "Enter" &&
+          !(event.target instanceof HTMLButtonElement)
+        ) {
+          // A focused level button takes Enter as its own click.
           run(() => void chooseFavorite(0));
         } else if (event.key === "Escape") {
           run(() => setPickingFavorite(false));
