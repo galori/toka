@@ -6196,6 +6196,63 @@ test("returns to where the results were scrolled to after a video", async () => 
   focusSearchField.mockRestore();
 });
 
+test("newly opened results start at the top after playback", async () => {
+  const searched = {
+    query: "clip",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 3,
+    totalPages: 1,
+    results: [1, 2, 3].map((number) => ({
+      id: `video-${number}`,
+      fileName: `clip-${number}.mp4`,
+      extension: "mp4",
+    })),
+  };
+  const opened = {
+    query: "path:/Videos/shoots",
+    page: 1,
+    pageSize: 24 as const,
+    totalResults: 1,
+    totalPages: 1,
+    results: [{ id: "video-9", fileName: "clip.mp4", extension: "mp4" }],
+  };
+  openMock.mockResolvedValue("/Videos/shoots");
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") return Promise.resolve(searched);
+    if (command === "open_folder") return Promise.resolve(opened);
+    if (command === "prepare_video")
+      return Promise.resolve({ filePath: "/Videos/clip.mp4" });
+    return Promise.resolve();
+  });
+  const scrollTo = vi.fn();
+  vi.stubGlobal("scrollTo", scrollTo);
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  vi.stubGlobal("scrollY", 1200);
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-2.mp4" }),
+  );
+  vi.stubGlobal("scrollY", 0);
+  await user.click(
+    await screen.findByRole("button", { name: "Back to results" }),
+  );
+  await screen.findByRole("button", { name: "Play clip-2.mp4" });
+  scrollTo.mockClear();
+
+  await user.click(await screen.findByRole("button", { name: "Open folder" }));
+  expect(await screen.findByLabelText("Playing clip.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  await screen.findByDisplayValue("path:/Videos/shoots");
+
+  // The old search's offset must not follow into the new results.
+  expect(scrollTo).not.toHaveBeenCalledWith(
+    expect.objectContaining({ top: 1200 }),
+  );
+});
+
 test("loads the next search page only when a lazy playlist reaches it", async () => {
   const firstPage = Array.from({ length: 24 }, (_, index) => ({
     id: `video-${index + 1}`,

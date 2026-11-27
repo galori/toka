@@ -4924,6 +4924,9 @@ export default function App() {
     searchedQuery.current = opened.query;
     launchedResults.current = undefined;
     setAddonSearch(undefined);
+    // Fresh results start at the top: the old search's scrolled offset must
+    // not follow into them when playback ends.
+    resultsScrollOffset.current = 0;
     // A search still in flight answers an older question than this one.
     requestNumber.current += 1;
     setIndexRefreshAvailable(false);
