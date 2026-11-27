@@ -205,7 +205,7 @@ printf '%s launchctl %s\\n' "$(date)" "$*" >> ${quote(paths.launchctlShimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
 # A stale pid file may name a recycled PID: only trust it if it is our indexer.
 if [ -n "$pid" ]; then
-  case "$(ps -p "$pid" -o args= 2>/dev/null)" in
+  case "$(ps -ww -p "$pid" -o args= 2>/dev/null)" in
     ${quote(paths.tsBinary)}|${quote(paths.tsBinary)}" "*) ;;
     *) pid= ;;
   esac
@@ -308,7 +308,8 @@ export function isProcessOf(pid, binary, procRoot = "/proc") {
 
 /** `ps -p <pid> -o args=` on macOS, or null when ps fails or the pid is gone. */
 function macCommandLine(pid) {
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
+  // -ww: never cut the line to the terminal width.
+  const result = spawnSync("ps", ["-ww", "-p", String(pid), "-o", "args="], {
     encoding: "utf8",
   });
   if (result.error || result.status !== 0) return null;
