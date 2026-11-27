@@ -110,6 +110,16 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 /// so back-to-back events must coalesce instead of each triggering a pass.
 const MIN_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the daemon recounts the most used tags. Counts shift slowly, and
+/// a recount reads every file's tags, so minutes apart is plenty.
+const TOP_TAGS_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Whether the top tags are due for a recount: never counted, or last counted
+/// at least [`TOP_TAGS_INTERVAL`] ago.
+fn top_tags_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= TOP_TAGS_INTERVAL)
+}
+
 /// Discards every queued filesystem event. Called after each pass so events
 /// the pass itself produced never trigger another one.
 fn drain_events<T>(receiver: &mpsc::Receiver<T>) {
@@ -181,9 +191,19 @@ pub fn run_daemon() -> Result<(), String> {
         let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
     }
     let thumbnails = ThumbnailWorker::new(Arc::clone(&logger));
+    let top_tags_database = database.clone();
     let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
+    let mut top_tags_counted: Option<Instant> = None;
     loop {
         supervisor.reconcile();
+        let now = Instant::now();
+        if top_tags_due(top_tags_counted, now) {
+            // Best effort: the app counts on demand when no list exists.
+            if let Err(error) = crate::top_tags::refresh(&top_tags_database) {
+                logger.record(format!("top tags not refreshed: {error}"));
+            }
+            top_tags_counted = Some(now);
+        }
         // An activity change publishes immediately; the wait below keeps
         // the heartbeat fresh while nothing changes.
         supervisor.publish_heartbeat();
@@ -1165,6 +1185,17 @@ mod tests {
             .ok()
             .and_then(|index| index.scan_progress(root_id).ok().flatten())
             .is_some_and(|progress| progress.files_indexable > 0)
+    }
+
+    #[test]
+    fn top_tags_are_due_when_never_counted_and_every_interval_after() {
+        let counted = Instant::now();
+        assert!(top_tags_due(None, counted));
+        assert!(!top_tags_due(
+            Some(counted),
+            counted + Duration::from_secs(60)
+        ));
+        assert!(top_tags_due(Some(counted), counted + TOP_TAGS_INTERVAL));
     }
 
     #[test]

@@ -262,6 +262,14 @@ export function setVideoTags(
   return invoke("set_video_tags", { resultId, tags });
 }
 
+// A tag many indexed videos carry, for one-gesture tagging.
+export type TopTag = { tag: string; count: number };
+
+// The most used tags, most used first; the indexer refreshes them in turn.
+export function getTopTags(): Promise<TopTag[]> {
+  return invoke("get_top_tags");
+}
+
 export function addVideoTags(
   resultId: string,
   tags: string[],

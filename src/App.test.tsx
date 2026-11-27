@@ -173,9 +173,7 @@ test("opens the keyboard shortcuts help from its button and question-mark shortc
   expect(help).toHaveTextContent(
     "Combine terms and group them with parentheses",
   );
-  expect(help).toHaveTextContent(
-    SEARCH_DATE_HELP_DESCRIPTION,
-  );
+  expect(help).toHaveTextContent(SEARCH_DATE_HELP_DESCRIPTION);
   expect(help).toHaveTextContent("Return to search");
   expect(help).toHaveTextContent("Ctrl+W");
   expect(help).toHaveTextContent("Space");
@@ -1805,6 +1803,102 @@ test("Enter on a focused level button picks that level, not a plain favorite", a
   );
 });
 
+function mockTopTags(topTags: string[], applied: string[] = []) {
+  let current = [...applied];
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    const tags = (args as { tags?: string[] } | undefined)?.tags ?? [];
+    if (command === "get_top_tags")
+      return Promise.resolve(topTags.map((tag, i) => ({ tag, count: 9 - i })));
+    if (command === "add_video_tags") {
+      current = [...current, ...tags];
+      return Promise.resolve({ fileName: "clip.mp4", tags: current });
+    }
+    if (command === "remove_video_tags") {
+      current = current.filter((tag) => !tags.includes(tag));
+      return Promise.resolve({ fileName: "clip.mp4", tags: current });
+    }
+    return Promise.resolve(undefined);
+  });
+}
+
+test("Y opens the common tags and a digit toggles that tag", async () => {
+  const user = await playWithTags(["beach"]);
+  mockTopTags(["beach", "cat", "dog"], ["beach"]);
+  const control = screen.getByRole("button", {
+    name: "Common tags for clip.mp4",
+  });
+  expect(control).toHaveAttribute("aria-keyshortcuts", "Y");
+
+  fireEvent.keyDown(window, { key: "y" });
+  const group = await screen.findByRole("group", { name: "Common tags" });
+  const chip = await within(group).findByRole("button", { name: "Tag cat" });
+  expect(chip).toHaveAttribute("aria-keyshortcuts", "2");
+  expect(
+    within(group).getByRole("button", { name: "Tag beach" }),
+  ).toHaveAttribute("aria-pressed", "true");
+
+  await user.keyboard("2");
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["cat"],
+  });
+  await waitFor(() =>
+    expect(screen.queryByRole("group", { name: "Common tags" })).toBeNull(),
+  );
+
+  // An applied tag toggles off.
+  fireEvent.keyDown(window, { key: "y" });
+  await screen.findByRole("button", { name: "Tag dog" });
+  await user.keyboard("1");
+  expect(invokeMock).toHaveBeenCalledWith("remove_video_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+});
+
+test("clicking a common tag adds it and Escape closes the palette", async () => {
+  const user = await playWithTags([]);
+  mockTopTags(["beach"]);
+  await user.click(
+    screen.getByRole("button", { name: "Common tags for clip.mp4" }),
+  );
+  await user.click(await screen.findByRole("button", { name: "Tag beach" }));
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+  fireEvent.keyDown(window, { key: "y" });
+  await screen.findByRole("group", { name: "Common tags" });
+  await user.keyboard("{Escape}");
+  expect(screen.queryByRole("group", { name: "Common tags" })).toBeNull();
+});
+
+test("the tag field suggests common tags that are not yet applied", async () => {
+  const user = await playWithTags(["beach"]);
+  mockTopTags(["beach", "cat"]);
+  fireEvent.keyDown(window, { key: "t" });
+  const suggestion = await screen.findByRole("button", {
+    name: "Add common tag cat",
+  });
+  expect(
+    screen.queryByRole("button", { name: "Add common tag beach" }),
+  ).toBeNull();
+  await user.click(suggestion);
+  expect(invokeMock).toHaveBeenCalledWith("add_video_tags", {
+    resultId: "video-1",
+    tags: ["cat"],
+  });
+});
+
+test("lists common tags in the help pane", async () => {
+  render(<App />);
+  fireEvent.keyDown(window, { key: "?" });
+  const help = await screen.findByRole("dialog", {
+    name: "Keyboard shortcuts",
+  });
+  expect(within(help).getByText(/Pick a common tag/)).toBeVisible();
+});
+
 test("lists favorites in the help pane", async () => {
   render(<App />);
   fireEvent.keyDown(window, { key: "?" });
@@ -1832,9 +1926,7 @@ test("lists relative date search syntax in the help pane", async () => {
   const help = await screen.findByRole("dialog", {
     name: "Keyboard shortcuts",
   });
-  expect(
-    within(help).getByText(SEARCH_DATE_HELP_DESCRIPTION),
-  ).toBeVisible();
+  expect(within(help).getByText(SEARCH_DATE_HELP_DESCRIPTION)).toBeVisible();
   await user.keyboard("{Escape}");
 });
 
@@ -2129,6 +2221,8 @@ test("edits the playing video's tags from the playback controls with T", async (
       ],
     })
     .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    // The open tag field fetches the common tags.
+    .mockResolvedValueOnce([])
     .mockResolvedValueOnce({
       fileName: "tagged [review work].mp4",
       tags: ["review", "work"],

@@ -2109,7 +2109,7 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
+    pub(crate) fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
         let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "INSERT INTO roots (
@@ -2838,6 +2838,28 @@ impl OwnedIndex {
             ],
         )?;
         Ok(())
+    }
+
+    /// How many indexed files carry each tag, from the denormalised
+    /// `tags_search` column. Files only: a folder's tags are not a file's.
+    pub fn tag_counts(&self) -> Result<std::collections::HashMap<String, u64>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Default::default());
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT tags_search FROM files WHERE tags_search != ''")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let mut seen = std::collections::HashSet::new();
+            for tag in row?.split_whitespace() {
+                if seen.insert(tag.to_owned()) {
+                    *counts.entry(tag.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     pub(crate) fn read_daemon_state(

@@ -1056,6 +1056,23 @@ fn update_video_tags(
 }
 
 #[tauri::command]
+fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
+    let failed = |message: String| CommandError {
+        kind: "Tags",
+        message,
+    };
+    let database = toka_search::owned_index::database_path().map_err(failed)?;
+    // The indexer daemon keeps this list fresh; count on demand until it has.
+    if let Some(tags) = toka_search::top_tags::read(&database) {
+        return Ok(tags);
+    }
+    if !database.exists() {
+        return Ok(Vec::new());
+    }
+    toka_search::top_tags::refresh(&database).map_err(failed)
+}
+
+#[tauri::command]
 fn add_folder_tags(
     result_id: String,
     tags: Vec<String>,
@@ -1469,6 +1486,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1505,6 +1523,7 @@ pub fn run() {
                 add_tags_to_videos,
                 add_folder_tags,
                 remove_folder_tags,
+                get_top_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -1549,6 +1568,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1577,6 +1597,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1605,6 +1626,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);

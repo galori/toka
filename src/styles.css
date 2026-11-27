@@ -1818,3 +1818,31 @@ button:focus-visible {
   margin-left: 4px;
   font-size: 0.75rem;
 }
+
+.quick-tags {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.quick-tags-list {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: max-content;
+  max-width: min(520px, 80vw);
+  padding: 6px;
+  border: 1px solid #40506a;
+  border-radius: 8px;
+  background: #172235;
+}
+.quick-tag[aria-pressed="true"] {
+  background: #2d4a73;
+}
+.quick-tags-empty {
+  font-size: 0.78rem;
+  color: #8fa3bf;
+}
