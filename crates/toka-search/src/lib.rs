@@ -19,6 +19,7 @@ pub mod service;
 pub mod sidecars;
 pub mod tags;
 pub mod thumbnails;
+pub mod top_tags;
 
 mod index_visibility;
 mod timestamp;

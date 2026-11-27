@@ -50,6 +50,8 @@ import {
   searchLogSettings as loadSearchLogSettings,
   setSearchLogSettings,
   addVideoTags,
+  getTopTags,
+  type TopTag,
   addTagsToVideos,
   removeVideoTags,
   addFolderTags,
@@ -539,18 +541,88 @@ function FavoritePicker({
   );
 }
 
+// Tag names are matched without regard to case: the index lowercases them,
+// while a file name may carry its own spelling.
+function findTag(tags: string[], tag: string): string | undefined {
+  const lower = tag.toLowerCase();
+  return tags.find((candidate) => candidate.toLowerCase() === lower);
+}
+
+// The digit that picks the n-th common tag: 1-9, then 0 for the tenth.
+const QUICK_TAG_KEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+
+function QuickTags({
+  video,
+  topTags,
+  open,
+  onOpenChange,
+  onToggle,
+  error,
+  shortcut,
+}: {
+  video: VideoResult;
+  topTags: TopTag[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onToggle: (tag: string) => void;
+  error?: string;
+  shortcut: string;
+}) {
+  const tags = video.tags ?? [];
+  return (
+    <div className="quick-tags">
+      <ControlButton
+        shortcut={shortcut}
+        className="tag-add quick-tags-toggle"
+        aria-label={`Common tags for ${video.fileName}`}
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <Label>#</Label>
+      </ControlButton>
+      {open ? (
+        <div role="group" aria-label="Common tags" className="quick-tags-list">
+          {topTags.length === 0 ? (
+            <span className="quick-tags-empty">No common tags yet</span>
+          ) : null}
+          {topTags.slice(0, QUICK_TAG_KEYS.length).map(({ tag }, index) => (
+            <ControlButton
+              key={tag}
+              shortcut={QUICK_TAG_KEYS[index]}
+              className="tag-pill quick-tag"
+              aria-label={`Tag ${tag}`}
+              aria-pressed={findTag(tags, tag) !== undefined}
+              onClick={() => onToggle(tag)}
+            >
+              <span className="tag-name">{tag}</span>
+            </ControlButton>
+          ))}
+        </div>
+      ) : null}
+      {error ? (
+        <p className="tag-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 function VideoTags({
   video,
   onChange,
   adding: controlledAdding,
   onAddingChange,
   shortcut,
+  suggestions = [],
 }: {
   video: VideoResult;
   onChange: (update: Pick<VideoResult, "fileName" | "tags">) => void;
   adding?: boolean;
   onAddingChange?: (adding: boolean) => void;
   shortcut?: string;
+  // Common tags offered under the open field.
+  suggestions?: TopTag[];
 }) {
   const field = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState("");
@@ -575,6 +647,11 @@ function VideoTags({
       setError(`Could not update tags: ${errorMessage(reason)}`);
     }
   };
+  const addSuggested = (tag: string) => {
+    void save(addVideoTags(video.id, [tag]));
+    setDraft("");
+    setAdding(false);
+  };
   const add = () => {
     const tag = draft.trim();
     if (!tag || tags.includes(tag)) return;
@@ -596,6 +673,21 @@ function VideoTags({
           <TagRemoveIcon />
         </button>
       ))}
+      {adding
+        ? suggestions
+            .filter(({ tag }) => findTag(tags, tag) === undefined)
+            .map(({ tag }) => (
+              <button
+                key={tag}
+                type="button"
+                className="tag-pill tag-suggestion"
+                aria-label={`Add common tag ${tag}`}
+                onClick={() => addSuggested(tag)}
+              >
+                <span className="tag-name">{tag}</span>
+              </button>
+            ))
+        : null}
       {adding ? (
         <input
           ref={field}
@@ -1214,6 +1306,10 @@ const HELP_SECTIONS: HelpSection[] = [
         description:
           "Pick a favorite level: 1-5 sets it, 0 or Backspace clears, Enter favorites with no level",
       },
+      {
+        shortcut: "Y",
+        description: "Pick a common tag: 1-9 and 0 toggle the ten most used",
+      },
       { shortcut: "Ctrl+Shift+A", description: "Open actions from add-ons" },
       {
         shortcut: "F",
@@ -1540,8 +1636,12 @@ function Player({
   const [addingTag, setAddingTag] = useState(false);
   const [addingFolderTag, setAddingFolderTag] = useState(false);
   const [pickingFavorite, setPickingFavorite] = useState(false);
+  const [pickingQuickTag, setPickingQuickTag] = useState(false);
+  const [quickTagError, setQuickTagError] = useState<string>();
+  const [topTags, setTopTags] = useState<TopTag[]>([]);
   const [favoriteError, setFavoriteError] = useState<string>();
-  const tagFieldOpen = addingTag || addingFolderTag || pickingFavorite;
+  const tagFieldOpen =
+    addingTag || addingFolderTag || pickingFavorite || pickingQuickTag;
   // An open tag editor keeps the controls up however fullscreen was entered.
   const controlsIdle =
     fullscreen && !controlsRevealed && !controlsPinned && !tagFieldOpen;
@@ -1567,6 +1667,7 @@ function Player({
   const addonMenuWrap = useRef<HTMLDivElement>(null);
   const addonMenuElement = useRef<HTMLDivElement>(null);
   const addonOpenRef = useRef(false);
+  const popoverOpenRef = useRef(false);
   const refreshNativeBounds = useRef<(() => void) | undefined>(undefined);
   const addonVideoGeneration = useRef(0);
   useLayoutEffect(() => {
@@ -2098,6 +2199,12 @@ function Player({
     addonOpenRef.current = addonOpen;
     refreshNativeBounds.current?.();
   }, [addonOpen]);
+  // The native picture paints above the page, so a popover that reaches into
+  // the video area would sit behind it; the picture waits while one is open.
+  useEffect(() => {
+    popoverOpenRef.current = pickingFavorite || pickingQuickTag;
+    refreshNativeBounds.current?.();
+  }, [pickingFavorite, pickingQuickTag]);
   useEffect(() => {
     // The error view replaces the surface these measurements come from, so the
     // watchers have to go with it: left running, the next resize would measure
@@ -2140,7 +2247,11 @@ function Player({
         height: Math.round(visibleHeight),
         // The Add-ons menu drops over the picture, and GTK paints the native
         // surface above it, so the picture steps aside while the menu is open.
-        visible: !addonOpenRef.current && visibleWidth > 0 && visibleHeight > 0,
+        visible:
+          !addonOpenRef.current &&
+          !popoverOpenRef.current &&
+          visibleWidth > 0 &&
+          visibleHeight > 0,
       }).catch((reason: unknown) => setError(errorMessage(reason)));
     };
     updateBounds();
@@ -2263,6 +2374,7 @@ function Player({
     }
     if (playingBack) pause();
     setPickingFavorite(false);
+    setPickingQuickTag(false);
     // One field at a time: both claim every keystroke while open.
     setAddingTag(!folder);
     setAddingFolderTag(folder);
@@ -2280,8 +2392,61 @@ function Player({
     }
     setAddingTag(false);
     setAddingFolderTag(false);
+    setPickingQuickTag(false);
     setPickingFavorite(true);
   };
+
+  const toggleQuickTags = () => {
+    if (pickingQuickTag) {
+      setPickingQuickTag(false);
+      return;
+    }
+    setQuickTagError(undefined);
+    if (fullscreen) {
+      controlsLastNear.current = Date.now();
+      setControlsRevealed(true);
+    }
+    setAddingTag(false);
+    setAddingFolderTag(false);
+    setPickingFavorite(false);
+    setPickingQuickTag(true);
+  };
+  // One quick-tag save at a time, decided from the newest known tags: a
+  // second toggle deciding from stale tags could add what it meant to remove.
+  const quickTagBusy = useRef(false);
+  const toggleQuickTag = async (tag: string) => {
+    setPickingQuickTag(false);
+    if (quickTagBusy.current || favoriteBusy.current) return;
+    quickTagBusy.current = true;
+    const videoId = video.id;
+    try {
+      const applied = findTag(knownTags.current, tag);
+      const update = await (applied
+        ? removeVideoTags(videoId, [applied])
+        : addVideoTags(videoId, [tag]));
+      if (videoIdRef.current === videoId) knownTags.current = update.tags ?? [];
+      updateVideoTags(update);
+      setQuickTagError(undefined);
+    } catch (reason) {
+      if (videoIdRef.current === videoId)
+        setQuickTagError(`Could not update tags: ${errorMessage(reason)}`);
+    } finally {
+      quickTagBusy.current = false;
+    }
+  };
+  // The list is fetched fresh whenever a control that offers it opens.
+  useEffect(() => {
+    if (!pickingQuickTag && !addingTag) return;
+    let current = true;
+    getTopTags()
+      .then((tags) => {
+        if (current && Array.isArray(tags)) setTopTags(tags);
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [pickingQuickTag, addingTag]);
   // One favorite change at a time: a second built from the same old tags
   // could land first and be overwritten by the slower reply.
   const favoriteBusy = useRef(false);
@@ -2314,7 +2479,9 @@ function Player({
       const remove = old.filter((tag) => !next.includes(tag));
       const add = next.filter((tag) => !old.includes(tag));
       const apply = (update: VideoTagUpdate) => {
-        knownTags.current = update.tags ?? [];
+        // A late reply for another video is not this one's baseline.
+        if (videoIdRef.current === videoId)
+          knownTags.current = update.tags ?? [];
         updateVideoTags(update);
       };
       if (remove.length) apply(await removeVideoTags(videoId, remove));
@@ -2339,9 +2506,14 @@ function Player({
   useEffect(() => {
     setPickingFavorite(false);
     setFavoriteError(undefined);
+    setPickingQuickTag(false);
+    setQuickTagError(undefined);
   }, [video.id]);
   useEffect(() => {
-    if (addonOpen) setPickingFavorite(false);
+    if (addonOpen) {
+      setPickingFavorite(false);
+      setPickingQuickTag(false);
+    }
   }, [addonOpen]);
 
   const restart = (from = 0) => {
@@ -3150,6 +3322,18 @@ function Player({
         }
         return;
       }
+      if (pickingQuickTag) {
+        const index = QUICK_TAG_KEYS.indexOf(event.key);
+        if (event.key.toLowerCase() === "y" && !event.shiftKey) {
+          run(toggleQuickTags);
+        } else if (index >= 0 && index < topTags.length) {
+          const { tag } = topTags[index];
+          run(() => void toggleQuickTag(tag));
+        } else if (event.key === "Escape") {
+          run(() => setPickingQuickTag(false));
+        }
+        return;
+      }
       if (addingTag || addingFolderTag) {
         if (event.key === "Escape")
           run(() => {
@@ -3201,6 +3385,8 @@ function Player({
         run(() => void copyPathRef.current());
       } else if (event.key.toLowerCase() === "f" && event.shiftKey) {
         run(toggleFavoritePicker);
+      } else if (event.key.toLowerCase() === "y" && !event.shiftKey) {
+        run(toggleQuickTags);
       } else if (event.key.toLowerCase() === "t" && event.shiftKey) {
         run(() => openTagField(true));
       } else if (event.key.toLowerCase() === "t") {
@@ -3245,6 +3431,10 @@ function Player({
     addingTag,
     addingFolderTag,
     pickingFavorite,
+    pickingQuickTag,
+    topTags,
+    toggleQuickTags,
+    toggleQuickTag,
     video,
     toggleFavoritePicker,
     chooseFavorite,
@@ -3716,6 +3906,18 @@ function Player({
                 onAddingChange={(adding) =>
                   adding ? openTagField() : setAddingTag(false)
                 }
+                suggestions={topTags}
+              />
+              <QuickTags
+                video={video}
+                shortcut="Y"
+                topTags={topTags}
+                open={pickingQuickTag}
+                onOpenChange={(open) =>
+                  open ? toggleQuickTags() : setPickingQuickTag(false)
+                }
+                onToggle={(tag) => void toggleQuickTag(tag)}
+                error={quickTagError}
               />
               <FavoritePicker
                 video={video}

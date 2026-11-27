@@ -1145,6 +1145,33 @@ fn update_video_tags(
 }
 
 #[tauri::command]
+async fn get_top_tags() -> Result<Vec<toka_search::top_tags::TopTag>, CommandError> {
+    let failed = |message: String| CommandError {
+        kind: "Tags",
+        message,
+    };
+    let database = toka_search::owned_index::database_path().map_err(failed)?;
+    // The indexer daemon keeps this list fresh; count on demand until it has.
+    // An empty list may predate the first scan, so it is counted again.
+    // A stale list (daemon stopped, or the app owns the index) is counted
+    // again. An empty one may predate the first scan, so it holds for a minute.
+    let minutes = |minutes: u64| std::time::Duration::from_secs(minutes * 60);
+    if let Some(tags) = toka_search::top_tags::read_fresh(&database, minutes(10)) {
+        if !tags.is_empty() || toka_search::top_tags::read_fresh(&database, minutes(1)).is_some() {
+            return Ok(tags);
+        }
+    }
+    if !database.exists() {
+        return Ok(Vec::new());
+    }
+    // A full count reads every file's tags: off the async runtime's threads.
+    tauri::async_runtime::spawn_blocking(move || toka_search::top_tags::refresh(&database))
+        .await
+        .map_err(|error| failed(error.to_string()))?
+        .map_err(failed)
+}
+
+#[tauri::command]
 fn add_folder_tags(
     result_id: String,
     tags: Vec<String>,
@@ -1560,6 +1587,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1598,6 +1626,7 @@ pub fn run() {
                 add_tags_to_videos,
                 add_folder_tags,
                 remove_folder_tags,
+                get_top_tags,
                 prepare_video,
                 subtitle_cues,
                 load_native_video,
@@ -1644,6 +1673,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1674,6 +1704,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);
@@ -1704,6 +1735,7 @@ pub fn run() {
         add_tags_to_videos,
         add_folder_tags,
         remove_folder_tags,
+        get_top_tags,
         prepare_video,
         subtitle_cues
     ]);

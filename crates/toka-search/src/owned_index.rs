@@ -1254,6 +1254,8 @@ pub fn index_data_files(database: &Path) -> Vec<PathBuf> {
         database.with_file_name(crate::indexer_daemon::LEGACY_DAEMON_LOCK_FILE_NAME),
         database.with_file_name(RENAME_OVERLAY_FILE_NAME),
         database.with_file_name(RENAME_OVERLAY_LOCK_FILE_NAME),
+        // Derived from the index, so it goes with it.
+        crate::top_tags::path_for(database),
     ];
     for suffix in ["", "-wal", "-shm", "-journal"] {
         files.push(database.with_file_name(format!("{}{suffix}", crate::config::INDEX_FILE_NAME)));
@@ -2109,7 +2111,7 @@ impl OwnedIndex {
             .map_err(OwnedIndexError::from)
     }
 
-    fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
+    pub(crate) fn insert_root(&mut self, id: &str, root: &Path) -> Result<(), OwnedIndexError> {
         let transaction = write_transaction(&mut self.connection)?;
         transaction.execute(
             "INSERT INTO roots (
@@ -2838,6 +2840,28 @@ impl OwnedIndex {
             ],
         )?;
         Ok(())
+    }
+
+    /// How many indexed files carry each tag, from the denormalised
+    /// `tags_search` column. Files only: a folder's tags are not a file's.
+    pub fn tag_counts(&self) -> Result<std::collections::HashMap<String, u64>, OwnedIndexError> {
+        if self.is_empty_database() {
+            return Ok(Default::default());
+        }
+        let mut statement = self
+            .connection
+            .prepare("SELECT tags_search FROM files WHERE tags_search != ''")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let mut seen = std::collections::HashSet::new();
+            for tag in row?.split_whitespace() {
+                if seen.insert(tag.to_owned()) {
+                    *counts.entry(tag.to_owned()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     pub(crate) fn read_daemon_state(
@@ -6712,6 +6736,7 @@ mod tests {
                 "daemon.lock",
                 "search-renames.json",
                 "search-renames.lock",
+                "top-tags.json",
                 "index.sqlite3",
                 "index.sqlite3-wal",
                 "index.sqlite3-shm",
