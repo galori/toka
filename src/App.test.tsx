@@ -1767,7 +1767,9 @@ test("tags the playing video's folder from its control and Shift+T", async () =>
       folderTags: ["beach"],
       resultIds: ["video-1", "video-2"],
     })
-    .mockResolvedValueOnce({ folderTags: [], resultIds: ["video-1"] });
+    .mockResolvedValueOnce({ filePath: "/Videos/Trip [beach]/clip-a.mp4" })
+    .mockResolvedValueOnce({ folderTags: [], resultIds: ["video-1"] })
+    .mockResolvedValueOnce({ filePath: "/Videos/Trip/clip-a.mp4" });
   const user = userEvent.setup();
   render(<App />);
   await user.type(screen.getByRole("searchbox"), "clip{Enter}");
@@ -2333,10 +2335,12 @@ test("edits the playing video's tags from the playback controls with T", async (
       fileName: "tagged [review work].mp4",
       tags: ["review", "work"],
     })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged [review work].mp4" })
     .mockResolvedValueOnce({
       fileName: "tagged [review].mp4",
       tags: ["review"],
-    });
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged [review].mp4" });
   const user = userEvent.setup();
   render(<App />);
 
@@ -2374,6 +2378,834 @@ test("edits the playing video's tags from the playback controls with T", async (
     resultId: "video-1",
     tags: ["work"],
   });
+});
+
+test("shows the renamed file everywhere the player names it after tagging", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValueOnce({
+      fileName: "tagged [review work].mp4",
+      tags: ["review", "work"],
+    })
+    .mockResolvedValueOnce({
+      filePath: "/Videos/tagged [review work].mp4",
+    });
+  Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+    configurable: true,
+    value: vi.fn().mockResolvedValue(undefined),
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+
+  fireEvent.keyDown(window, { key: "t" });
+  const tagInput = screen.getByRole("textbox", {
+    name: "Add tag to tagged.mp4",
+  });
+  await user.type(tagInput, "review{Enter}");
+
+  // The heading, the windowed path, and the fullscreen overlay all name the
+  // file the tags renamed — not the name it had when playback started.
+  expect(
+    await screen.findByRole("heading", {
+      name: "tagged [review work].mp4",
+    }),
+  ).toBeVisible();
+  expect(
+    await screen.findByDisplayValue("/Videos/tagged [review work].mp4"),
+  ).toBeVisible();
+
+  await enterFullscreen(user);
+  const info = screen.getByRole("region", {
+    name: "Fullscreen video information",
+  });
+  expect(
+    within(info).getByText("/Videos/tagged [review work].mp4"),
+  ).toBeVisible();
+});
+
+test("shows the moved file path after its folder is retagged", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "clip",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "clip-a.mp4",
+          extension: "mp4",
+          folderTags: ["trip"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/Trip/clip-a.mp4" })
+    .mockResolvedValueOnce({
+      folderTags: ["beach", "trip"],
+      resultIds: ["video-1"],
+    })
+    .mockResolvedValueOnce({
+      filePath: "/Videos/Trip [beach trip]/clip-a.mp4",
+    });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-a.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip-a.mp4");
+  expect(
+    screen.getByDisplayValue("/Videos/Trip/clip-a.mp4"),
+  ).toBeVisible();
+
+  fireEvent.keyDown(window, { key: "T", shiftKey: true });
+  await user.keyboard("beach{Enter}");
+
+  // The file name is unchanged, but the folder carrying it moved, so the
+  // windowed path follows the folder to its new name.
+  expect(
+    await screen.findByDisplayValue("/Videos/Trip [beach trip]/clip-a.mp4"),
+  ).toBeVisible();
+  expect(invokeMock).toHaveBeenCalledWith("add_folder_tags", {
+    resultId: "video-1",
+    tags: ["beach"],
+  });
+});
+
+test("keeps its place in the video when tagging renames the file", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["review", "work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValueOnce({
+      fileName: "tagged [review].mp4",
+      tags: ["review"],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged [review].mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.play(video);
+
+  // Removing a tag from the pill retags without pausing first, so playback
+  // is running when the file is renamed underneath it.
+  await user.click(screen.getByRole("button", { name: "Remove tag work" }));
+  const renamed = await screen.findByLabelText("Playing tagged [review].mp4");
+  // The new source is in place once the windowed path names it.
+  await screen.findByDisplayValue("/Videos/tagged [review].mp4");
+  // A real engine starts the new source at the beginning; jsdom leaves the
+  // element's clock alone, so the test puts it where the engine would.
+  (renamed as HTMLVideoElement).currentTime = 0;
+  fireEvent.loadedMetadata(renamed);
+  // The new source loads like any other: the player puts the viewer back
+  // where the rename found them instead of restarting the video.
+  expect(renamed).toHaveProperty("currentTime", 20);
+});
+
+test("keeps the latest path when two retags refresh out of order", async () => {
+  let preparations = 0;
+  const pending: Array<(value: { filePath: string }) => void> = [];
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["a", "b"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        pending.push(resolve);
+      });
+    }
+    if (command === "remove_video_tags") {
+      const [tag] = (args as { tags: string[] }).tags;
+      return Promise.resolve(
+        tag === "a"
+          ? { fileName: "tagged [b].mp4", tags: ["b"] }
+          : { fileName: "tagged.mp4", tags: [] },
+      );
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+  const removeA = screen.getByRole("button", { name: "Remove tag a" });
+  const removeB = screen.getByRole("button", { name: "Remove tag b" });
+
+  // Two removals before either refresh answers.
+  fireEvent.click(removeA);
+  fireEvent.click(removeB);
+  await waitFor(() => expect(pending).toHaveLength(2));
+
+  // The first refresh answers last, with the older path — the display
+  // still ends on the latest rename rather than the latest answer.
+  await act(async () => {
+    pending[1]({ filePath: "/Videos/tagged.mp4" });
+    pending[0]({ filePath: "/Videos/tagged [b].mp4" });
+  });
+  expect(await screen.findByDisplayValue("/Videos/tagged.mp4")).toBeVisible();
+});
+
+test("leaves the new video alone when an old video's tag answers late", async () => {
+  let answerRemove!: (value: { fileName: string; tags: string[] }) => void;
+  const removal = new Promise<{ fileName: string; tags: string[] }>(
+    (resolve) => {
+      answerRemove = resolve;
+    },
+  );
+  let preparations = 0;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "clip-a.mp4",
+            extension: "mp4",
+            tags: ["x"],
+          },
+          { id: "video-2", fileName: "clip-b.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      return Promise.resolve({
+        filePath:
+          preparations === 1 ? "/Videos/clip-a.mp4" : "/Videos/clip-b.mp4",
+      });
+    }
+    if (command === "remove_video_tags") return removal;
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-a.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip-a.mp4");
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag x" }));
+
+  // Advance before the tag answers.
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  await screen.findByLabelText("Playing clip-b.mp4");
+  await act(async () => {
+    answerRemove({ fileName: "clip-a [y].mp4", tags: ["y"] });
+  });
+
+  // The late answer still retags its own video in the playlist — but the
+  // display, and the prepared source behind it, stay the new video's, with
+  // no third preparation run for the old one.
+  expect(await screen.findByText("clip-a [y].mp4")).toBeVisible();
+  expect(screen.getByRole("heading", { name: "clip-b.mp4" })).toBeVisible();
+  expect(screen.getByDisplayValue("/Videos/clip-b.mp4")).toBeVisible();
+  expect(preparations).toBe(2);
+});
+
+test("carries the saved position across a retag that lands mid-swap", async () => {
+  const pending: Array<(value: { filePath: string }) => void> = [];
+  let preparations = 0;
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["a", "b"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        pending.push(resolve);
+      });
+    }
+    if (command === "remove_video_tags") {
+      const [tag] = (args as { tags: string[] }).tags;
+      return Promise.resolve(
+        tag === "a"
+          ? { fileName: "tagged [b].mp4", tags: ["b"] }
+          : { fileName: "tagged.mp4", tags: [] },
+      );
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.play(video);
+  const removeA = screen.getByRole("button", { name: "Remove tag a" });
+  const removeB = screen.getByRole("button", { name: "Remove tag b" });
+
+  fireEvent.click(removeA);
+  await waitFor(() => expect(pending).toHaveLength(1));
+  await act(async () => {
+    pending[0]({ filePath: "/Videos/tagged [b].mp4" });
+  });
+  await screen.findByDisplayValue("/Videos/tagged [b].mp4");
+  // The first swap's source is loading: the engine reset the clock, and
+  // its metadata has not arrived yet.
+  (video as HTMLVideoElement).currentTime = 0;
+
+  fireEvent.click(removeB);
+  await waitFor(() => expect(pending).toHaveLength(2));
+  await act(async () => {
+    pending[1]({ filePath: "/Videos/tagged.mp4" });
+  });
+  await screen.findByDisplayValue("/Videos/tagged.mp4");
+
+  // The second retag carried the saved position forward instead of
+  // sampling the reset clock, so the new source resumes where the first
+  // retag found the viewer.
+  fireEvent.loadedMetadata(video);
+  expect(video).toHaveProperty("currentTime", 20);
+});
+
+test("honours a pause that lands while the retag refresh is loading", async () => {
+  let preparations = 0;
+  let answerRefresh!: (value: { filePath: string }) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        answerRefresh = resolve;
+      });
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.play(video);
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // Pause after the retag started but before its source arrives.
+  await user.click(screen.getByRole("button", { name: "Pause" }));
+  await waitFor(() => expect(answerRefresh).toBeDefined());
+  await act(async () => {
+    answerRefresh({ filePath: "/Videos/tagged [review].mp4" });
+  });
+  await screen.findByDisplayValue("/Videos/tagged [review].mp4");
+
+  (video as HTMLVideoElement).currentTime = 0;
+  fireEvent.loadedMetadata(video);
+  // The position is restored, but playback stays paused: resuming would
+  // undo the pause that landed mid-flight.
+  expect(video).toHaveProperty("currentTime", 20);
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+});
+
+test("refreshes the current video when a late folder rename moved it", async () => {
+  let answerPrepareB!: (value: { filePath: string }) => void;
+  let answerFolder!: (value: {
+    folderTags: string[];
+    resultIds: string[];
+  }) => void;
+  let preparations = 0;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [
+          { id: "video-1", fileName: "clip-a.mp4", extension: "mp4" },
+          { id: "video-2", fileName: "clip-b.mp4", extension: "mp4" },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/Trip/clip-a.mp4" });
+      if (preparations === 2)
+        return new Promise<{ filePath: string }>((resolve) => {
+          answerPrepareB = resolve;
+        });
+      return Promise.resolve({
+        filePath: "/Videos/Trip [beach]/clip-b.mp4",
+      });
+    }
+    if (command === "add_folder_tags")
+      return new Promise<{ folderTags: string[]; resultIds: string[] }>(
+        (resolve) => {
+          answerFolder = resolve;
+        },
+      );
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip-a.mp4" }),
+  );
+  await screen.findByLabelText("Playing clip-a.mp4");
+
+  // Tag A's folder, then move to B in the same folder before it answers.
+  // B's own preparation is still pending, so the folder answer is what
+  // first prepares it.
+  fireEvent.keyDown(window, { key: "T", shiftKey: true });
+  await user.keyboard("beach{Enter}");
+  await user.click(screen.getByRole("button", { name: "Next video" }));
+  await act(async () => {
+    answerFolder({ folderTags: ["beach"], resultIds: ["video-1", "video-2"] });
+  });
+  await screen.findByLabelText("Playing clip-b.mp4");
+
+  // The rename moved the current video too, so its path follows the folder
+  // to the new name — even though the command started from the old one.
+  expect(
+    await screen.findByDisplayValue("/Videos/Trip [beach]/clip-b.mp4"),
+  ).toBeVisible();
+  expect(
+    await screen.findByRole("button", { name: "Remove folder tag beach" }),
+  ).toBeVisible();
+
+  // B's own preparation, started before the rename, answers last with the
+  // old path — and must not overwrite the refresh that already applied.
+  await act(async () => {
+    answerPrepareB({ filePath: "/Videos/Trip/clip-b.mp4" });
+  });
+  expect(screen.getByDisplayValue("/Videos/Trip [beach]/clip-b.mp4")).toBeVisible();
+  expect(preparations).toBe(3);
+});
+
+test("keeps a seek made while the retag refresh is loading", async () => {
+  let preparations = 0;
+  let answerRefresh!: (value: { filePath: string }) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        answerRefresh = resolve;
+      });
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.play(video);
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // Seek after the retag started but before its source arrives.
+  fireEvent.change(screen.getByRole("slider", { name: "Video timeline" }), {
+    target: { value: "65" },
+  });
+  await waitFor(() => expect(answerRefresh).toBeDefined());
+  await act(async () => {
+    answerRefresh({ filePath: "/Videos/tagged [review].mp4" });
+  });
+  await screen.findByDisplayValue("/Videos/tagged [review].mp4");
+
+  (video as HTMLVideoElement).currentTime = 0;
+  fireEvent.loadedMetadata(video);
+  // The new source resumes where the seek put the viewer, not where the
+  // retag found them.
+  expect(video).toHaveProperty("currentTime", 65);
+});
+
+test("keeps a scrub made after the swapped source starts loading", async () => {
+  let preparations = 0;
+  let answerRefresh!: (value: { filePath: string }) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        answerRefresh = resolve;
+      });
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 20,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+  fireEvent.play(video);
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  await waitFor(() => expect(answerRefresh).toBeDefined());
+  await act(async () => {
+    answerRefresh({ filePath: "/Videos/tagged [review].mp4" });
+  });
+  await screen.findByDisplayValue("/Videos/tagged [review].mp4");
+  // The engine reset the clock for the new source; its metadata has not
+  // arrived yet when the viewer scrubs.
+  (video as HTMLVideoElement).currentTime = 0;
+  fireEvent.change(screen.getByRole("slider", { name: "Video timeline" }), {
+    target: { value: "40" },
+  });
+  // The scrub moved the pending resume along; the element's own clock is
+  // reset again so the assertion below proves the handler restores the
+  // scrub rather than the mock retaining it.
+  (video as HTMLVideoElement).currentTime = 0;
+
+  fireEvent.loadedMetadata(video);
+  // The metadata handler keeps the scrub instead of undoing it.
+  expect(video).toHaveProperty("currentTime", 40);
+});
+
+test("stays stopped when a retag lands after loop-off ended the video", async () => {
+  invokeMock
+    .mockResolvedValueOnce({
+      query: "tagged",
+      page: 1,
+      pageSize: 24,
+      totalResults: 1,
+      totalPages: 1,
+      results: [
+        {
+          id: "video-1",
+          fileName: "tagged.mp4",
+          extension: "mp4",
+          tags: ["review", "work"],
+        },
+      ],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged.mp4" })
+    .mockResolvedValueOnce({
+      fileName: "tagged [review].mp4",
+      tags: ["review"],
+    })
+    .mockResolvedValueOnce({ filePath: "/Videos/tagged [review].mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  const video = await screen.findByLabelText("Playing tagged.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  fireEvent.loadedMetadata(video);
+
+  await user.click(loopControl());
+  await user.click(loopControl());
+  expect(loopControl()).toHaveAccessibleName("Loop: off");
+  fireEvent.ended(video);
+  // Scrub back without pressing Play: the video stays stopped.
+  fireEvent.change(screen.getByRole("slider", { name: "Video timeline" }), {
+    target: { value: "10" },
+  });
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  await screen.findByDisplayValue("/Videos/tagged [review].mp4");
+
+  (video as HTMLVideoElement).currentTime = 0;
+  fireEvent.loadedMetadata(video);
+  // The position is restored, but the video does not start on its own.
+  expect(video).toHaveProperty("currentTime", 10);
+  expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+});
+
+test("retries the retag refresh once when it fails", async () => {
+  let preparations = 0;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      if (preparations === 2)
+        return Promise.reject(new Error("The video is momentarily unavailable."));
+      return Promise.resolve({ filePath: "/Videos/tagged [review].mp4" });
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // The first refresh failed, but the retry brings the display up to date
+  // rather than leaving it behind.
+  expect(
+    await screen.findByDisplayValue("/Videos/tagged [review].mp4"),
+  ).toBeVisible();
+  expect(preparations).toBe(3);
+});
+
+test("shows an error when the retag refresh fails twice", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["review", "work"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      const calls = invokeMock.mock.calls.filter(
+        ([name]) => name === "prepare_video",
+      ).length;
+      if (calls === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return Promise.reject(new Error("That video is no longer available."));
+    }
+    if (command === "remove_video_tags")
+      return Promise.resolve({
+        fileName: "tagged [review].mp4",
+        tags: ["review"],
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+
+  fireEvent.click(screen.getByRole("button", { name: "Remove tag work" }));
+  // Both the refresh and its retry failed, so the player says so instead
+  // of preparing forever.
+  expect(
+    await screen.findByRole("heading", {
+      name: "This video could not be played",
+    }),
+  ).toBeVisible();
 });
 
 test("uses one control for playing and pausing", async () => {
