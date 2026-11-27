@@ -660,7 +660,7 @@ fn query_for_location(path: &std::path::Path) -> String {
 }
 
 fn check_openable_file(path: &std::path::Path) -> Result<(), CommandError> {
-    if search::is_supported_video(path) || search::is_supported_image(path) {
+    if search::is_supported_media(path, search::MediaType::Both) {
         return Ok(());
     }
     Err(CommandError {

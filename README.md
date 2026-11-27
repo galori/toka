@@ -72,7 +72,8 @@ Text can target `tags:`, `filename:`, `path:`, or `folder:`. `folder:`
 searches every parent path component; `path:` searches the whole path including
 the file's own name, so `path:/Videos/trip` finds everything under that folder
 and `path:/Videos/trip/clip.mp4` finds the one file — even where the index has
-never looked. Quote values with spaces, such as `path:"/My Videos/trip"`. The
+never looked. Quote values with spaces, such as `path:"/My Videos/trip"`.
+`~/` names your home folder; `~other/` is not expanded. The
 path scope toggle still covers only the folders above the file.
 `type:image` and `type:video` match media kinds. `extension:jpg` matches an
 exact extension without regard to case.
@@ -122,11 +123,12 @@ output error returns exit code `1`. A missing query returns exit code `2`. Use
 (the same SHA shown when the app first launches), e.g.
 `toka <version> (Git SHA 1a2b3c…)`.
 
-Run `toka` with a folder, video, or playlist to play it straight away:
+Run `toka` with a folder, video, image, or playlist to play it straight away:
 
 ```sh
 toka ~/Videos/trip
 toka ~/Videos/trip/clip.mp4
+toka ~/Photos/trip/beach.jpg
 ```
 
 The folder or file opens playing, with its `path:` query in the search field,

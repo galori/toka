@@ -787,21 +787,25 @@ impl SearchEngine {
         // opened straight from disk was never indexed, and a broken index
         // must not hide a folder that is right there.
         let terms = path_terms(&expression);
-        let direct = filesystem_candidates(&terms);
+        let direct = filesystem_candidates(&terms, request.media_type);
+        // Falling back to named files is honest only when every possible
+        // match comes from them: `path:/x AND tags:y` narrows the walked
+        // set, but `path:/x OR tags:y` would silently drop the index half.
+        let covered = !direct.is_empty() && query_covered_by_direct(&expression);
         let mut candidates = match self.candidates(query, needs_whole_path, context) {
             Ok(candidates) => candidates,
             Err(error) => {
-                if direct.is_empty() {
+                if !covered {
                     return Err(error);
                 }
-                // The index failed but named files still answer: logged, so a
-                // half-answered `OR` never looks complete in hindsight.
+                // The index failed but the named files still answer whole:
+                // logged, so the failure never passes unseen.
                 self.logger.record_error(context, &error.to_string());
                 Vec::new()
             }
         };
         if let Err(error) = self.provider.retain_visible_paths(&mut candidates) {
-            if direct.is_empty() {
+            if !covered {
                 return Err(error);
             }
             self.logger.record_error(context, &error.to_string());
@@ -1877,6 +1881,26 @@ fn split_comparison(value: &str) -> (Comparison, &str) {
     (Comparison::Equal, value)
 }
 
+/// Whether every possible match of the query comes from the folders and
+/// files its `path:`/`folder:` terms name: a positive location term pins its
+/// branch to the walked set, anything else can match beyond it, `AND`
+/// narrows to either side, `OR` needs both, and `NOT` flips the sense.
+fn query_covered_by_direct(expression: &QueryExpr) -> bool {
+    fn covered(expression: &QueryExpr, negated: bool) -> bool {
+        match expression {
+            QueryExpr::Term(QueryTerm::Text {
+                field: QueryField::Path | QueryField::Folder,
+                ..
+            }) => !negated,
+            QueryExpr::Term(_) => false,
+            QueryExpr::Not(inner) => covered(inner, !negated),
+            QueryExpr::And(left, right) => covered(left, negated) || covered(right, negated),
+            QueryExpr::Or(left, right) => covered(left, negated) && covered(right, negated),
+        }
+    }
+    covered(expression, false)
+}
+
 fn query_needs_whole_path(expression: &QueryExpr) -> bool {
     match expression {
         QueryExpr::Term(QueryTerm::Text { field, .. }) => {
@@ -2071,7 +2095,9 @@ fn is_path_shaped(value: &str) -> bool {
 fn expand_location(value: &str) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+            // Without the trim, `~//etc` joins an absolute rest and escapes
+            // the home folder entirely.
+            return home.join(rest.trim_start_matches(['/', '\\']));
         }
     } else if value == "~" {
         if let Some(home) = dirs::home_dir() {
@@ -2081,13 +2107,13 @@ fn expand_location(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Every playable file the query names directly: each positive `path:` or
-/// `folder:` value that exists on disk contributes its file, or a folder's
-/// whole contents, canonicalized so files the index already knows
-/// deduplicate. One visited set across values, so overlapping folders are
-/// walked once. Values naming nothing are left to the index's substring
-/// match.
-fn filesystem_candidates(terms: &[(String, bool)]) -> Vec<PathBuf> {
+/// Every playable file of the requested kind the query names directly: each
+/// positive `path:` or `folder:` value that exists on disk contributes its
+/// file, or a folder's whole contents, canonicalized so files the index
+/// already knows deduplicate. One visited set across values, so overlapping
+/// folders are walked once. Values naming nothing are left to the index's
+/// substring match.
+fn filesystem_candidates(terms: &[(String, bool)], media_type: MediaType) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let mut visited = HashSet::new();
     for (value, positive) in terms {
@@ -2102,11 +2128,11 @@ fn filesystem_candidates(terms: &[(String, bool)]) -> Vec<PathBuf> {
             continue;
         }
         if real.is_file() {
-            if is_supported_media(&real, MediaType::Both) {
+            if is_supported_media(&real, media_type) {
                 files.push(real);
             }
         } else if real.is_dir() {
-            collect_media_recursive(&real, &mut files, &mut visited);
+            collect_media_recursive(&real, &mut files, &mut visited, media_type);
         }
     }
     files
@@ -2119,6 +2145,7 @@ fn collect_media_recursive(
     directory: &Path,
     out: &mut Vec<PathBuf>,
     visited: &mut HashSet<PathBuf>,
+    media_type: MediaType,
 ) {
     let Ok(real) = std::fs::canonicalize(directory) else {
         return;
@@ -2132,8 +2159,8 @@ fn collect_media_recursive(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_media_recursive(&path, out, visited);
-        } else if path.is_file() && is_supported_media(&path, MediaType::Both) {
+            collect_media_recursive(&path, out, visited, media_type);
+        } else if path.is_file() && is_supported_media(&path, media_type) {
             out.push(std::fs::canonicalize(&path).unwrap_or(path));
         }
     }
@@ -2141,7 +2168,8 @@ fn collect_media_recursive(
 
 /// A `path:`/`folder:` value resolved once per search: the folded form for
 /// substring matching and, for values naming somewhere real, the canonical
-/// location for prefix matching — so neither is recomputed per candidate.
+/// location for prefix matching. The query side is resolved once; each
+/// candidate file is still canonicalized on a substring miss.
 struct ResolvedPathTerm {
     value: String,
     folded: String,
@@ -3547,6 +3575,37 @@ mod tests {
     }
 
     #[test]
+    fn path_fallback_refuses_queries_it_cannot_answer_whole() {
+        let directory = tempdir().unwrap();
+        let clip = directory.path().join("clip.mp4");
+        fs::write(&clip, b"test").unwrap();
+        let engine = SearchEngine::new(Arc::new(ErrorProvider));
+        let or_query = format!("path:\"{}\" OR tags:elsewhere", directory.path().display());
+
+        // The `tags:` half needs the index: failing honestly beats a partial
+        // answer dressed as complete.
+        let error = engine.search(request(&or_query)).unwrap_err();
+        assert!(matches!(error, SearchError::Provider(_)), "{error}");
+
+        // Every match still comes from named folders here, so the fallback
+        // stands: narrowing with `AND`, or another `path:` branch.
+        let and_query = format!("path:\"{}\" AND filename:clip", directory.path().display());
+        assert_eq!(
+            names(&engine.search(request(&and_query)).unwrap()),
+            ["clip.mp4"]
+        );
+        let both_query = format!(
+            "path:\"{}\" OR path:\"{}\"",
+            directory.path().display(),
+            directory.path().display()
+        );
+        assert_eq!(
+            names(&engine.search(request(&both_query)).unwrap()),
+            ["clip.mp4"]
+        );
+    }
+
+    #[test]
     fn path_fallback_logs_the_index_failure_it_survived() {
         let directory = tempdir().unwrap();
         let clip = directory.path().join("clip.mp4");
@@ -3588,6 +3647,7 @@ mod tests {
     fn home_shorthand_expands_to_the_viewers_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_location("~/clips"), home.join("clips"));
+        assert_eq!(expand_location("~//clips"), home.join("clips"));
         assert_eq!(expand_location("~"), home);
         assert_eq!(expand_location("/Videos"), PathBuf::from("/Videos"));
         assert_eq!(
