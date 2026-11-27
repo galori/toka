@@ -190,9 +190,15 @@ pub fn run_daemon() -> Result<(), String> {
         // watch fails.
         let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
     }
-    let thumbnails = ThumbnailWorker::new(Arc::clone(&logger));
+    let probe_failures = Arc::new(crate::media::ProbeFailures::default());
+    let thumbnails = ThumbnailWorker::new(
+        database.clone(),
+        Arc::clone(&logger),
+        Arc::clone(&probe_failures),
+    );
     let top_tags_database = database.clone();
-    let mut supervisor = OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails);
+    let mut supervisor =
+        OwnedSupervisor::new(database, Arc::clone(&logger), thumbnails, probe_failures);
     let mut top_tags_counted: Option<Instant> = None;
     let top_tags_running = Arc::new(AtomicBool::new(false));
     loop {
@@ -629,6 +635,9 @@ pub(crate) fn path_available(path: &Path, expected: Option<&MountIdentity>) -> b
     }
 }
 
+/// The post-scan enrichment pass: thumbnails plus video durations, one
+/// folder at a time. Sharing the pass keeps one queue (and one heartbeat
+/// backlog count) for both, and ffprobe never runs beside ffmpeg.
 #[derive(Clone)]
 pub(crate) struct ThumbnailWorker {
     sender: mpsc::Sender<PathBuf>,
@@ -640,7 +649,11 @@ pub(crate) struct ThumbnailWorker {
 }
 
 impl ThumbnailWorker {
-    pub(crate) fn new(logger: Arc<IndexLogger>) -> Self {
+    pub(crate) fn new(
+        database: PathBuf,
+        logger: Arc<IndexLogger>,
+        probe_failures: Arc<crate::media::ProbeFailures>,
+    ) -> Self {
         Self::with_generator(move |folder| {
             crate::thumbnails::generate_folder_with_failures(folder, |video, message| {
                 logger.record(format!(
@@ -648,6 +661,20 @@ impl ThumbnailWorker {
                     video = video.display()
                 ));
             });
+            crate::media::enrich_folder_durations(
+                &database,
+                folder,
+                &probe_failures,
+                |video| {
+                    crate::media::probe_duration_seconds(video).map(crate::media::seconds_to_ms)
+                },
+                |video, message| {
+                    logger.record(format!(
+                        "duration probing failed for {video}: {message}",
+                        video = video.display()
+                    ));
+                },
+            );
         })
     }
 
@@ -744,6 +771,7 @@ pub(crate) struct OwnedSupervisor {
     database: PathBuf,
     logger: Arc<IndexLogger>,
     thumbnails: ThumbnailWorker,
+    probe_failures: Arc<crate::media::ProbeFailures>,
     watchers: HashMap<String, ActiveWatcher>,
     last_failure: HashMap<String, Instant>,
     heartbeat: DaemonHeartbeat,
@@ -804,12 +832,14 @@ impl OwnedSupervisor {
         database: PathBuf,
         logger: Arc<IndexLogger>,
         thumbnails: ThumbnailWorker,
+        probe_failures: Arc<crate::media::ProbeFailures>,
     ) -> Self {
         Self {
             heartbeat: DaemonHeartbeat::new(database.clone()),
             database,
             logger,
             thumbnails,
+            probe_failures,
             watchers: HashMap::new(),
             last_failure: HashMap::new(),
         }
@@ -1077,6 +1107,59 @@ impl OwnedSupervisor {
                 }
             }
         }
+        self.backfill_durations(&index);
+    }
+
+    /// Enqueues folders whose videos still lack durations: migrated
+    /// databases start with every duration unknown, and repair-added files
+    /// never pass the scan hook. Only when the enrichment queue is idle,
+    /// a few folders per pass, so a slow probe never stacks the backlog.
+    /// Videos whose probe already failed for their current bytes are not
+    /// backfilled: without that skip the queue would never drain and the
+    /// daemon would never report idle.
+    fn backfill_durations(&self, index: &OwnedIndex) {
+        if self.thumbnails.pending_count_excluding(&[]) != 0 {
+            return;
+        }
+        let missing = match index.videos_missing_durations(200) {
+            Ok(missing) => missing,
+            Err(error) => {
+                self.logger
+                    .record(format!("could not list videos missing durations: {error}"));
+                return;
+            }
+        };
+        let mut folders = Vec::new();
+        for path in missing {
+            if self.probe_failed(&path) {
+                continue;
+            }
+            let Some(folder) = path.parent().map(Path::to_path_buf) else {
+                continue;
+            };
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+            if folders.len() >= 4 {
+                break;
+            }
+        }
+        for folder in folders {
+            self.thumbnails.enqueue(&folder);
+        }
+    }
+
+    /// Whether probing `path` already failed for the bytes on disk. A file
+    /// that cannot even be statted reads as failed: the next scan drops
+    /// its row, and meanwhile there is nothing to probe.
+    fn probe_failed(&self, path: &Path) -> bool {
+        let Ok(metadata) = fs::metadata(path) else {
+            return true;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return true;
+        };
+        self.probe_failures.contains(path, metadata.len(), modified)
     }
 
     /// Removes the watcher for `id` when its worker thread already exited,
@@ -1153,10 +1236,23 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_supervisor(database: PathBuf, thumbnails: ThumbnailWorker) -> OwnedSupervisor {
+        test_supervisor_with_failures(
+            database,
+            thumbnails,
+            Arc::new(crate::media::ProbeFailures::default()),
+        )
+    }
+
+    fn test_supervisor_with_failures(
+        database: PathBuf,
+        thumbnails: ThumbnailWorker,
+        probe_failures: Arc<crate::media::ProbeFailures>,
+    ) -> OwnedSupervisor {
         OwnedSupervisor::new(
             database,
             Arc::new(IndexLogger::new(PathBuf::from("/nonexistent-indexer.log"))),
             thumbnails,
+            probe_failures,
         )
     }
 
@@ -1310,6 +1406,7 @@ mod tests {
             database.clone(),
             Arc::new(IndexLogger::new(log.clone())),
             quiet_thumbnails(),
+            Arc::new(crate::media::ProbeFailures::default()),
         );
         supervisor.reconcile();
         assert_eq!(supervisor.active_count(), 1);
@@ -1334,6 +1431,7 @@ mod tests {
             database,
             Arc::new(IndexLogger::new(log.clone())),
             quiet_thumbnails(),
+            Arc::new(crate::media::ProbeFailures::default()),
         );
 
         supervisor.reconcile();
@@ -1365,6 +1463,124 @@ mod tests {
 
         let scanned = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(scanned, media.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn reconcile_backfills_folders_missing_durations() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+        // Indexed before the supervisor ever runs, as a migrated database
+        // would be: every duration unknown, no scan hook to fire.
+        let folders = manager.folders().unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&folders[0].id, &folders[0].path, |_| {})
+            .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let thumbnails = ThumbnailWorker::with_generator(move |folder| {
+            let _ = sender.send(folder.to_path_buf());
+        });
+        let mut supervisor = test_supervisor(database, thumbnails);
+        supervisor.reconcile();
+
+        let backfilled = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(backfilled, media.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn backfill_waits_for_an_idle_enrichment_queue() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+        let folders = manager.folders().unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&folders[0].id, &folders[0].path, |_| {})
+            .unwrap();
+
+        // A worker stuck on one folder: the queue never idles, so the
+        // backfill must not pile on while the scan hook also fires.
+        let (release, release_receiver) = mpsc::channel::<()>();
+        let (sender, receiver) = mpsc::channel();
+        let thumbnails = ThumbnailWorker::with_generator(move |folder| {
+            let _ = sender.send(folder.to_path_buf());
+            let _ = release_receiver.recv();
+        });
+        thumbnails.enqueue(Path::new("/media/busy"));
+        let mut supervisor = test_supervisor(database, thumbnails);
+        supervisor.reconcile();
+
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            PathBuf::from("/media/busy")
+        );
+        // Only the busy folder arrives: no backfill enqueue joins it.
+        assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
+        drop(release);
+    }
+
+    #[test]
+    fn backfill_skips_folders_whose_probes_already_failed() {
+        let directory = tempdir().unwrap();
+        let media = directory.path().join("media");
+        fs::create_dir(&media).unwrap();
+        write_media(&media, "clip.mp4");
+        let database = directory.path().join("state").join("index.sqlite3");
+        let manager = OwnedIndexManager::under(database.clone());
+        manager.add_folder(&media).unwrap();
+        let folders = manager.folders().unwrap();
+        OwnedIndex::open(&database)
+            .unwrap()
+            .scan_root(&folders[0].id, &folders[0].path, |_| {})
+            .unwrap();
+        // One enrichment pass already failed the only clip: the failure
+        // the worker recorded must hold the backfill off, or the queue
+        // would never drain and the daemon would never report idle.
+        let probe_failures = Arc::new(crate::media::ProbeFailures::default());
+        crate::media::enrich_folder_durations(
+            &database,
+            &media.canonicalize().unwrap(),
+            &probe_failures,
+            |_| Err::<u64, String>("ffprobe says no".into()),
+            |_, _| {},
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        let thumbnails = ThumbnailWorker::with_generator(move |folder| {
+            let _ = sender.send(folder.to_path_buf());
+        });
+        let mut supervisor =
+            test_supervisor_with_failures(database, thumbnails, Arc::clone(&probe_failures));
+        supervisor.reconcile();
+
+        // The watcher still scans and its hook still fires once; the
+        // backfill, which runs synchronously in the pass above, must stay
+        // silent about the failed clip.
+        assert!(
+            poll_until(Duration::from_secs(10), || {
+                supervisor
+                    .watchers
+                    .values()
+                    .next()
+                    .is_some_and(|entry| entry.watcher.live().stage == WorkerStage::Watching)
+            }),
+            "expected the watcher to finish its scan"
+        );
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)).unwrap(),
+            media.canonicalize().unwrap()
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(500)).is_err());
     }
 
     #[test]
@@ -1462,6 +1678,7 @@ mod tests {
             database,
             Arc::new(IndexLogger::new(log.clone())),
             quiet_thumbnails(),
+            Arc::new(crate::media::ProbeFailures::default()),
         );
         supervisor.watchers.insert(
             id,

@@ -1710,6 +1710,14 @@ fn run_candidates_command(
         }
     };
     if options.json {
+        // Known durations ride along, keyed by lossy path, so the app
+        // sorts and badges without a second call. Unknown paths are
+        // absent, never zero.
+        let durations: serde_json::Map<String, serde_json::Value> = engine
+            .durations_for(&candidates)
+            .into_iter()
+            .map(|(path, ms)| (path.to_string_lossy().into_owned(), serde_json::json!(ms)))
+            .collect();
         // Lossy strings, never `PathBuf`s: real paths can hold
         // non-UTF-8 bytes on Unix, and those must not break this
         // document — the same lossy encoding the human output uses.
@@ -1722,6 +1730,7 @@ fn run_candidates_command(
             "query": options.query,
             "indexRevision": revision,
             "candidates": candidates,
+            "durations": durations,
         });
         return print_json(&document, "ts candidates", stdout, stderr);
     }
@@ -1781,6 +1790,7 @@ fn print_text(text: &str, stdout: &mut impl Write, stderr: &mut impl Write) -> i
 mod tests {
     use super::run_command;
     use std::{
+        collections::HashMap,
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
@@ -3495,6 +3505,76 @@ mod tests {
         assert_eq!(
             document["candidates"],
             serde_json::json!([videos[0].to_string_lossy(), videos[1].to_string_lossy(),])
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn candidates_json_carries_known_durations_by_path() {
+        struct DurationProvider {
+            paths: Vec<PathBuf>,
+            durations: HashMap<PathBuf, u64>,
+        }
+
+        impl SearchProvider for DurationProvider {
+            fn candidates(
+                &self,
+                _query: &str,
+                _whole_path: bool,
+                _context: &SearchLogContext,
+            ) -> Result<Vec<PathBuf>, SearchError> {
+                Ok(self.paths.clone())
+            }
+
+            fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+                paths
+                    .iter()
+                    .filter_map(|path| self.durations.get(path).map(|ms| (path.clone(), *ms)))
+                    .collect()
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let known = directory.path().join("family-known.mp4");
+        let unknown = directory.path().join("family-unknown.mp4");
+        fs::write(&known, b"video").unwrap();
+        fs::write(&unknown, b"video").unwrap();
+        let engine = SearchEngine::new(Arc::new(DurationProvider {
+            paths: vec![known.clone(), unknown.clone()],
+            durations: [(known.clone(), 61_500)].into_iter().collect(),
+        }));
+        let args = ["ts", "candidates", "family", "--json"]
+            .map(OsString::from)
+            .to_vec();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let status = run_command(
+            &args,
+            || Ok(engine),
+            no_verbose_engine,
+            no_stats,
+            no_folders,
+            no_add_folder,
+            no_remove_folder,
+            no_sync_path,
+            no_sync_rename,
+            no_thumbnail,
+            no_preview,
+            no_status,
+            no_daemon_run,
+            no_service,
+            no_reset,
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(status, 0);
+        let document: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+        assert_eq!(
+            document["durations"],
+            serde_json::json!({ known.to_string_lossy().into_owned(): 61_500 })
         );
         assert!(stderr.is_empty());
     }

@@ -28,7 +28,7 @@ import App, {
 import "./styles.css";
 
 const SEARCH_DATE_HELP_DESCRIPTION =
-  'Limit terms by field, size, or date: created:today, modified:yesterday, ranges like modified:2026-01-01..2026-12-31, or quoted windows like created:">= 1 day ago"';
+  'Limit terms by field, size, length, or date: created:today, modified:yesterday, ranges like modified:2026-01-01..2026-12-31, or quoted windows like created:">= 1 day ago"';
 
 const windowApiMock = vi.hoisted(() => ({
   close: vi.fn(),
@@ -1340,6 +1340,57 @@ test("cycles what results are sorted by from its keyboard shortcut", async () =>
   await waitFor(() =>
     expect(lastSearchSort()).toEqual({ field: "size", direction: "desc" }),
   );
+
+  // Duration follows size in the cycle, longest first.
+  fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({
+      field: "duration",
+      direction: "desc",
+    }),
+  );
+  expect(screen.getByRole("combobox", { name: "Sort results" })).toHaveValue(
+    "duration",
+  );
+});
+
+test("sorts results by duration from the sort control", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(
+    await screen.findByRole("button", { name: "Play b.mp4" }),
+  ).toBeVisible();
+
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Sort results" }),
+    "duration",
+  );
+
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "duration", direction: "desc" }),
+  );
+});
+
+test("shows each result's length on its tile", async () => {
+  invokeMock.mockResolvedValue({
+    ...twoResultPage("holiday"),
+    results: [
+      { id: "video-1", fileName: "b.mp4", extension: "mp4", durationMs: 61500 },
+      { id: "video-2", fileName: "a.mp4", extension: "mp4" },
+    ],
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  const long = await screen.findByRole("button", { name: "Play b.mp4" });
+  const unknown = await screen.findByRole("button", { name: "Play a.mp4" });
+
+  // The known length badges its tile; the unprobed clip badges nothing.
+  expect(long.querySelector(".duration-badge")).toHaveTextContent("1:01");
+  expect(unknown.querySelector(".duration-badge")).not.toBeInTheDocument();
 });
 
 test("shuffling an ordered search returns it to a shuffled search", async () => {

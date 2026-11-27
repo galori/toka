@@ -18,6 +18,7 @@
 //! `--json` documents must carry `"schema": 1`.
 
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -399,7 +400,16 @@ fn string_list(
 /// and add-ons exactly as it filtered provider candidates before. `ts
 /// candidates` applies no field or NOT filtering of its own, so a
 /// negation the viewer's fields would keep is never dropped inside `ts`.
-pub fn search_candidates(query: &str) -> Result<(Vec<PathBuf>, u64), String> {
+/// What `ts candidates` answered: the matching paths, the index revision
+/// the search saw, and the durations that rode along keyed by path —
+/// unknown paths are absent.
+pub struct TsCandidates {
+    pub paths: Vec<PathBuf>,
+    pub revision: u64,
+    pub durations: HashMap<PathBuf, u64>,
+}
+
+pub fn search_candidates(query: &str) -> Result<TsCandidates, String> {
     let args = [
         OsString::from("candidates"),
         OsString::from("--json"),
@@ -412,7 +422,27 @@ pub fn search_candidates(query: &str) -> Result<(Vec<PathBuf>, u64), String> {
     let revision = field(&document, "candidates", "indexRevision")?
         .as_u64()
         .ok_or_else(|| "`ts candidates` answered without a numeric `indexRevision`.".to_owned())?;
-    Ok((paths, revision))
+    Ok(TsCandidates {
+        paths,
+        revision,
+        durations: candidate_durations(&document),
+    })
+}
+
+/// The durations `ts candidates` carried, if any. Tolerant by design: an
+/// older helper answers without the key, and a malformed entry reads as
+/// unknown — never a failed search.
+fn candidate_durations(document: &serde_json::Value) -> HashMap<PathBuf, u64> {
+    document
+        .get("durations")
+        .and_then(serde_json::Value::as_object)
+        .map(|durations| {
+            durations
+                .iter()
+                .filter_map(|(path, ms)| ms.as_u64().map(|ms| (PathBuf::from(path), ms)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Maps a `ts candidates` failure back to the search error it reports.
@@ -435,12 +465,14 @@ fn search_error_from_ts(message: String) -> SearchError {
 /// index reads moved across the process boundary.
 pub struct TsSearchProvider {
     revision: Mutex<Option<u64>>,
+    durations: Mutex<HashMap<PathBuf, u64>>,
 }
 
 impl TsSearchProvider {
     pub fn new() -> Self {
         Self {
             revision: Mutex::new(None),
+            durations: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -462,12 +494,24 @@ impl SearchProvider for TsSearchProvider {
         // index, like the owned provider it replaces — there is no
         // narrower set to ask for, so the flag stays unused.
         match search_candidates(query) {
-            Ok((paths, revision)) => {
-                *self.revision.lock().unwrap() = Some(revision);
-                Ok(paths)
+            Ok(found) => {
+                *self.revision.lock().unwrap() = Some(found.revision);
+                *self.durations.lock().unwrap() = found.durations;
+                Ok(found.paths)
             }
             Err(message) => Err(search_error_from_ts(message)),
         }
+    }
+
+    fn durations_for(&self, paths: &[PathBuf]) -> HashMap<PathBuf, u64> {
+        // The last search's durations: every engine call reads candidates
+        // before asking for durations, so this is fresh — and later pages
+        // read the snapshot, never this cache.
+        let durations = self.durations.lock().unwrap();
+        paths
+            .iter()
+            .filter_map(|path| durations.get(path).map(|ms| (path.clone(), *ms)))
+            .collect()
     }
 
     fn retain_visible_paths(&self, paths: &mut Vec<PathBuf>) -> Result<(), SearchError> {
@@ -1846,10 +1890,59 @@ EOF
         );
         let _env = use_ts(&shim);
 
-        let (paths, revision) = search_candidates("--dash").unwrap();
+        let found = search_candidates("--dash").unwrap();
 
-        assert!(paths.is_empty());
-        assert_eq!(revision, 1);
+        assert!(found.paths.is_empty());
+        assert_eq!(found.revision, 1);
+        assert!(found.durations.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn candidate_durations_ride_along_and_tolerate_older_helpers() {
+        use toka_search::search::SearchProvider;
+        let directory = tempfile::tempdir().unwrap();
+        let shim = write_shim(
+            directory.path(),
+            "ts",
+            r#"#!/bin/sh
+cat <<'EOF'
+{"schema": 1, "query": "clip", "indexRevision": 7, "candidates": ["/media/one.mp4", "/media/two.mp4"], "durations": {"/media/one.mp4": 61500, "/media/bad.mp4": "soon"}}
+EOF
+"#,
+        );
+        let _env = use_ts(&shim);
+        let provider = TsSearchProvider::new();
+
+        let (paths, revision) = {
+            let found = search_candidates("clip").unwrap();
+            assert_eq!(found.revision, 7);
+            assert_eq!(found.paths.len(), 2);
+            (found.paths, found.revision)
+        };
+        // Through the provider: the search caches, then serves.
+        use toka_search::search::{MediaType, SearchFields, SearchRequest, SearchSort, PAGE_SIZE};
+        let request = SearchRequest {
+            query: "clip".to_owned(),
+            page: 1,
+            page_size: PAGE_SIZE,
+            search_id: None,
+            fields: SearchFields::default(),
+            media_type: MediaType::Videos,
+            sort: SearchSort::default(),
+        };
+        let context = toka_search::search_log::SearchLogContext::from(&request);
+        let found = provider.candidates("clip", false, &context).unwrap();
+        assert_eq!(found, paths);
+        assert_eq!(provider.revision(), revision);
+        let durations = provider.durations_for(&[
+            PathBuf::from("/media/one.mp4"),
+            PathBuf::from("/media/two.mp4"),
+        ]);
+        // The known length serves; the unknown path and the malformed
+        // entry stay absent.
+        assert_eq!(durations.len(), 1);
+        assert_eq!(durations[&PathBuf::from("/media/one.mp4")], 61_500);
     }
 
     #[cfg(unix)]

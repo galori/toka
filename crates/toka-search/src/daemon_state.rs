@@ -553,11 +553,13 @@ mod tests {
         {
             let connection = rusqlite::Connection::open(&database).unwrap();
             // Rewind to version 1: no liveness table, no indexable
-            // counter, version markers back to 1.
+            // counter, no duration column, version markers back to 1.
             connection
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();

@@ -67,36 +67,11 @@ pub(crate) fn generate_folder_with_failures<F>(folder: &Path, mut on_failure: F)
 where
     F: FnMut(&Path, &str),
 {
-    for video in video_paths(folder) {
+    for video in crate::media::video_paths(folder) {
         if let Err(GenerationFailure::New(message)) = generate_result(&video) {
             on_failure(&video, &message);
         }
     }
-}
-
-fn video_paths(folder: &Path) -> Vec<PathBuf> {
-    let mut pending = vec![folder.to_path_buf()];
-    let mut videos = Vec::new();
-    while let Some(directory) = pending.pop() {
-        let Ok(entries) = fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_dir() {
-                pending.push(path);
-            } else if file_type.is_file()
-                && crate::search::is_supported_video(&path)
-                && crate::search::is_non_empty_file(&path)
-            {
-                videos.push(path);
-            }
-        }
-    }
-    videos
 }
 
 /// Frames sampled evenly across the video, for the preview that runs while the
@@ -121,7 +96,7 @@ pub fn preview(video: &Path) -> Option<Vec<PathBuf>> {
     if cached_failure(&failure).is_some() {
         return None;
     }
-    let offsets = match duration(video) {
+    let offsets = match crate::media::probe_duration_seconds(video) {
         Ok(duration) => preview_offsets(duration, PREVIEW_FRAMES),
         Err(message) => {
             remember_failure(&failure, &message);
@@ -241,37 +216,6 @@ fn fingerprint(video: &Path) -> String {
     format!("{:x}", md5_fingerprint(video))
 }
 
-/// How long the video runs, so a preview can be spread across it. A file
-/// ffprobe cannot read the length of is one Toka leaves showing its still.
-fn duration(video: &Path) -> Result<f64, String> {
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-        ])
-        .arg(video)
-        .output()
-        .map_err(|error| format!("could not run ffprobe: {error}"))?;
-    if !output.status.success() {
-        return Err(command_error(&output));
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .map_err(|error| format!("ffprobe returned an invalid duration: {error}"))
-        .and_then(|seconds| {
-            if seconds.is_finite() && seconds > 0.0 {
-                Ok(seconds)
-            } else {
-                Err("ffprobe returned a non-positive duration".into())
-            }
-        })
-}
-
 /// One frame from `at` seconds in, written whole: ffmpeg is given a temporary
 /// name and the result renamed into place, so a reader never finds a half
 /// written picture in the cache.
@@ -306,7 +250,7 @@ fn extract(video: &Path, at: f64, output: &Path, width: u32) -> Result<PathBuf, 
     };
     if !output_result.status.success() {
         let _ = fs::remove_file(&temporary);
-        return Err(command_error(&output_result));
+        return Err(crate::media::command_error(&output_result));
     }
     if !temporary.is_file() {
         return Err("ffmpeg succeeded without writing a thumbnail".into());
@@ -336,15 +280,6 @@ fn cached_failure(marker: &Path) -> Option<String> {
 
 fn remember_failure(marker: &Path, message: &str) {
     let _ = fs::write(marker, message);
-}
-
-fn command_error(output: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if stderr.is_empty() {
-        format!("decoder exited with {}", output.status)
-    } else {
-        stderr
-    }
 }
 
 fn md5_fingerprint(path: &Path) -> u64 {
@@ -475,25 +410,6 @@ mod tests {
             offsets.iter().all(|at| *at > 0.0 && *at < 0.4),
             "{offsets:?}"
         );
-    }
-
-    #[test]
-    fn background_scanning_finds_supported_videos_recursively() {
-        let root = tempdir().unwrap();
-        let clip = root.path().join("clip.mp4");
-        let empty = root.path().join("empty.mp4");
-        let notes = root.path().join("notes.txt");
-        let nested = root.path().join("nested");
-        let movie = nested.join("movie.MKV");
-        fs::write(&clip, b"video").unwrap();
-        fs::write(&empty, b"").unwrap();
-        fs::write(&notes, b"text").unwrap();
-        fs::create_dir(&nested).unwrap();
-        fs::write(&movie, b"video").unwrap();
-
-        let mut found = video_paths(root.path());
-        found.sort();
-        assert_eq!(found, vec![clip, movie]);
     }
 
     #[test]

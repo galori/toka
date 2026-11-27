@@ -24,7 +24,7 @@ use std::{
 
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const REPAIR_SCAN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Media files committed per scan transaction.
 const SCAN_BATCH_SIZE: usize = 128;
@@ -36,7 +36,7 @@ CREATE TABLE schema_meta (
 ) WITHOUT ROWID;
 
 INSERT INTO schema_meta (key, value) VALUES
-    ('schema_version', 2),
+    ('schema_version', 3),
     ('index_revision', 0);
 
 CREATE TABLE roots (
@@ -63,6 +63,7 @@ CREATE TABLE files (
     size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
     created_at_ns INTEGER,
     modified_at_ns INTEGER NOT NULL,
+    duration_ms INTEGER CHECK (duration_ms >= 0),
     file_name_search TEXT NOT NULL,
     tags_search TEXT NOT NULL,
     folders_search TEXT NOT NULL
@@ -73,6 +74,7 @@ CREATE INDEX files_media_type ON files (media_type);
 CREATE INDEX files_size_bytes ON files (size_bytes);
 CREATE INDEX files_created_at_ns ON files (created_at_ns);
 CREATE INDEX files_modified_at_ns ON files (modified_at_ns);
+CREATE INDEX files_duration_ms ON files (duration_ms);
 
 CREATE TABLE root_files (
     root_id TEXT NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
@@ -190,6 +192,18 @@ CREATE TABLE daemon_state (
 );
 
 UPDATE schema_meta SET value = 2 WHERE key = 'schema_version';
+"#;
+
+/// Version 2 databases have no duration column; the migration only adds
+/// it and its index, so every row survives with an unknown duration and
+/// no re-index is required. The background worker fills durations in
+/// after the migration commits.
+const MIGRATION_2_TO_3: &str = r#"
+ALTER TABLE files ADD COLUMN duration_ms INTEGER CHECK (duration_ms >= 0);
+
+CREATE INDEX files_duration_ms ON files (duration_ms);
+
+UPDATE schema_meta SET value = 3 WHERE key = 'schema_version';
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -375,8 +389,9 @@ pub struct OwnedIndex {
     /// The `user_version` this handle opened at. A migrating open always
     /// normalizes to [`SCHEMA_VERSION`]; a read-only open keeps whatever it
     /// found, so readers can tolerate older schemas (no `daemon_state`
-    /// table or `files_indexable` column on version 1, no tables at all on
-    /// a version 0 empty file) instead of erroring on them.
+    /// table or `files_indexable` column on version 1, no `duration_ms`
+    /// column on versions 1 and 2, no tables at all on a version 0 empty
+    /// file) instead of erroring on them.
     opened_version: i64,
 }
 
@@ -1865,7 +1880,7 @@ impl OwnedIndex {
         // Refuse unknown schemas before opening at all: even opening can
         // create -shm sidecars or roll back a hot journal.
         if let Some(version) = pre_open_user_version(path) {
-            if version != 0 && version != 1 && version != SCHEMA_VERSION {
+            if version != 0 && version != 1 && version != 2 && version != SCHEMA_VERSION {
                 return Err(OwnedIndexError::UnsupportedSchema(version));
             }
         }
@@ -1886,7 +1901,7 @@ impl OwnedIndex {
         // not even securing the parent — so a newer app's index still
         // opens once upgraded again.
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 0 && version != 1 && version != SCHEMA_VERSION {
+        if version != 0 && version != 1 && version != 2 && version != SCHEMA_VERSION {
             return Err(OwnedIndexError::UnsupportedSchema(version));
         }
 
@@ -1924,6 +1939,11 @@ impl OwnedIndex {
             }
             1 => {
                 transaction.execute_batch(MIGRATION_1_TO_2)?;
+                transaction.execute_batch(MIGRATION_2_TO_3)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            2 => {
+                transaction.execute_batch(MIGRATION_2_TO_3)?;
                 transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             // A concurrent first-opener migrated while this one waited for
@@ -1949,7 +1969,8 @@ impl OwnedIndex {
     /// listing. `PRAGMA query_only` makes any accidental write fail loudly
     /// instead of slipping through. Readers must tolerate whatever the
     /// accepted schemas lack (today: no `daemon_state` table on version 1,
-    /// and an empty file on version 0). The 5s busy timeout matches
+    /// no `duration_ms` column on versions 1 and 2, and an empty file on
+    /// version 0). The 5s busy timeout matches
     /// writable opens: on a read-only handle it only waits out a writer's
     /// lock, never writes.
     pub fn open_read_only(path: &Path) -> Result<Self, OwnedIndexError> {
@@ -1958,7 +1979,7 @@ impl OwnedIndex {
         connection.execute_batch("PRAGMA query_only = ON;")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
-            0 | 1 | SCHEMA_VERSION => {}
+            0 | 1 | 2 | SCHEMA_VERSION => {}
             other => return Err(OwnedIndexError::UnsupportedSchema(other)),
         }
         Ok(Self {
@@ -1975,10 +1996,10 @@ impl OwnedIndex {
     }
 
     /// Whether `scan_runs` has the version 2 indexable counter. A
-    /// migrating open always lands on version 2; only a read-only open of
-    /// a version 1 database answers false.
+    /// migrating open always lands on the current version; only a
+    /// read-only open of a version 1 database answers false.
     fn has_indexable_column(&self) -> bool {
-        self.opened_version >= SCHEMA_VERSION
+        self.opened_version >= 2
     }
 
     pub(crate) fn roots(&self) -> Result<Vec<(String, PathBuf)>, OwnedIndexError> {
@@ -2322,6 +2343,96 @@ impl OwnedIndex {
         Ok((videos as u64, images as u64))
     }
 
+    /// Whether `files` has the version 3 duration column. A migrating
+    /// open always lands on the current version; only a read-only open
+    /// of a version 1 or 2 database answers false.
+    fn has_duration_column(&self) -> bool {
+        self.opened_version >= SCHEMA_VERSION
+    }
+
+    /// The known durations of `paths`, in whole milliseconds. Unknown
+    /// files — never probed, unprobed on an old schema, or not indexed —
+    /// are simply absent, never zero.
+    pub(crate) fn durations_for(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<HashMap<PathBuf, u64>, OwnedIndexError> {
+        let mut durations = HashMap::new();
+        if paths.is_empty() || self.is_empty_database() || !self.has_duration_column() {
+            return Ok(durations);
+        }
+        // One query per chunk: a search page holds dozens of paths, but a
+        // full sort holds thousands, past SQLite's parameter limit.
+        for chunk in paths.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT path, duration_ms FROM files
+                 WHERE path IN ({placeholders}) AND duration_ms IS NOT NULL"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let params: Vec<Vec<u8>> = chunk.iter().map(|path| path_bytes(path)).collect();
+            let mut rows = statement.query(rusqlite::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                let path = path_from_bytes(row.get::<_, Vec<u8>>(0)?);
+                let duration: i64 = row.get(1)?;
+                durations.insert(path, duration.max(0) as u64);
+            }
+        }
+        Ok(durations)
+    }
+
+    /// Records a probed duration, but only when the row still describes
+    /// the file the probe read: a file that changed mid-probe was already
+    /// re-queued with an unknown duration, and a stale write would pin the
+    /// wrong length on it. Answers whether the write landed.
+    pub(crate) fn set_duration_ms(
+        &self,
+        path: &Path,
+        size_bytes: i64,
+        modified_at_ns: i64,
+        duration_ms: u64,
+    ) -> Result<bool, OwnedIndexError> {
+        if self.is_empty_database() || !self.has_duration_column() {
+            return Ok(false);
+        }
+        let duration = i64::try_from(duration_ms).unwrap_or(i64::MAX);
+        let changed = self.connection.execute(
+            "UPDATE files SET duration_ms = ?1
+             WHERE path = ?2 AND size_bytes = ?3 AND modified_at_ns = ?4",
+            rusqlite::params![duration, path_bytes(path), size_bytes, modified_at_ns],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Up to `limit` indexed videos still missing a duration, for the
+    /// background probe pass. Images never want one, and neither do files
+    /// under offline roots: their storage is gone, so a probe could only
+    /// fail and be retried every pass.
+    pub(crate) fn videos_missing_durations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<PathBuf>, OwnedIndexError> {
+        if self.is_empty_database() || !self.has_duration_column() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT files.path FROM files
+             JOIN root_files ON root_files.file_id = files.id
+             JOIN roots ON roots.id = root_files.root_id
+             WHERE files.media_type = 'video'
+               AND files.duration_ms IS NULL
+               AND roots.state != 'offline'
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(path_from_bytes(row.get::<_, Vec<u8>>(0)?))
+        })?;
+        rows.collect::<Result<_, _>>()
+            .map_err(OwnedIndexError::from)
+    }
+
     /// Scans one root to completion. Watchers run the cancellable batch
     /// form below instead, so `stop` aborts a scan in progress.
     pub fn scan_root<F>(
@@ -2609,6 +2720,12 @@ impl OwnedIndex {
                     size_bytes = excluded.size_bytes,
                     created_at_ns = excluded.created_at_ns,
                     modified_at_ns = excluded.modified_at_ns,
+                    duration_ms = CASE
+                        WHEN size_bytes IS excluded.size_bytes
+                         AND modified_at_ns IS excluded.modified_at_ns
+                        THEN duration_ms
+                        ELSE NULL
+                    END,
                     file_name_search = excluded.file_name_search,
                     tags_search = excluded.tags_search,
                     folders_search = excluded.folders_search",
@@ -3092,6 +3209,12 @@ impl OwnedIndex {
                 size_bytes = excluded.size_bytes,
                 created_at_ns = excluded.created_at_ns,
                 modified_at_ns = excluded.modified_at_ns,
+                duration_ms = CASE
+                    WHEN size_bytes IS excluded.size_bytes
+                     AND modified_at_ns IS excluded.modified_at_ns
+                    THEN duration_ms
+                    ELSE NULL
+                END,
                 file_name_search = excluded.file_name_search,
                 tags_search = excluded.tags_search,
                 folders_search = excluded.folders_search",
@@ -3708,7 +3831,7 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(busy_timeout, 5_000);
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         for table in [
             "schema_meta",
             "roots",
@@ -4432,8 +4555,9 @@ mod tests {
                 || quote(display_path) || ' ' || quote(file_name) || ' '
                 || quote(extension) || ' ' || quote(media_type) || ' '
                 || quote(size_bytes) || ' ' || quote(created_at_ns) || ' '
-                || quote(modified_at_ns) || ' ' || quote(file_name_search) || ' '
-                || quote(tags_search) || ' ' || quote(folders_search)
+                || quote(modified_at_ns) || ' ' || quote(duration_ms) || ' '
+                || quote(file_name_search) || ' ' || quote(tags_search) || ' '
+                || quote(folders_search)
              FROM files ORDER BY id",
         ));
         dump.extend(dump_table(
@@ -6833,13 +6957,16 @@ mod tests {
             let mut index = OwnedIndex::open(&database).unwrap();
             index.insert_root("root", &root).unwrap();
             index.scan_root("root", &root, |_| {}).unwrap();
-            // Rewind to version 1: drop the liveness table and the
-            // indexable counter, plus both version markers.
+            // Rewind to version 1: drop the liveness table, the
+            // indexable counter, and the duration column, plus both
+            // version markers.
             index
                 .connection
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -6855,7 +6982,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let meta: i64 = index
             .connection
             .query_row(
@@ -6864,7 +6991,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(meta, 2);
+        assert_eq!(meta, 3);
         // Roots, files, and progress survive; nothing needs rescanning.
         let roots = index.roots_with_state().unwrap();
         assert_eq!(roots.len(), 1);
@@ -6883,6 +7010,250 @@ mod tests {
             columns.contains(&"files_indexable".to_owned()),
             "{columns:?}"
         );
+    }
+
+    #[test]
+    fn opening_a_version_2_database_migrates_it_without_rescanning() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        std::fs::write(root.join("clip.mp4"), b"video").unwrap();
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            // Rewind to version 2: drop the duration index and column,
+            // plus both version markers.
+            index
+                .connection
+                .execute_batch(
+                    "DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
+                     UPDATE schema_meta SET value = 2 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 2)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open(&database).unwrap();
+
+        let version: i64 = index
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        let meta: i64 = index
+            .connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(meta, 3);
+        // Roots and files survive; every duration starts unknown.
+        assert_eq!(index.roots_with_state().unwrap().len(), 1);
+        assert_eq!(indexed_display_paths(&index).len(), 1);
+        let duration: Option<i64> = index
+            .connection
+            .query_row("SELECT duration_ms FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(duration, None);
+        let columns: Vec<String> = index
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('files')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(columns.contains(&"duration_ms".to_owned()), "{columns:?}");
+    }
+
+    fn scan_two_clips(root: &Path) -> (PathBuf, PathBuf) {
+        let one = root.join("one.mp4");
+        let two = root.join("two.mp4");
+        std::fs::write(&one, b"video one").unwrap();
+        std::fs::write(&two, b"video two").unwrap();
+        std::fs::write(root.join("still.jpg"), b"image").unwrap();
+        (one, two)
+    }
+
+    fn file_size_and_mtime(index: &OwnedIndex, path: &Path) -> (i64, i64) {
+        index
+            .connection
+            .query_row(
+                "SELECT size_bytes, modified_at_ns FROM files WHERE path = ?1",
+                [path_bytes(path)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn durations_start_unknown_and_read_back_in_one_query() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (one, two) = scan_two_clips(&root);
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert!(index
+            .durations_for(&[one.clone(), two.clone()])
+            .unwrap()
+            .is_empty());
+
+        let (size, mtime) = file_size_and_mtime(&index, &one);
+        assert!(index.set_duration_ms(&one, size, mtime, 61_500).unwrap());
+        let (size, mtime) = file_size_and_mtime(&index, &two);
+        assert!(index.set_duration_ms(&two, size, mtime, 3_000).unwrap());
+
+        let durations = index
+            .durations_for(&[one.clone(), two.clone(), root.join("missing.mp4")])
+            .unwrap();
+        assert_eq!(durations.len(), 2);
+        assert_eq!(durations[&one], 61_500);
+        assert_eq!(durations[&two], 3_000);
+    }
+
+    #[test]
+    fn duration_writes_lose_to_a_changed_file() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (one, _) = scan_two_clips(&root);
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let (size, mtime) = file_size_and_mtime(&index, &one);
+
+        // A probe that started before the file changed must not overwrite
+        // the fresh row the rescan is about to commit.
+        assert!(!index
+            .set_duration_ms(&one, size + 1, mtime, 61_500)
+            .unwrap());
+        assert!(!index
+            .set_duration_ms(&one, size, mtime + 1, 61_500)
+            .unwrap());
+        assert!(!index
+            .set_duration_ms(&root.join("missing.mp4"), size, mtime, 61_500)
+            .unwrap());
+
+        assert!(index.durations_for(&[one]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rescanning_an_unchanged_file_keeps_its_duration() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (one, _) = scan_two_clips(&root);
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let (size, mtime) = file_size_and_mtime(&index, &one);
+        assert!(index.set_duration_ms(&one, size, mtime, 61_500).unwrap());
+
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert_eq!(
+            index.durations_for(std::slice::from_ref(&one)).unwrap()[&one],
+            61_500
+        );
+    }
+
+    #[test]
+    fn rescanning_a_changed_file_forgets_its_duration() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (one, _) = scan_two_clips(&root);
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("root", &root).unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+        let (size, mtime) = file_size_and_mtime(&index, &one);
+        assert!(index.set_duration_ms(&one, size, mtime, 61_500).unwrap());
+
+        std::fs::write(&one, b"a much longer video one").unwrap();
+        index.scan_root("root", &root, |_| {}).unwrap();
+
+        assert!(index.durations_for(&[one]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn videos_missing_durations_lists_only_unprobed_online_videos() {
+        let directory = tempdir().unwrap();
+        let online = directory.path().join("online");
+        let offline = directory.path().join("offline");
+        std::fs::create_dir(&online).unwrap();
+        std::fs::create_dir(&offline).unwrap();
+        let online = online.canonicalize().unwrap();
+        let offline = offline.canonicalize().unwrap();
+        let (one, two) = scan_two_clips(&online);
+        let gone = offline.join("gone.mp4");
+        std::fs::write(&gone, b"video gone").unwrap();
+        let database = directory.path().join("index.sqlite3");
+        let mut index = OwnedIndex::open(&database).unwrap();
+        index.insert_root("online", &online).unwrap();
+        index.insert_root("offline", &offline).unwrap();
+        index.scan_root("online", &online, |_| {}).unwrap();
+        index.scan_root("offline", &offline, |_| {}).unwrap();
+        index.set_root_state("offline", "offline").unwrap();
+        let (size, mtime) = file_size_and_mtime(&index, &one);
+        assert!(index.set_duration_ms(&one, size, mtime, 61_500).unwrap());
+
+        let missing = index.videos_missing_durations(100).unwrap();
+
+        // The probed clip, the image, and the offline root's clip are all
+        // absent: only the unprobed online video wants a probe.
+        assert_eq!(missing, vec![two]);
+    }
+
+    #[test]
+    fn duration_reads_on_old_schemas_answer_empty() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let (one, _) = scan_two_clips(&root);
+        let database = directory.path().join("index.sqlite3");
+        {
+            let mut index = OwnedIndex::open(&database).unwrap();
+            index.insert_root("root", &root).unwrap();
+            index.scan_root("root", &root, |_| {}).unwrap();
+            index
+                .connection
+                .execute_batch(
+                    "DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
+                     UPDATE schema_meta SET value = 2 WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            index
+                .connection
+                .pragma_update(None, "user_version", 2)
+                .unwrap();
+        }
+
+        let index = OwnedIndex::open_read_only(&database).unwrap();
+
+        assert!(index.durations_for(&[one]).unwrap().is_empty());
+        assert!(index.videos_missing_durations(100).unwrap().is_empty());
     }
 
     #[test]
@@ -6910,12 +7281,14 @@ mod tests {
             index.insert_root("root", &root).unwrap();
             index.scan_root("root", &root, |_| {}).unwrap();
             // Rewind to version 1: no liveness table, no indexable
-            // counter, version markers back to 1.
+            // counter, no duration column, version markers back to 1.
             index
                 .connection
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -7031,12 +7404,14 @@ mod tests {
             index.insert_root("root", &root).unwrap();
             index.scan_root("root", &root, |_| {}).unwrap();
             // Rewind to version 1: no liveness table, no indexable
-            // counter, version markers back to 1.
+            // counter, no duration column, version markers back to 1.
             index
                 .connection
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -7103,6 +7478,8 @@ mod tests {
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -7188,6 +7565,8 @@ mod tests {
                 .execute_batch(
                     "DROP TABLE daemon_state;
                      ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                     DROP INDEX files_duration_ms;
+                     ALTER TABLE files DROP COLUMN duration_ms;
                      UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
                 )
                 .unwrap();
@@ -7219,7 +7598,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(index.roots().unwrap().len(), 1);
         assert_eq!(indexed_display_paths(&index).len(), 1);
 
@@ -7244,7 +7623,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -7317,6 +7696,8 @@ mod tests {
                  UPDATE roots SET state = 'offline' WHERE id = 'offline';
                  DROP TABLE daemon_state;
                  ALTER TABLE scan_runs DROP COLUMN files_indexable;
+                 DROP INDEX files_duration_ms;
+                 ALTER TABLE files DROP COLUMN duration_ms;
                  UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
             )
             .unwrap();
@@ -7341,7 +7722,7 @@ mod tests {
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let states = index.roots_with_state().unwrap();
         assert_eq!(
             states
@@ -7450,7 +7831,7 @@ mod tests {
         }
         Connection::open(&database)
             .unwrap()
-            .pragma_update(None, "user_version", 2)
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
             .unwrap();
         OwnedIndex::open(&database).unwrap();
     }

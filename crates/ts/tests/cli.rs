@@ -2651,8 +2651,8 @@ fn indexer_log_path(home: &ScratchHome) -> PathBuf {
         .join("logs/indexer.log")
 }
 
-/// Rewinds a version 2 index to version 1: no liveness table, no
-/// indexable counter, version markers back to 1.
+/// Rewinds a version 3 index to version 1: no liveness table, no
+/// indexable counter, no duration column, version markers back to 1.
 #[cfg(not(feature = "fixtures"))]
 fn rewind_to_v1(database: &Path) {
     let connection = rusqlite::Connection::open(database).unwrap();
@@ -2660,6 +2660,8 @@ fn rewind_to_v1(database: &Path) {
         .execute_batch(
             "DROP TABLE daemon_state;
              ALTER TABLE scan_runs DROP COLUMN files_indexable;
+             DROP INDEX files_duration_ms;
+             ALTER TABLE files DROP COLUMN duration_ms;
              UPDATE schema_meta SET value = 1 WHERE key = 'schema_version';",
         )
         .unwrap();
@@ -2736,7 +2738,7 @@ fn read_commands_leave_a_version_1_database_untouched() {
     create_video(&media, 0);
     create_video(&media, 1);
 
-    // A scanned version 2 index, rewound to version 1.
+    // A scanned version 3 index, rewound to version 1.
     let media_argument = media.to_string_lossy().into_owned();
     let output = run_at(&home, &["folders", "add", &media_argument]);
     assert_eq!(output.status.code(), Some(0));
@@ -2822,14 +2824,14 @@ fn read_commands_leave_a_version_1_database_untouched() {
     assert_eq!(document["totalResults"], 2);
     assert_v1_untouched(&database, &before, &dump);
 
-    // A write migrates: adding a folder moves the database to version 2,
+    // A write migrates: adding a folder moves the database to version 3,
     // and the version 1 content survives the move.
     let more = home.home.path().join("more");
     fs::create_dir_all(&more).unwrap();
     let more_argument = more.to_string_lossy().into_owned();
     let output = run_at(&home, &["folders", "add", &more_argument]);
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(schema_user_version(&database), 2);
+    assert_eq!(schema_user_version(&database), 3);
     let output = run_at(&home, &["stats", "--json"]);
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
@@ -2848,7 +2850,7 @@ fn read_commands_leave_a_version_1_database_untouched() {
             "the daemon never published a heartbeat"
         );
     });
-    assert_eq!(schema_user_version(&database), 2);
+    assert_eq!(schema_user_version(&database), 3);
     let output = run_at(&home, &["folders", "list", "--json"]);
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(output.stdout).unwrap()).unwrap();
