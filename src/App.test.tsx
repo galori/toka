@@ -2293,6 +2293,16 @@ test("the open picker swallows other player shortcuts and Shift+F toggles it", a
   expect(screen.queryByRole("group", { name: "Favorite level" })).toBeNull();
 });
 
+test("the open picker ignores Alt digits, which seek elsewhere", async () => {
+  await playWithTags([]);
+  fireEvent.keyDown(window, { key: "F", shiftKey: true });
+  expect(screen.getByRole("group", { name: "Favorite level" })).toBeVisible();
+  invokeMock.mockClear();
+  fireEvent.keyDown(window, { key: "1", altKey: true });
+  expect(invokeMock).not.toHaveBeenCalled();
+  expect(screen.getByRole("group", { name: "Favorite level" })).toBeVisible();
+});
+
 test("shows an error when the favorite cannot be saved", async () => {
   const user = await playWithTags([]);
   invokeMock.mockRejectedValueOnce(new Error("disk full"));
@@ -3407,6 +3417,53 @@ test("refreshes the current video when a late folder rename moved it", async () 
     screen.getByDisplayValue("/Videos/Trip [beach]/clip-b.mp4"),
   ).toBeVisible();
   expect(preparations).toBe(3);
+});
+
+test("a seek made while preparing does not freeze the clock", async () => {
+  let answerPrepare!: (value: { filePath: string }) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "clip",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "video-1", fileName: "clip.mp4", extension: "mp4" }],
+      });
+    if (command === "prepare_video")
+      return new Promise<{ filePath: string }>((resolve) => {
+        answerPrepare = resolve;
+      });
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "clip{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play clip.mp4" }),
+  );
+  await waitFor(() => expect(answerPrepare).toBeDefined());
+  expect(screen.getByText("Preparing video…")).toBeVisible();
+
+  // The engine does not exist yet, so the seek has nowhere to go.
+  fireEvent.keyDown(window, { key: "ArrowRight" });
+  await act(async () => {
+    answerPrepare({ filePath: "/Videos/clip.mp4" });
+  });
+  const video = await screen.findByLabelText("Playing clip.mp4");
+  Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+  Object.defineProperty(video, "currentTime", {
+    configurable: true,
+    writable: true,
+    value: 0,
+  });
+  fireEvent.loadedMetadata(video);
+  fireEvent.timeUpdate(video);
+
+  // The clock follows the engine from its start instead of holding the
+  // position the early seek named.
+  expect(screen.getByText("0:00 / 2:00")).toBeVisible();
 });
 
 test("keeps a seek made while the retag refresh is loading", async () => {
@@ -9201,8 +9258,10 @@ test("pauses and steps an approximate web frame on the first press", async () =>
 
 test("uses mpv frame-step commands and native OSD feedback", async () => {
   let nativeTime = 20;
+  let reportNullTime = false;
   invokeMock.mockImplementation((command: string, args?: unknown) => {
     if (command === "step_native_video") {
+      if (reportNullTime) return Promise.resolve(null);
       nativeTime += (args as { forward: boolean }).forward ? 1 / 25 : -1 / 25;
       return Promise.resolve(nativeTime);
     }
@@ -9273,12 +9332,21 @@ test("uses mpv frame-step commands and native OSD feedback", async () => {
     screen.getByRole("button", { name: /Step forward one frame/ }),
   );
   await waitFor(() => expect(steps().at(-1)).toBe(true));
+
+  // When mpv cannot report where the step landed, the feedback falls back to
+  // the estimate and says so instead of presenting a guess as measured.
+  reportNullTime = true;
+  fireEvent.keyDown(window, { key: "." });
+  await waitFor(() =>
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "+1 frame (approx.) · 0:20",
+    ),
+  );
 });
 
-test("adds rapid native arrow seeks while backend position polling is stale", async () => {
-  const nativeTime = 1000;
-  invokeMock.mockImplementation((command: string, args?: unknown) => {
-    if (command === "search_videos")
+test("a failed native OSD message leaves playback running", async () => {
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
       return Promise.resolve({
         query: "native",
         page: 1,
@@ -9287,21 +9355,25 @@ test("adds rapid native arrow seeks while backend position polling is stale", as
         totalPages: 1,
         results: [{ id: "video-1", fileName: "native.mkv", extension: "mkv" }],
       });
-    if (command === "prepare_video")
+    }
+    if (command === "prepare_video") {
       return Promise.resolve({
         filePath: "/Videos/native.mkv",
         playbackBackend: "native",
         subtitles: [],
       });
+    }
     if (command === "native_video_rotation") return Promise.resolve(0);
-    if (command === "native_playback_state")
+    if (command === "native_playback_state") {
       return Promise.resolve({
-        duration: 3600,
-        currentTime: nativeTime,
+        duration: 120,
+        currentTime: 20,
         paused: false,
         ended: false,
       });
-    if (command === "seek_native_video") return Promise.resolve();
+    }
+    if (command === "show_native_video_text")
+      return Promise.reject(new Error("OSD unavailable"));
     return Promise.resolve();
   });
   const user = userEvent.setup();
@@ -9312,16 +9384,103 @@ test("adds rapid native arrow seeks while backend position polling is stale", as
   );
   await screen.findByLabelText("Playing native.mkv");
   await waitFor(() =>
-    expect(screen.getByText("16:40 / 1:00:00")).toBeVisible(),
+    expect(invokeMock).toHaveBeenCalledWith("native_playback_state"),
   );
 
-  fireEvent.keyDown(window, { key: "ArrowRight" });
-  fireEvent.keyDown(window, { key: "ArrowRight" });
-  const seeks = invokeMock.mock.calls
-    .filter(([command]) => command === "seek_native_video")
-    .map(([, args]) => (args as { seconds: number }).seconds);
-  expect(seeks).toEqual([1005, 1010]);
-  expect(screen.getByRole("status")).toHaveTextContent("+5s · 16:50");
+  fireEvent.keyDown(window, { key: "j" });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith(
+      "show_native_video_text",
+      expect.anything(),
+    ),
+  );
+  expect(await screen.findByLabelText("Playing native.mkv")).toBeVisible();
+  expect(screen.queryByText("This video could not be played")).toBeNull();
+});
+
+test("adds rapid native arrow seeks while backend position polling is stale", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    let nativeTime = 1000;
+    const releaseSeeks: Array<() => void> = [];
+    invokeMock.mockImplementation((command: string, args?: unknown) => {
+      if (command === "search_videos")
+        return Promise.resolve({
+          query: "native",
+          page: 1,
+          pageSize: 24,
+          totalResults: 1,
+          totalPages: 1,
+          results: [
+            { id: "video-1", fileName: "native.mkv", extension: "mkv" },
+          ],
+        });
+      if (command === "prepare_video")
+        return Promise.resolve({
+          filePath: "/Videos/native.mkv",
+          playbackBackend: "native",
+          subtitles: [],
+        });
+      if (command === "native_video_rotation") return Promise.resolve(0);
+      if (command === "native_playback_state")
+        return Promise.resolve({
+          duration: 3600,
+          currentTime: nativeTime,
+          paused: false,
+          ended: false,
+        });
+      if (command === "seek_native_video") {
+        const seconds = (args as { seconds: number }).seconds;
+        return new Promise<void>((resolve) => {
+          releaseSeeks.push(() => {
+            nativeTime = seconds;
+            resolve();
+          });
+        });
+      }
+      return Promise.resolve();
+    });
+    const polls = () =>
+      invokeMock.mock.calls.filter(
+        ([command]) => command === "native_playback_state",
+      ).length;
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    render(<App />);
+    await user.type(screen.getByRole("searchbox"), "native{Enter}");
+    await user.click(
+      await screen.findByRole("button", { name: "Play native.mkv" }),
+    );
+    await screen.findByLabelText("Playing native.mkv");
+    await waitFor(() =>
+      expect(screen.getByText("16:40 / 1:00:00")).toBeVisible(),
+    );
+
+    // A poll in flight when the first seek resolves reports the old position
+    // afterwards, and must not drag the request back.
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    const pollsBefore = polls();
+    vi.advanceTimersByTime(300);
+    releaseSeeks.splice(0).forEach((release) => release());
+    await act(async () => {});
+    expect(polls()).toBeGreaterThan(pollsBefore);
+    expect(screen.getByText("16:45 / 1:00:00")).toBeVisible();
+
+    // The second press builds on the first while its own poll is still stale.
+    fireEvent.keyDown(window, { key: "ArrowRight" });
+    vi.advanceTimersByTime(300);
+    await act(async () => {});
+    expect(screen.getByText("16:50 / 1:00:00")).toBeVisible();
+    releaseSeeks.splice(0).forEach((release) => release());
+    await act(async () => {});
+
+    const seeks = invokeMock.mock.calls
+      .filter(([command]) => command === "seek_native_video")
+      .map(([, args]) => (args as { seconds: number }).seconds);
+    expect(seeks).toEqual([1005, 1010]);
+    expect(screen.getByRole("status")).toHaveTextContent("+5s · 16:50");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("plays the playlist Toka was launched with and leaves it to come back to", async () => {
@@ -10093,4 +10252,134 @@ test("a pause that lands as a looped native video ends is not undone by the rest
     paused: false,
   });
   expect(screen.getByRole("button", { name: "Play" })).toBeVisible();
+});
+
+test("a scrub during a loop restart seek still resumes native playback", async () => {
+  let ended = false;
+  const releaseSeeks: Array<() => void> = [];
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [{ id: "native-1", fileName: "native.mp4", extension: "mp4" }],
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/native.mp4",
+        playbackBackend: "native",
+      });
+    }
+    if (command === "seek_native_video") {
+      return new Promise<void>((resolve) => {
+        releaseSeeks.push(() => resolve());
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 2,
+        currentTime: 2,
+        paused: false,
+        ended,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play native.mp4" }),
+  );
+  await screen.findByLabelText("Playing native.mp4");
+  fireEvent.keyDown(window, { key: "l" });
+  expect(loopControl()).toHaveAccessibleName("Loop: this video");
+  invokeMock.mockClear();
+
+  ended = true;
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("seek_native_video", {
+      seconds: 0,
+    }),
+  );
+  ended = false;
+  // The scrub supersedes the restart's position, not its intent to play.
+  fireEvent.change(screen.getByRole("slider", { name: "Video timeline" }), {
+    target: { value: "1" },
+  });
+  await act(async () => {
+    releaseSeeks.forEach((release) => release());
+  });
+
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("set_native_paused", {
+      paused: false,
+    }),
+  );
+  expect(screen.getByRole("button", { name: "Pause" })).toBeVisible();
+});
+
+test("a native frame step rejected after a file change fails nothing", async () => {
+  let rejectStep!: (reason: unknown) => void;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "search_videos") {
+      return Promise.resolve({
+        query: "native",
+        page: 1,
+        pageSize: 24,
+        totalResults: 2,
+        totalPages: 1,
+        results: [1, 2].map((number) => ({
+          id: `video-${number}`,
+          fileName: `clip-${number}.mkv`,
+          extension: "mkv",
+        })),
+      });
+    }
+    if (command === "prepare_video") {
+      return Promise.resolve({
+        filePath: "/Videos/clip.mkv",
+        playbackBackend: "native",
+        subtitles: [],
+      });
+    }
+    if (command === "step_native_video") {
+      return new Promise<number>((_resolve, reject) => {
+        rejectStep = reject;
+      });
+    }
+    if (command === "native_playback_state") {
+      return Promise.resolve({
+        duration: 120,
+        currentTime: 20,
+        paused: false,
+        ended: false,
+      });
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "native{Enter}");
+  await user.click(await screen.findByRole("button", { name: "Play all" }));
+  await screen.findByLabelText("Playing clip-1.mkv");
+
+  fireEvent.keyDown(window, { key: "." });
+  await waitFor(() =>
+    expect(invokeMock).toHaveBeenCalledWith("step_native_video", {
+      forward: true,
+    }),
+  );
+  fireEvent.keyDown(window, { key: "PageDown" });
+  await screen.findByLabelText("Playing clip-2.mkv");
+  await act(async () => {
+    rejectStep(new Error("mpv closed the file"));
+  });
+
+  expect(await screen.findByLabelText("Playing clip-2.mkv")).toBeVisible();
+  expect(screen.queryByText("This video could not be played")).toBeNull();
 });

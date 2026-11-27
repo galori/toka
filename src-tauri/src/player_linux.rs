@@ -1190,7 +1190,10 @@ pub fn seek(player: &NativePlayer, seconds: f64) -> Result<(), String> {
 }
 
 /// Advances or reverses one decoded frame and returns mpv's resulting time.
-pub fn step_frame(player: &NativePlayer, forward: bool) -> Result<f64, String> {
+/// The command call is synchronous, so the read below observes the frame the
+/// player stepped to; when the property itself is unavailable the caller
+/// falls back to its estimate and says so.
+pub fn step_frame(player: &NativePlayer, forward: bool) -> Result<Option<f64>, String> {
     player.with_mpv(|mpv| {
         let command = if forward {
             "frame-step"
@@ -1198,7 +1201,7 @@ pub fn step_frame(player: &NativePlayer, forward: bool) -> Result<f64, String> {
             "frame-back-step"
         };
         mpv.command(&[command])?;
-        Ok(mpv.get_double("time-pos").unwrap_or(0.0))
+        Ok(mpv.get_double("time-pos").ok())
     })
 }
 

@@ -1569,6 +1569,10 @@ function Player({
   const pendingSeek = useRef<
     { target: number; direction: -1 | 1; tolerance: number } | undefined
   >(undefined);
+  // A new native session's first position report is its engine starting up,
+  // so it is accepted unconditionally: a seek made while the file was still
+  // preparing named a position in an engine that did not exist yet.
+  const nativeSessionSynced = useRef(true);
   const playbackPositionGeneration = useRef(0);
   const nativeSeekGeneration = useRef(0);
   const frameStepGeneration = useRef(0);
@@ -2064,6 +2068,7 @@ function Player({
     setCurrentTime(0);
     seekPosition.current = 0;
     pendingSeek.current = undefined;
+    nativeSessionSynced.current = false;
     playbackPositionGeneration.current += 1;
     nativeSeekGeneration.current += 1;
     frameStepGeneration.current += 1;
@@ -2277,7 +2282,11 @@ function Player({
         .then((state) => {
           if (generation !== playbackPositionGeneration.current) return;
           setDuration(state.duration);
-          reportPlaybackPosition(state.currentTime);
+          reportPlaybackPosition(
+            state.currentTime,
+            !nativeSessionSynced.current,
+          );
+          nativeSessionSynced.current = true;
           if (!state.ended) advancing = false;
           if (state.ended && !advancing && !pausedByViewer.current) {
             advancing = true;
@@ -2543,22 +2552,29 @@ function Player({
     seekPosition.current = target;
     if (native) {
       const generation = ++nativeSeekGeneration.current;
+      const restartedVideo = currentVideoId.current;
+      // A scrub that lands while the restart seek is in flight moves the
+      // position but keeps the loop's intent to play, so the resume below is
+      // cancelled only by a pause or a move to another video — not by a
+      // newer seek the way the pending position above is.
+      const resumeCancelled = () =>
+        currentVideoId.current !== restartedVideo || pausedByViewer.current;
       playbackPositionGeneration.current += 1;
       void seekNativeVideo(target)
         .then(() => {
-          if (generation !== nativeSeekGeneration.current) return;
-          playbackPositionGeneration.current += 1;
-          pendingSeek.current = undefined;
-          if (!pausedByViewer.current) return setNativePaused(false);
+          if (generation === nativeSeekGeneration.current) {
+            playbackPositionGeneration.current += 1;
+            pendingSeek.current = undefined;
+          }
+          if (!resumeCancelled()) return setNativePaused(false);
         })
         .then(() => {
-          if (
-            generation === nativeSeekGeneration.current &&
-            !pausedByViewer.current
-          )
-            setPlayingBack(true);
+          if (!resumeCancelled()) setPlayingBack(true);
         })
-        .catch((reason: unknown) => setError(errorMessage(reason)));
+        .catch((reason: unknown) => {
+          if (generation !== nativeSeekGeneration.current) return;
+          setError(errorMessage(reason));
+        });
     } else if (element.current) {
       element.current.currentTime = target;
       play();
@@ -2680,10 +2696,9 @@ function Player({
     if (seekOverlayTimeout.current !== undefined)
       window.clearTimeout(seekOverlayTimeout.current);
     setSeekOverlay(overlay);
-    if (native)
-      void showNativeVideoText(overlay.text, delay).catch((reason: unknown) =>
-        setError(errorMessage(reason)),
-      );
+    // Feedback text is cosmetic: a failure to show it must not stop the
+    // video the way a failed seek does.
+    if (native) void showNativeVideoText(overlay.text, delay).catch(() => {});
     seekOverlayTimeout.current = window.setTimeout(() => {
       seekOverlayTimeout.current = undefined;
       setSeekOverlay(undefined);
@@ -2721,7 +2736,12 @@ function Player({
           playbackPositionGeneration.current += 1;
           pendingSeek.current = undefined;
         })
-        .catch((reason: unknown) => setError(errorMessage(reason)));
+        .catch((reason: unknown) => {
+          // A seek superseded by a newer one, or left behind by a move to
+          // another video, must not fail the playback that replaced it.
+          if (generation !== nativeSeekGeneration.current) return;
+          setError(errorMessage(reason));
+        });
     } else if (element.current) element.current.currentTime = target;
     setCurrentTime(target);
     noteSeek(target);
@@ -2799,7 +2819,8 @@ function Player({
           )
             return;
           playbackPositionGeneration.current += 1;
-          const measured = Number.isFinite(actual);
+          const measured =
+            typeof actual === "number" && Number.isFinite(actual);
           const reached = measured ? clampSeekPosition(actual) : estimated;
           const fromPosition = seekPosition.current;
           seekPosition.current = reached;
@@ -2822,7 +2843,12 @@ function Player({
             SEEK_FEEDBACK_DURATION,
           );
         })
-        .catch((reason: unknown) => setError(errorMessage(reason)));
+        .catch((reason: unknown) => {
+          // A step left behind by a move to another video must not fail the
+          // file that replaced it.
+          if (generation !== frameStepGeneration.current) return;
+          setError(errorMessage(reason));
+        });
       return;
     }
 
@@ -3415,8 +3441,14 @@ function Player({
     const onKeyDown = (event: KeyboardEvent) => {
       if (helpOpen) return;
       const target = event.target;
+      // Alt video arrows are handled below; every other Alt combination keeps
+      // the old behavior of being ignored, so the gates between here and
+      // there say no to Alt before matching their own keys.
       const addonShortcut =
-        event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "a";
+        event.ctrlKey &&
+        event.shiftKey &&
+        !event.altKey &&
+        event.key.toLowerCase() === "a";
       if (
         event.defaultPrevented ||
         (event.ctrlKey &&
@@ -3456,10 +3488,12 @@ function Player({
         return;
       }
       if (addonOpen) {
+        if (event.altKey) return;
         if (event.key === "Escape") run(() => closeAddonMenu(true));
         return;
       }
       if (pickingFavorite) {
+        if (event.altKey) return;
         const current = favoriteLevel(video.tags ?? []);
         if (event.shiftKey && event.key.toLowerCase() === "f") {
           run(toggleFavoritePicker);
@@ -3480,6 +3514,7 @@ function Player({
         return;
       }
       if (pickingQuickTag) {
+        if (event.altKey) return;
         const index = QUICK_TAG_KEYS.indexOf(event.key);
         if (event.key.toLowerCase() === "y" && !event.shiftKey) {
           run(toggleQuickTags);
@@ -3492,6 +3527,7 @@ function Player({
         return;
       }
       if (addingTag || addingFolderTag) {
+        if (event.altKey) return;
         if (event.key === "Escape")
           run(() => {
             setAddingTag(false);
@@ -3910,6 +3946,11 @@ function Player({
                 };
                 media.currentTime = resume.time;
               }
+              // A seek made while this source was still preparing named a
+              // position in an engine that did not exist yet, so the clock it
+              // starts from wins and any such target is dropped.
+              seekPosition.current = media.currentTime;
+              pendingSeek.current = undefined;
               if (pausedByViewer.current) {
                 media.pause();
                 setPlayingBack(false);

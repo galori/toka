@@ -1403,7 +1403,7 @@ fn seek_native_video(
 fn step_native_video(
     forward: bool,
     player: State<'_, Arc<player_linux::NativePlayer>>,
-) -> Result<f64, CommandError> {
+) -> Result<Option<f64>, CommandError> {
     player_linux::step_frame(player.inner(), forward).map_err(playback_error)
 }
 

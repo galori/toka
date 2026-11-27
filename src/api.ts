@@ -368,7 +368,7 @@ export function seekNativeVideo(seconds: number): Promise<void> {
   return invoke("seek_native_video", { seconds });
 }
 
-export function stepNativeVideo(forward: boolean): Promise<number> {
+export function stepNativeVideo(forward: boolean): Promise<number | null> {
   return invoke("step_native_video", { forward });
 }
 
