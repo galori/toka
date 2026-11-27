@@ -28,7 +28,7 @@ import App, {
 import "./styles.css";
 
 const SEARCH_DATE_HELP_DESCRIPTION =
-  'Limit terms by field, size, or date: created:today, modified:yesterday, ranges like modified:2025-01-01..2025-12-31, or quoted windows like created:">= 1 day ago"';
+  'Limit terms by field, size, or date: created:today, modified:yesterday, ranges like modified:2026-01-01..2026-12-31, or quoted windows like created:">= 1 day ago"';
 
 const windowApiMock = vi.hoisted(() => ({
   close: vi.fn(),
