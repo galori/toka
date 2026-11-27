@@ -1293,6 +1293,10 @@ function Player({
   const sidecarTracks = useRef<TextTrack[]>([]);
   const [index, setIndex] = useState(startIndex);
   const [prepared, setPrepared] = useState<PreparedVideo>();
+  // The path the player last prepared, mirrored synchronously so a tag
+  // refresh can tell a rename from a no-op even while the re-render for
+  // an earlier refresh is still queued.
+  const preparedPath = useRef<string | undefined>(undefined);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [error, setError] = useState<string>();
@@ -1380,20 +1384,24 @@ function Player({
   useLayoutEffect(() => {
     addonVideoGeneration.current += 1;
   }, [video.id]);
-  // Numbers each video so a tag refresh that finishes late cannot put an
-  // old video's path under the one now playing.
-  const videoGeneration = useRef(0);
+  // The video on screen right now, read live so a tag refresh started for
+  // an older video — its tag command answered after the viewer moved on —
+  // never touches the new video's display.
+  const currentVideoId = useRef(video.id);
   useLayoutEffect(() => {
-    videoGeneration.current += 1;
+    currentVideoId.current = video.id;
   }, [video.id]);
   // Numbers each tag refresh so two retags in flight cannot apply out of
   // order: only the latest one may move the displayed path.
   const retagRefresh = useRef(0);
   // Where web playback was when a retag swapped the source underneath it:
   // the engine starts the new file at the beginning, so the metadata
-  // handler puts the viewer back here — paused or playing as they were.
+  // handler puts the viewer back here. The record outlives that event for
+  // a retag that lands while a previous swap is still loading — that one
+  // carries the position forward instead of sampling the reset clock —
+  // and a new video clears it outright.
   const resumeAfterRetag = useRef<
-    { time: number; paused: boolean } | undefined
+    { time: number; pending: boolean } | undefined
   >(undefined);
   const focusAddonButton = useCallback(() => {
     const button = addonMenuWrap.current?.firstElementChild;
@@ -1618,28 +1626,37 @@ function Player({
   // engine reloads the new source, so it resumes where the rename found it.
   const refreshPreparedAfterRetag = async () => {
     const id = video.id;
-    const generation = videoGeneration.current;
+    // A tag command that answered after the viewer moved on still updates
+    // its own video's tags — but the display belongs to the new video now.
+    if (currentVideoId.current !== id) return;
     retagRefresh.current += 1;
     const refresh = retagRefresh.current;
     // Read now, while the render's values are the video's own: by the time
-    // the re-read answers, the player may have moved on.
+    // the re-read answers, the player may have moved on. While a previous
+    // swap is still loading, the element's clock is the new source's reset
+    // one rather than the viewer's position, so the pending resume carries
+    // forward instead of being sampled again.
+    const pending = resumeAfterRetag.current;
     const resume =
       !isImage && prepared?.playbackBackend !== "native"
         ? {
-            time: element.current?.currentTime ?? currentTime,
-            paused: !playingBack,
+            time:
+              pending?.pending === true
+                ? pending.time
+                : (element.current?.currentTime ?? currentTime),
           }
         : undefined;
     try {
       const next = await prepareVideo(id);
       // A newer refresh, or a newer video, owns the display now — and the
       // resume, which is only ever stored alongside the path it belongs to.
-      if (
-        videoGeneration.current !== generation ||
-        refresh !== retagRefresh.current
-      )
+      if (currentVideoId.current !== id || refresh !== retagRefresh.current)
         return;
-      if (resume) resumeAfterRetag.current = resume;
+      // A tag the name already carried renames nothing: the source stays,
+      // so there is no new beginning to resume from.
+      if (next.filePath === preparedPath.current) return;
+      preparedPath.current = next.filePath;
+      if (resume) resumeAfterRetag.current = { ...resume, pending: true };
       setPrepared(next);
     } catch {
       // The tags themselves were saved; only the displayed path stays
@@ -1690,6 +1707,7 @@ function Player({
     let active = true;
     let nativeActive = false;
     setPrepared(undefined);
+    preparedPath.current = undefined;
     setDuration(0);
     setCurrentTime(0);
     imageElapsed.current = 0;
@@ -1737,6 +1755,7 @@ function Player({
         }
         if (active) {
           setPrepared(result);
+          preparedPath.current = result.filePath;
           if (isImage) {
             imageElapsed.current = 0;
             setCurrentTime(0);
@@ -3159,18 +3178,22 @@ function Player({
               media.volume = volume / 100;
               // A retag swaps the source under the playing video, and the
               // engine starts the new file at the beginning — so the player
-              // puts the viewer back where the rename found them, paused or
-              // playing as they were.
+              // puts the viewer back where the rename found them. The record
+              // stays for a retag that lands while this swap is still
+              // loading, which carries it forward; a new video clears it.
+              // Whether playback resumes follows the viewer's latest intent,
+              // not the state the retag found, which a pause or resume since
+              // has overruled.
               const resume = resumeAfterRetag.current;
-              resumeAfterRetag.current = undefined;
               if (resume) {
+                resumeAfterRetag.current = { ...resume, pending: false };
                 media.currentTime = resume.time;
                 setCurrentTime(resume.time);
-                if (resume.paused) {
-                  pausedByViewer.current = true;
-                  setPlayingBack(false);
-                  return;
-                }
+              }
+              if (pausedByViewer.current) {
+                media.pause();
+                setPlayingBack(false);
+                return;
               }
               play();
             }}
