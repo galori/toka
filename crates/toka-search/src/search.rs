@@ -701,7 +701,7 @@ impl SearchEngine {
                 saved.query == query
                     && saved.fields == request.fields
                     && saved.media_type == request.media_type
-                    && saved.sort == request.sort
+                    && same_sort(saved.sort, request.sort)
             })
             .cloned()
             .ok_or(SearchError::SearchExpired)?;
@@ -1104,6 +1104,15 @@ fn next_random(state: &mut u64) -> u64 {
     drawn = (drawn ^ (drawn >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     drawn = (drawn ^ (drawn >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     drawn ^ (drawn >> 31)
+}
+
+/// Whether two sorts order a search the same way. A shuffle answers to no
+/// direction, so its ascending and descending are the same order — and an
+/// add-on launch snapshotted under the Rust default still matches the
+/// later pages the frontend asks for under its own.
+fn same_sort(left: SearchSort, right: SearchSort) -> bool {
+    left.field == right.field
+        && (left.field == SortField::Shuffle || left.direction == right.direction)
 }
 
 /// Puts a search's matches in the order the viewer asked for. Shuffling is
@@ -2831,11 +2840,35 @@ mod tests {
         assert_eq!(explicit.sort.direction, SortDirection::Desc);
     }
 
-    /// A later page belongs to the order the first page set. Asking for it
-    /// in a different order restarts from page one rather than mixing two
-    /// orders on one screen.
+    /// A shuffle answers to no direction: a later page of one stays valid
+    /// whichever direction it names — including across the Rust and
+    /// frontend defaults, which need never agree.
     #[test]
-    fn a_later_page_in_a_different_sort_restarts_from_page_one() {
+    fn later_pages_of_a_shuffle_ignore_the_direction() {
+        let directory = tempdir().unwrap();
+        let paths = clips(directory.path(), 30);
+        let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));
+        let first = engine
+            .search(sorted("clip", SortField::Shuffle, SortDirection::Asc))
+            .unwrap();
+        let mut next_request = page_two("clip");
+        next_request.search_id = Some(first.search_id.clone());
+        next_request.sort = SearchSort {
+            field: SortField::Shuffle,
+            direction: SortDirection::Desc,
+        };
+
+        let second = engine.search(next_request).unwrap();
+
+        assert_eq!(second.search_id, first.search_id);
+        assert_eq!(second.total_results, 30);
+    }
+
+    /// A later page belongs to the order the first page set. Asking for it
+    /// in a different order is refused rather than mixing two orders on
+    /// one screen; the caller starts the search again from page one.
+    #[test]
+    fn a_later_page_in_a_different_sort_tells_the_caller_to_restart_from_page_one() {
         let directory = tempdir().unwrap();
         let paths = clips(directory.path(), 30);
         let engine = SearchEngine::new(Arc::new(FakeProvider::new(paths)));

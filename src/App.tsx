@@ -4014,6 +4014,20 @@ export default function App() {
     setSortField(next.value);
   };
 
+  // Shuffling an ordered search returns it to a shuffled search: the whole
+  // set is dealt again rather than only the page on screen. An
+  // already-shuffled search, or a launched folder that was never searched,
+  // just re-deals the page it shows.
+  const shuffleResults = () => {
+    if (searchedQuery.current && sort.field !== "shuffle") {
+      setSortField("shuffle");
+      return;
+    }
+    setPage((current) =>
+      current ? { ...current, results: shuffleVideos(current.results) } : current,
+    );
+  };
+
   // Turns the order around: A to Z becomes Z to A, newest first becomes
   // oldest first. Shuffling answers to no direction, so the shortcut and
   // the disabled toggle both leave it alone.
@@ -5048,13 +5062,7 @@ export default function App() {
                 shortcut="R"
                 className="playlist-button"
                 aria-label="Shuffle results"
-                onClick={() =>
-                  setPage((current) =>
-                    current
-                      ? { ...current, results: shuffleVideos(current.results) }
-                      : current,
-                  )
-                }
+                onClick={shuffleResults}
               >
                 <Label>Shuffle</Label>
               </ControlButton>

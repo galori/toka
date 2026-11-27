@@ -981,6 +981,80 @@ test("cycles what results are sorted by from its keyboard shortcut", async () =>
   );
 });
 
+test("shuffling an ordered search returns it to a shuffled search", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "Sort results" }),
+    "name",
+  );
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "name", direction: "asc" }),
+  );
+
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  // The whole search is dealt again rather than only the page on screen.
+  // The direction the name order used is kept, and ignored while shuffling.
+  await waitFor(() =>
+    expect(lastSearchSort()).toEqual({ field: "shuffle", direction: "asc" }),
+  );
+  expect(screen.getByRole("combobox", { name: "Sort results" })).toHaveValue(
+    "shuffle",
+  );
+});
+
+test("shuffling a shuffled search re-deals the page on screen", async () => {
+  invokeMock.mockResolvedValue(twoResultPage("holiday"));
+  const user = userEvent.setup();
+  render(<App />);
+  await user.type(screen.getByRole("searchbox"), "holiday{Enter}");
+  expect(await screen.findByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  invokeMock.mockClear();
+
+  randomMock.mockReturnValueOnce(0);
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  expect(
+    screen
+      .getAllByRole("button", { name: /^Play .*\.mp4$/ })
+      .map((tile) => tile.getAttribute("aria-label")),
+  ).toEqual(["Play a.mp4", "Play b.mp4"]);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
+});
+
+test("shuffling a launched folder re-deals its page", async () => {
+  launchIntentMock.mockResolvedValue({ page: twoResultPage("folder") });
+  invokeMock.mockResolvedValue({ filePath: "/Videos/b.mp4" });
+  const user = userEvent.setup();
+  render(<App />);
+
+  expect(await screen.findByLabelText("Playing b.mp4")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Back to results" }));
+  expect(screen.getByRole("button", { name: "Play b.mp4" })).toBeVisible();
+  invokeMock.mockClear();
+
+  randomMock.mockReturnValueOnce(0);
+  await user.click(screen.getByRole("button", { name: "Shuffle results" }));
+
+  expect(
+    screen
+      .getAllByRole("button", { name: /^Play .*\.mp4$/ })
+      .map((tile) => tile.getAttribute("aria-label")),
+  ).toEqual(["Play a.mp4", "Play b.mp4"]);
+  expect(invokeMock).not.toHaveBeenCalledWith(
+    "search_videos",
+    expect.anything(),
+  );
+});
+
 test("searches again as soon as the parts being searched change", async () => {
   invokeMock.mockResolvedValue(searchPage("holiday"));
   const user = userEvent.setup();
