@@ -167,6 +167,24 @@ async function build(flags) {
 
 // --------------------------------------------------------------- launch
 
+/**
+ * Puts this platform's service-manager shims first on PATH: systemctl and
+ * loginctl on Linux, launchctl on macOS (where `ts install` uses launchd).
+ */
+function writeShims(paths) {
+  const shims =
+    process.platform === "darwin"
+      ? [[paths.launchctlShim, launchctlShimScript(paths)]]
+      : [
+          [paths.shim, shimScript(paths)],
+          [paths.loginctlShim, loginctlShimScript()],
+        ];
+  for (const [file, script] of shims) {
+    writeFileSync(file, script);
+    chmodSync(file, 0o755);
+  }
+}
+
 function prepareHome(paths, flags) {
   for (const directory of [
     paths.config,
@@ -178,15 +196,7 @@ function prepareHome(paths, flags) {
   ]) {
     mkdirSync(directory, { recursive: true });
   }
-  if (process.platform === "linux") {
-    writeFileSync(paths.shim, shimScript(paths));
-    chmodSync(paths.shim, 0o755);
-    writeFileSync(paths.loginctlShim, loginctlShimScript());
-    chmodSync(paths.loginctlShim, 0o755);
-  } else if (process.platform === "darwin") {
-    writeFileSync(paths.launchctlShim, launchctlShimScript(paths));
-    chmodSync(paths.launchctlShim, 0o755);
-  }
+  writeShims(paths);
   if (flags["no-seed"] || existsSync(paths.indexFolders)) return;
   const source = path.resolve(
     paths.worktree,
@@ -269,12 +279,17 @@ async function launch(flags) {
       env: { ...process.env, TOKA_ISOLATED_SUPERVISOR: "1" },
     });
     supervisor.unref();
+    // Our own child: its exit event says it is gone, with no PID lookup.
+    let supervisorExited = false;
+    supervisor.on("exit", () => {
+      supervisorExited = true;
+    });
     for (let waited = 0; waited < 15000; waited += 100) {
       if (describeRun(paths).appRunning) {
         report(describeRun(paths));
         return;
       }
-      if (!isSupervisorOf(supervisor.pid, scriptPath)) break;
+      if (supervisorExited) break;
       await sleepMs(100);
     }
     killGroup(supervisor.pid, "SIGTERM");
@@ -432,15 +447,7 @@ function printEnv(flags) {
   const paths = isolatedPaths(targetWorktree(flags));
   mkdirSync(paths.shimDir, { recursive: true });
   mkdirSync(paths.runDir, { recursive: true });
-  if (process.platform === "linux") {
-    writeFileSync(paths.shim, shimScript(paths));
-    chmodSync(paths.shim, 0o755);
-    writeFileSync(paths.loginctlShim, loginctlShimScript());
-    chmodSync(paths.loginctlShim, 0o755);
-  } else if (process.platform === "darwin") {
-    writeFileSync(paths.launchctlShim, launchctlShimScript(paths));
-    chmodSync(paths.launchctlShim, 0o755);
-  }
+  writeShims(paths);
   const env = isolatedEnv(paths, {});
   mkdirSync(paths.tmp, { recursive: true });
   const quoted = (value) => `'${value.replaceAll("'", "'\\''")}'`;

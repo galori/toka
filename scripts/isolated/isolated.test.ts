@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmod,
   mkdir,
@@ -174,45 +174,38 @@ describe("shimScript and seedConfig", () => {
     }
   });
 
-  it("launchctl shim reports agent as running and no-ops bootout/bootstrap", async () => {
+  it("launchctl shim logs, reports the agent running, and never signals a PID that is not the isolated indexer", async () => {
     await mkdir(path.resolve(".scratch"), { recursive: true });
     const dir = await mkdtemp(path.resolve(".scratch/launchctl-test-"));
+    // An unrelated process whose PID a stale pid file names.
+    const bystander = spawn("sleep", ["30"], { detached: true });
     try {
       const pidFile = path.join(dir, "indexer.pid");
-      const logFile = path.join(dir, "launchctl-shim.log");
-      const fakeTs = path.join(dir, "ts");
-      // A stand-in ts that just records it was called.
-      const called = path.join(dir, "ts-called");
-      await writeFile(
-        fakeTs,
-        `#!/bin/sh\ntouch ${called}\nsleep 60 &\necho $! > ${pidFile}\n`,
-      );
-      await chmod(fakeTs, 0o755);
+      const log = path.join(dir, "it's.log");
+      await writeFile(pidFile, `${bystander.pid}\n`);
       const shim = path.join(dir, "launchctl");
       await writeFile(
         shim,
         launchctlShimScript({
           ...isolatedPaths(dir, {}),
-          tsBinary: fakeTs,
           indexerPidFile: pidFile,
-          launchctlShimLog: logFile,
+          launchctlShimLog: log,
         }),
       );
       await chmod(shim, 0o755);
-      // print should report running
       const print = spawnSync(shim, ["print", "gui/501/app.toka.ts"], {
         encoding: "utf8",
       });
       expect(print.status).toBe(0);
       expect(print.stdout).toContain("state = running");
-      // bootout should succeed as a no-op when nothing is running
-      const bootout = spawnSync(shim, ["bootout", "gui/501"], {
-        encoding: "utf8",
-      });
+      const bootout = spawnSync(shim, ["bootout", "gui/501/app.toka.ts"]);
       expect(bootout.status).toBe(0);
-      // Log file should exist
-      await stat(logFile);
+      expect(() => process.kill(bystander.pid!, 0)).not.toThrow();
+      expect(await readFile(log, "utf8")).toContain(
+        "launchctl bootout gui/501/app.toka.ts",
+      );
     } finally {
+      bystander.kill("SIGKILL");
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -485,19 +478,32 @@ setInterval(() => {}, 1000);
       await expect(stat(home)).rejects.toThrow();
     }, 30000);
 
-    it("launchctl shim prevents ts install from managing the real launchd agent", async () => {
+    it("lets the app's launchctl bootout and bootstrap act on the isolated indexer only, and cleans up the respawned one", async () => {
       expect(run("launch", "--detach").status).toBe(0);
       const home = path.join(repo, ".scratch/isolated-home");
       const shim = path.join(home, "bin/launchctl");
+      const first = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
 
-      // The shim's print subcommand reports running so ts install short-circuits.
-      const print = spawnSync(shim, ["print", "gui/501/app.toka.ts"], {
-        encoding: "utf8",
+      spawnSync(shim, ["bootout", "gui/501/app.toka.ts"]);
+      await vi.waitFor(() => expect(() => process.kill(first, 0)).toThrow());
+
+      spawnSync(shim, ["bootstrap", "gui/501", "app.toka.ts.plist"], {
+        env: isolatedEnv(isolatedPaths(repo, env), env),
       });
-      expect(print.status).toBe(0);
-      expect(print.stdout).toContain("state = running");
+      const second = Number(
+        (await readFile(path.join(home, "run/indexer.pid"), "utf8")).trim(),
+      );
+      expect(second).not.toBe(first);
+      await vi.waitFor(() =>
+        expect(isIsolatedIndexerProcess(second, isolatedPaths(repo, env))).toBe(
+          true,
+        ),
+      );
 
       expect(run("stop").status).toBe(0);
+      await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
     }, 30000);
 
     it("refuses to launch when nothing has been built", () => {

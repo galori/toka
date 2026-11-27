@@ -203,6 +203,16 @@ export function launchctlShimScript(paths) {
 PIDFILE=${quote(paths.indexerPidFile)}
 printf '%s launchctl %s\\n' "$(date)" "$*" >> ${quote(paths.launchctlShimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
+# A stale pid file may name a recycled PID: only trust it if it is our indexer.
+if [ -n "$pid" ]; then
+  case "$(ps -p "$pid" -o args= 2>/dev/null)" in
+    ${quote(paths.tsBinary)}|${quote(paths.tsBinary)}" "*) ;;
+    *) pid= ;;
+  esac
+fi
+if [ -n "$pid" ] && ! printf ' %s ' "$(ps ewww -o command= -p "$pid" 2>/dev/null)" | grep -qF ${quote(` XDG_CONFIG_HOME=${paths.config} `)}; then
+  pid=
+fi
 case "$1" in
   print)
     # Report the agent as bootstrapped and running so ts install short-circuits.
@@ -222,7 +232,9 @@ case "$1" in
     ;;
   bootstrap|kickstart)
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-      ${quote(paths.tsBinary)} daemon run >> ${quote(paths.indexerLog)} 2>&1 &
+      # macOS has no setsid(1); perl's setpgrp makes the indexer its own
+      # group leader, so bootout and stop can signal its whole group.
+      /usr/bin/perl -e 'setpgrp(0, 0); exec @ARGV or die' ${quote(paths.tsBinary)} daemon run >> ${quote(paths.indexerLog)} 2>&1 </dev/null &
       echo $! > "$PIDFILE"
     fi
     ;;
@@ -283,19 +295,24 @@ export function isProcessOf(pid, binary, procRoot = "/proc") {
       return false;
     }
   }
-  // macOS: compare the full argv[0] from `ps -p <pid> -o args=`
-  // shortcut: `ps -o args=` truncates long paths at ~1024 chars; upgrade to
-  // sysctl proc_pidpathinfo if that ever becomes a problem.
-  try {
-    const result = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
-      encoding: "utf8",
-    });
-    if (result.status !== 0) return false;
-    const argv0 = result.stdout.trim().split(/\s+/)[0];
-    return argv0 === binary;
-  } catch {
-    return false;
-  }
+  // macOS: `ps -o args=` joins argv with spaces, so argv[0] cannot be split
+  // out of a path that has spaces; match the binary as a prefix instead.
+  // shortcut: a different binary named "<binary> <something>" would match;
+  // upgrade to sysctl KERN_PROCARGS2 through a native helper if that matters.
+  const commandLine = macCommandLine(pid);
+  return (
+    commandLine !== null &&
+    (commandLine === binary || commandLine.startsWith(`${binary} `))
+  );
+}
+
+/** `ps -p <pid> -o args=` on macOS, or null when ps fails or the pid is gone. */
+function macCommandLine(pid) {
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return null;
+  return result.stdout.trim();
 }
 
 /**
@@ -328,25 +345,19 @@ function isIsolatedBinary(pid, paths, binary, procRoot) {
       return false;
     }
   }
-  // macOS: read env via `ps ewww -p <pid>` (env appended after args, space-separated).
-  // shortcut: very long env strings may be truncated by ps; a production fix
-  // would use sysctl KERN_PROCARGS2 via a small native helper.
-  try {
-    const result = spawnSync("ps", ["ewww", "-p", String(pid)], {
-      encoding: "utf8",
-    });
-    if (result.status !== 0) return false;
-    // ps ewww output: header line, then `pid tt stat time command env...`
-    // The environment key=value pairs follow the command on the same line.
-    const line = result.stdout.split("\n").find((l) => {
-      const trimmed = l.trimStart();
-      return trimmed.startsWith(String(pid) + " ") || trimmed.startsWith(String(pid) + "\t");
-    });
-    if (!line) return false;
-    return line.includes(`XDG_CONFIG_HOME=${paths.config}`);
-  } catch {
-    return false;
-  }
+  // macOS: `ps ewww` prints the environment after the command line, each
+  // entry separated by a space. Padding both ends anchors the match, so a
+  // longer path that merely starts with this config path never counts.
+  // shortcut: ps joins entries with bare spaces, so another variable whose
+  // value contains " XDG_CONFIG_HOME=<config> " would also match; upgrade to
+  // sysctl KERN_PROCARGS2 through a native helper if that ever matters.
+  const result = spawnSync("ps", ["ewww", "-o", "command=", "-p", String(pid)], {
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) return false;
+  return ` ${result.stdout.trim()} `.includes(
+    ` XDG_CONFIG_HOME=${paths.config} `,
+  );
 }
 
 /** The live indexer PID: the pid file wins, since the shim may have respawned it. */
@@ -386,34 +397,13 @@ export function isSupervisorOf(pid, scriptPath, procRoot = "/proc") {
       return false;
     }
   }
-  // macOS: check liveness first; verify identity when ps is available.
-  // shortcut: if ps is unavailable, we fall back to a plain liveness check,
-  // which is weaker (a recycled PID looks alive), but safe for the supervisor
-  // polling loop — upgrade to sysctl KERN_PROCARGS2 if stricter checks needed.
-  try {
-    process.kill(pid, 0);
-  } catch {
-    return false; // process is gone
-  }
-  try {
-    const result = spawnSync("ps", ["-p", String(pid), "-o", "args="], {
-      encoding: "utf8",
-    });
-    if (result.error) {
-      // ps unavailable — we know the PID is alive; treat it as the supervisor.
-      return true;
-    }
-    if (result.status !== 0) return false;
-    const args = result.stdout.trim().split(/\s+/);
-    return args.some(
-      (part) =>
-        part.endsWith(".mjs") &&
-        (part === scriptPath || path.resolve(part) === scriptPath),
-    );
-  } catch {
-    // ps threw — PID is alive (checked above), treat as supervisor.
-    return true;
-  }
+  // macOS: the script path must appear whole in the command line. A
+  // supervisor always runs with the absolute path (launch re-execs itself
+  // with it).
+  // shortcut: a foreground launch started with a relative path is not
+  // recognised, so `stop` leaves that one to exit when its app stops.
+  const commandLine = macCommandLine(pid);
+  return commandLine !== null && ` ${commandLine} `.includes(` ${scriptPath} `);
 }
 
 export function readState(paths) {
