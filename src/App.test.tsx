@@ -2132,6 +2132,69 @@ test("keeps its place in the video when tagging renames the file", async () => {
   expect(renamed).toHaveProperty("currentTime", 20);
 });
 
+test("keeps the latest path when two retags refresh out of order", async () => {
+  let preparations = 0;
+  const pending: Array<(value: { filePath: string }) => void> = [];
+  invokeMock.mockImplementation((command: string, args?: unknown) => {
+    if (command === "search_videos")
+      return Promise.resolve({
+        query: "tagged",
+        page: 1,
+        pageSize: 24,
+        totalResults: 1,
+        totalPages: 1,
+        results: [
+          {
+            id: "video-1",
+            fileName: "tagged.mp4",
+            extension: "mp4",
+            tags: ["a", "b"],
+          },
+        ],
+      });
+    if (command === "prepare_video") {
+      preparations += 1;
+      if (preparations === 1)
+        return Promise.resolve({ filePath: "/Videos/tagged.mp4" });
+      return new Promise<{ filePath: string }>((resolve) => {
+        pending.push(resolve);
+      });
+    }
+    if (command === "remove_video_tags") {
+      const [tag] = (args as { tags: string[] }).tags;
+      return Promise.resolve(
+        tag === "a"
+          ? { fileName: "tagged [b].mp4", tags: ["b"] }
+          : { fileName: "tagged.mp4", tags: [] },
+      );
+    }
+    return Promise.resolve();
+  });
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.type(screen.getByRole("searchbox"), "tagged{Enter}");
+  await user.click(
+    await screen.findByRole("button", { name: "Play tagged.mp4" }),
+  );
+  await screen.findByLabelText("Playing tagged.mp4");
+  const removeA = screen.getByRole("button", { name: "Remove tag a" });
+  const removeB = screen.getByRole("button", { name: "Remove tag b" });
+
+  // Two removals before either refresh answers.
+  fireEvent.click(removeA);
+  fireEvent.click(removeB);
+  await waitFor(() => expect(pending).toHaveLength(2));
+
+  // The first refresh answers last, with the older path — the display
+  // still ends on the latest rename rather than the latest answer.
+  await act(async () => {
+    pending[1]({ filePath: "/Videos/tagged.mp4" });
+    pending[0]({ filePath: "/Videos/tagged [b].mp4" });
+  });
+  expect(await screen.findByDisplayValue("/Videos/tagged.mp4")).toBeVisible();
+});
+
 test("uses one control for playing and pausing", async () => {
   invokeMock
     .mockResolvedValueOnce({

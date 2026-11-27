@@ -1386,6 +1386,9 @@ function Player({
   useLayoutEffect(() => {
     videoGeneration.current += 1;
   }, [video.id]);
+  // Numbers each tag refresh so two retags in flight cannot apply out of
+  // order: only the latest one may move the displayed path.
+  const retagRefresh = useRef(0);
   // Where web playback was when a retag swapped the source underneath it:
   // the engine starts the new file at the beginning, so the metadata
   // handler puts the viewer back here — paused or playing as they were.
@@ -1616,29 +1619,31 @@ function Player({
   const refreshPreparedAfterRetag = async () => {
     const id = video.id;
     const generation = videoGeneration.current;
-    if (!isImage && prepared?.playbackBackend !== "native") {
-      resumeAfterRetag.current = {
-        time: element.current?.currentTime ?? currentTime,
-        paused: !playingBack,
-      };
-    }
+    retagRefresh.current += 1;
+    const refresh = retagRefresh.current;
+    // Read now, while the render's values are the video's own: by the time
+    // the re-read answers, the player may have moved on.
+    const resume =
+      !isImage && prepared?.playbackBackend !== "native"
+        ? {
+            time: element.current?.currentTime ?? currentTime,
+            paused: !playingBack,
+          }
+        : undefined;
     try {
       const next = await prepareVideo(id);
-      if (videoGeneration.current !== generation) {
-        resumeAfterRetag.current = undefined;
+      // A newer refresh, or a newer video, owns the display now — and the
+      // resume, which is only ever stored alongside the path it belongs to.
+      if (
+        videoGeneration.current !== generation ||
+        refresh !== retagRefresh.current
+      )
         return;
-      }
-      // A tag the name already carried renames nothing: the source stays,
-      // so there is no new beginning to resume from.
-      if (next.filePath === prepared?.filePath) {
-        resumeAfterRetag.current = undefined;
-        return;
-      }
+      if (resume) resumeAfterRetag.current = resume;
       setPrepared(next);
     } catch {
       // The tags themselves were saved; only the displayed path stays
       // behind until the next video is prepared.
-      resumeAfterRetag.current = undefined;
     }
   };
   const updateVideoTags = (update: Pick<VideoResult, "fileName" | "tags">) => {
