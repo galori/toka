@@ -83,6 +83,7 @@ export function isolatedPaths(worktree, env = process.env) {
     // macOS shim: launchctl
     launchctlShim: path.join(home, "bin", "launchctl"),
     launchctlShimLog: path.join(home, "run", "launchctl-shim.log"),
+    launchdLoaded: path.join(home, "run", "launchd-loaded"),
     indexerPidFile: path.join(home, "run", "indexer.pid"),
     indexerLog: path.join(home, "run", "indexer.log"),
     tmp: path.join(home, "tmp"),
@@ -190,10 +191,13 @@ exit 0
  * A stand-in `launchctl` for macOS. `ts install` calls `launchctl bootstrap`,
  * `launchctl print`, `launchctl bootout`, and `launchctl kickstart`; unshimmed,
  * an isolated instance would manage the user's real launchd agent. The shim
- * logs each call and acts only on the isolated indexer:
- * - `bootout` / `bootstrap + kickstart` start/stop the isolated indexer.
- * - `print` reports the agent as bootstrapped and running (so `ts install`
- *   thinks the service is already installed and healthy, skipping re-install).
+ * logs each call and acts only on the isolated indexer, standing in for the
+ * agent the way launchd would:
+ * - `bootstrap` / `kickstart` mark the agent loaded and start the indexer
+ *   unless it already runs; `bootout` stops it and marks the agent unloaded.
+ * - `print` answers as launchd does: "Could not find service" while
+ *   unloaded, else `state = running` or `state = not running` from the
+ *   verified indexer, so `ts start` after `ts stop` really starts it.
  * Every other call is a no-op that succeeds.
  */
 export function launchctlShimScript(paths) {
@@ -201,6 +205,7 @@ export function launchctlShimScript(paths) {
 # Installed by scripts/isolated (macOS): isolated Toka must never manage the
 # real launchd agent. It controls the isolated indexer instead.
 PIDFILE=${quote(paths.indexerPidFile)}
+LOADED=${quote(paths.launchdLoaded)}
 printf '%s launchctl %s\\n' "$(date)" "$*" >> ${quote(paths.launchctlShimLog)}
 pid=$(cat "$PIDFILE" 2>/dev/null)
 # A stale pid file may name a recycled PID: only trust it if it is our indexer.
@@ -215,11 +220,19 @@ if [ -n "$pid" ] && ! printf ' %s ' "$(ps ewww -o command= -p "$pid" 2>/dev/null
 fi
 case "$1" in
   print)
-    # Report the agent as bootstrapped and running so ts install short-circuits.
-    printf 'state = running\\n'
+    if [ ! -f "$LOADED" ]; then
+      echo "Could not find service \\"$2\\" in domain for user gui" >&2
+      exit 113
+    fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf 'state = running\\n'
+    else
+      printf 'state = not running\\n'
+    fi
     exit 0
     ;;
   bootout)
+    rm -f "$LOADED"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill -s TERM -- "-$pid" 2>/dev/null
       n=0
@@ -231,6 +244,7 @@ case "$1" in
     fi
     ;;
   bootstrap|kickstart)
+    touch "$LOADED"
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
       # macOS has no setsid(1); perl's setpgrp makes the indexer its own
       # group leader, so bootout and stop can signal its whole group.

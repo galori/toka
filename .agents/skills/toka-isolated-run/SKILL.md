@@ -56,10 +56,10 @@ them and pass `--worktree`.
     indexer (stop / start `toka-search.service`); every other call is a no-op.
     `loginctl` shim reports lingering as already enabled and no-ops everything
     else, so `ts install` never changes host login state.
-  - **macOS**: `launchctl` shim intercepts `ts install`'s `print`, `bootstrap`,
-    `bootout`, and `kickstart` calls; `print` reports the agent as already running
-    so the install short-circuits; `bootout`/`bootstrap` stop and start the
-    isolated indexer instead. The real launchd agent is never reached.
+  - **macOS**: `launchctl` shim logs to `run/launchctl-shim.log` and stands in
+    for the agent: `bootstrap`/`kickstart` mark it loaded and start the isolated
+    indexer unless it runs, `bootout` stops it, and `print` answers as launchd
+    would from that state. The real launchd agent is never reached.
   Never launch the isolated binary by hand without the env (use `env` below).
 - `TMPDIR` is also isolated (`<home>/tmp`): Toka's thumbnail cache lives in the
   temp dir and "reset index" deletes it.

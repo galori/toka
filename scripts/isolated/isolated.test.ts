@@ -174,7 +174,7 @@ describe("shimScript and seedConfig", () => {
     }
   });
 
-  it("launchctl shim logs, reports the agent running, and never signals a PID that is not the isolated indexer", async () => {
+  it("launchctl shim logs, answers print as launchd would, and never signals a PID that is not the isolated indexer", async () => {
     await mkdir(path.resolve(".scratch"), { recursive: true });
     const dir = await mkdtemp(path.resolve(".scratch/launchctl-test-"));
     // An unrelated process whose PID a stale pid file names.
@@ -190,17 +190,26 @@ describe("shimScript and seedConfig", () => {
           ...isolatedPaths(dir, {}),
           indexerPidFile: pidFile,
           launchctlShimLog: log,
+          launchdLoaded: path.join(dir, "loaded"),
         }),
       );
       await chmod(shim, 0o755);
-      const print = spawnSync(shim, ["print", "gui/501/app.toka.ts"], {
-        encoding: "utf8",
-      });
-      expect(print.status).toBe(0);
-      expect(print.stdout).toContain("state = running");
+      const print = () =>
+        spawnSync(shim, ["print", "gui/501/app.toka.ts"], { encoding: "utf8" });
+      // Not loaded yet: launchd's own "no such job" answer, which `ts`
+      // reads as not bootstrapped.
+      expect(print().status).toBe(113);
+      expect(print().stderr).toContain("Could not find service");
+      // Loaded, but the pid file names no isolated indexer (and this
+      // home's ts was never built, so none starts): loaded, not running.
+      expect(spawnSync(shim, ["kickstart", "-k", "gui/501/app.toka.ts"]).status).toBe(0);
+      await writeFile(pidFile, `${bystander.pid}\n`);
+      expect(print().status).toBe(0);
+      expect(print().stdout).toContain("state = not running");
       const bootout = spawnSync(shim, ["bootout", "gui/501/app.toka.ts"]);
       expect(bootout.status).toBe(0);
       expect(() => process.kill(bystander.pid!, 0)).not.toThrow();
+      expect(print().status).toBe(113);
       expect(await readFile(log, "utf8")).toContain(
         "launchctl bootout gui/501/app.toka.ts",
       );
@@ -501,6 +510,11 @@ setInterval(() => {}, 1000);
           true,
         ),
       );
+      // Loaded and running again, as `ts start` and `ts status` read it.
+      expect(
+        spawnSync(shim, ["print", "gui/501/app.toka.ts"], { encoding: "utf8" })
+          .stdout,
+      ).toContain("state = running");
 
       expect(run("stop").status).toBe(0);
       await vi.waitFor(() => expect(() => process.kill(second, 0)).toThrow());
